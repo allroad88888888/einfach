@@ -8,16 +8,22 @@ import type {
   SetFormatRangeRequest,
   SpreadsheetBackend,
   UnmergeRangeRequest,
+  VisibleProjectionResult,
   VisibleProjectionRequest,
 } from '@einfach/spreadsheet-ui-core'
 import {
+  beginProjectionAtom,
+  findReplaceOpenAtom,
   formatCellsEditorAtom,
   formatPainterStateAtom,
   historyStackAtom,
+  resolveProjectionAtom,
   selectCellAtom,
   setWorkspaceActiveSheetAtom,
   startEditingAtom,
+  toolbarActiveSurfaceAtom,
   toolbarIntentAtom,
+  toolbarMutationLifecycleAtom,
   setSheetProtectionAtom,
 } from '@einfach/spreadsheet-ui-core'
 import { setLocale } from '../src/i18n'
@@ -85,6 +91,7 @@ function createRecordingBackend() {
     async setFormatRange(request) {
       setFormatRangeCalls.push(request)
       return {
+        kind: request.kind,
         sheetId: request.sheetId,
         requestId: request.requestId,
         revision: 2,
@@ -94,6 +101,7 @@ function createRecordingBackend() {
     async mergeRange(request) {
       mergeRangeCalls.push(request)
       return {
+        kind: request.kind,
         sheetId: request.sheetId,
         requestId: request.requestId,
         revision: 2,
@@ -103,15 +111,67 @@ function createRecordingBackend() {
     async unmergeRange(request) {
       unmergeRangeCalls.push(request)
       return {
+        kind: request.kind,
         sheetId: request.sheetId,
         requestId: request.requestId,
         revision: 3,
         affectedRange: { ...request.range },
       }
     },
+    async setFilterSort(request) {
+      return {
+        sheetId: request.sheetId,
+        requestId: request.requestId,
+        revision: 4,
+      }
+    },
   }
 
-  return { backend, setFormatRangeCalls, mergeRangeCalls, unmergeRangeCalls, readVisibleProjectionCalls }
+  return {
+    backend,
+    setFormatRangeCalls,
+    mergeRangeCalls,
+    unmergeRangeCalls,
+    readVisibleProjectionCalls,
+  }
+}
+
+function seedReadyProjection(store: ReturnType<typeof createStore>) {
+  seedVisibleProjection(store, {
+    kind: 'visible-window',
+    sheetId: 'sheet-1',
+    requestId: 1,
+    window: { rowStart: 0, rowEnd: 4, colStart: 0, colEnd: 4 },
+    cells: [
+      {
+        row: 0,
+        col: 0,
+        displayValue: 'A1',
+        valueKind: 'string',
+        format: {},
+      },
+    ],
+  })
+}
+
+function seedVisibleProjection(
+  store: ReturnType<typeof createStore>,
+  result: VisibleProjectionResult,
+) {
+  const begin = store.setter(beginProjectionAtom, {
+    kind: 'visible-window',
+    sheetId: result.sheetId,
+    reason: 'test',
+    window: result.window,
+  })
+  expect(begin.status).toBe('started')
+  if (begin.status !== 'started') throw new Error('projection seed lane did not start')
+
+  const resolved = store.setter(resolveProjectionAtom, {
+    request: begin.request,
+    result: { ...result, requestId: begin.request.requestId },
+  })
+  expect(resolved.status).toBe('accepted')
 }
 
 function getButtons(container: HTMLElement) {
@@ -121,8 +181,12 @@ function getButtons(container: HTMLElement) {
     underline: container.querySelector(
       '[data-testid="toolbar-btn-underline"]',
     ) as HTMLButtonElement,
-    fillColor: container.querySelector('[data-testid="toolbar-btn-fill-color"]') as HTMLButtonElement,
-    textColor: container.querySelector('[data-testid="toolbar-btn-text-color"]') as HTMLButtonElement,
+    fillColor: container.querySelector(
+      '[data-testid="toolbar-btn-fill-color"]',
+    ) as HTMLButtonElement,
+    textColor: container.querySelector(
+      '[data-testid="toolbar-btn-text-color"]',
+    ) as HTMLButtonElement,
     numberFormat: container.querySelector(
       '[data-testid="toolbar-btn-number-format"]',
     ) as HTMLButtonElement,
@@ -139,6 +203,9 @@ function getButtons(container: HTMLElement) {
       container.querySelector('[data-testid="toolbar-merge-unmerge"]') as HTMLButtonElement | null,
     painter: container.querySelector(
       '[data-testid="toolbar-btn-format-painter"]',
+    ) as HTMLButtonElement,
+    findReplace: container.querySelector(
+      '[data-testid="toolbar-btn-find-replace"]',
     ) as HTMLButtonElement,
   }
 }
@@ -176,6 +243,39 @@ describe('vNext SpreadsheetToolbar', () => {
     expect(buttons.numberFormat.disabled).toBe(false)
     // Still no mergeRange port on the fake backend.
     expect(buttons.merge.disabled).toBe(true)
+    // Find/Replace is not an actionable entrypoint without searchRange.
+    expect(buttons.findReplace.disabled).toBe(true)
+  })
+
+  it('opens Find from the toolbar with a search-only backend', async () => {
+    const store = createStore()
+    const backend: SpreadsheetBackend = {
+      ...createFakeBackend(),
+      async searchRange(request) {
+        return {
+          kind: 'search-range',
+          sheetId: request.sheetId,
+          requestId: request.requestId,
+          revision: request.revision,
+          matches: [],
+          pageStart: request.pageStart,
+          totalCount: 0,
+        }
+      },
+    }
+    store.setter(setWorkspaceActiveSheetAtom, { sheetId: 'sheet-1' })
+
+    const { container } = render(() => (
+      <SpreadsheetUiProvider backend={backend} store={store}>
+        <SpreadsheetToolbar />
+      </SpreadsheetUiProvider>
+    ))
+
+    const button = getButtons(container).findReplace
+    await waitFor(() => expect(button.disabled).toBe(false))
+    expect(button.getAttribute('data-capability')).toBe('find-only')
+    fireEvent.click(button)
+    expect(store.getter(findReplaceOpenAtom)).toBe(true)
   })
 
   it('disables formatting commands while editing is drafting', () => {
@@ -220,7 +320,9 @@ describe('vNext SpreadsheetToolbar', () => {
       </SpreadsheetUiProvider>
     ))
 
-    fireEvent.click(container.querySelector('[data-testid="toolbar-btn-bold"]') as HTMLButtonElement)
+    fireEvent.click(
+      container.querySelector('[data-testid="toolbar-btn-bold"]') as HTMLButtonElement,
+    )
 
     expect(store.getter(toolbarIntentAtom)).toEqual({
       type: 'toolbar.format.command',
@@ -238,31 +340,20 @@ describe('vNext SpreadsheetToolbar', () => {
 
     store.setter(setWorkspaceActiveSheetAtom, { sheetId: 'sheet-1' })
     store.setter(selectCellAtom, { sheetId: 'sheet-1', coord: { row: 0, col: 0 } })
-    store.setter(spreadsheetProjectionSnapshotAtom, {
-      status: 'ready',
-      request: {
-        kind: 'visible-window',
-        sheetId: 'sheet-1',
-        requestId: 1,
-        reason: 'test',
-        window: { rowStart: 0, rowEnd: 4, colStart: 0, colEnd: 4 },
-      },
-      result: {
-        kind: 'visible-window',
-        sheetId: 'sheet-1',
-        requestId: 1,
-        window: { rowStart: 0, rowEnd: 4, colStart: 0, colEnd: 4 },
-        cells: [
-          {
-            row: 0,
-            col: 0,
-            displayValue: 'A1',
-            valueKind: 'string',
-            format: {},
-          },
-        ],
-      },
-      error: undefined,
+    seedVisibleProjection(store, {
+      kind: 'visible-window',
+      sheetId: 'sheet-1',
+      requestId: 1,
+      window: { rowStart: 0, rowEnd: 4, colStart: 0, colEnd: 4 },
+      cells: [
+        {
+          row: 0,
+          col: 0,
+          displayValue: 'A1',
+          valueKind: 'string',
+          format: {},
+        },
+      ],
     })
 
     const { container } = render(() => (
@@ -271,7 +362,9 @@ describe('vNext SpreadsheetToolbar', () => {
       </SpreadsheetUiProvider>
     ))
 
-    fireEvent.click(container.querySelector('[data-testid="toolbar-btn-bold"]') as HTMLButtonElement)
+    fireEvent.click(
+      container.querySelector('[data-testid="toolbar-btn-bold"]') as HTMLButtonElement,
+    )
 
     await waitFor(() => {
       expect(setFormatRangeCalls).toHaveLength(1)
@@ -280,6 +373,7 @@ describe('vNext SpreadsheetToolbar', () => {
     expect(setFormatRangeCalls[0]).toEqual({
       kind: 'set-format-range',
       sheetId: 'sheet-1',
+      requestId: expect.any(Number),
       range: { rowStart: 0, rowEnd: 0, colStart: 0, colEnd: 0 },
       format: { bold: true },
     })
@@ -294,38 +388,137 @@ describe('vNext SpreadsheetToolbar', () => {
     })
   })
 
+  it('reconciles a dispatched transport rejection without resending the mutation', async () => {
+    const store = createStore()
+    const recording = createRecordingBackend()
+    const requests: SetFormatRangeRequest[] = []
+    const backend: SpreadsheetBackend = {
+      ...recording.backend,
+      async setFormatRange(request) {
+        requests.push(request)
+        throw new Error('transport rejected after dispatch')
+      },
+    }
+
+    store.setter(setWorkspaceActiveSheetAtom, { sheetId: 'sheet-1' })
+    store.setter(selectCellAtom, { sheetId: 'sheet-1', coord: { row: 0, col: 0 } })
+    seedReadyProjection(store)
+
+    const { container } = render(() => (
+      <SpreadsheetUiProvider backend={backend} store={store}>
+        <SpreadsheetToolbar />
+      </SpreadsheetUiProvider>
+    ))
+
+    fireEvent.click(getButtons(container).bold)
+
+    await waitFor(() => {
+      expect(store.getter(toolbarMutationLifecycleAtom).status).toBe('outcome-unknown')
+      expect(
+        container.querySelector('[data-testid="toolbar-mutation-refresh-retry"]'),
+      ).not.toBeNull()
+    })
+    expect(container.querySelector('[data-testid="toolbar-mutation-retry"]')).toBeNull()
+    expect(requests).toHaveLength(1)
+    expect(store.getter(historyStackAtom).entries).toHaveLength(0)
+
+    fireEvent.click(
+      container.querySelector(
+        '[data-testid="toolbar-mutation-refresh-retry"]',
+      ) as HTMLButtonElement,
+    )
+
+    await waitFor(() => {
+      expect(store.getter(toolbarMutationLifecycleAtom)).toMatchObject({
+        status: 'outcome-unknown',
+        canRetryRefresh: false,
+      })
+      expect(recording.readVisibleProjectionCalls).toHaveLength(1)
+      expect(store.getter(historyStackAtom).entries).toHaveLength(0)
+      expect(container.querySelector('[data-testid="toolbar-mutation-refresh-retry"]')).toBeNull()
+    })
+    expect(requests).toHaveLength(1)
+  })
+
+  it('offers reconcile-only recovery after an ambiguous ACK without resending the mutation', async () => {
+    const store = createStore()
+    const recording = createRecordingBackend()
+    const requests: SetFormatRangeRequest[] = []
+    const backend: SpreadsheetBackend = {
+      ...recording.backend,
+      async setFormatRange(request) {
+        requests.push(request)
+        return {
+          kind: request.kind,
+          sheetId: request.sheetId,
+          requestId: 999_999,
+          revision: 2,
+          affectedRange: { ...request.range },
+        }
+      },
+    }
+
+    store.setter(setWorkspaceActiveSheetAtom, { sheetId: 'sheet-1' })
+    store.setter(selectCellAtom, { sheetId: 'sheet-1', coord: { row: 0, col: 0 } })
+    seedReadyProjection(store)
+
+    const { container } = render(() => (
+      <SpreadsheetUiProvider backend={backend} store={store}>
+        <SpreadsheetToolbar />
+      </SpreadsheetUiProvider>
+    ))
+
+    fireEvent.click(getButtons(container).bold)
+
+    await waitFor(() => {
+      expect(store.getter(toolbarMutationLifecycleAtom).status).toBe('outcome-unknown')
+      expect(
+        container.querySelector('[data-testid="toolbar-mutation-refresh-retry"]'),
+      ).not.toBeNull()
+    })
+    expect(requests).toHaveLength(1)
+    expect(recording.readVisibleProjectionCalls).toHaveLength(0)
+    expect(store.getter(historyStackAtom).entries).toHaveLength(0)
+
+    fireEvent.click(
+      container.querySelector(
+        '[data-testid="toolbar-mutation-refresh-retry"]',
+      ) as HTMLButtonElement,
+    )
+
+    await waitFor(() => {
+      expect(store.getter(toolbarMutationLifecycleAtom)).toMatchObject({
+        status: 'outcome-unknown',
+        canRetryRefresh: false,
+      })
+      expect(recording.readVisibleProjectionCalls).toHaveLength(1)
+      expect(container.querySelector('[data-testid="toolbar-mutation-refresh-retry"]')).toBeNull()
+    })
+    expect(requests).toHaveLength(1)
+    expect(store.getter(historyStackAtom).entries).toHaveLength(0)
+  })
+
   it('maps toolbar number formats from sorted visible rows to source rows', async () => {
     const store = createStore()
     const { backend, setFormatRangeCalls } = createRecordingBackend()
 
     store.setter(setWorkspaceActiveSheetAtom, { sheetId: 'sheet-1' })
     store.setter(selectCellAtom, { sheetId: 'sheet-1', coord: { row: 5, col: 4 } })
-    store.setter(spreadsheetProjectionSnapshotAtom, {
-      status: 'ready',
-      request: {
-        kind: 'visible-window',
-        sheetId: 'sheet-1',
-        requestId: 1,
-        reason: 'test',
-        window: { rowStart: 0, rowEnd: 8, colStart: 0, colEnd: 5 },
-      },
-      result: {
-        kind: 'visible-window',
-        sheetId: 'sheet-1',
-        requestId: 1,
-        window: { rowStart: 0, rowEnd: 8, colStart: 0, colEnd: 5 },
-        cells: [
-          {
-            row: 5,
-            col: 4,
-            originalRow: 1,
-            displayValue: '300',
-            valueKind: 'number',
-            format: {},
-          },
-        ],
-      },
-      error: undefined,
+    seedVisibleProjection(store, {
+      kind: 'visible-window',
+      sheetId: 'sheet-1',
+      requestId: 1,
+      window: { rowStart: 0, rowEnd: 8, colStart: 0, colEnd: 5 },
+      cells: [
+        {
+          row: 5,
+          col: 4,
+          originalRow: 1,
+          displayValue: '300',
+          valueKind: 'number',
+          format: {},
+        },
+      ],
     })
 
     const { container } = render(() => (
@@ -340,6 +533,7 @@ describe('vNext SpreadsheetToolbar', () => {
     expect(setFormatRangeCalls[0]).toEqual({
       kind: 'set-format-range',
       sheetId: 'sheet-1',
+      requestId: expect.any(Number),
       range: { rowStart: 1, rowEnd: 1, colStart: 4, colEnd: 4 },
       format: { numberFormat: { kind: 'percent', digits: 0 } },
     })
@@ -379,10 +573,130 @@ describe('vNext SpreadsheetToolbar', () => {
       // The dropdown no longer renders a nested submenu — the Custom row is a
       // plain item with no aria-haspopup and no submenu siblings.
       expect(custom?.getAttribute('aria-haspopup')).toBeNull()
-      expect(
-        document.body.querySelector('[data-testid="number-format-custom-submenu"]'),
-      ).toBeNull()
+      expect(document.body.querySelector('[data-testid="number-format-custom-submenu"]')).toBeNull()
       cleanup()
+    }
+  })
+
+  it('uses the Core active surface as the single authority for all dropdowns and palettes', async () => {
+    const store = createStore()
+    const { backend } = createRecordingBackend()
+
+    store.setter(setWorkspaceActiveSheetAtom, { sheetId: 'sheet-1' })
+    store.setter(selectCellAtom, { sheetId: 'sheet-1', coord: { row: 0, col: 0 } })
+
+    const { container } = render(() => (
+      <SpreadsheetUiProvider backend={backend} store={store}>
+        <SpreadsheetToolbar />
+      </SpreadsheetUiProvider>
+    ))
+
+    const surfaceCases = [
+      {
+        buttonTestId: 'toolbar-btn-h-align',
+        surface: { kind: 'dropdown', id: 'alignment' },
+        panelTestId: 'toolbar-h-align-dropdown',
+      },
+      {
+        buttonTestId: 'toolbar-btn-v-align',
+        surface: { kind: 'dropdown', id: 'vertical-alignment' },
+        panelTestId: 'toolbar-v-align-dropdown',
+      },
+      {
+        buttonTestId: 'toolbar-btn-number-format',
+        surface: { kind: 'dropdown', id: 'number-format' },
+        panelTestId: 'number-format-dropdown',
+      },
+      {
+        buttonTestId: 'toolbar-btn-borders',
+        surface: { kind: 'dropdown', id: 'border' },
+        panelTestId: 'toolbar-borders-dropdown',
+      },
+      {
+        buttonTestId: 'toolbar-btn-merge',
+        surface: { kind: 'dropdown', id: 'merge' },
+        panelTestId: 'toolbar-merge-dropdown',
+      },
+      {
+        buttonTestId: 'toolbar-btn-font-family',
+        surface: { kind: 'dropdown', id: 'font-family' },
+        panelTestId: 'toolbar-font-family-dropdown',
+      },
+      {
+        buttonTestId: 'toolbar-btn-font-size',
+        surface: { kind: 'dropdown', id: 'font-size' },
+        panelTestId: 'toolbar-font-size-dropdown',
+      },
+      {
+        buttonTestId: 'toolbar-btn-rotation',
+        surface: { kind: 'dropdown', id: 'rotation' },
+        panelTestId: 'toolbar-rotation-dropdown',
+      },
+      {
+        buttonTestId: 'toolbar-btn-sort',
+        surface: { kind: 'dropdown', id: 'sort' },
+        panelTestId: 'toolbar-sort-dropdown',
+      },
+      {
+        buttonTestId: 'toolbar-btn-text-color',
+        surface: { kind: 'palette', id: 'text-color' },
+        panelTestId: 'toolbar-color-popover',
+        paletteMode: 'text',
+      },
+      {
+        buttonTestId: 'toolbar-btn-fill-color',
+        surface: { kind: 'palette', id: 'fill-color' },
+        panelTestId: 'toolbar-color-popover',
+        paletteMode: 'fill',
+      },
+    ] as const
+
+    const buttons = surfaceCases.map(({ buttonTestId }) => {
+      const button = container.querySelector(
+        `[data-testid="${buttonTestId}"]`,
+      ) as HTMLButtonElement | null
+      expect(button).not.toBeNull()
+      return button!
+    })
+
+    const sortButton = buttons[surfaceCases.findIndex(({ surface }) => surface.id === 'sort')]
+    await waitFor(() => expect(sortButton.disabled).toBe(false))
+
+    for (const [index, surfaceCase] of surfaceCases.entries()) {
+      const button = buttons[index]
+      expect(button.disabled).toBe(false)
+      fireEvent.click(button)
+
+      await waitFor(() => {
+        expect(store.getter(toolbarActiveSurfaceAtom)).toEqual(surfaceCase.surface)
+        expect(
+          document.body.querySelector(`[data-testid="${surfaceCase.panelTestId}"]`),
+        ).not.toBeNull()
+      })
+
+      for (const [buttonIndex, candidate] of buttons.entries()) {
+        expect(candidate.getAttribute('aria-expanded')).toBe(
+          buttonIndex === index ? 'true' : 'false',
+        )
+      }
+
+      const palette = document.body.querySelector(
+        '[data-testid="toolbar-color-popover"]',
+      ) as HTMLElement | null
+      if ('paletteMode' in surfaceCase) {
+        expect(palette?.dataset.mode).toBe(surfaceCase.paletteMode)
+      } else {
+        expect(palette).toBeNull()
+      }
+    }
+
+    fireEvent.click(buttons.at(-1)!)
+    await waitFor(() => {
+      expect(store.getter(toolbarActiveSurfaceAtom)).toBeNull()
+      expect(document.body.querySelector('[data-testid="toolbar-color-popover"]')).toBeNull()
+    })
+    for (const button of buttons) {
+      expect(button.getAttribute('aria-expanded')).toBe('false')
     }
   })
 
@@ -428,23 +742,12 @@ describe('vNext SpreadsheetToolbar', () => {
     store.setter(setWorkspaceActiveSheetAtom, { sheetId: 'sheet-1' })
     store.setter(selectCellAtom, { sheetId: 'sheet-1', coord: { row: 0, col: 0 } })
     store.setter(selectCellAtom, { sheetId: 'sheet-1', coord: { row: 1, col: 1 }, extend: true })
-    store.setter(spreadsheetProjectionSnapshotAtom, {
-      status: 'ready',
-      request: {
-        kind: 'visible-window',
-        sheetId: 'sheet-1',
-        requestId: 1,
-        reason: 'test',
-        window: { rowStart: 0, rowEnd: 4, colStart: 0, colEnd: 4 },
-      },
-      result: {
-        kind: 'visible-window',
-        sheetId: 'sheet-1',
-        requestId: 1,
-        window: { rowStart: 0, rowEnd: 4, colStart: 0, colEnd: 4 },
-        cells: [],
-      },
-      error: undefined,
+    seedVisibleProjection(store, {
+      kind: 'visible-window',
+      sheetId: 'sheet-1',
+      requestId: 1,
+      window: { rowStart: 0, rowEnd: 4, colStart: 0, colEnd: 4 },
+      cells: [],
     })
 
     const { container } = render(() => (
@@ -471,38 +774,29 @@ describe('vNext SpreadsheetToolbar', () => {
     expect(mergeRangeCalls[0]).toEqual({
       kind: 'merge-range',
       sheetId: 'sheet-1',
+      requestId: expect.any(Number),
       range: { rowStart: 0, rowEnd: 1, colStart: 0, colEnd: 1 },
     })
     await waitFor(() => {
       expect(readVisibleProjectionCalls).toHaveLength(1)
+      expect(store.getter(toolbarMutationLifecycleAtom).status).toBe('ready')
     })
 
     // The fake backend doesn't mutate the projection. Inject a merge anchor at
     // A1 covering A1:B2 so the unmerge button becomes enabled, then click it.
-    store.setter(spreadsheetProjectionSnapshotAtom, {
-      status: 'ready',
-      request: {
-        kind: 'visible-window',
-        sheetId: 'sheet-1',
-        requestId: 2,
-        reason: 'test',
-        window: { rowStart: 0, rowEnd: 4, colStart: 0, colEnd: 4 },
-      },
-      result: {
-        kind: 'visible-window',
-        sheetId: 'sheet-1',
-        requestId: 2,
-        window: { rowStart: 0, rowEnd: 4, colStart: 0, colEnd: 4 },
-        cells: [
-          {
-            row: 0,
-            col: 0,
-            displayValue: '',
-            mergedSpan: { rows: 2, cols: 2 },
-          },
-        ],
-      },
-      error: undefined,
+    seedVisibleProjection(store, {
+      kind: 'visible-window',
+      sheetId: 'sheet-1',
+      requestId: 2,
+      window: { rowStart: 0, rowEnd: 4, colStart: 0, colEnd: 4 },
+      cells: [
+        {
+          row: 0,
+          col: 0,
+          displayValue: '',
+          mergedSpan: { rows: 2, cols: 2 },
+        },
+      ],
     })
 
     buttons = getButtons(container)
@@ -517,12 +811,13 @@ describe('vNext SpreadsheetToolbar', () => {
     expect(unmergeRangeCalls[0]).toEqual({
       kind: 'unmerge-range',
       sheetId: 'sheet-1',
+      requestId: expect.any(Number),
       range: { rowStart: 0, rowEnd: 1, colStart: 0, colEnd: 1 },
     })
     expect(readVisibleProjectionCalls).toHaveLength(2)
   })
 
-  it('disables format buttons when active cell is locked in a protected sheet', () => {
+  it('disables format buttons under Excel sheet editing protection for a locked cell', () => {
     const store = createStore()
     const backend = createFakeBackend()
 
@@ -545,7 +840,7 @@ describe('vNext SpreadsheetToolbar', () => {
     expect(buttons.fillColor.disabled).toBe(true)
     expect(buttons.textColor.disabled).toBe(true)
     expect(buttons.numberFormat.disabled).toBe(true)
-    // Protected sheet → the merge dropdown anchor button is disabled.
+    // Excel editing protection disables the merge dropdown anchor button.
     expect(buttons.merge.disabled).toBe(true)
   })
 
@@ -579,31 +874,20 @@ describe('vNext SpreadsheetToolbar', () => {
 
     store.setter(setWorkspaceActiveSheetAtom, { sheetId: 'sheet-1' })
     store.setter(selectCellAtom, { sheetId: 'sheet-1', coord: { row: 0, col: 0 } })
-    store.setter(spreadsheetProjectionSnapshotAtom, {
-      status: 'ready',
-      request: {
-        kind: 'visible-window',
-        sheetId: 'sheet-1',
-        requestId: 1,
-        reason: 'test',
-        window: { rowStart: 0, rowEnd: 4, colStart: 0, colEnd: 4 },
-      },
-      result: {
-        kind: 'visible-window',
-        sheetId: 'sheet-1',
-        requestId: 1,
-        window: { rowStart: 0, rowEnd: 4, colStart: 0, colEnd: 4 },
-        cells: [
-          {
-            row: 0,
-            col: 0,
-            displayValue: 'A1',
-            valueKind: 'string',
-            format: { bold: true },
-          },
-        ],
-      },
-      error: undefined,
+    seedVisibleProjection(store, {
+      kind: 'visible-window',
+      sheetId: 'sheet-1',
+      requestId: 1,
+      window: { rowStart: 0, rowEnd: 4, colStart: 0, colEnd: 4 },
+      cells: [
+        {
+          row: 0,
+          col: 0,
+          displayValue: 'A1',
+          valueKind: 'string',
+          format: { bold: true },
+        },
+      ],
     })
 
     const { container } = render(() => (
@@ -627,23 +911,12 @@ describe('vNext SpreadsheetToolbar', () => {
 
     store.setter(setWorkspaceActiveSheetAtom, { sheetId: 'sheet-1' })
     store.setter(selectCellAtom, { sheetId: 'sheet-1', coord: { row: 0, col: 0 } })
-    store.setter(spreadsheetProjectionSnapshotAtom, {
-      status: 'ready',
-      request: {
-        kind: 'visible-window',
-        sheetId: 'sheet-1',
-        requestId: 1,
-        reason: 'test',
-        window: { rowStart: 0, rowEnd: 4, colStart: 0, colEnd: 4 },
-      },
-      result: {
-        kind: 'visible-window',
-        sheetId: 'sheet-1',
-        requestId: 1,
-        window: { rowStart: 0, rowEnd: 4, colStart: 0, colEnd: 4 },
-        cells: [{ row: 0, col: 0, displayValue: '', valueKind: 'string', format: {} }],
-      },
-      error: undefined,
+    seedVisibleProjection(store, {
+      kind: 'visible-window',
+      sheetId: 'sheet-1',
+      requestId: 1,
+      window: { rowStart: 0, rowEnd: 4, colStart: 0, colEnd: 4 },
+      cells: [{ row: 0, col: 0, displayValue: '', valueKind: 'string', format: {} }],
     })
 
     const { container } = render(() => (
@@ -666,23 +939,12 @@ describe('vNext SpreadsheetToolbar', () => {
 
     store.setter(setWorkspaceActiveSheetAtom, { sheetId: 'sheet-1' })
     store.setter(selectCellAtom, { sheetId: 'sheet-1', coord: { row: 0, col: 0 } })
-    store.setter(spreadsheetProjectionSnapshotAtom, {
-      status: 'ready',
-      request: {
-        kind: 'visible-window',
-        sheetId: 'sheet-1',
-        requestId: 1,
-        reason: 'test',
-        window: { rowStart: 0, rowEnd: 4, colStart: 0, colEnd: 4 },
-      },
-      result: {
-        kind: 'visible-window',
-        sheetId: 'sheet-1',
-        requestId: 1,
-        window: { rowStart: 0, rowEnd: 4, colStart: 0, colEnd: 4 },
-        cells: [{ row: 0, col: 0, displayValue: '', valueKind: 'string', format: {} }],
-      },
-      error: undefined,
+    seedVisibleProjection(store, {
+      kind: 'visible-window',
+      sheetId: 'sheet-1',
+      requestId: 1,
+      window: { rowStart: 0, rowEnd: 4, colStart: 0, colEnd: 4 },
+      cells: [{ row: 0, col: 0, displayValue: '', valueKind: 'string', format: {} }],
     })
 
     const { container } = render(() => (
@@ -731,23 +993,12 @@ describe('vNext SpreadsheetToolbar', () => {
 
     store.setter(setWorkspaceActiveSheetAtom, { sheetId: 'sheet-1' })
     store.setter(selectCellAtom, { sheetId: 'sheet-1', coord: { row: 0, col: 0 } })
-    store.setter(spreadsheetProjectionSnapshotAtom, {
-      status: 'ready',
-      request: {
-        kind: 'visible-window',
-        sheetId: 'sheet-1',
-        requestId: 1,
-        reason: 'test',
-        window: { rowStart: 0, rowEnd: 4, colStart: 0, colEnd: 4 },
-      },
-      result: {
-        kind: 'visible-window',
-        sheetId: 'sheet-1',
-        requestId: 1,
-        window: { rowStart: 0, rowEnd: 4, colStart: 0, colEnd: 4 },
-        cells: [{ row: 0, col: 0, displayValue: '', valueKind: 'string', format: { bold: true } }],
-      },
-      error: undefined,
+    seedVisibleProjection(store, {
+      kind: 'visible-window',
+      sheetId: 'sheet-1',
+      requestId: 1,
+      window: { rowStart: 0, rowEnd: 4, colStart: 0, colEnd: 4 },
+      cells: [{ row: 0, col: 0, displayValue: '', valueKind: 'string', format: { bold: true } }],
     })
 
     const { container } = render(() => (

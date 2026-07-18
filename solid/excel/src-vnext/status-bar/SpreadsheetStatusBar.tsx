@@ -1,5 +1,5 @@
-import { useAtomValue, useSetAtom, useStore } from '@einfach/solid'
-import { createEffect, createMemo, For, onCleanup } from 'solid-js'
+import { useAtomValue, useSetAtom } from '@einfach/solid'
+import { createMemo, For } from 'solid-js'
 import {
   clipboardIntentAtom,
   keyboardModeAtom,
@@ -10,8 +10,6 @@ import {
   setViewModeAtom,
   setZoomLevelAtom,
   statusBarAggregateConfigAtom,
-  statusBarAggregateTruncatedAtom,
-  statusBarProjectionCellsAtom,
   toggleStatusBarAggregateAtom,
   toolbarIntentAtom,
   viewModeAtom,
@@ -22,7 +20,6 @@ import {
   zoomLevelAtom,
   type CellCoord,
   type CellRange,
-  type DisplayCell,
   type KeyboardMode,
   type ClipboardIntent,
   type MenuCommandIntent,
@@ -70,6 +67,8 @@ export interface SpreadsheetStatusBarProps {
   orientation?: 'horizontal' | 'vertical'
 }
 
+type StatusBarTranslate = ReturnType<typeof useT>
+
 function getColumnLabel(index: number): string {
   let value = index + 1
   let label = ''
@@ -95,7 +94,7 @@ function countRange(range: CellRange): number {
   return (range.rowEnd - range.rowStart + 1) * (range.colEnd - range.colStart + 1)
 }
 
-function formatRange(selection: SelectionState, range: CellRange): string {
+function formatRange(selection: SelectionState, range: CellRange, t: StatusBarTranslate): string {
   switch (selection.kind) {
     case 'cell':
       return toA1(selection.focus)
@@ -109,66 +108,74 @@ function formatRange(selection: SelectionState, range: CellRange): string {
     case 'column':
       return `${getColumnLabel(range.colStart)}:${getColumnLabel(range.colEnd)}`
     case 'all':
-      return 'All'
+      return t('status.selection.all')
     default:
       return ''
   }
 }
 
-function formatProjectionStatus(snapshot: ProjectionSnapshot): string {
+function formatProjectionStatus(snapshot: ProjectionSnapshot, t: StatusBarTranslate): string {
   switch (snapshot.status) {
     case 'idle':
-      return 'Idle'
+      return t('status.projection.idle')
     case 'loading':
-      return 'Loading'
+      return t('status.projection.loading')
     case 'ready':
-      return 'Ready'
+      return t('status.projection.ready')
     case 'error':
-      return snapshot.error?.message ?? 'Error'
+      return snapshot.error?.message ?? t('status.projection.error')
     default:
-      return 'Unknown'
+      return t('status.projection.unknown')
   }
 }
 
-function formatVisibleWindow(snapshot: ProjectionSnapshot, fallbackWindow: CellRange): string {
-  const window = snapshot.result?.kind === 'visible-window' ? snapshot.result.window : fallbackWindow
-  return `${countRange(window)} cells`
+function formatVisibleWindow(
+  snapshot: ProjectionSnapshot,
+  fallbackWindow: CellRange,
+  t: StatusBarTranslate,
+): string {
+  const window =
+    snapshot.result?.kind === 'visible-window' ? snapshot.result.window : fallbackWindow
+  return t('status.visibleCells', { count: countRange(window) })
 }
 
-function formatLoadedValues(snapshot: ProjectionSnapshot): string {
+function formatLoadedValues(snapshot: ProjectionSnapshot, t: StatusBarTranslate): string {
   const loaded = snapshot.result?.cells.length ?? 0
-  return `${loaded} loaded`
+  return t('status.loadedValues', { count: loaded })
 }
 
-function formatToolbarIntent(intent: ToolbarIntent | null): string | null {
+function formatToolbarIntent(intent: ToolbarIntent | null, t: StatusBarTranslate): string | null {
   if (intent?.type === 'toolbar.format.command') {
-    return `Toolbar ${intent.command}`
+    return t('status.lastCommand.toolbar', { command: intent.command })
   }
 
   if (intent?.type === 'toolbar.surface.open') {
-    return `Toolbar ${intent.surface.id}`
+    return t('status.lastCommand.toolbar', { command: intent.surface.id })
   }
 
   return null
 }
 
-function formatMenuIntent(intent: MenuCommandIntent | null): string | null {
+function formatMenuIntent(intent: MenuCommandIntent | null, t: StatusBarTranslate): string | null {
   if (!intent) {
     return null
   }
 
-  return `Menu ${intent.command}`
+  return t('status.lastCommand.menu', { command: intent.command })
 }
 
-function formatClipboardIntent(intent: ClipboardIntent | null): string | null {
+function formatClipboardIntent(
+  intent: ClipboardIntent | null,
+  t: StatusBarTranslate,
+): string | null {
   if (!intent) return null
   switch (intent.type) {
     case 'clipboard.copy':
-      return 'Clipboard copy'
+      return t('status.lastCommand.clipboardCopy')
     case 'clipboard.cut':
-      return 'Clipboard cut'
+      return t('status.lastCommand.clipboardCut')
     case 'clipboard.paste':
-      return 'Clipboard paste'
+      return t('status.lastCommand.clipboardPaste')
     default:
       return null
   }
@@ -207,24 +214,6 @@ function formatAggregateValue(key: StatusBarAggregateKey, value: number): string
   return value.toFixed(2).replace(/\.?0+$/, '')
 }
 
-function rangesIntersect(a: CellRange, b: CellRange): boolean {
-  return (
-    a.rowStart <= b.rowEnd &&
-    a.rowEnd >= b.rowStart &&
-    a.colStart <= b.colEnd &&
-    a.colEnd >= b.colStart
-  )
-}
-
-function rangeContains(outer: CellRange, inner: CellRange): boolean {
-  return (
-    outer.rowStart <= inner.rowStart &&
-    outer.rowEnd >= inner.rowEnd &&
-    outer.colStart <= inner.colStart &&
-    outer.colEnd >= inner.colEnd
-  )
-}
-
 const KEYBOARD_MODE_TO_BADGE: Record<KeyboardMode, StatusBarInputMode> = {
   navigation: 'ready',
   editing: 'edit',
@@ -245,7 +234,6 @@ const VIEW_MODE_BUTTONS: ReadonlyArray<{ value: StatusBarViewMode; label: string
 ]
 
 export function SpreadsheetStatusBar(props: SpreadsheetStatusBarProps) {
-  const store = useStore()
   const t = useT()
   const selectionSnapshot = useAtomValue(selectionSnapshotAtom)
   const projectionSnapshot = useAtomValue(spreadsheetProjectionSnapshotAtom)
@@ -264,44 +252,21 @@ export function SpreadsheetStatusBar(props: SpreadsheetStatusBarProps) {
   const resetZoom = useSetAtom(resetZoomLevelAtom)
   const setViewMode = useSetAtom(setViewModeAtom)
 
-  // Mirror projection cells into the vanilla atom so the aggregates derivation
-  // stays host-agnostic. Also surface a `truncated` hint when the selection
-  // exceeds the visible projection window.
-  createEffect(() => {
-    const snapshot = projectionSnapshot()
-    const cells: readonly DisplayCell[] = snapshot.result?.cells ?? []
-    store.setter(statusBarProjectionCellsAtom, cells)
-
-    const range = selectionSnapshot().range
-    const window =
-      snapshot.result?.kind === 'visible-window' ? snapshot.result.window : visibleWindow()
-    const truncated =
-      countRange(range) > 0 && countRange(window) > 0
-        ? !rangeContains(window, range) && rangesIntersect(window, range)
-        : false
-    store.setter(statusBarAggregateTruncatedAtom, truncated)
-  })
-
-  onCleanup(() => {
-    store.setter(statusBarProjectionCellsAtom, [])
-    store.setter(statusBarAggregateTruncatedAtom, false)
-  })
-
   const activeAddress = createMemo(() => toA1(selectionSnapshot().activeCell))
   const selectionText = createMemo(() =>
-    formatRange(selectionSnapshot().selection, selectionSnapshot().range),
+    formatRange(selectionSnapshot().selection, selectionSnapshot().range, t),
   )
-  const projectionText = createMemo(() => formatProjectionStatus(projectionSnapshot()))
+  const projectionText = createMemo(() => formatProjectionStatus(projectionSnapshot(), t))
   const visibleCellsText = createMemo(() =>
-    formatVisibleWindow(projectionSnapshot(), visibleWindow()),
+    formatVisibleWindow(projectionSnapshot(), visibleWindow(), t),
   )
-  const loadedValuesText = createMemo(() => formatLoadedValues(projectionSnapshot()))
+  const loadedValuesText = createMemo(() => formatLoadedValues(projectionSnapshot(), t))
   const commandText = createMemo(
     () =>
-      formatClipboardIntent(clipboardIntent()) ??
-      formatMenuIntent(menuCommandIntent()) ??
-      formatToolbarIntent(toolbarIntent()) ??
-      'Ready',
+      formatClipboardIntent(clipboardIntent(), t) ??
+      formatMenuIntent(menuCommandIntent(), t) ??
+      formatToolbarIntent(toolbarIntent(), t) ??
+      t('status.lastCommand.ready'),
   )
 
   const inputMode = createMemo<StatusBarInputMode>(() => KEYBOARD_MODE_TO_BADGE[keyboardMode()])
@@ -334,6 +299,18 @@ export function SpreadsheetStatusBar(props: SpreadsheetStatusBarProps) {
     }
   }
 
+  const aggregateSummaryText = createMemo(() => {
+    const values = visibleAggregates().map(
+      (key) => `${t(AGGREGATE_LABEL_KEYS[key])} ${formatAggregateValue(key, aggregateValue(key))}`,
+    )
+    const summary =
+      values.length === 0
+        ? t('status.aggregate.summaryEmpty')
+        : t('status.aggregate.summary', { values: values.join(', ') })
+
+    return aggregates().truncated ? t('status.aggregate.summaryTruncated', { summary }) : summary
+  })
+
   const handleSliderInput = (event: Event) => {
     const target = event.currentTarget as HTMLInputElement
     const value = Number(target.value)
@@ -365,7 +342,11 @@ export function SpreadsheetStatusBar(props: SpreadsheetStatusBarProps) {
         </span>
       ) : null}
       {showSection('projection') ? (
-        <span class="spreadsheet-status-bar-item" data-testid="status-projection">
+        <span
+          class="spreadsheet-status-bar-item"
+          data-testid="status-projection"
+          aria-label={t('status.projection.label')}
+        >
           {projectionText()}
         </span>
       ) : null}
@@ -386,44 +367,71 @@ export function SpreadsheetStatusBar(props: SpreadsheetStatusBarProps) {
       ) : null}
 
       {showSection('aggregates') ? (
-        <span
-          class="spreadsheet-status-bar-aggregates"
-          data-testid="status-aggregates"
-          data-truncated={aggregates().truncated ? 'true' : 'false'}
-        >
-        <For each={AGGREGATE_ORDER}>
-          {(key) => {
-            const enabled = () => Boolean(aggregateConfig()[key])
-            return (
-              <button
-                type="button"
-                class="spreadsheet-status-bar-aggregate"
-                data-testid={`status-aggregate-${key}`}
-                data-enabled={enabled() ? 'true' : 'false'}
-                aria-pressed={enabled()}
-                onClick={() => toggleAggregate(key)}
-              >
-                <span class="spreadsheet-status-bar-aggregate-label">
-                  {t(AGGREGATE_LABEL_KEYS[key])}
-                </span>
-                {enabled() ? (
-                  <span
-                    class="spreadsheet-status-bar-aggregate-value"
-                    data-testid={`status-aggregate-${key}-value`}
+        <>
+          <span
+            class="spreadsheet-status-bar-aggregates"
+            data-testid="status-aggregates"
+            data-truncated={aggregates().truncated ? 'true' : 'false'}
+            role="group"
+            aria-label={t('status.aggregate.groupLabel')}
+          >
+            <For each={AGGREGATE_ORDER}>
+              {(key) => {
+                const enabled = () => Boolean(aggregateConfig()[key])
+                return (
+                  <button
+                    type="button"
+                    class="spreadsheet-status-bar-aggregate"
+                    data-testid={`status-aggregate-${key}`}
+                    data-enabled={enabled() ? 'true' : 'false'}
+                    aria-label={t('status.aggregate.toggleLabel', {
+                      aggregate: t(AGGREGATE_LABEL_KEYS[key]),
+                    })}
+                    aria-pressed={enabled()}
+                    onClick={() => toggleAggregate(key)}
                   >
-                    {formatAggregateValue(key, aggregateValue(key))}
-                  </span>
-                ) : null}
-              </button>
-            )
-          }}
-        </For>
-          {visibleAggregates().length === 0 ? (
-            <span class="spreadsheet-status-bar-aggregate-empty" data-testid="status-aggregates-empty">
-              No aggregates
-            </span>
-          ) : null}
-        </span>
+                    <span class="spreadsheet-status-bar-aggregate-label">
+                      {t(AGGREGATE_LABEL_KEYS[key])}
+                    </span>
+                    {enabled() ? (
+                      <span
+                        class="spreadsheet-status-bar-aggregate-value"
+                        data-testid={`status-aggregate-${key}-value`}
+                      >
+                        {formatAggregateValue(key, aggregateValue(key))}
+                      </span>
+                    ) : null}
+                  </button>
+                )
+              }}
+            </For>
+            {visibleAggregates().length === 0 ? (
+              <span
+                class="spreadsheet-status-bar-aggregate-empty"
+                data-testid="status-aggregates-empty"
+              >
+                {t('status.aggregate.empty')}
+              </span>
+            ) : null}
+            {aggregates().truncated ? (
+              <span
+                class="spreadsheet-status-bar-aggregate-truncated"
+                data-testid="status-aggregates-truncated"
+              >
+                {t('status.aggregate.truncated')}
+              </span>
+            ) : null}
+          </span>
+          <span
+            class="spreadsheet-status-bar-aggregate-summary"
+            data-testid="status-aggregates-summary"
+            role="status"
+            aria-live="polite"
+            aria-atomic="true"
+          >
+            {aggregateSummaryText()}
+          </span>
+        </>
       ) : null}
 
       {showSection('view-modes') ? (
@@ -435,6 +443,7 @@ export function SpreadsheetStatusBar(props: SpreadsheetStatusBarProps) {
                 class="spreadsheet-status-bar-view-mode"
                 data-testid={`status-view-mode-${item.value}`}
                 data-active={viewMode() === item.value ? 'true' : 'false'}
+                aria-label={t(item.label)}
                 aria-pressed={viewMode() === item.value}
                 onClick={() => setViewMode(item.value)}
               >
@@ -454,6 +463,9 @@ export function SpreadsheetStatusBar(props: SpreadsheetStatusBarProps) {
                 class="spreadsheet-status-bar-zoom-preset"
                 data-testid={`status-zoom-preset-${Math.round(preset * 100)}`}
                 data-active={zoomLevel() === preset ? 'true' : 'false'}
+                aria-label={t('status.zoom.presetLabel', {
+                  percent: Math.round(preset * 100),
+                })}
                 aria-pressed={zoomLevel() === preset}
                 onClick={() => setZoom(preset)}
               >
@@ -469,13 +481,15 @@ export function SpreadsheetStatusBar(props: SpreadsheetStatusBarProps) {
             max={Math.round(ZOOM_LEVEL_MAX * 100)}
             step="1"
             value={zoomSliderValue()}
+            aria-label={t('status.zoom.sliderLabel')}
             onInput={handleSliderInput}
           />
           <button
             type="button"
             class="spreadsheet-status-bar-zoom-value"
             data-testid="status-zoom-value"
-            aria-label="Reset zoom to 100%"
+            aria-label={t('status.zoom.resetLabel')}
+            aria-pressed={zoomLevel() === 1}
             onClick={() => resetZoom()}
           >
             {zoomPercent()}%

@@ -1,9 +1,9 @@
 import type { Store } from '@einfach/core'
 import {
   pushHistoryAtom,
-  redoHistoryAtom,
-  resolveHistoryAtom,
-  undoHistoryAtom,
+  retryHistoryRefreshAtom,
+  runRedoHistoryAtom,
+  runUndoHistoryAtom,
   type HistoryEntry,
   type SpreadsheetBackend,
 } from '@einfach/spreadsheet-ui-core'
@@ -46,69 +46,37 @@ export function recordHistoryEntry(
   if (!backendSupportsUndo(backend)) {
     return false
   }
-  store.setter(pushHistoryAtom, entry)
-  return true
+  return store.setter(pushHistoryAtom, entry)
 }
 
 export async function dispatchUndo(
   store: Store,
   backend: SpreadsheetBackend,
 ): Promise<boolean> {
-  // Capability check FIRST: if the backend can't undo, we must not
-  // pop the entry — otherwise the entry vanishes from the stack
-  // while the workbook stays mutated, which is exactly the silent-
-  // success bug (HIGH #6). The dialog should gate its push via
-  // `recordHistoryEntry`, but defending here too keeps a stale entry
-  // recoverable if a future backend swap loses the undoTransaction
-  // port mid-session.
-  if (!backendSupportsUndo(backend)) {
-    return false
-  }
-  const entry = store.setter(undoHistoryAtom)
-  if (!entry) return false
-  try {
-    // backendSupportsUndo confirmed undoTransaction is defined; the
-    // non-null assertion below is therefore safe at runtime.
-    const result = await backend.undoTransaction!({
-      kind: 'undo-transaction',
-      transactionId: entry.transactionId,
-    })
-    store.setter(resolveHistoryAtom, {
-      transactionId: entry.transactionId,
-      ok: true,
-      revision: result.revision,
-    })
-    await refreshVisibleProjection(store, backend)
-    return true
-  } catch {
-    store.setter(resolveHistoryAtom, { transactionId: entry.transactionId, ok: false })
-    return false
-  }
+  const outcome = await store.setter(runUndoHistoryAtom, {
+    source: backend,
+    refreshProjection: () => refreshVisibleProjection(store, backend),
+  })
+  return outcome === 'completed'
 }
 
 export async function dispatchRedo(
   store: Store,
   backend: SpreadsheetBackend,
 ): Promise<boolean> {
-  if (!backendSupportsRedo(backend)) {
-    return false
-  }
-  const entry = store.setter(redoHistoryAtom)
-  if (!entry) return false
-  try {
-    const result = await backend.redoTransaction!({
-      kind: 'redo-transaction',
-      transactionId: entry.transactionId,
-    })
-    store.setter(resolveHistoryAtom, {
-      transactionId: entry.transactionId,
-      ok: true,
-      revision: result.revision,
-    })
-    await refreshVisibleProjection(store, backend)
-    return true
-  } catch {
-    store.setter(resolveHistoryAtom, { transactionId: entry.transactionId, ok: false })
-    return false
-  }
+  const outcome = await store.setter(runRedoHistoryAtom, {
+    source: backend,
+    refreshProjection: () => refreshVisibleProjection(store, backend),
+  })
+  return outcome === 'completed'
+}
+
+export async function retryHistoryRefresh(
+  store: Store,
+  backend: SpreadsheetBackend,
+): Promise<boolean> {
+  const outcome = await store.setter(retryHistoryRefreshAtom, {
+    refreshProjection: () => refreshVisibleProjection(store, backend),
+  })
+  return outcome === 'completed'
 }

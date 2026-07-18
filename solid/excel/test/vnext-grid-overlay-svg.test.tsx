@@ -8,11 +8,10 @@ import {
   addSelectionRegionAtom,
   copyClipboardAtom,
   cutClipboardAtom,
-  pointerSessionAtom,
+  readViewportFreezeCanonicalAtom,
   selectCellAtom,
   setSelectionAtom,
-  setViewportFreezeAtom,
-  type PointerSessionState,
+  startPointerAtom,
 } from '@einfach/spreadsheet-ui-core'
 import {
   FILL_HANDLE_SIZE,
@@ -33,7 +32,8 @@ function flush() {
   return new Promise<void>((resolve) => setTimeout(resolve, 0))
 }
 
-function createFakeBackend(): SpreadsheetBackend {
+function createFakeBackend(freeze = { rows: 0, cols: 0 }): SpreadsheetBackend {
+  let revision = 0
   return {
     async readVisibleProjection(request) {
       return {
@@ -51,6 +51,27 @@ function createFakeBackend(): SpreadsheetBackend {
     async setCellInput() {
       throw new Error('not used')
     },
+    async readFreezeConfig(request) {
+      return {
+        kind: 'freeze-config',
+        sheetId: request.sheetId,
+        requestId: request.requestId,
+        revision,
+        freeze: { ...freeze },
+      }
+    },
+    async setFreezeConfig(request) {
+      if (request.revision !== undefined && request.revision !== revision) {
+        throw new Error('freeze revision conflict')
+      }
+      freeze = { ...request.freeze }
+      revision += 1
+      return {
+        sheetId: request.sheetId,
+        requestId: request.requestId,
+        revision,
+      }
+    },
   }
 }
 
@@ -65,6 +86,7 @@ function rectFor(row: number, col: number) {
 
 interface MountOptions {
   store?: ReturnType<typeof createStore>
+  backend?: SpreadsheetBackend
   sheetId?: string
   cells?: DisplayCell[]
 }
@@ -72,7 +94,7 @@ interface MountOptions {
 function mount(options: MountOptions = {}) {
   const store = options.store ?? createStore()
   const sheetId = options.sheetId ?? 'sheet-1'
-  const backend = createFakeBackend()
+  const backend = options.backend ?? createFakeBackend()
   const utils = render(() => (
     <SpreadsheetUiProvider backend={backend} store={store}>
       <div style={{ position: 'relative', width: '400px', height: '200px' }}>
@@ -255,10 +277,14 @@ describe('SpreadsheetGridOverlaySvg', () => {
     // a math-derived rect; the contract here is just "frozen state present →
     // selection still drawn for that cell."
     const store = createStore()
-    store.setter(setViewportFreezeAtom, { sheetId: 'sheet-1', rows: 2, cols: 2 })
+    const backend = createFakeBackend({ rows: 2, cols: 2 })
+    await store.setter(readViewportFreezeCanonicalAtom, {
+      source: backend,
+      sheetId: 'sheet-1',
+    })
     store.setter(selectCellAtom, { sheetId: 'sheet-1', coord: { row: 0, col: 0 } })
 
-    const { container } = mount({ store })
+    const { container } = mount({ store, backend })
     await flush()
 
     const active = await waitFor(() => {
@@ -386,16 +412,15 @@ describe('SpreadsheetGridOverlaySvg', () => {
       anchor: { row: 0, col: 0 },
       focus: { row: 0, col: 0 },
     })
-    // The pointerSessionAtom shape mirrors what the host writes during a real
-    // fill-handle drag. We set it directly to avoid simulating mouse events.
-    store.setter(pointerSessionAtom, {
-      status: 'active',
-      interaction: {
-        kind: 'fill-handle',
-        sheetId: 'sheet-1',
-        previewRange: { rowStart: 0, rowEnd: 3, colStart: 0, colEnd: 0 },
-      },
-    } as PointerSessionState)
+    store.setter(startPointerAtom, {
+      kind: 'fill-handle',
+      sheetId: 'sheet-1',
+      sourceRange: { rowStart: 0, rowEnd: 0, colStart: 0, colEnd: 0 },
+      focus: { row: 3, col: 0 },
+      previewRange: { rowStart: 0, rowEnd: 3, colStart: 0, colEnd: 0 },
+      direction: 'down',
+      source: 'pointer',
+    })
     const { container } = mount({ store })
     await flush()
 

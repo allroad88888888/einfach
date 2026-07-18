@@ -1,9 +1,9 @@
 import { useAtomValue } from '@einfach/solid'
 import { onCleanup, onMount, Show } from 'solid-js'
 import {
-  openRemoveDuplicatesAtom,
-  openTextToColumnsAtom,
+  openRemoveDuplicatesFromSelectionAtom,
   registerCustomFormulaAtom,
+  runTextToColumnsEntrypointAtom,
   selectCellAtom,
   selectionAtom,
   selectionSnapshotAtom,
@@ -12,8 +12,10 @@ import {
   viewportShowFormulaBarAtom,
   workspaceSessionAtom,
 } from '@einfach/spreadsheet-ui-core'
-import { removeDuplicatesSheetIdAtom } from '../provider'
-import { createStaticSpreadsheetBackend } from '../adapter'
+import {
+  createStaticNamedRangeCapabilityPort,
+  createStaticSpreadsheetBackend,
+} from '../adapter'
 import { SpreadsheetCommentThread } from '../comments'
 import { SpreadsheetConditionalFormatDialog } from '../conditional-formatting'
 import { SpreadsheetContextMenu } from '../context-menu'
@@ -26,6 +28,7 @@ import { SpreadsheetFormatPainter } from '../format-painter'
 import { SpreadsheetFormulaBar } from '../formula-bar'
 import { SpreadsheetGrid } from '../grid'
 import { SpreadsheetHistoryTimeline } from '../history'
+import { SpreadsheetMenuBar } from '../menu-bar'
 import { SpreadsheetNameManagerDialog } from '../named-ranges'
 import { SpreadsheetPasteSpecialDialog } from '../paste-special'
 import { SpreadsheetRemoveDuplicatesDialog } from '../remove-duplicates'
@@ -43,6 +46,8 @@ const sheets = [
   { id: 'sheet-1', name: 'Sales' },
   { id: 'sheet-2', name: 'Forecast' },
 ]
+
+const namedRangeCapabilityPort = createStaticNamedRangeCapabilityPort()
 
 const backend = createStaticSpreadsheetBackend({
   revision: 1,
@@ -127,48 +132,19 @@ function VNextWave5Workbook() {
   const activeSheetId = () => workspace().activeSheetId ?? sheets[0].id
 
   /**
-   * Wave 7.1 test trigger — mirrors the menu-bar dispatch path for
-   * `open-text-to-columns`. The Wave 5 demo intentionally omits the
-   * menubar (Univer parity), so e2e walks click this hidden trigger
-   * after selecting a single source column.
+   * Wave 7.1 compatibility test trigger for `open-text-to-columns`. The
+   * visible menu is the production entrypoint; this direct helper remains
+   * available only for focused flow and compatibility tests.
    */
   async function triggerTextToColumnsForSelection() {
-    const snap = store.getter(selectionSnapshotAtom)
-    const sheetId = snap.selection.sheetId || store.getter(workspaceSessionAtom).activeSheetId || ''
-    if (!sheetId) return
-    const range = snap.range
-    const rows: { sourceRow: number; text: string }[] = []
-    if (range.colStart === range.colEnd) {
-      const projection = await backend.readRangeProjection({
-        kind: 'range',
-        sheetId,
-        range,
-        requestId: 0,
-        reason: 'toolbar',
-      })
-      const byRow = new Map<number, string>()
-      for (const cell of projection.cells) {
-        if (cell.col === range.colStart) byRow.set(cell.row, cell.displayValue ?? '')
-      }
-      for (let r = range.rowStart; r <= range.rowEnd; r += 1) {
-        rows.push({ sourceRow: r, text: byRow.get(r) ?? '' })
-      }
-    }
-    store.setter(openTextToColumnsAtom, {
-      sheetId,
-      anchor: { row: range.rowStart, col: range.colStart },
-      rows,
-    })
+    await store.setter(runTextToColumnsEntrypointAtom, { source: backend })
   }
 
   /**
-   * Wave 7.5 test trigger — mirrors the menu-bar dispatch path for
-   * `open-remove-duplicates`. The Wave 5 demo omits the menubar, so e2e
-   * walks fire a `spreadsheet:open-remove-duplicates` window event after
-   * selecting the source range. The handler reads the live selection,
-   * fetches a `range` projection (so the dialog can render header labels
-   * and the preview atom has cells to scan), and dispatches the open
-   * command. Empty / single-cell selections are tolerated as no-ops.
+   * Wave 7.5 compatibility test trigger for `open-remove-duplicates`. The
+   * visible menu is the production entrypoint; e2e may still fire the
+   * `spreadsheet:open-remove-duplicates` event as a direct-flow /
+   * compatibility hook after selecting the source range.
    */
   async function triggerRemoveDuplicatesForSelection() {
     const snap = store.getter(selectionSnapshotAtom)
@@ -177,25 +153,7 @@ function VNextWave5Workbook() {
     if (!sheetId) return
     const range = snap.range
     if (range.rowStart > range.rowEnd || range.colStart > range.colEnd) return
-    const projection = await backend.readRangeProjection({
-      kind: 'range',
-      sheetId,
-      range,
-      requestId: 0,
-      reason: 'toolbar',
-    })
-    // Capture the sheetId BEFORE flipping the open flag so the confirm
-    // flow operates on the sheet the dialog was scanning, even if the
-    // user navigates to another sheet mid-dialog (HIGH bug: wrong-sheet
-    // deletion race). Mirrors the menubar dispatcher's two-write
-    // transaction.
-    store.setter(removeDuplicatesSheetIdAtom, sheetId)
-    store.setter(openRemoveDuplicatesAtom, {
-      startRow: range.rowStart,
-      startCol: range.colStart,
-      endRow: range.rowEnd,
-      endCol: range.colEnd,
-    }, projection.cells)
+    await store.setter(openRemoveDuplicatesFromSelectionAtom, { source: backend })
   }
 
   onMount(() => {
@@ -252,11 +210,9 @@ function VNextWave5Workbook() {
 
   /**
    * Wave 7.1 test hook — listen for a `spreadsheet:open-text-to-columns`
-   * custom event so e2e walks can open the dialog without a visible /
-   * focusable trigger button in the demo DOM (the wave5 demo omits the
-   * menubar; the production code path is exercised via the menu-bar
-   * dispatch unit test). Production hosts never dispatch this event, so
-   * the listener is inert outside of test.
+   * custom event. The visible menu is the production entrypoint; this
+   * listener remains only as a direct-flow / compatibility test hook and
+   * is inert unless a host explicitly dispatches the event.
    */
   onMount(() => {
     function onOpenRequest() {
@@ -284,6 +240,10 @@ function VNextWave5Workbook() {
 
   return (
     <>
+      <SpreadsheetMenuBar
+        data-testid="wave5-menu-bar"
+        hiddenItemIds={['file.printPreview']}
+      />
       <SpreadsheetToolbar data-testid="wave5-toolbar" />
       <Show when={showFormulaBar()}>
         <SpreadsheetFormulaBar data-testid="wave5-formula-bar" />
@@ -375,7 +335,10 @@ export function VNextWave5Demo() {
         </p>
       </div>
 
-      <SpreadsheetUiProvider backend={backend}>
+      <SpreadsheetUiProvider
+        backend={backend}
+        namedRangeCapabilityPort={namedRangeCapabilityPort}
+      >
         <VNextWave5Workbook />
       </SpreadsheetUiProvider>
     </div>

@@ -4,6 +4,9 @@ import { afterEach, describe, expect, it } from '@jest/globals'
 import { cleanup, fireEvent, render } from '@solidjs/testing-library'
 import { createStore } from '@einfach/core'
 import {
+  selectionRegionsAtom,
+  selectionSnapshotAtom,
+  setMultiRegionSelectionAtom,
   sheetTabsAtom,
   sheetTabsSheetsAtom,
   workspaceSessionAtom,
@@ -43,6 +46,7 @@ function createFakeBackend(seedSheets: SpreadsheetSheetMetadata[] = []) {
       revision += 1
       sheets = [...sheets, createdSheet]
       return {
+        requestId: request.requestId,
         sheetId: createdSheet.id,
         activeSheetId: createdSheet.id,
         createdSheet,
@@ -56,6 +60,7 @@ function createFakeBackend(seedSheets: SpreadsheetSheetMetadata[] = []) {
         sheet.id === request.sheetId ? { ...sheet, name: request.name } : sheet,
       )
       return {
+        requestId: request.requestId,
         sheetId: request.sheetId,
         activeSheetId: request.sheetId,
         revision,
@@ -69,6 +74,7 @@ function createFakeBackend(seedSheets: SpreadsheetSheetMetadata[] = []) {
         .filter((sheet) => sheet.id !== request.sheetId)
         .map((sheet, index) => ({ ...sheet, index }))
       return {
+        requestId: request.requestId,
         sheetId: request.sheetId,
         activeSheetId: sheets[Math.min(deleteIndex, sheets.length - 1)]?.id ?? null,
         revision,
@@ -79,6 +85,7 @@ function createFakeBackend(seedSheets: SpreadsheetSheetMetadata[] = []) {
       revision += 1
       sheets = reorderSheetMetadata(sheets, request)
       return {
+        requestId: request.requestId,
         sheetId: request.sheetId,
         activeSheetId: request.sheetId,
         revision,
@@ -114,6 +121,23 @@ function dispatchPointerEvent(
 describe('vNext SpreadsheetSheetTabs', () => {
   it('switches workspace activeSheetId when a tab is clicked', async () => {
     const store = createStore()
+    store.setter(setMultiRegionSelectionAtom, {
+      regions: [
+        {
+          kind: 'range',
+          sheetId: 'sheet-1',
+          anchor: { row: 1, col: 1 },
+          focus: { row: 3, col: 3 },
+        },
+        {
+          kind: 'cell',
+          sheetId: 'sheet-1',
+          anchor: { row: 6, col: 6 },
+          focus: { row: 6, col: 6 },
+        },
+      ],
+      primaryIndex: 0,
+    })
 
     const sheets = [
       { id: 'sheet-1', name: 'Sheet One', index: 0 },
@@ -133,6 +157,19 @@ describe('vNext SpreadsheetSheetTabs', () => {
     fireEvent.click(secondTab)
 
     expect(store.getter(workspaceSessionAtom).activeSheetId).toBe('sheet-2')
+    expect(store.getter(selectionSnapshotAtom).activeCell).toEqual({
+      sheetId: 'sheet-2',
+      row: 3,
+      col: 3,
+    })
+    expect(store.getter(selectionRegionsAtom)).toEqual([
+      {
+        kind: 'cell',
+        sheetId: 'sheet-2',
+        anchor: { row: 3, col: 3 },
+        focus: { row: 3, col: 3 },
+      },
+    ])
     expect(getByRole('tab', { name: 'Sheet Two' }).getAttribute('class')).toContain('is-active')
     expect(getByRole('tab', { name: 'Sheet Two' }).getAttribute('data-active')).toBe('true')
   })
@@ -218,29 +255,53 @@ describe('vNext SpreadsheetSheetTabs', () => {
     ))
 
     await flushAsyncWork()
+    store.setter(setMultiRegionSelectionAtom, {
+      regions: [
+        {
+          kind: 'range',
+          sheetId: 'sheet-1',
+          anchor: { row: 1, col: 1 },
+          focus: { row: 4, col: 2 },
+        },
+        {
+          kind: 'cell',
+          sheetId: 'sheet-1',
+          anchor: { row: 7, col: 7 },
+          focus: { row: 7, col: 7 },
+        },
+      ],
+      primaryIndex: 0,
+    })
     fireEvent.click(getByTestId('sheet-tab-add'))
     await flushAsyncWork()
     getByRole('tab', { name: 'Sheet3' })
 
     expect(store.getter(workspaceSessionAtom).activeSheetId).toBe('sheet-3')
+    expect(store.getter(selectionSnapshotAtom).activeCell).toEqual({
+      sheetId: 'sheet-3',
+      row: 4,
+      col: 2,
+    })
+    expect(store.getter(selectionRegionsAtom)).toHaveLength(1)
     expect(store.getter(sheetTabsSheetsAtom).map((sheet) => sheet.name)).toEqual([
       'Sheet One',
       'Sheet Two',
       'Sheet3',
     ])
 
-    const originalConfirm = window.confirm
-    window.confirm = () => true
-    try {
-      fireEvent.contextMenu(getByRole('tab', { name: 'Sheet3' }))
-      fireEvent.click(getByTestId('sheet-tab-menu-delete'))
-      await flushAsyncWork()
-      expect(queryByRole('tab', { name: 'Sheet3' })).toBeNull()
-    } finally {
-      window.confirm = originalConfirm
-    }
+    fireEvent.contextMenu(getByRole('tab', { name: 'Sheet3' }))
+    fireEvent.click(getByTestId('sheet-tab-menu-delete'))
+    expect(getByRole('dialog').textContent).toContain('Delete sheet “Sheet3”?')
+    fireEvent.click(getByTestId('sheet-tab-delete-confirm'))
+    await flushAsyncWork()
+    expect(queryByRole('tab', { name: 'Sheet3' })).toBeNull()
 
     expect(store.getter(workspaceSessionAtom).activeSheetId).toBe('sheet-2')
+    expect(store.getter(selectionSnapshotAtom).activeCell).toEqual({
+      sheetId: 'sheet-2',
+      row: 4,
+      col: 2,
+    })
   })
 
   it('reorders sheet tabs through pointer drag and preserves the active sheet', async () => {
@@ -291,5 +352,152 @@ describe('vNext SpreadsheetSheetTabs', () => {
       'Sheet Two',
     ])
     expect(store.getter(workspaceSessionAtom).activeSheetId).toBe('sheet-2')
+  })
+
+  it('disables commands with an explanation when the live list port is missing', async () => {
+    const store = createStore()
+    const sheets = [{ id: 'sheet-1', name: 'Sheet One', index: 0 }]
+    const backend = createFakeBackend(sheets)
+    backend.listSheets = undefined
+
+    const { getByRole, getByTestId } = render(() => (
+      <SpreadsheetUiProvider backend={backend} store={store}>
+        <SpreadsheetSheetTabs sheets={sheets} />
+      </SpreadsheetUiProvider>
+    ))
+
+    await flushAsyncWork()
+    expect(getByRole('tab', { name: 'Sheet One' }).isConnected).toBe(true)
+    const addButton = getByTestId('sheet-tab-add') as HTMLButtonElement
+    expect(addButton.disabled).toBe(true)
+    expect(addButton.getAttribute('title')).toBe(
+      'Add sheet is unavailable without a live sheet list',
+    )
+    expect(getByRole('alert').textContent).toContain(
+      'Live sheet list is unavailable; sheet changes are disabled',
+    )
+  })
+
+  it('keeps a rejected rename draft and reports the backend error inline', async () => {
+    const store = createStore()
+    const sheets = [
+      { id: 'sheet-1', name: 'Sheet One', index: 0 },
+      { id: 'sheet-2', name: 'Sheet Two', index: 1 },
+    ]
+    const backend = createFakeBackend(sheets)
+    backend.renameSheet = async () => {
+      throw new Error('duplicate sheet name')
+    }
+
+    const { getByRole } = render(() => (
+      <SpreadsheetUiProvider backend={backend} store={store}>
+        <SpreadsheetSheetTabs sheets={sheets} />
+      </SpreadsheetUiProvider>
+    ))
+
+    await flushAsyncWork()
+    fireEvent.doubleClick(getByRole('tab', { name: 'Sheet One' }))
+    const editor = getByRole('textbox') as HTMLInputElement
+    fireEvent.input(editor, { target: { value: 'Sheet Two' } })
+    fireEvent.keyDown(editor, { key: 'Enter', code: 'Enter', keyCode: 13 })
+    await flushAsyncWork()
+
+    expect((getByRole('textbox') as HTMLInputElement).value).toBe('Sheet Two')
+    expect(getByRole('alert').textContent).toContain('duplicate sheet name')
+    expect(store.getter(sheetTabsAtom)).toMatchObject({
+      rename: { sheetId: 'sheet-1', draftName: 'Sheet Two' },
+      lastMutation: { outcome: 'rejected' },
+    })
+    expect(store.getter(sheetTabsSheetsAtom)[0]?.name).toBe('Sheet One')
+  })
+
+  it('ignores a mismatched rename response without changing the visible sheet list', async () => {
+    const store = createStore()
+    const sheets = [
+      { id: 'sheet-1', name: 'Sheet One', index: 0 },
+      { id: 'sheet-2', name: 'Sheet Two', index: 1 },
+    ]
+    const backend = createFakeBackend(sheets)
+    backend.renameSheet = async (request) => ({
+      requestId: (request.requestId ?? 0) + 1,
+      sheetId: request.sheetId,
+      activeSheetId: request.sheetId,
+      revision: 1,
+      sheets: sheets.map((sheet) =>
+        sheet.id === request.sheetId ? { ...sheet, name: request.name } : sheet,
+      ),
+    })
+
+    const { getByRole } = render(() => (
+      <SpreadsheetUiProvider backend={backend} store={store}>
+        <SpreadsheetSheetTabs sheets={sheets} />
+      </SpreadsheetUiProvider>
+    ))
+
+    await flushAsyncWork()
+    fireEvent.doubleClick(getByRole('tab', { name: 'Sheet One' }))
+    const editor = getByRole('textbox') as HTMLInputElement
+    fireEvent.input(editor, { target: { value: 'Renamed' } })
+    fireEvent.keyDown(editor, { key: 'Enter', code: 'Enter', keyCode: 13 })
+    await flushAsyncWork()
+
+    expect((getByRole('textbox') as HTMLInputElement).value).toBe('Renamed')
+    expect(getByRole('alert').textContent).toContain(
+      'Ignored a sheet mutation response that did not match its request',
+    )
+    expect(store.getter(sheetTabsAtom)).toMatchObject({
+      rename: { sheetId: 'sheet-1', draftName: 'Renamed' },
+      lastMutation: { outcome: 'protocol-error' },
+    })
+    expect(store.getter(sheetTabsSheetsAtom).map((sheet) => sheet.name)).toEqual([
+      'Sheet One',
+      'Sheet Two',
+    ])
+  })
+
+  it('disables the add command while pending and does not dispatch duplicates', async () => {
+    const store = createStore()
+    const sheets = [
+      { id: 'sheet-1', name: 'Sheet One', index: 0 },
+      { id: 'sheet-2', name: 'Sheet Two', index: 1 },
+    ]
+    const backend = createFakeBackend(sheets)
+    let addCalls = 0
+    let settleAdd: (() => void) | undefined
+    backend.addSheet = (request) => {
+      addCalls += 1
+      return new Promise((resolve) => {
+        settleAdd = () => {
+          const createdSheet = { id: 'sheet-3', name: 'Sheet3', index: 2 }
+          resolve({
+            requestId: request.requestId,
+            sheetId: createdSheet.id,
+            activeSheetId: createdSheet.id,
+            createdSheet,
+            sheets: [...sheets, createdSheet],
+          })
+        }
+      })
+    }
+
+    const { getByRole, getByTestId } = render(() => (
+      <SpreadsheetUiProvider backend={backend} store={store}>
+        <SpreadsheetSheetTabs sheets={sheets} />
+      </SpreadsheetUiProvider>
+    ))
+
+    await flushAsyncWork()
+    const addButton = getByTestId('sheet-tab-add') as HTMLButtonElement
+    fireEvent.click(addButton)
+    fireEvent.click(addButton)
+    expect(addCalls).toBe(1)
+    await flushAsyncWork()
+    expect(addButton.disabled).toBe(true)
+    expect(addButton.getAttribute('title')).toBe('Another sheet change is in progress')
+
+    settleAdd?.()
+    await flushAsyncWork()
+    expect(getByRole('tab', { name: 'Sheet3' }).isConnected).toBe(true)
+    expect(addButton.disabled).toBe(false)
   })
 })

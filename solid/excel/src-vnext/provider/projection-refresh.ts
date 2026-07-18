@@ -1,14 +1,49 @@
 import type { Store } from '@einfach/core'
 import {
-  createVisibleProjectionRequest,
+  beginProjectionAtom,
+  rejectProjectionAtom,
+  resolveProjectionAtom,
   type ProjectionRequestReason,
   type SpreadsheetBackend,
+  type VisibleProjectionRequest,
 } from '@einfach/spreadsheet-ui-core'
-import {
-  advanceSpreadsheetProjectionRequestIdAtom,
-  isVisibleProjectionResult,
-  spreadsheetProjectionSnapshotAtom,
-} from './atoms'
+import { isVisibleProjectionResult, spreadsheetProjectionSnapshotAtom } from './atoms'
+
+/**
+ * Owns the single visible-projection transport and drains the store-local
+ * latest-only successor queue. Callers must pass only a request returned as
+ * `started`; requests returned as `queued` are drained by the active owner.
+ *
+ * The returned promise represents the whole drained batch: an older failure
+ * with a successor is superseded, while a terminal failure from the final
+ * request is rethrown.
+ */
+export async function runVisibleProjectionTransport(
+  store: Store,
+  backend: SpreadsheetBackend,
+  initialRequest: VisibleProjectionRequest,
+): Promise<void> {
+  let request = initialRequest
+
+  while (true) {
+    try {
+      const result = await backend.readVisibleProjection(request)
+      const outcome = store.setter(resolveProjectionAtom, { request, result })
+      if (outcome.nextRequest) {
+        request = outcome.nextRequest
+        continue
+      }
+      return
+    } catch (error) {
+      const outcome = store.setter(rejectProjectionAtom, { request, error })
+      if (outcome.status === 'rejected' && outcome.nextRequest) {
+        request = outcome.nextRequest
+        continue
+      }
+      throw error
+    }
+  }
+}
 
 export async function refreshVisibleProjection(
   store: Store,
@@ -19,9 +54,9 @@ export async function refreshVisibleProjection(
   const snapshot = store.getter(spreadsheetProjectionSnapshotAtom)
   const window = isVisibleProjectionResult(snapshot.result)
     ? snapshot.result.window
-      : snapshot.request?.kind === 'visible-window'
-        ? snapshot.request.window
-        : undefined
+    : snapshot.request?.kind === 'visible-window'
+      ? snapshot.request.window
+      : undefined
   const resolvedSheetId =
     sheetId ??
     (isVisibleProjectionResult(snapshot.result)
@@ -31,26 +66,13 @@ export async function refreshVisibleProjection(
         : undefined)
   if (!window || !resolvedSheetId) return
 
-  const requestId = store.setter(advanceSpreadsheetProjectionRequestIdAtom)
-  const request = createVisibleProjectionRequest({
+  const begin = store.setter(beginProjectionAtom, {
+    kind: 'visible-window',
     sheetId: resolvedSheetId,
     window,
-    requestId,
     reason,
+    retainResult: true,
   })
-  store.setter(spreadsheetProjectionSnapshotAtom, {
-    status: 'loading',
-    request,
-    result: snapshot.result,
-    error: undefined,
-  })
-
-  const result = await backend.readVisibleProjection(request)
-  if (store.getter(spreadsheetProjectionSnapshotAtom).request?.requestId !== requestId) return
-  store.setter(spreadsheetProjectionSnapshotAtom, {
-    status: 'ready',
-    request,
-    result,
-    error: undefined,
-  })
+  if (begin.status !== 'started' || begin.request.kind !== 'visible-window') return
+  await runVisibleProjectionTransport(store, backend, begin.request)
 }

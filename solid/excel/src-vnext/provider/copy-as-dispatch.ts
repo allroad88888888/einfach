@@ -1,11 +1,14 @@
-import { atom, type Store } from '@einfach/core'
+import type { Store } from '@einfach/core'
 import {
+  copyAsErrorAtom,
   encodeSelectionAsImage,
   encodeSelectionAsPlainText,
   encodeSelectionForClipboard,
-  lastCopyAsAtom,
+  publishCopyAsResultAtom,
+  reportCopyAsStatusAtom,
   selectionSnapshotAtom,
   type CellRange,
+  type CopyAsError,
   type CopyAsResult,
   type CopyAsTextResult,
   type EncodeSelectionAsImageResult,
@@ -32,31 +35,8 @@ import { renderRangeAsImage } from '../copy-as/renderRangeAsImage'
  */
 export const MAX_COPY_AS_CELLS = 100_000
 
-/**
- * Discriminated reason for the most recent copy-as failure. UI can read
- * this to surface a status-bar message ("copyAs.status.failed" / ".tooLarge"
- * / ".fallback"). Cleared back to `null` on a successful multi-MIME write.
- */
-export type CopyAsError =
-  | { kind: 'too-large'; cells: number; limit: number }
-  | { kind: 'fallback-plain-only' }
-  | { kind: 'failed' }
-  // --- image variants (Wave 8.4 / .5) -----------------------------------
-  // `image-too-large` mirrors `too-large` but is keyed by estimated pixel
-  // count, not cell count — the pre-flight gate in
-  // `encodeSelectionAsImage` rejects on `width × height` and the host
-  // surfaces a different status string ("selection too large to render")
-  // because the cap semantics differ.
-  | { kind: 'image-too-large'; estimatedPixels: number; limit: number }
-  // Backend omits both `exportRangeAsImage` and a host-side renderer
-  // (the dispatch helper installs the SVG renderer when missing, so this
-  // variant is rare in practice — useful for tests that force a stripped
-  // backend).
-  | { kind: 'image-no-backend' }
-  | { kind: 'image-failed' }
-
-export const copyAsErrorAtom = atom<CopyAsError | null>(null)
-copyAsErrorAtom.debugLabel = 'spreadsheet.copyAs.error'
+export { copyAsErrorAtom }
+export type { CopyAsError }
 
 /**
  * Test-only mirror of `lastCopyAsAtom` written to `window.__einfach_lastCopyAs__`
@@ -215,6 +195,10 @@ export async function dispatchCopyAs(
   if (totalCells > MAX_COPY_AS_CELLS) {
     const clipped = clipRectToCap(range)
     const requestId = store.setter(advanceSpreadsheetProjectionRequestIdAtom)
+    if (requestId === null) {
+      store.setter(reportCopyAsStatusAtom, { kind: 'failed' })
+      return
+    }
     const result = await backend.readRangeProjection({
       kind: 'range',
       sheetId,
@@ -234,16 +218,16 @@ export async function dispatchCopyAs(
     try {
       if (typeof navigator !== 'undefined' && navigator.clipboard?.writeText) {
         await navigator.clipboard.writeText(plain)
-        store.setter(copyAsErrorAtom, {
+        store.setter(reportCopyAsStatusAtom, {
           kind: 'too-large',
           cells: totalCells,
           limit: MAX_COPY_AS_CELLS,
         })
       } else {
-        store.setter(copyAsErrorAtom, { kind: 'failed' })
+        store.setter(reportCopyAsStatusAtom, { kind: 'failed' })
       }
     } catch {
-      store.setter(copyAsErrorAtom, { kind: 'failed' })
+      store.setter(reportCopyAsStatusAtom, { kind: 'failed' })
     }
     // Intentionally leave `lastCopyAsAtom` untouched — we never produced
     // the html/markdown flavours, and overwriting it with a partial result
@@ -254,6 +238,10 @@ export async function dispatchCopyAs(
 
   // --- Normal path: encode all three flavours, multi-tier write. ---
   const requestId = store.setter(advanceSpreadsheetProjectionRequestIdAtom)
+  if (requestId === null) {
+    store.setter(reportCopyAsStatusAtom, { kind: 'failed' })
+    return
+  }
   const result = await backend.readRangeProjection({
     kind: 'range',
     sheetId,
@@ -277,18 +265,18 @@ export async function dispatchCopyAs(
   if (tier === null) {
     // Both paths failed — leave `lastCopyAsAtom` unchanged so consumers
     // can distinguish "never copied" from "wrote stale value".
-    store.setter(copyAsErrorAtom, { kind: 'failed' })
+    store.setter(reportCopyAsStatusAtom, { kind: 'failed' })
     return
   }
 
   // Success at some tier. Persist the encoded triple + clear errors.
-  store.setter(lastCopyAsAtom, encoded)
+  store.setter(publishCopyAsResultAtom, encoded)
   setE2EMirror(encoded)
   if (tier === 'rich-triple') {
-    store.setter(copyAsErrorAtom, null)
+    store.setter(reportCopyAsStatusAtom, null)
   } else {
     // Tier 2 or 3 — partial success. Surface as a non-fatal status.
-    store.setter(copyAsErrorAtom, { kind: 'fallback-plain-only' })
+    store.setter(reportCopyAsStatusAtom, { kind: 'fallback-plain-only' })
   }
 }
 
@@ -510,24 +498,24 @@ export async function dispatchCopyAsImage(
       renderingBackend,
     )
   } catch {
-    store.setter(copyAsErrorAtom, { kind: 'image-failed' })
+    store.setter(reportCopyAsStatusAtom, { kind: 'image-failed' })
     return
   }
 
   if (!encoded.ok) {
     switch (encoded.reason) {
       case 'no-backend':
-        store.setter(copyAsErrorAtom, { kind: 'image-no-backend' })
+        store.setter(reportCopyAsStatusAtom, { kind: 'image-no-backend' })
         return
       case 'too-large':
-        store.setter(copyAsErrorAtom, {
+        store.setter(reportCopyAsStatusAtom, {
           kind: 'image-too-large',
           estimatedPixels: encoded.estimatedPixels ?? 0,
           limit: encoded.limit ?? 0,
         })
         return
       case 'empty-bytes':
-        store.setter(copyAsErrorAtom, { kind: 'image-failed' })
+        store.setter(reportCopyAsStatusAtom, { kind: 'image-failed' })
         return
     }
   }
@@ -538,16 +526,16 @@ export async function dispatchCopyAsImage(
   // the atom mirror, not `navigator.clipboard.read()`, when the system
   // clipboard is unavailable.
   const snapshot: CopyAsResult = { kind: 'image', mimeType: 'image/png', blob: encoded.blob }
-  store.setter(lastCopyAsAtom, snapshot)
+  store.setter(publishCopyAsResultAtom, snapshot)
   setE2EMirror(snapshot)
 
   const tier = await writeImageToClipboard(encoded.blob)
   if (tier === 'system-clipboard') {
-    store.setter(copyAsErrorAtom, null)
+    store.setter(reportCopyAsStatusAtom, null)
   } else {
     // atom-only — still a soft success, surfaced as the same
     // "fallback-plain-only" status the text triple uses for tier-2 / tier-3
     // landings. The host shows "saved snapshot — clipboard not available".
-    store.setter(copyAsErrorAtom, { kind: 'fallback-plain-only' })
+    store.setter(reportCopyAsStatusAtom, { kind: 'fallback-plain-only' })
   }
 }

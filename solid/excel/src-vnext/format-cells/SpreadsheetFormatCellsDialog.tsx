@@ -3,17 +3,20 @@
 import { For, Show, createEffect, createMemo, onCleanup } from 'solid-js'
 import { useAtomValue } from '@einfach/solid'
 import {
+  captureFormatCellsBackendCapabilitiesAtom,
   closeFormatCellsAtom,
   formatCellsActiveTabAtom,
   formatCellsDraftAtom,
   formatCellsEditorAtom,
-  formatCellsSavePayloadAtom,
   patchFormatCellsDraftAtom,
-  saveFormatCellsAtom,
+  runFormatCellsSaveAtom,
   setFormatCellsActiveTabAtom,
   type FormatCellsDraft,
+  type CellRange,
   type FormatCellsNumberCategory,
   type FormatCellsTabId,
+  type RunFormatCellsSaveInput,
+  type SpreadsheetBackend,
   type SpreadsheetAlignment,
   type SpreadsheetBorderStyle,
   type SpreadsheetNumberFormat,
@@ -174,11 +177,32 @@ export function SpreadsheetFormatCellsDialog(props: SpreadsheetFormatCellsDialog
   const t = useT()
   const store = useSpreadsheetUiStore()
   const backend = useSpreadsheetBackend()
+  const capabilities = store.setter(captureFormatCellsBackendCapabilitiesAtom, backend)
+  const projectionBackend = Object.freeze({
+    readVisibleProjection: capabilities.readVisibleProjection,
+  }) as SpreadsheetBackend
+  const savePorts: RunFormatCellsSaveInput = Object.freeze({
+    resolveSourceRanges: Object.freeze((sheetId: string, range: CellRange) =>
+      resolveProjectionSourceRanges(store, sheetId, range),
+    ),
+    setFormatRange: capabilities.setFormatRange,
+    refreshProjection:
+      capabilities.readVisibleProjection === undefined
+        ? undefined
+        : Object.freeze((sheetId: string) =>
+            refreshVisibleProjection(store, projectionBackend, sheetId),
+          ),
+  })
   const editor = useAtomValue(formatCellsEditorAtom)
   const activeTab = useAtomValue(formatCellsActiveTabAtom)
   const draft = useAtomValue(formatCellsDraftAtom)
 
-  const isOpen = () => editor().status === 'open'
+  const openEditor = () => {
+    const current = editor()
+    return current.status === 'open' ? current : null
+  }
+
+  const isOpen = () => openEditor() !== null
 
   const currentCategory = createMemo(() => detectCategory(draft()))
 
@@ -206,33 +230,8 @@ export function SpreadsheetFormatCellsDialog(props: SpreadsheetFormatCellsDialog
     store.setter(closeFormatCellsAtom)
   }
 
-  async function handleSave() {
-    const payload = store.getter(formatCellsSavePayloadAtom)
-    if (!payload) return
-    if (backend.setFormatRange) {
-      try {
-        const sourceRanges = resolveProjectionSourceRanges(
-          store,
-          payload.sheetId,
-          payload.range,
-        )
-        for (const sourceRange of sourceRanges) {
-          await backend.setFormatRange({
-            kind: 'set-format-range',
-            sheetId: payload.sheetId,
-            range: sourceRange,
-            format: payload.format,
-          })
-        }
-        await refreshVisibleProjection(store, backend, payload.sheetId)
-      } catch {
-        // Surface failure by leaving the editor open. A production build
-        // would dispatch a diagnostic atom; we omit the console log to comply
-        // with the repo's no-console lint rule.
-        return
-      }
-    }
-    store.setter(saveFormatCellsAtom)
+  function handleSave() {
+    void store.setter(runFormatCellsSaveAtom, savePorts)
   }
 
   function onCategoryChange(category: FormatCellsNumberCategory) {
@@ -406,7 +405,11 @@ export function SpreadsheetFormatCellsDialog(props: SpreadsheetFormatCellsDialog
                     data-testid="format-cells-number-decimals"
                     value={(() => {
                       const nf = draft()?.numberFormat
-                      if (nf && ((nf as { kind: string }).kind === 'decimal' || (nf as { kind: string }).kind === 'number')) {
+                      if (
+                        nf &&
+                        ((nf as { kind: string }).kind === 'decimal' ||
+                          (nf as { kind: string }).kind === 'number')
+                      ) {
                         return (nf as { digits?: number }).digits ?? 2
                       }
                       return 2
@@ -517,9 +520,7 @@ export function SpreadsheetFormatCellsDialog(props: SpreadsheetFormatCellsDialog
                   type="checkbox"
                   data-testid="format-cells-shrink"
                   checked={!!draft()?.shrinkToFit}
-                  onChange={(event) =>
-                    patch({ shrinkToFit: event.currentTarget.checked })
-                  }
+                  onChange={(event) => patch({ shrinkToFit: event.currentTarget.checked })}
                 />
                 <span>{t('formatCells.alignment.shrink')}</span>
               </label>
@@ -562,7 +563,9 @@ export function SpreadsheetFormatCellsDialog(props: SpreadsheetFormatCellsDialog
                   onChange={selectFamily}
                 >
                   <option value="">{t('formatCells.font.familyDefault')}</option>
-                  <For each={FONT_FAMILIES}>{(family) => <option value={family}>{family}</option>}</For>
+                  <For each={FONT_FAMILIES}>
+                    {(family) => <option value={family}>{family}</option>}
+                  </For>
                 </select>
               </label>
               <label class="format-cells-row">
@@ -608,9 +611,7 @@ export function SpreadsheetFormatCellsDialog(props: SpreadsheetFormatCellsDialog
                   type="checkbox"
                   data-testid="format-cells-strikethrough"
                   checked={!!draft()?.strikethrough}
-                  onChange={(event) =>
-                    patch({ strikethrough: event.currentTarget.checked })
-                  }
+                  onChange={(event) => patch({ strikethrough: event.currentTarget.checked })}
                 />
                 <span>{t('formatCells.font.strikethrough')}</span>
               </label>
@@ -670,9 +671,7 @@ export function SpreadsheetFormatCellsDialog(props: SpreadsheetFormatCellsDialog
                       type="button"
                       data-testid={`format-cells-border-side-${side}`}
                       class={
-                        draft()?.borders?.[side]
-                          ? 'format-cells-side-active'
-                          : 'format-cells-side'
+                        draft()?.borders?.[side] ? 'format-cells-side-active' : 'format-cells-side'
                       }
                       onClick={() => toggleSide(side)}
                     >
@@ -733,12 +732,8 @@ export function SpreadsheetFormatCellsDialog(props: SpreadsheetFormatCellsDialog
                 data-testid="format-cells-border-preview"
                 style={{
                   'border-top': draft()?.borders?.top ? '1px solid #333' : '1px dashed #ccc',
-                  'border-right': draft()?.borders?.right
-                    ? '1px solid #333'
-                    : '1px dashed #ccc',
-                  'border-bottom': draft()?.borders?.bottom
-                    ? '1px solid #333'
-                    : '1px dashed #ccc',
+                  'border-right': draft()?.borders?.right ? '1px solid #333' : '1px dashed #ccc',
+                  'border-bottom': draft()?.borders?.bottom ? '1px solid #333' : '1px dashed #ccc',
                   'border-left': draft()?.borders?.left ? '1px solid #333' : '1px dashed #ccc',
                   padding: '12px 20px',
                   display: 'inline-block',
@@ -828,19 +823,21 @@ export function SpreadsheetFormatCellsDialog(props: SpreadsheetFormatCellsDialog
         </div>
 
         <div class="format-cells-actions">
-          <button
-            type="button"
-            data-testid="format-cells-cancel"
-            onClick={handleCancel}
-          >
+          <Show when={openEditor()?.error}>
+            {(message) => (
+              <span role="alert" data-testid="format-cells-save-error">
+                {message()}
+              </span>
+            )}
+          </Show>
+          <button type="button" data-testid="format-cells-cancel" onClick={handleCancel}>
             {t('formatCells.cancel')}
           </button>
           <button
             type="button"
             data-testid="format-cells-save"
-            onClick={() => {
-              void handleSave()
-            }}
+            disabled={openEditor()?.pending || openEditor()?.phase === 'outcome-unknown-blocked'}
+            onClick={handleSave}
           >
             {t('formatCells.save')}
           </button>

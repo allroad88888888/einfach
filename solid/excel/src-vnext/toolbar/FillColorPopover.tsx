@@ -1,9 +1,6 @@
-import { atom } from '@einfach/core'
-import { useAtomValue } from '@einfach/solid'
 import { For, Show, createEffect, createSignal, onCleanup } from 'solid-js'
 
 import { useT } from '../../src/i18n'
-import { useSpreadsheetUiStore } from '../provider'
 
 /**
  * A small color-picker popover anchored beneath the toolbar fill/text color
@@ -12,20 +9,11 @@ import { useSpreadsheetUiStore } from '../provider'
  * either a `#rrggbb` string or `''` for "no fill"/"automatic") and closes the
  * popover.
  *
- * State lives in a module-level atom (`colorPopoverAtom`) so it survives the
- * Solid 1.9.12 Provider re-execution gotcha called out in CLAUDE.md.
+ * Visibility and mode are controlled by the Core-owned toolbar surface state.
+ * This view keeps only transient hover feedback and DOM positioning locally.
  */
 
 export type ColorPopoverMode = 'fill' | 'text'
-
-export interface ColorPopoverState {
-  readonly mode: ColorPopoverMode | null
-}
-
-const initialState: ColorPopoverState = { mode: null }
-
-export const colorPopoverAtom = atom<ColorPopoverState>(initialState)
-colorPopoverAtom.debugLabel = 'spreadsheet.toolbar.colorPopover'
 
 /**
  * Excel-style 8x5 palette (40 swatches). Mirrors the "Standard Colors" + a
@@ -46,27 +34,27 @@ const PALETTE: readonly (readonly string[])[] = [
 ]
 
 interface FillColorPopoverProps {
+  /** Core-derived visibility; this component never owns a second open flag. */
+  readonly open: boolean
+  /** Core-derived active palette mode. */
+  readonly mode: ColorPopoverMode | null
   /**
    * Bounding rect of the anchor button so the popover can position itself just
    * beneath it. We re-read this each time the popover opens.
    */
-  anchorRect: () => DOMRect | null
+  readonly anchorRect: () => DOMRect | null
   /** Called with a `#rrggbb` hex string OR `''` to mean "no fill"/"automatic". */
-  onPick: (hex: string) => void
+  readonly onPick: (hex: string) => void
+  /** Routes dismissal back through the Core close command. */
+  readonly onRequestClose: () => void
 }
 
 export function FillColorPopover(props: FillColorPopoverProps) {
   const t = useT()
-  const store = useSpreadsheetUiStore()
-  const popover = useAtomValue(colorPopoverAtom)
   const [hoverHex, setHoverHex] = createSignal<string | null>(null)
   let containerRef: HTMLDivElement | undefined
 
-  const isOpen = () => popover().mode !== null
-
-  function close() {
-    store.setter(colorPopoverAtom, initialState)
-  }
+  const isOpen = () => props.open && props.mode !== null
 
   createEffect(() => {
     if (!isOpen()) return
@@ -75,7 +63,7 @@ export function FillColorPopover(props: FillColorPopoverProps) {
     function onKeyDown(event: KeyboardEvent) {
       if (event.key === 'Escape') {
         event.stopPropagation()
-        close()
+        props.onRequestClose()
       }
     }
 
@@ -91,7 +79,7 @@ export function FillColorPopover(props: FillColorPopoverProps) {
         )
         if (anchor) return
       }
-      close()
+      props.onRequestClose()
     }
 
     document.addEventListener('keydown', onKeyDown)
@@ -115,7 +103,6 @@ export function FillColorPopover(props: FillColorPopoverProps) {
 
   function handlePick(hex: string) {
     props.onPick(hex)
-    close()
   }
 
   return (
@@ -126,12 +113,10 @@ export function FillColorPopover(props: FillColorPopoverProps) {
         }}
         class="spreadsheet-color-popover"
         data-testid="toolbar-color-popover"
-        data-mode={popover().mode ?? ''}
+        data-mode={props.mode ?? ''}
         role="dialog"
         aria-label={
-          popover().mode === 'fill'
-            ? t('toolbar.fillColor.title')
-            : t('toolbar.textColor.title')
+          props.mode === 'fill' ? t('toolbar.fillColor.title') : t('toolbar.textColor.title')
         }
         style={positionStyle()}
       >
@@ -145,11 +130,11 @@ export function FillColorPopover(props: FillColorPopoverProps) {
         >
           <span
             class="spreadsheet-color-popover-no-fill-icon"
-            data-mode={popover().mode ?? ''}
+            data-mode={props.mode ?? ''}
             aria-hidden="true"
           >
             <Show
-              when={popover().mode === 'fill'}
+              when={props.mode === 'fill'}
               fallback={
                 /* Automatic: solid-fill square hints "use default text color" */
                 <svg width="14" height="14" viewBox="0 0 14 14">
@@ -176,27 +161,17 @@ export function FillColorPopover(props: FillColorPopoverProps) {
                   stroke="#8a8a8a"
                   stroke-width="1"
                 />
-                <line
-                  x1="2"
-                  y1="12"
-                  x2="12"
-                  y2="2"
-                  stroke="#d13438"
-                  stroke-width="1.5"
-                />
+                <line x1="2" y1="12" x2="12" y2="2" stroke="#d13438" stroke-width="1.5" />
               </svg>
             </Show>
           </span>
           <span class="spreadsheet-color-popover-no-fill-label">
-            {popover().mode === 'fill'
+            {props.mode === 'fill'
               ? t('toolbar.colorPopover.noFill')
               : t('toolbar.colorPopover.automatic')}
           </span>
         </button>
-        <div
-          class="spreadsheet-color-popover-section-title"
-          aria-hidden="true"
-        >
+        <div class="spreadsheet-color-popover-section-title" aria-hidden="true">
           {t('toolbar.colorPopover.themeColors')}
         </div>
         <div class="spreadsheet-color-popover-grid" role="grid">
@@ -231,10 +206,7 @@ export function FillColorPopover(props: FillColorPopoverProps) {
           disabled
           title={t('toolbar.colorPopover.moreColors')}
         >
-          <span
-            class="spreadsheet-color-popover-more-icon"
-            aria-hidden="true"
-          >
+          <span class="spreadsheet-color-popover-more-icon" aria-hidden="true">
             <svg width="14" height="14" viewBox="0 0 14 14">
               <circle cx="7" cy="7" r="5.5" fill="none" stroke="#8a8a8a" stroke-width="1" />
               <path d="M7 1.5 A5.5 5.5 0 0 1 12.5 7 L7 7 Z" fill="#ffc000" />
@@ -247,12 +219,9 @@ export function FillColorPopover(props: FillColorPopoverProps) {
             {t('toolbar.colorPopover.moreColors')}
           </span>
         </button>
-        <div
-          class="spreadsheet-color-popover-hint"
-          data-testid="color-popover-hint"
-        >
+        <div class="spreadsheet-color-popover-hint" data-testid="color-popover-hint">
           {hoverHex() === ''
-            ? popover().mode === 'fill'
+            ? props.mode === 'fill'
               ? t('toolbar.colorPopover.noFill')
               : t('toolbar.colorPopover.automatic')
             : (hoverHex() ?? '')}

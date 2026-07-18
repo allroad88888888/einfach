@@ -1,24 +1,31 @@
 /** @jsxImportSource solid-js */
 
-import { Show, For, createEffect, onCleanup } from 'solid-js'
-import { atom } from '@einfach/core'
+import { For, Show, createEffect, onCleanup } from 'solid-js'
 import { useAtomValue } from '@einfach/solid'
-import { useT } from '../../src/i18n'
+import { locale, useT } from '../../src/i18n'
 import {
+  closeNameManagerAtom,
+  deleteNameManagerEntryAtom,
   nameManagerEditorAtom,
   nameManagerKindDraftAtom,
   nameManagerNameDraftAtom,
   nameManagerParamsDraftAtom,
   nameManagerRefersToDraftAtom,
   nameManagerScopeDraftAtom,
-  nameRegistryCacheAtom,
-  setNameRegistryAtom,
-  closeNameManagerAtom,
+  nameManagerSelectedEntryAtom,
+  nameManagerSessionIdAtom,
+  namedRangeCapabilitiesAtom,
+  namedRangeMutationBlockedAtom,
+  namedRangeMutationStateAtom,
+  namedRangeRegistryStateAtom,
+  openNameManagerAtom,
+  saveNameManagerAtom,
   sheetTabsSheetsAtom,
+  workspaceSessionAtom,
   type NameManagerKind,
   type NamedRange,
+  type NamedRangeBackendCapabilities,
   type NamedRangeScope,
-  type NamedRangeRefersTo,
 } from '@einfach/spreadsheet-ui-core'
 import { useSpreadsheetBackend, useSpreadsheetUiStore } from '../provider'
 
@@ -27,245 +34,165 @@ export interface SpreadsheetNameManagerDialogProps {
   'data-testid'?: string
 }
 
-// Per-instance dialog state that need not survive 1.9.12 Provider remount
-// hazards (resolved in `2b7d65e` but we keep atom-backing as the standard
-// pattern — see `project_solid_provider_remount.md`). These atoms are
-// instantiated alongside the dialog component below.
-
 function scopeToString(scope: NamedRangeScope): string {
-  if (scope === 'workbook') return 'workbook'
-  return scope.sheetId
+  return scope === 'workbook' ? 'workbook' : `sheet:${scope.sheetId}`
 }
 
-function stringToScope(value: string): NamedRangeScope {
-  if (value === 'workbook') return 'workbook'
-  return { sheetId: value }
+function scopeKind(scope: string): 'workbook' | 'sheet' {
+  return scope === 'workbook' ? 'workbook' : 'sheet'
 }
 
-function refersToToFormFields(rt: NamedRangeRefersTo): {
-  kind: NameManagerKind
-  refersTo: string
-  params: string
-} {
-  if (rt.kind === 'range') {
-    return { kind: 'range', refersTo: `${rt.sheetId}!${rt.address}`, params: '' }
-  }
-  if (rt.kind === 'lambda') {
-    return { kind: 'lambda', refersTo: rt.body, params: rt.params.join(', ') }
-  }
-  // constant / value
-  return { kind: 'value', refersTo: rt.value, params: '' }
+function bindingKind(kind: NameManagerKind): keyof NamedRangeBackendCapabilities['bindings'] {
+  return kind === 'value' ? 'constant' : kind
 }
 
-// Local error atom (per-dialog instance, not exported — would normally live
-// in `spreadsheet-ui-core` but the error string is purely UI state).
-const errorAtom = atom<string | null>(null)
-errorAtom.debugLabel = 'spreadsheet.nameManager.error.local'
+const STATUS_COPY = {
+  en: {
+    capabilityUnavailable: 'Name operations are unavailable for this workbook.',
+    confirmedNotApplied: 'The change was not applied. Your draft is kept.',
+    deleteSelectionRequired: 'Select a name to delete.',
+    invalidNameOrReference: 'The name or reference is invalid.',
+    ledgerFull: 'The name operation history is full. Try again after it is resolved.',
+    operationUnavailable: 'This name operation is currently unavailable.',
+    operationUnsupported: 'This name operation is not supported.',
+    outcomeUnknown: 'The operation result could not be confirmed. Your draft is kept.',
+    projectionUnknown: 'The name list could not be confirmed. No change was sent.',
+    refreshing: 'Refreshing the name list…',
+    workbookContextChanged: 'The workbook context changed. Review the draft and try again.',
+  },
+  zh: {
+    capabilityUnavailable: '当前工作簿暂不支持名称操作。',
+    confirmedNotApplied: '本次更改未应用，草稿已保留。',
+    deleteSelectionRequired: '请选择要删除的名称。',
+    invalidNameOrReference: '名称或引用无效。',
+    ledgerFull: '名称操作记录已满，请等待当前操作解决后重试。',
+    operationUnavailable: '当前名称操作不可用。',
+    operationUnsupported: '当前名称操作不受支持。',
+    outcomeUnknown: '操作结果尚未确认，草稿已保留。',
+    projectionUnknown: '名称列表尚未确认，未发送新的更改。',
+    refreshing: '正在刷新名称列表…',
+    workbookContextChanged: '工作簿上下文已变化，请检查草稿后重试。',
+  },
+} as const
 
-// Locally-tracked selected entry — needed to know which row the Delete
-// button targets. Identity by name + scope-stringified.
-const selectedEntryAtom = atom<NamedRange | null>(null)
-selectedEntryAtom.debugLabel = 'spreadsheet.nameManager.selectedEntry'
+type StatusCopyKey = keyof (typeof STATUS_COPY)['en']
+
+const CORE_ERROR_COPY_KEY: Readonly<Record<string, StatusCopyKey>> = Object.freeze({
+  名称能力不可用: 'capabilityUnavailable',
+  名称列表正在刷新: 'refreshing',
+  名称列表未确认: 'projectionUnknown',
+  当前名称操作不可用: 'operationUnavailable',
+  当前名称操作不受支持: 'operationUnsupported',
+  名称操作记录已满: 'ledgerFull',
+  工作簿上下文已变化: 'workbookContextChanged',
+  请选择要删除的名称: 'deleteSelectionRequired',
+  名称或引用无效: 'invalidNameOrReference',
+  操作结果未确认: 'outcomeUnknown',
+})
 
 export function SpreadsheetNameManagerDialog(props: SpreadsheetNameManagerDialogProps) {
   const t = useT()
   const store = useSpreadsheetUiStore()
   const backend = useSpreadsheetBackend()
   const editor = useAtomValue(nameManagerEditorAtom)
-  const registry = useAtomValue(nameRegistryCacheAtom)
+  const capability = useAtomValue(namedRangeCapabilitiesAtom)
+  const registry = useAtomValue(namedRangeRegistryStateAtom)
+  const mutation = useAtomValue(namedRangeMutationStateAtom)
+  const mutationBlocked = useAtomValue(namedRangeMutationBlockedAtom)
+  const selectedEntry = useAtomValue(nameManagerSelectedEntryAtom)
+  const sessionId = useAtomValue(nameManagerSessionIdAtom)
+  const workspace = useAtomValue(workspaceSessionAtom)
   const sheets = useAtomValue(sheetTabsSheetsAtom)
   const name = useAtomValue(nameManagerNameDraftAtom)
   const scope = useAtomValue(nameManagerScopeDraftAtom)
   const refersTo = useAtomValue(nameManagerRefersToDraftAtom)
   const kind = useAtomValue(nameManagerKindDraftAtom)
   const params = useAtomValue(nameManagerParamsDraftAtom)
-  const selectedEntry = useAtomValue(selectedEntryAtom)
-  const error = useAtomValue(errorAtom)
 
   const isOpen = () => editor().status !== 'closed'
+  const interactionLocked = () =>
+    mutation().status === 'pending' || registry().status === 'refreshing'
+
+  const controllerReady = () =>
+    capability().status === 'ready' && registry().status === 'ready' && !mutationBlocked()
+
+  function supportsCurrentSave(): boolean {
+    if (!controllerReady()) return false
+    const currentCapability = capability().capabilities
+    if (currentCapability === null) return false
+    if (!currentCapability.scopes.includes(scopeKind(scope()))) return false
+    const currentBinding = bindingKind(kind())
+    if (!currentCapability.bindings[currentBinding]) return false
+    return currentBinding !== 'range' || currentCapability.rangeSemantics !== 'unsupported'
+  }
+
+  function supportsCurrentDelete(): boolean {
+    if (!controllerReady()) return false
+    const entry = selectedEntry() ?? editor().draft
+    const currentCapability = capability().capabilities
+    if (entry === undefined || entry === null || currentCapability === null) return false
+    return (
+      currentCapability.delete &&
+      currentCapability.scopes.includes(entry.scope === 'workbook' ? 'workbook' : 'sheet')
+    )
+  }
+
+  function isSelected(entry: NamedRange): boolean {
+    const current = selectedEntry()
+    return (
+      current !== null &&
+      current.name === entry.name &&
+      scopeToString(current.scope) === scopeToString(entry.scope)
+    )
+  }
+
+  function statusMessage(): string | null {
+    const copy = STATUS_COPY[locale()]
+    const currentMutation = mutation()
+    if (currentMutation.status === 'blocked' && currentMutation.error === '名称或引用无效') {
+      if (name().trim().length === 0) return t('nameManager.error.nameRequired')
+      if (refersTo().trim().length === 0) return t('nameManager.error.refersToRequired')
+    }
+    if (currentMutation.error !== null) {
+      const copyKey = CORE_ERROR_COPY_KEY[currentMutation.error]
+      return copyKey === undefined ? currentMutation.error : copy[copyKey]
+    }
+    if (currentMutation.status === 'outcome-unknown') return copy.outcomeUnknown
+    if (currentMutation.status === 'confirmed-not-applied') return copy.confirmedNotApplied
+    if (registry().status === 'projection-unknown') return copy.projectionUnknown
+    if (capability().status === 'unavailable') return copy.capabilityUnavailable
+    if (registry().status === 'refreshing') return copy.refreshing
+    return null
+  }
 
   createEffect(() => {
     if (!isOpen()) return
     function onKeyDown(event: KeyboardEvent) {
-      if (event.key === 'Escape') {
-        event.stopPropagation()
-        store.setter(closeNameManagerAtom)
-      }
+      if (event.key !== 'Escape') return
+      event.stopPropagation()
+      store.setter(closeNameManagerAtom)
     }
     document.addEventListener('keydown', onKeyDown)
     onCleanup(() => document.removeEventListener('keydown', onKeyDown))
   })
 
-  function setName(value: string) {
-    store.setter(nameManagerNameDraftAtom, value)
-  }
-  function setScope(value: string) {
-    store.setter(nameManagerScopeDraftAtom, value)
-  }
-  function setRefersTo(value: string) {
-    store.setter(nameManagerRefersToDraftAtom, value)
-  }
-  function setKind(value: NameManagerKind) {
-    store.setter(nameManagerKindDraftAtom, value)
-  }
-  function setParams(value: string) {
-    store.setter(nameManagerParamsDraftAtom, value)
-  }
-  function setSelectedEntry(value: NamedRange | null) {
-    store.setter(selectedEntryAtom, value)
-  }
-  function setError(value: string | null) {
-    store.setter(errorAtom, value)
+  function selectEntry(entry: NamedRange): void {
+    store.setter(openNameManagerAtom, { status: 'editing-existing', draft: entry })
   }
 
-  function populateFromEntry(entry: NamedRange) {
-    const form = refersToToFormFields(entry.refersTo)
-    setSelectedEntry(entry)
-    setName(entry.name)
-    setScope(scopeToString(entry.scope))
-    setKind(form.kind)
-    setParams(form.params)
-    setRefersTo(form.refersTo)
-    setError(null)
+  function save(): void {
+    store.setter(saveNameManagerAtom, {
+      source: backend,
+      sessionId: sessionId(),
+      activeSheetId: workspace().activeSheetId ?? sheets()[0]?.id,
+    })
   }
 
-  function resetForm() {
-    setSelectedEntry(null)
-    setName('')
-    setScope('workbook')
-    setKind('range')
-    setParams('')
-    setRefersTo('')
-    setError(null)
-  }
-
-  // Reset on the closed→open edge. Uses the atoms directly so the
-  // per-instance state survives any consumer remount (1.9.12 hazard:
-  // historically the component body could re-execute, dropping `let`
-  // locals; atom values persist).
-  createEffect((wasOpen: boolean) => {
-    const open = isOpen()
-    if (open && !wasOpen) {
-      const draft = editor().draft
-      if (draft) {
-        const form = refersToToFormFields(draft.refersTo)
-        setSelectedEntry(draft)
-        setName(draft.name)
-        setScope(scopeToString(draft.scope))
-        setKind(form.kind)
-        setParams(form.params)
-        setRefersTo(form.refersTo)
-      } else {
-        setSelectedEntry(null)
-        setName('')
-        setScope('workbook')
-        setKind('range')
-        setParams('')
-        setRefersTo('')
-      }
-      setError(null)
-    }
-    return open
-  }, false)
-
-  function buildRefersTo(): NamedRangeRefersTo | null {
-    const value = refersTo().trim()
-    const currentKind = kind()
-    if (currentKind === 'lambda') {
-      const paramList = params()
-        .split(',')
-        .map((p) => p.trim())
-        .filter((p) => p.length > 0)
-      const body = value.startsWith('=') ? value : `=${value}`
-      if (body.length <= 1) return null
-      return { kind: 'lambda', params: paramList, body }
-    }
-    if (currentKind === 'range') {
-      const sep = value.indexOf('!')
-      if (sep !== -1) {
-        return { kind: 'range', sheetId: value.slice(0, sep), address: value.slice(sep + 1) }
-      }
-      // Treat range-without-sheet-prefix as the active scope sheet, or the
-      // first sheet for workbook-scoped names.
-      const scopeVal = scope()
-      const sheetId = scopeVal === 'workbook' ? sheets()[0]?.id ?? '' : scopeVal
-      return { kind: 'range', sheetId, address: value }
-    }
-    return { kind: 'constant', value }
-  }
-
-  function close() {
-    store.setter(closeNameManagerAtom)
-    resetForm()
-  }
-
-  async function refreshNameRegistry() {
-    if (!backend.listNamedRanges) {
-      store.setter(setNameRegistryAtom, {
-        names: registry(),
-      })
-      return
-    }
-    const result = await backend.listNamedRanges({ kind: 'list-named-ranges' })
-    store.setter(setNameRegistryAtom, result)
-  }
-
-  async function handleSave() {
-    if (!backend.setNamedRange) return
-    const nameVal = (name() || (editor().draft?.name ?? '')).trim()
-    if (nameVal.length === 0) {
-      setError(t('nameManager.error.nameRequired'))
-      return
-    }
-    if (refersTo().trim().length === 0) {
-      setError(t('nameManager.error.refersToRequired'))
-      return
-    }
-    const built = buildRefersTo()
-    if (!built) {
-      setError(t('nameManager.error.refersToRequired'))
-      return
-    }
-    if (built.kind === 'lambda' && built.params.length === 0) {
-      setError(t('nameManager.error.paramsRequired'))
-      return
-    }
-    try {
-      await backend.setNamedRange({
-        kind: 'set-named-range',
-        name: nameVal,
-        scope: stringToScope(scope()),
-        refersTo: built,
-      })
-      await refreshNameRegistry()
-    } catch (err) {
-      setError(err instanceof Error ? err.message : String(err))
-      return
-    }
-    close()
-  }
-
-  async function handleDelete() {
-    if (!backend.deleteNamedRange) return
-    const entry = selectedEntry() ?? editor().draft
-    if (!entry) return
-    try {
-      await backend.deleteNamedRange({
-        kind: 'delete-named-range',
-        name: entry.name,
-        scope: entry.scope,
-      })
-      await refreshNameRegistry()
-    } catch (err) {
-      setError(err instanceof Error ? err.message : String(err))
-      return
-    }
-    setSelectedEntry(null)
-    setError(null)
-  }
-
-  function handleClose() {
-    close()
+  function remove(): void {
+    store.setter(deleteNameManagerEntryAtom, {
+      source: backend,
+      sessionId: sessionId(),
+    })
   }
 
   function refersToLabel(): string {
@@ -277,6 +204,9 @@ export function SpreadsheetNameManagerDialog(props: SpreadsheetNameManagerDialog
       <div
         class={`name-manager-dialog ${props.class ?? ''}`.trim()}
         data-testid={props['data-testid'] ?? 'name-manager-dialog'}
+        data-capability-status={capability().status}
+        data-registry-status={registry().status}
+        data-mutation-status={mutation().status}
         role="dialog"
         aria-modal="true"
         aria-label={t('nameManager.title')}
@@ -286,21 +216,23 @@ export function SpreadsheetNameManagerDialog(props: SpreadsheetNameManagerDialog
           class="dialog-close-x"
           data-testid="dialog-close-x"
           aria-label={t('dialog.close.label')}
-          onClick={handleClose}
+          onClick={() => store.setter(closeNameManagerAtom)}
         >
           ×
         </button>
+
         <ul data-testid="name-list">
-          <For each={registry()}>
+          <For each={registry().names}>
             {(entry) => (
-              <li
-                data-name={entry.name}
-                onClick={() => {
-                  populateFromEntry(entry)
-                }}
-                style={{ cursor: 'pointer' }}
-              >
-                {entry.name} ({scopeToString(entry.scope)})
+              <li data-name={entry.name}>
+                <button
+                  type="button"
+                  aria-pressed={isSelected(entry)}
+                  disabled={interactionLocked()}
+                  onClick={() => selectEntry(entry)}
+                >
+                  {entry.name} ({scopeToString(entry.scope)})
+                </button>
               </li>
             )}
           </For>
@@ -313,9 +245,8 @@ export function SpreadsheetNameManagerDialog(props: SpreadsheetNameManagerDialog
             data-testid="name-input"
             type="text"
             value={name()}
-            onInput={(e) => {
-              setName(e.currentTarget.value)
-            }}
+            disabled={interactionLocked()}
+            onInput={(event) => store.setter(nameManagerNameDraftAtom, event.currentTarget.value)}
           />
 
           <label for="name-scope-select">{t('nameManager.scope')}</label>
@@ -323,13 +254,12 @@ export function SpreadsheetNameManagerDialog(props: SpreadsheetNameManagerDialog
             id="name-scope-select"
             data-testid="name-scope-select"
             value={scope()}
-            onChange={(e) => {
-              setScope(e.currentTarget.value)
-            }}
+            disabled={interactionLocked()}
+            onChange={(event) => store.setter(nameManagerScopeDraftAtom, event.currentTarget.value)}
           >
             <option value="workbook">{t('nameManager.scope.workbook')}</option>
             <For each={sheets()}>
-              {(sheet) => <option value={sheet.id}>{sheet.name}</option>}
+              {(sheet) => <option value={`sheet:${sheet.id}`}>{sheet.name}</option>}
             </For>
           </select>
 
@@ -338,9 +268,10 @@ export function SpreadsheetNameManagerDialog(props: SpreadsheetNameManagerDialog
             id="name-mgr-kind-select"
             data-testid="name-mgr-kind-select"
             value={kind()}
-            onChange={(e) => {
-              setKind(e.currentTarget.value as NameManagerKind)
-            }}
+            disabled={interactionLocked()}
+            onChange={(event) =>
+              store.setter(nameManagerKindDraftAtom, event.currentTarget.value as NameManagerKind)
+            }
           >
             <option value="range">{t('nameManager.kind.range')}</option>
             <option value="value">{t('nameManager.kind.value')}</option>
@@ -355,9 +286,10 @@ export function SpreadsheetNameManagerDialog(props: SpreadsheetNameManagerDialog
               type="text"
               placeholder="x, y, z"
               value={params()}
-              onInput={(e) => {
-                setParams(e.currentTarget.value)
-              }}
+              disabled={interactionLocked()}
+              onInput={(event) =>
+                store.setter(nameManagerParamsDraftAtom, event.currentTarget.value)
+              }
             />
           </Show>
 
@@ -367,42 +299,42 @@ export function SpreadsheetNameManagerDialog(props: SpreadsheetNameManagerDialog
             data-testid="name-refers-to"
             type="text"
             value={refersTo()}
-            onInput={(e) => {
-              setRefersTo(e.currentTarget.value)
-            }}
+            disabled={interactionLocked()}
+            onInput={(event) =>
+              store.setter(nameManagerRefersToDraftAtom, event.currentTarget.value)
+            }
           />
         </div>
 
-        <Show when={error()}>
-          <div data-testid="name-error-text" role="alert">
-            {error()}
-          </div>
+        <Show when={statusMessage()}>
+          {(message) => (
+            <div data-testid="name-error-text" role="status">
+              {message()}
+            </div>
+          )}
         </Show>
 
         <div class="nm-actions">
           <button
             type="button"
             data-testid="name-save-button"
-            onClick={() => {
-              void handleSave()
-            }}
+            disabled={!supportsCurrentSave()}
+            onClick={save}
           >
             {t('nameManager.save')}
           </button>
           <button
             type="button"
             data-testid="name-delete-button"
-            disabled={!selectedEntry() && !editor().draft}
-            onClick={() => {
-              void handleDelete()
-            }}
+            disabled={!supportsCurrentDelete()}
+            onClick={remove}
           >
             {t('nameManager.delete')}
           </button>
           <button
             type="button"
             data-testid="name-close-button"
-            onClick={handleClose}
+            onClick={() => store.setter(closeNameManagerAtom)}
           >
             {t('nameManager.close')}
           </button>

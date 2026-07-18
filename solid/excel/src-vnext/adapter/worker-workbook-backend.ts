@@ -26,6 +26,8 @@ import type {
   RangeProjectionResult,
   RangeTsvExportRequest,
   RangeTsvExportResult,
+  RemoveRowsExactRequest,
+  RemoveRowsExactResult,
   RemoveRowsRequest,
   RemoveRowsResult,
   ReorderSheetRequest,
@@ -35,7 +37,6 @@ import type {
   SetCellInputRequest,
   SetColumnWidthRequest,
   SetConditionalFormatRuleRequest,
-  SetFilterSortRequest,
   SetFormatRangeRequest,
   SetNamedRangeRequest,
   SetRowHeightRequest,
@@ -44,7 +45,7 @@ import type {
   SpreadsheetBackend,
   SpreadsheetCellFormat,
   SpreadsheetSheetMetadata,
-  FilterSortState,
+  ToolbarBackendMutationResult,
   ValidationMode,
   ValidationRule,
   VisibleProjectionRequest,
@@ -56,7 +57,6 @@ import {
   cloneCell,
   cloneConditionalFormatRule,
   cloneConditionalFormatRuleEntry,
-  cloneFilterSortState,
   cloneFormat,
   cloneNamedRange,
   cloneRange,
@@ -65,13 +65,14 @@ import {
   DEFAULT_WORKBOOK_LOCALE,
   estimateUtf8Bytes,
   evaluateValidationLocal,
-  filterSortHasEffect,
   formatNumberValue,
   isCoordInsideRange,
   keyFor,
+  namedRangeIdentity,
   nextConditionalFormatRuleId,
   normalizeDimensionSize,
   normalizeFormat,
+  normalizeNamedRangeName,
   normalizeRange,
   numericValue,
   reorderSheetMetadata,
@@ -80,7 +81,6 @@ import {
   validationSeverityForMode,
   type RangeFormatLayer,
   getEffectiveFormat,
-  buildFilterSortDisplayRows as buildFilterSortDisplayRowsShared,
 } from '@einfach/spreadsheet-ui-core'
 
 import {
@@ -108,6 +108,12 @@ export interface WorkerWorkbookSpreadsheetBackendOptions {
   workerFactory?: () => WorkerLike
   sheets?: readonly (string | WorkerWorkbookBackendSheetInput)[]
   revision?: ProjectionRevision
+  /**
+   * Explicit host witness that this worker runtime really applies deleteRows.
+   * Omitted/false by default because the current TS runtime ACKs structural
+   * commands without mutating its workbook. Only the WASM demo may opt in.
+   */
+  removeRowsExactCapability?: false | 'worker-engine-delete-rows'
   afterInit?: (
     client: WorkerWorkbookClient,
     sheets: WorkerWorkbookBackendSheet[],
@@ -115,6 +121,7 @@ export interface WorkerWorkbookSpreadsheetBackendOptions {
 }
 
 export interface WorkerWorkbookSpreadsheetBackend extends SpreadsheetBackend {
+  removeRowsExact?(request: RemoveRowsExactRequest): Promise<RemoveRowsExactResult>
   ready(): Promise<WorkerWorkbookBackendSheet[]>
   sheets(): WorkerWorkbookBackendSheet[]
   dispose(): void
@@ -135,11 +142,6 @@ const DEFAULT_SHEETS = ['Sheet1']
 const DEFAULT_IMPORT_CELLS_PER_CHUNK = 10_000
 const MIN_IMPORT_CELLS_PER_CHUNK = 1
 const MAX_IMPORT_CELLS_PER_CHUNK = 10_000
-// Excel-compatible max row index. Used as the row end when reading wide data for
-// filter/sort overlays — readSparseRange returns only cells that exist, so this
-// sentinel costs nothing for sparse sheets.
-const EXCEL_MAX_SHEET_ROW = 1_048_575
-
 function normalizeSheetInputs(
   sheets: readonly (string | WorkerWorkbookBackendSheetInput)[] | undefined,
 ): WorkerWorkbookBackendSheetInput[] {
@@ -293,95 +295,34 @@ function rangesIntersect(left: CellRange, right: CellRange): boolean {
   )
 }
 
-function namedRangeScopeEquals(left: NamedRange['scope'], right: NamedRange['scope']): boolean {
-  if (left === 'workbook' || right === 'workbook') return left === right
-  return left.sheetId === right.sheetId
+function namedRangeMatches(
+  entry: NamedRange,
+  name: string,
+  scope: NamedRange['scope'],
+): boolean {
+  const targetIdentity = namedRangeIdentity(name, scope)
+  return targetIdentity !== null && namedRangeIdentity(entry.name, entry.scope) === targetIdentity
 }
 
-function readCellValue(cells: Map<string, DisplayCell>, row: number, col: number): string {
-  return cells.get(keyFor(row, col))?.displayValue ?? ''
-}
-
-function buildFilterSortDisplayRows(
-  cells: Map<string, DisplayCell>,
-  state: FilterSortState | undefined,
-): number[] | null {
-  // Filter/sort always operates over the full sheet — row 0 is the header, rows 1..maxRow
-  // are scanned for filter rules and sort directives. The viewport window has no bearing
-  // on this; cells outside the window must still participate so they can be repositioned
-  // into it.
-  let maxRow = -1
-  for (const cell of cells.values()) {
-    if (cell.row > maxRow) maxRow = cell.row
+function namedRangeAddressEndpoints(
+  address: string,
+): { start: string; end: string } | null {
+  const parts = address
+    .trim()
+    .split(':')
+    .map((part) => part.trim())
+  if (parts.length === 1 && parts[0]) {
+    return { start: parts[0], end: parts[0] }
   }
-  if (maxRow < 0) return filterSortHasEffect(state) ? [] : null
-  return buildFilterSortDisplayRowsShared(
-    state,
-    { headerRow: 0, startRow: 1, endRow: maxRow + 1 },
-    (row, col) => readCellValue(cells, row, col),
-  )
-}
-
-function projectFilterSortWindow(
-  cells: DisplayCell[],
-  range: CellRange,
-  displayRows: readonly number[],
-): DisplayCell[] {
-  const bySource = new Map(cells.map((cell) => [keyFor(cell.row, cell.col), cell]))
-  const projected: DisplayCell[] = []
-  for (let row = range.rowStart; row <= range.rowEnd; row += 1) {
-    const sourceRow = displayRows[row]
-    if (sourceRow === undefined) continue
-    for (let col = range.colStart; col <= range.colEnd; col += 1) {
-      const cell = bySource.get(keyFor(sourceRow, col))
-      if (!cell) continue
-      projected.push({
-        ...cloneCell(cell),
-        row,
-        col,
-        originalRow: sourceRow,
-      })
-    }
+  if (parts.length === 2 && parts[0] && parts[1]) {
+    return { start: parts[0], end: parts[1] }
   }
-  return projected
+  return null
 }
 
-function applyFilterSortOverlay(
-  cells: DisplayCell[],
-  range: CellRange,
-  state: FilterSortState | undefined,
-): { cells: DisplayCell[]; displayRows: number[] | null } {
-  const bySource = new Map(cells.map((cell) => [keyFor(cell.row, cell.col), cell]))
-  const displayRows = buildFilterSortDisplayRows(bySource, state)
-  if (displayRows === null) return { cells, displayRows: null }
-  return { cells: projectFilterSortWindow(cells, range, displayRows), displayRows }
-}
-
-/**
- * Audit D-7: given a cached display-row permutation, compute the
- * contiguous SOURCE row band that projects into the requested window —
- * bounded by existing content, never the 0..EXCEL_MAX_SHEET_ROW
- * sentinel. Returns `null` when no source row projects into the window
- * (nothing to read at all).
- */
-function sourceRowRangeForWindow(
-  displayRows: readonly number[],
-  range: CellRange,
-): CellRange | null {
-  let minRow = Number.POSITIVE_INFINITY
-  let maxRow = -1
-  for (let row = range.rowStart; row <= range.rowEnd; row += 1) {
-    const sourceRow = displayRows[row]
-    if (sourceRow === undefined) continue
-    if (sourceRow < minRow) minRow = sourceRow
-    if (sourceRow > maxRow) maxRow = sourceRow
-  }
-  if (maxRow < 0) return null
-  return { rowStart: minRow, rowEnd: maxRow, colStart: range.colStart, colEnd: range.colEnd }
-}
-
-function emptyFormatRangeSnapshot(range: SparseRangeWire): FormatRangeSnapshot {
-  return { ...range, cellFormats: [], rangeFormats: [] }
+function isNamedRangeEngineUnsupported(error: unknown): boolean {
+  const code = (error as Error & { code?: string })?.code
+  return code === 'NAME_BINDING_UNSUPPORTED' || code === 'UNKNOWN_COMMAND'
 }
 
 function cloneValidationRule(rule: ValidationRule): ValidationRule {
@@ -481,9 +422,8 @@ function getConditionalFormatForCell(
 
 // Exported for the audit D-11 pin in test/audit-adapter-scaling.test.ts.
 //
-// `window` is the bounding box of every (sourceRow, col) coordinate the
-// per-cell loop can test — the projected window unioned with the
-// filter/sort source-row band when one is active. Rules scoped entirely
+// `window` is the canonical requested range and bounds every (row, col)
+// coordinate the per-cell loop can test. Rules scoped entirely
 // outside it can never match, so they are dropped BEFORE the per-cell
 // loop (audit D-11, second half). The pre-filter is a pure superset
 // test: per-cell `isCoordInsideRange` still decides membership for the
@@ -559,15 +499,12 @@ function fillBlankFormatOnlyCells(
   range: CellRange,
   cellFormats: Map<string, SpreadsheetCellFormat>,
   rangeFormats: readonly RangeFormatLayer[],
-  displayRows: readonly number[] | null,
 ): void {
   for (let row = range.rowStart; row <= range.rowEnd; row += 1) {
-    const sourceRow = displayRows ? displayRows[row] : row
-    if (sourceRow === undefined) continue
     for (let col = range.colStart; col <= range.colEnd; col += 1) {
       const key = keyFor(row, col)
       if (cellMap.has(key)) continue
-      const format = getEffectiveFormat(sourceRow, col, cellFormats, rangeFormats)
+      const format = getEffectiveFormat(row, col, cellFormats, rangeFormats)
       if (!format) continue
       cellMap.set(key, {
         row,
@@ -575,7 +512,6 @@ function fillBlankFormatOnlyCells(
         displayValue: '',
         valueKind: 'blank',
         format,
-        ...(displayRows ? { originalRow: sourceRow } : {}),
       })
     }
   }
@@ -585,13 +521,12 @@ function mergeFormatsIntoCells(
   cells: DisplayCell[],
   range: CellRange,
   snapshot: FormatRangeSnapshot,
-  displayRows: readonly number[] | null = null,
 ): DisplayCell[] {
   const { cellFormats, rangeFormats } = preprocessFormatSnapshot(snapshot)
   const formatted = attachFormatsToCells(cells, cellFormats, rangeFormats)
   const cellMap = new Map<string, DisplayCell>()
   for (const cell of formatted) cellMap.set(keyFor(cell.row, cell.col), cell)
-  fillBlankFormatOnlyCells(cellMap, range, cellFormats, rangeFormats, displayRows)
+  fillBlankFormatOnlyCells(cellMap, range, cellFormats, rangeFormats)
   return [...cellMap.values()].sort((left, right) =>
     left.row === right.row ? left.col - right.col : left.row - right.row,
   )
@@ -609,12 +544,8 @@ function applyNumberFormatToCell(cell: DisplayCell, workbookLocale: string): Dis
     return cell
   }
 
-  const raw = cell.displayValue
-  const numeric = Number(raw)
-  const value =
-    cell.valueKind === 'number' && Number.isFinite(numeric)
-      ? numeric
-      : raw
+  if (cell.valueKind === 'number' && !Number.isFinite(cell.numericValue)) return cell
+  const value = cell.valueKind === 'number' ? cell.numericValue! : cell.displayValue
   const locale = cell.format?.locale ?? workbookLocale
   const result = formatNumberValue(numberFormat, value, { locale })
 
@@ -659,6 +590,11 @@ function snapshotToDisplayCell(snapshot: CellSnapshotWire): DisplayCell | null {
     col: coord.col,
     displayValue: snapshot.display,
     valueKind,
+  }
+
+  if (snapshot.type === 'number' && valueKind === 'number') {
+    const value = numericValue(snapshot.display)
+    if (value !== null) cell.numericValue = value
   }
 
   if (snapshot.formula !== '') {
@@ -819,35 +755,15 @@ export function createWorkerWorkbookSpreadsheetBackend(
   let revision = options.revision ?? 0
   let disposed = false
   const client: WorkerWorkbookClient = resolvedClient
-  // Toolbar-overlay metadata (data validation, conditional format, filter/sort, named ranges) is
+  // Toolbar-overlay metadata (data validation, conditional format, named ranges) is
   // intentionally kept on the main thread for now: the WASM Workbook does not yet model these and
   // would not round-trip them through undo/redo or formula evaluation. The host applies them on
   // top of the worker's projection. Move into the Rust workbook once it grows native support; at
   // that point these Maps should disappear (not be extended).
   const validationRulesBySheetId = new Map<string, WorkerValidationRuleLayer[]>()
   const conditionalFormatRulesBySheetId = new Map<string, ConditionalFormatRuleEntry[]>()
-  const filterSortBySheetId = new Map<string, FilterSortState>()
-  // Audit D-7: cached display-row permutation per sheet while filter/sort
-  // is active. Bounded: at most one entry per sheet with an active
-  // filter/sort state; entries drop on setFilterSort and deleteSheet and
-  // self-invalidate via the content generation + state identity checks.
-  // A cache hit lets readRange fetch only the source rows that project
-  // into the window instead of re-reading rows 0..EXCEL_MAX_SHEET_ROW
-  // and rebuilding the permutation on every viewport refresh.
-  type FilterSortDisplayRowsCacheEntry = {
-    generation: number
-    state: FilterSortState
-    colStart: number
-    colEnd: number
-    displayRows: number[]
-  }
-  const filterSortDisplayRowsCache = new Map<string, FilterSortDisplayRowsCacheEntry>()
-  // Monotonic content generation, bumped on EVERY revision bump
-  // (including hosts that seed a non-numeric `revision`, where the
-  // public revision cannot increment). Cache-validity backstop for the
-  // D-7 permutation cache.
-  let contentGeneration = 0
   let namedRanges: NamedRange[] = []
+  let namedRangeMutationTail: Promise<void> = Promise.resolve()
   const readyPromise = client
     .initWorkbook(sheetInputs.map((sheet) => sheet.name))
     .then(async (metas) => {
@@ -861,17 +777,72 @@ export function createWorkerWorkbookSpreadsheetBackend(
   // after every settle; forwarding it lets the grid refetch the visible
   // projection without a user interaction.
   const contentChangeHandlers = new Set<() => void>()
+  let sheetIndexRemapDepth = 0
+  let deferredContentChange = false
+
+  function notifyContentChangeHandlers(): void {
+    for (const handler of contentChangeHandlers) handler()
+  }
+
+  function beginSheetIndexRemap(): void {
+    sheetIndexRemapDepth += 1
+  }
+
+  function finishSheetIndexRemap(): void {
+    sheetIndexRemapDepth = Math.max(0, sheetIndexRemapDepth - 1)
+    if (sheetIndexRemapDepth > 0 || !deferredContentChange) return
+    deferredContentChange = false
+    notifyContentChangeHandlers()
+  }
+
   const offDirty = client.onCellsDirty(() => {
     bumpRevision()
-    for (const handler of contentChangeHandlers) handler()
+    if (sheetIndexRemapDepth > 0) {
+      deferredContentChange = true
+      return
+    }
+    notifyContentChangeHandlers()
   })
 
   function bumpRevision(): ProjectionRevision {
-    contentGeneration += 1
     if (typeof revision === 'number' && Number.isFinite(revision)) {
       revision += 1
     }
     return revision
+  }
+
+  function assertNamedRangeBackendActive(): void {
+    if (disposed) {
+      throw createBackendError(
+        'BACKEND_DISPOSED',
+        'named range mutation completed after the worker backend was disposed',
+      )
+    }
+  }
+
+  function enqueueNamedRangeMutation(
+    mutation: () => Promise<NamedRangeMutationResult>,
+  ): Promise<NamedRangeMutationResult> {
+    const result = namedRangeMutationTail.then(mutation, mutation)
+    namedRangeMutationTail = result.then(
+      () => undefined,
+      () => undefined,
+    )
+    return result
+  }
+
+  function workerNamedRangeMutationResult(
+    request: SetNamedRangeRequest | DeleteNamedRangeRequest,
+    outcome: NamedRangeMutationResult['outcome'],
+    resultRevision: ProjectionRevision = revision,
+  ): NamedRangeMutationResult {
+    return {
+      requestId: request.requestId,
+      revision: request.revision ?? resultRevision,
+      outcome,
+      authority: 'worker-engine-ack',
+      canonical: false,
+    }
   }
 
   /**
@@ -880,14 +851,11 @@ export function createWorkerWorkbookSpreadsheetBackend(
    * sheet's id IS reused by the next added sheet — stale entries are not
    * just leaks, they get inherited. Per-sheet-keyed state in this
    * backend: `validationRulesBySheetId`, `conditionalFormatRulesBySheetId`,
-   * `filterSortBySheetId`, `filterSortDisplayRowsCache` (D-7), and the
-   * sheet-scoped entries of `namedRanges`.
+   * and the sheet-scoped entries of `namedRanges`.
    */
   function dropSheetOverlayState(sheetId: string): void {
     validationRulesBySheetId.delete(sheetId)
     conditionalFormatRulesBySheetId.delete(sheetId)
-    filterSortBySheetId.delete(sheetId)
-    filterSortDisplayRowsCache.delete(sheetId)
     namedRanges = namedRanges.filter(
       (item) => item.scope === 'workbook' || item.scope.sheetId !== sheetId,
     )
@@ -966,103 +934,23 @@ export function createWorkerWorkbookSpreadsheetBackend(
     return sheet
   }
 
-  function validCachedDisplayRows(
-    sheetId: string,
-    state: FilterSortState,
-    range: CellRange,
-  ): number[] | null {
-    const entry = filterSortDisplayRowsCache.get(sheetId)
-    if (!entry) return null
-    if (entry.generation !== contentGeneration) return null
-    // `setFilterSort` always installs a fresh clone, so identity is a
-    // sound staleness check for the spec itself.
-    if (entry.state !== state) return null
-    // The permutation was derived from a read bounded to one column
-    // band; reuse only for the same band (matches the pre-cache
-    // behavior where each read derived the permutation from its own
-    // column window).
-    if (entry.colStart !== range.colStart || entry.colEnd !== range.colEnd) return null
-    return entry.displayRows
-  }
-
   async function readRange(
     sheetId: string,
     range: CellRange,
     requestRevision?: ProjectionRevision,
   ): Promise<{ cells: DisplayCell[]; revision?: ProjectionRevision }> {
     const sheet = await resolveSheet(sheetId)
-    const filterSortState = filterSortBySheetId.get(sheetId)
-    const filterSortActive = filterSortHasEffect(filterSortState)
+    const sparseRange = toSparseRange(sheet.idx, range)
+    const [snapshots, formatSnapshot] = await Promise.all([
+      client.readSparseRange(sparseRange),
+      client.snapshotFormatRange(sparseRange),
+    ])
+    const cells = snapshots
+      .map(snapshotToDisplayCell)
+      .filter((cell): cell is DisplayCell => cell !== null)
+      .sort((left, right) => (left.row === right.row ? left.col - right.col : left.row - right.row))
 
-    // Audit D-7: when filter/sort is active, source rows outside the
-    // viewport may reposition into it, so ONE wide read per (content
-    // generation, filter/sort state, column band) is unavoidable — the
-    // permutation needs every candidate row. But per viewport REFRESH
-    // (scroll tick, post-edit re-read) the cached permutation tells us
-    // exactly which source rows project into the window, so cache hits
-    // read a row band bounded by existing content instead of
-    // 0..EXCEL_MAX_SHEET_ROW.
-    const cachedDisplayRows = filterSortActive
-      ? validCachedDisplayRows(sheetId, filterSortState!, range)
-      : null
-    const dataRange: CellRange | null = !filterSortActive
-      ? range
-      : cachedDisplayRows
-        ? sourceRowRangeForWindow(cachedDisplayRows, range)
-        : {
-            rowStart: 0,
-            rowEnd: EXCEL_MAX_SHEET_ROW,
-            colStart: range.colStart,
-            colEnd: range.colEnd,
-          }
-
-    let cells: DisplayCell[] = []
-    let formatSnapshot: FormatRangeSnapshot = emptyFormatRangeSnapshot(
-      toSparseRange(sheet.idx, range),
-    )
-    if (dataRange) {
-      const sparseDataRange = toSparseRange(sheet.idx, dataRange)
-      const [snapshots, rangeFormatSnapshot] = await Promise.all([
-        client.readSparseRange(sparseDataRange),
-        client.snapshotFormatRange(sparseDataRange),
-      ])
-      formatSnapshot = rangeFormatSnapshot
-      cells = snapshots
-        .map(snapshotToDisplayCell)
-        .filter((cell): cell is DisplayCell => cell !== null)
-        .sort((left, right) =>
-          left.row === right.row ? left.col - right.col : left.row - right.row,
-        )
-    }
-
-    let projectedCells = cells
-    let displayRows: number[] | null = null
-    if (filterSortActive) {
-      if (cachedDisplayRows) {
-        displayRows = cachedDisplayRows
-        projectedCells = projectFilterSortWindow(cells, range, displayRows)
-      } else {
-        const overlay = applyFilterSortOverlay(cells, range, filterSortState)
-        projectedCells = overlay.cells
-        displayRows = overlay.displayRows
-        if (displayRows) {
-          filterSortDisplayRowsCache.set(sheetId, {
-            generation: contentGeneration,
-            state: filterSortState!,
-            colStart: range.colStart,
-            colEnd: range.colEnd,
-            displayRows,
-          })
-        }
-      }
-    }
-
-    const formattedCells = mergeFormatsIntoCells(
-      projectedCells,
-      range,
-      formatSnapshot,
-      displayRows,
-    )
+    const formattedCells = mergeFormatsIntoCells(cells, range, formatSnapshot)
     const numberFormattedCells = applyNumberFormatsToCells(formattedCells)
     const validatedCells = applyValidationOverlay(
       numberFormattedCells,
@@ -1070,26 +958,11 @@ export function createWorkerWorkbookSpreadsheetBackend(
       validationRulesBySheetId.get(sheetId) ?? [],
     )
 
-    // Bounding box of every source coordinate the conditional-format
-    // overlay can test: cells projected by filter/sort carry an
-    // `originalRow` inside `dataRange`'s source-row band, while blank
-    // cells injected by the validation overlay sit at display rows
-    // inside `range` — so the window unions both row bands over the
-    // shared column band (audit D-11).
-    const conditionalFormatWindow: CellRange = dataRange
-      ? {
-          rowStart: Math.min(range.rowStart, dataRange.rowStart),
-          rowEnd: Math.max(range.rowEnd, dataRange.rowEnd),
-          colStart: range.colStart,
-          colEnd: range.colEnd,
-        }
-      : range
-
     return {
       cells: applyConditionalFormatOverlay(
         validatedCells,
         conditionalFormatRulesBySheetId.get(sheetId) ?? [],
-        conditionalFormatWindow,
+        range,
       ).sort((left, right) =>
         left.row === right.row ? left.col - right.col : left.row - right.row,
       ),
@@ -1263,6 +1136,178 @@ export function createWorkerWorkbookSpreadsheetBackend(
     }
   }
 
+  async function removeRowsThroughWorker(request: RemoveRowsRequest): Promise<RemoveRowsResult> {
+    if (request.rows.length === 0) {
+      return {
+        sheetId: request.sheetId,
+        removedRows: 0,
+        revision: request.revision ?? revision,
+      }
+    }
+
+    const unique = Array.from(new Set(request.rows)).filter(
+      (row) => Number.isInteger(row) && row >= 0,
+    )
+    if (unique.length === 0) {
+      return {
+        sheetId: request.sheetId,
+        removedRows: 0,
+        revision: request.revision ?? revision,
+      }
+    }
+
+    const sheet = await resolveSheet(request.sheetId)
+    unique.sort((left, right) => right - left)
+
+    const bands: Array<{ startRow: number; count: number }> = []
+    for (const rowIndex of unique) {
+      const last = bands[bands.length - 1]
+      if (last && last.startRow === rowIndex + 1) {
+        last.startRow = rowIndex
+        last.count += 1
+      } else {
+        bands.push({ startRow: rowIndex, count: 1 })
+      }
+    }
+
+    const successfullyRemoved: number[] = []
+    let failureCause: unknown = null
+    for (const band of bands) {
+      try {
+        const accepted = await client.deleteRows(sheet.idx, band.startRow, band.count)
+        if (accepted !== true) {
+          failureCause = createBackendError(
+            'DELETE_ROWS_NOT_ACCEPTED',
+            `worker did not accept deleteRows(${band.startRow}, ${band.count})`,
+          )
+          break
+        }
+        for (let offset = band.count - 1; offset >= 0; offset -= 1) {
+          successfullyRemoved.push(band.startRow + offset)
+        }
+      } catch (error) {
+        failureCause = error
+        break
+      }
+    }
+
+    if (failureCause !== null) {
+      const nextRevision = bumpRevision()
+      const partialMinRow =
+        successfullyRemoved.length > 0 ? successfullyRemoved[successfullyRemoved.length - 1] : 0
+      const partialMaxRow = successfullyRemoved.length > 0 ? successfullyRemoved[0] : 0
+      const error = new Error(
+        'removeRows partially failed: deleted ' +
+          String(successfullyRemoved.length) +
+          ' of ' +
+          String(unique.length) +
+          ' rows before the worker rejected — ' +
+          (failureCause instanceof Error ? failureCause.message : String(failureCause)),
+      ) as Error & {
+        cause?: unknown
+        removedRows: number
+        partial: true
+        affectedRange?: RemoveRowsResult['affectedRange']
+        revision: number | string
+      }
+      error.cause = failureCause
+      error.removedRows = successfullyRemoved.length
+      error.partial = true
+      error.revision = request.revision ?? nextRevision
+      if (successfullyRemoved.length > 0) {
+        error.affectedRange = {
+          startRow: partialMinRow,
+          endRow: partialMaxRow,
+          startCol: 0,
+          endCol: Number.MAX_SAFE_INTEGER,
+        }
+      }
+      throw error
+    }
+
+    const minRow = unique[unique.length - 1]
+    const maxRow = unique[0]
+    const nextRevision = bumpRevision()
+    return {
+      sheetId: request.sheetId,
+      removedRows: unique.length,
+      affectedRange: {
+        startRow: minRow,
+        endRow: maxRow,
+        startCol: 0,
+        endCol: Number.MAX_SAFE_INTEGER,
+      },
+      revision: request.revision ?? nextRevision,
+    }
+  }
+
+  function assertExactRemoveRowsRequest(request: RemoveRowsExactRequest): void {
+    const range = request.targetRange
+    const validRange =
+      Number.isSafeInteger(range.rowStart) &&
+      Number.isSafeInteger(range.rowEnd) &&
+      Number.isSafeInteger(range.colStart) &&
+      Number.isSafeInteger(range.colEnd) &&
+      range.rowStart >= 0 &&
+      range.colStart >= 0 &&
+      range.rowStart <= range.rowEnd &&
+      range.colStart <= range.colEnd
+    const validRows =
+      request.rows.length > 0 &&
+      request.rows.every(
+        (row, index) =>
+          Number.isSafeInteger(row) &&
+          row >= range.rowStart &&
+          row <= range.rowEnd &&
+          (index === 0 || request.rows[index - 1] < row),
+      )
+    const validRevision =
+      typeof request.revision === 'number' &&
+      Number.isFinite(request.revision) &&
+      request.revision === revision
+
+    if (!validRange || !validRows || !validRevision) {
+      throw createBackendError(
+        'INVALID_REMOVE_ROWS_EXACT_REQUEST',
+        'removeRowsExact requires a canonical in-range row list and the current numeric revision',
+      )
+    }
+  }
+
+  async function removeRowsExact(request: RemoveRowsExactRequest): Promise<RemoveRowsExactResult> {
+    assertExactRemoveRowsRequest(request)
+    const mutation = await removeRowsThroughWorker({
+      kind: 'remove-rows',
+      sheetId: request.sheetId,
+      rows: [...request.rows],
+    })
+    if (
+      typeof mutation.revision !== 'number' ||
+      !Number.isFinite(mutation.revision) ||
+      mutation.revision === request.revision
+    ) {
+      throw createBackendError(
+        'INVALID_REMOVE_ROWS_EXACT_ACK',
+        'worker row deletion completed without a distinct numeric revision',
+      )
+    }
+
+    return {
+      requestId: request.requestId,
+      sheetId: request.sheetId,
+      targetRange: { ...request.targetRange },
+      removedRowIndices: [...request.rows],
+      removedRows: request.rows.length,
+      affectedRange: {
+        startRow: request.rows[0],
+        endRow: request.targetRange.rowEnd,
+        startCol: request.targetRange.colStart,
+        endCol: request.targetRange.colEnd,
+      },
+      revision: mutation.revision,
+    }
+  }
+
   return {
     async listSheets() {
       await refreshSheetLookup()
@@ -1428,121 +1473,13 @@ export function createWorkerWorkbookSpreadsheetBackend(
      * workbook entirely untouched.
      */
     async removeRows(request: RemoveRowsRequest): Promise<RemoveRowsResult> {
-      // LOW: short-circuit BEFORE coercing the array so we never bump
-      // revision on an empty input array.
-      if (request.rows.length === 0) {
-        return {
-          sheetId: request.sheetId,
-          removedRows: 0,
-          revision: request.revision ?? revision,
-        }
-      }
+      return removeRowsThroughWorker(request)
+    },
 
-      const unique = Array.from(new Set(request.rows)).filter(
-        (r) => Number.isInteger(r) && r >= 0,
-      )
-      if (unique.length === 0) {
-        return {
-          sheetId: request.sheetId,
-          removedRows: 0,
-          revision: request.revision ?? revision,
-        }
-      }
-
-      const sheet = await resolveSheet(request.sheetId)
-      unique.sort((a, b) => b - a)
-
-      // Audit D-10: collapse the descending row list into contiguous
-      // bands; each band is one `deleteRows(start, count)` RPC. Bands
-      // are processed in descending start order, so earlier deletions
-      // never shift the indices of later bands.
-      const bands: Array<{ startRow: number; count: number }> = []
-      for (const rowIdx of unique) {
-        const last = bands[bands.length - 1]
-        if (last && last.startRow === rowIdx + 1) {
-          last.startRow = rowIdx
-          last.count += 1
-        } else {
-          bands.push({ startRow: rowIdx, count: 1 })
-        }
-      }
-
-      const successfullyRemoved: number[] = []
-      let failureCause: unknown = null
-      for (const band of bands) {
-        try {
-          await client.deleteRows(sheet.idx, band.startRow, band.count)
-          // Keep `successfullyRemoved` in descending row order so the
-          // partial-failure affectedRange picks min/max from the ends.
-          for (let offset = band.count - 1; offset >= 0; offset -= 1) {
-            successfullyRemoved.push(band.startRow + offset)
-          }
-        } catch (err) {
-          failureCause = err
-          break
-        }
-      }
-
-      if (failureCause !== null) {
-        // At least one delete went through before we hit the failure:
-        // the workbook IS dirty, so bump the revision and let the
-        // caller record a history entry for the partial work. Throw an
-        // Error that carries `removedRows` so the dialog can surface
-        // both the partial success and the underlying RPC rejection.
-        const nextRevision = bumpRevision()
-        const partialMinRow =
-          successfullyRemoved.length > 0
-            ? successfullyRemoved[successfullyRemoved.length - 1]
-            : 0
-        const partialMaxRow =
-          successfullyRemoved.length > 0 ? successfullyRemoved[0] : 0
-        const error = new Error(
-          'removeRows partially failed: deleted ' +
-            String(successfullyRemoved.length) +
-            ' of ' +
-            String(unique.length) +
-            ' rows before the worker rejected — ' +
-            (failureCause instanceof Error
-              ? failureCause.message
-              : String(failureCause)),
-        ) as Error & {
-          cause?: unknown
-          removedRows: number
-          partial: true
-          affectedRange?: RemoveRowsResult['affectedRange']
-          revision: number | string
-        }
-        error.cause = failureCause
-        error.removedRows = successfullyRemoved.length
-        error.partial = true
-        error.revision = request.revision ?? nextRevision
-        if (successfullyRemoved.length > 0) {
-          error.affectedRange = {
-            startRow: partialMinRow,
-            endRow: partialMaxRow,
-            startCol: 0,
-            endCol: Number.MAX_SAFE_INTEGER,
-          }
-        }
-        throw error
-      }
-
-      const minRow = unique[unique.length - 1]
-      const maxRow = unique[0]
-      const nextRevision = bumpRevision()
-      return {
-        sheetId: request.sheetId,
-        removedRows: unique.length,
-        affectedRange: {
-          startRow: minRow,
-          endRow: maxRow,
-          startCol: 0,
-          // Sheet width is workbook-defined; the UI invalidation will be
-          // capped by the next visible-window projection anyway.
-          endCol: Number.MAX_SAFE_INTEGER,
-        },
-        revision: request.revision ?? nextRevision,
-      }
+    get removeRowsExact() {
+      return options.removeRowsExactCapability === 'worker-engine-delete-rows'
+        ? removeRowsExact
+        : undefined
     },
 
     async insertColumns(request: InsertColumnsRequest): Promise<BackendMutationResult> {
@@ -1557,7 +1494,7 @@ export function createWorkerWorkbookSpreadsheetBackend(
       return structuralMutationResult(request, bumpRevision())
     },
 
-    async setFormatRange(request: SetFormatRangeRequest): Promise<BackendMutationResult> {
+    async setFormatRange(request: SetFormatRangeRequest): Promise<ToolbarBackendMutationResult> {
       const sheet = await resolveSheet(request.sheetId)
       await client.setFormatRange(
         toSparseRange(sheet.idx, request.range),
@@ -1566,6 +1503,7 @@ export function createWorkerWorkbookSpreadsheetBackend(
       const nextRevision = bumpRevision()
 
       return {
+        kind: request.kind,
         sheetId: request.sheetId,
         requestId: request.requestId,
         revision: request.revision ?? nextRevision,
@@ -1707,15 +1645,27 @@ export function createWorkerWorkbookSpreadsheetBackend(
 
       let nextRevision = revision
       if (changed) {
-        const ok = await client.moveSheet(lookup.sheets[fromIndex].idx, toIndex)
-        if (!ok) {
-          throw createBackendError(
-            'SHEET_REORDER_FAILED',
-            `cannot reorder sheet: ${request.sheetId}`,
-          )
+        // A real worker may publish cellsDirty before the moveSheet ACK. Hold
+        // that coarse refresh ping until sheetList has rebuilt the canonical
+        // stable-id -> positional-index lookup, otherwise an active stable id
+        // can briefly read the sheet that moved into its old index.
+        beginSheetIndexRemap()
+        try {
+          const ok = await client.moveSheet(lookup.sheets[fromIndex].idx, toIndex)
+          if (!ok) {
+            throw createBackendError(
+              'SHEET_REORDER_FAILED',
+              `cannot reorder sheet: ${request.sheetId}`,
+            )
+          }
+          nextRevision = bumpRevision()
+          await refreshSheetLookup(lookup.sheets)
+        } finally {
+          // Never leave worker content notifications suppressed when the
+          // command rejects. The successful path flushes only after the
+          // canonical sheet-list refresh above.
+          finishSheetIndexRemap()
         }
-        nextRevision = bumpRevision()
-        await refreshSheetLookup(lookup.sheets)
       }
 
       return sheetMutationResult(request.requestId, {
@@ -1730,91 +1680,110 @@ export function createWorkerWorkbookSpreadsheetBackend(
         requestId: request.requestId,
         revision: request.revision ?? revision,
         names: namedRanges.map(cloneNamedRange),
+        authority: 'adapter-post-ack-overlay',
+        definitionReadback: 'full',
+        canonical: false,
       }
     },
 
     async setNamedRange(request: SetNamedRangeRequest): Promise<NamedRangeMutationResult> {
-      const name = request.name.trim()
-      if (name.length === 0) throw createBackendError('INVALID_NAME', 'name cannot be empty')
-      const entry: NamedRange = {
-        name,
-        scope: request.scope === 'workbook' ? 'workbook' : { sheetId: request.scope.sheetId },
-        refersTo: { ...request.refersTo },
-      }
-      const existingIndex = namedRanges.findIndex(
-        (item) => item.name === name && namedRangeScopeEquals(item.scope, request.scope),
-      )
-      namedRanges =
-        existingIndex >= 0
-          ? namedRanges.map((item, index) => (index === existingIndex ? entry : item))
-          : [...namedRanges, entry]
-      // Forward to the worker engine so formulas can actually resolve the
-      // name at evaluation time. Lambda bindings are TS-runtime only — the
-      // WASM runtime refuses with NAME_BINDING_UNSUPPORTED (graceful path);
-      // we swallow that error so range/value bindings still cache host-side
-      // and the dialog stays functional on the wasm backend.
-      await readyPromise
-      try {
-        const refersTo = request.refersTo
-        if (refersTo.kind === 'lambda') {
-          await client.defineName(name, {
-            kind: 'lambda',
-            params: refersTo.params,
-            body: refersTo.body,
-          })
-        } else if (refersTo.kind === 'range') {
-          // Look up the sheet name for the engine. The wire shape expects
-          // the human-readable name (e.g. "Sheet1"), not the host sheet id.
-          const sheet = lookup.sheets.find((s) => s.id === refersTo.sheetId)
-          if (sheet) {
-            await client.defineName(name, {
+      return enqueueNamedRangeMutation(async () => {
+        assertNamedRangeBackendActive()
+        const name = normalizeNamedRangeName(request.name)
+        if (!name) throw createBackendError('INVALID_NAME', 'invalid named range name')
+        if (request.scope !== 'workbook') {
+          return workerNamedRangeMutationResult(request, 'confirmed-not-applied')
+        }
+
+        await readyPromise
+        assertNamedRangeBackendActive()
+        try {
+          const refersTo = request.refersTo
+          let accepted: boolean
+          if (refersTo.kind === 'lambda') {
+            accepted = await client.defineName(name, {
+              kind: 'lambda',
+              params: refersTo.params,
+              body: refersTo.body,
+            })
+          } else if (refersTo.kind === 'range') {
+            // The engine owns workbook names and resolves range bindings by
+            // human-readable sheet name plus separate start/end addresses.
+            const sheet = lookup.sheets.find((candidate) => candidate.id === refersTo.sheetId)
+            const endpoints = namedRangeAddressEndpoints(refersTo.address)
+            if (!sheet || !endpoints) {
+              return workerNamedRangeMutationResult(request, 'confirmed-not-applied')
+            }
+            accepted = await client.defineName(name, {
               kind: 'range',
               sheetName: sheet.name,
-              start: refersTo.address,
-              end: refersTo.address,
+              ...endpoints,
+            })
+          } else {
+            accepted = await client.defineName(name, {
+              kind: 'value',
+              literal: refersTo.value,
             })
           }
-        } else {
-          await client.defineName(name, {
-            kind: 'value',
-            literal: refersTo.value,
-          })
+
+          assertNamedRangeBackendActive()
+          if (!accepted) {
+            return workerNamedRangeMutationResult(request, 'confirmed-not-applied')
+          }
+        } catch (error) {
+          assertNamedRangeBackendActive()
+          if (isNamedRangeEngineUnsupported(error)) {
+            return workerNamedRangeMutationResult(request, 'confirmed-not-applied')
+          }
+          throw error
         }
-      } catch (err) {
-        const code = (err as Error & { code?: string })?.code
-        // Wasm runtime refuses with NAME_BINDING_UNSUPPORTED for any defineName.
-        // The host-side cache (`namedRanges` array) still records the entry so
-        // the dialog UI lists it; engine resolution is the TS runtime's job.
-        if (code !== 'NAME_BINDING_UNSUPPORTED' && code !== 'UNKNOWN_COMMAND') {
-          throw err
+
+        const entry: NamedRange = {
+          name,
+          scope: 'workbook',
+          refersTo: { ...request.refersTo },
         }
-      }
-      const nextRevision = bumpRevision()
-      return {
-        requestId: request.requestId,
-        revision: request.revision ?? nextRevision,
-      }
+        const existingIndex = namedRanges.findIndex((item) =>
+          namedRangeMatches(item, name, request.scope),
+        )
+        namedRanges =
+          existingIndex >= 0
+            ? namedRanges.map((item, index) => (index === existingIndex ? entry : item))
+            : [...namedRanges, entry]
+        return workerNamedRangeMutationResult(request, 'w0-acknowledged', bumpRevision())
+      })
     },
 
     async deleteNamedRange(request: DeleteNamedRangeRequest): Promise<NamedRangeMutationResult> {
-      const next = namedRanges.filter(
-        (item) => !(item.name === request.name && namedRangeScopeEquals(item.scope, request.scope)),
-      )
-      namedRanges = next
-      await readyPromise
-      try {
-        await client.undefineName(request.name)
-      } catch (err) {
-        const code = (err as Error & { code?: string })?.code
-        if (code !== 'NAME_BINDING_UNSUPPORTED' && code !== 'UNKNOWN_COMMAND') {
-          throw err
+      return enqueueNamedRangeMutation(async () => {
+        assertNamedRangeBackendActive()
+        const name = normalizeNamedRangeName(request.name)
+        if (!name) throw createBackendError('INVALID_NAME', 'invalid named range name')
+        if (request.scope !== 'workbook') {
+          return workerNamedRangeMutationResult(request, 'confirmed-not-applied')
         }
-      }
-      const nextRevision = bumpRevision()
-      return {
-        requestId: request.requestId,
-        revision: request.revision ?? nextRevision,
-      }
+
+        await readyPromise
+        assertNamedRangeBackendActive()
+        try {
+          const accepted = await client.undefineName(name)
+          assertNamedRangeBackendActive()
+          if (!accepted) {
+            return workerNamedRangeMutationResult(request, 'confirmed-not-applied')
+          }
+        } catch (error) {
+          assertNamedRangeBackendActive()
+          if (isNamedRangeEngineUnsupported(error)) {
+            return workerNamedRangeMutationResult(request, 'confirmed-not-applied')
+          }
+          throw error
+        }
+
+        namedRanges = namedRanges.filter(
+          (item) => !namedRangeMatches(item, name, request.scope),
+        )
+        return workerNamedRangeMutationResult(request, 'w0-acknowledged', bumpRevision())
+      })
     },
 
     async setValidationRule(request: SetValidationRuleRequest): Promise<BackendMutationResult> {
@@ -1942,27 +1911,6 @@ export function createWorkerWorkbookSpreadsheetBackend(
       contentChangeHandlers.add(handler)
       return () => {
         contentChangeHandlers.delete(handler)
-      }
-    },
-
-    async setFilterSort(request: SetFilterSortRequest): Promise<BackendMutationResult> {
-      const next = cloneFilterSortState({
-        rules: request.rules,
-        directives: request.directives,
-      })
-      if (filterSortHasEffect(next)) {
-        filterSortBySheetId.set(request.sheetId, next)
-      } else {
-        filterSortBySheetId.delete(request.sheetId)
-      }
-      // Audit D-7: the permutation derives from the spec — drop the
-      // cached one (the state-identity check would also catch this; the
-      // delete keeps the cache from holding a dead sheet band).
-      filterSortDisplayRowsCache.delete(request.sheetId)
-      return {
-        sheetId: request.sheetId,
-        requestId: request.requestId,
-        revision: request.revision ?? bumpRevision(),
       }
     },
 

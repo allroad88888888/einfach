@@ -4,6 +4,7 @@ import { afterEach, describe, expect, it, jest } from '@jest/globals'
 import { createStore } from '@einfach/core'
 import { cleanup, fireEvent, render, waitFor } from '@solidjs/testing-library'
 import type {
+  BackendMutationResult,
   SetFormatRangeRequest,
   SpreadsheetBackend,
   VisibleProjectionRequest,
@@ -15,17 +16,30 @@ import {
   armFormatPainterStickyAtom,
   exitFormatPainterAtom,
   formatPainterClipboardAtom,
+  formatPainterControllerAtom,
+  formatPainterPendingAtom,
   formatPainterStateAtom,
   selectCellAtom,
   setSelectionAtom,
   setWorkspaceActiveSheetAtom,
   type CapturedFormat,
 } from '@einfach/spreadsheet-ui-core'
-import { SpreadsheetUiProvider, spreadsheetProjectionSnapshotAtom } from '../src-vnext/provider'
+import { SpreadsheetUiProvider } from '../src-vnext/provider'
 import { SpreadsheetToolbar } from '../src-vnext/toolbar'
 import { SpreadsheetFormatPainter } from '../src-vnext/format-painter'
+import { seedReadyVisibleProjection } from './projection-test-fixture'
 
 afterEach(cleanup)
+
+function deferred<T>() {
+  let resolve!: (value: T | PromiseLike<T>) => void
+  let reject!: (reason?: unknown) => void
+  const promise = new Promise<T>((resolvePromise, rejectPromise) => {
+    resolve = resolvePromise
+    reject = rejectPromise
+  })
+  return { promise, resolve, reject }
+}
 
 function richFormat(): CapturedFormat['format'] {
   return {
@@ -61,24 +75,30 @@ function makeProjectionResult(sheetId: string): VisibleProjectionResult {
   }
 }
 
+function makeProjectionResultForRequest(
+  request: VisibleProjectionRequest,
+): VisibleProjectionResult {
+  return {
+    kind: 'visible-window',
+    sheetId: request.sheetId,
+    requestId: request.requestId,
+    revision: request.revision,
+    window: { ...request.window },
+    cells: [
+      { row: 0, col: 0, displayValue: 'A1', valueKind: 'string', format: richFormat() },
+      { row: 1, col: 0, displayValue: 'A2', valueKind: 'string', format: richFormat() },
+      { row: 2, col: 2, displayValue: 'C3', valueKind: 'string', format: richFormat() },
+    ],
+  }
+}
+
 function createRecordingBackend() {
   const setFormatRangeCalls: SetFormatRangeRequest[] = []
   const readVisibleProjectionCalls: VisibleProjectionRequest[] = []
   const backend: SpreadsheetBackend = {
     async readVisibleProjection(request) {
       readVisibleProjectionCalls.push(request)
-      return {
-        kind: 'visible-window',
-        sheetId: request.sheetId,
-        requestId: request.requestId,
-        revision: request.revision,
-        window: { ...request.window },
-        cells: [
-          { row: 0, col: 0, displayValue: 'A1', valueKind: 'string', format: richFormat() },
-          { row: 1, col: 0, displayValue: 'A2', valueKind: 'string', format: richFormat() },
-          { row: 2, col: 2, displayValue: 'C3', valueKind: 'string', format: richFormat() },
-        ],
-      }
+      return makeProjectionResultForRequest(request)
     },
     async readRangeProjection() {
       throw new Error('not used')
@@ -102,7 +122,7 @@ function createRecordingBackend() {
 function primeStoreWithProjection(store: ReturnType<typeof createStore>) {
   store.setter(setWorkspaceActiveSheetAtom, { sheetId: 'sheet-1' })
   store.setter(selectCellAtom, { sheetId: 'sheet-1', coord: { row: 0, col: 0 } })
-  store.setter(spreadsheetProjectionSnapshotAtom, {
+  seedReadyVisibleProjection(store, {
     status: 'ready',
     request: {
       kind: 'visible-window',
@@ -145,6 +165,236 @@ describe('SpreadsheetFormatPainter atoms (integration)', () => {
     expect(call.sheetId).toBe('sheet-1')
     expect(call.range).toEqual({ rowStart: 1, rowEnd: 4, colStart: 1, colEnd: 3 })
     expect(call.format).toEqual(richFormat())
+  })
+})
+
+describe('SpreadsheetFormatPainter thin-host contract', () => {
+  it('captures capability getters once and preserves each original backend receiver', async () => {
+    const store = createStore()
+    const mutationCalls: SetFormatRangeRequest[] = []
+    const refreshCalls: VisibleProjectionRequest[] = []
+    const mutationReceivers: unknown[] = []
+    const refreshReceivers: unknown[] = []
+    let mutationCapabilityReads = 0
+    let refreshCapabilityReads = 0
+    const backend = {
+      async readRangeProjection() {
+        throw new Error('not used')
+      },
+      async setCellInput() {
+        throw new Error('not used')
+      },
+    } as unknown as SpreadsheetBackend
+
+    Object.defineProperties(backend, {
+      setFormatRange: {
+        configurable: true,
+        enumerable: true,
+        get() {
+          mutationCapabilityReads += 1
+          return async function (
+            this: unknown,
+            request: SetFormatRangeRequest,
+          ): Promise<BackendMutationResult> {
+            mutationReceivers.push(this)
+            mutationCalls.push(request)
+            return {
+              sheetId: request.sheetId,
+              requestId: request.requestId,
+              affectedRange: { ...request.range },
+            }
+          }
+        },
+      },
+      readVisibleProjection: {
+        configurable: true,
+        enumerable: true,
+        get() {
+          refreshCapabilityReads += 1
+          return async function (
+            this: unknown,
+            request: VisibleProjectionRequest,
+          ): Promise<VisibleProjectionResult> {
+            refreshReceivers.push(this)
+            refreshCalls.push(request)
+            return makeProjectionResultForRequest(request)
+          }
+        },
+      },
+    })
+    primeStoreWithProjection(store)
+
+    render(() => (
+      <SpreadsheetUiProvider backend={backend} store={store}>
+        <SpreadsheetFormatPainter />
+      </SpreadsheetUiProvider>
+    ))
+
+    expect(mutationCapabilityReads).toBe(1)
+    expect(refreshCapabilityReads).toBe(1)
+
+    store.setter(armFormatPainterAtom, { format: richFormat() })
+    store.setter(selectCellAtom, { sheetId: 'sheet-1', coord: { row: 1, col: 0 } })
+
+    await waitFor(() => {
+      expect(mutationCalls).toHaveLength(1)
+      expect(refreshCalls).toHaveLength(1)
+      expect(store.getter(formatPainterPendingAtom)).toBe(false)
+    })
+    expect(mutationCapabilityReads).toBe(1)
+    expect(refreshCapabilityReads).toBe(1)
+    expect(mutationReceivers).toEqual([backend])
+    expect(refreshReceivers).toEqual([backend])
+    expect(mutationCalls[0]!.requestId).toBe(1)
+    expect(store.getter(formatPainterStateAtom)).toBe('idle')
+  })
+
+  it('fails closed before mutation when refresh capability is absent', async () => {
+    const store = createStore()
+    const setFormatRange = jest.fn(async (request: SetFormatRangeRequest) => ({
+      sheetId: request.sheetId,
+      requestId: request.requestId,
+      affectedRange: request.range,
+    }))
+    const backend = {
+      async readRangeProjection() {
+        throw new Error('not used')
+      },
+      async setCellInput() {
+        throw new Error('not used')
+      },
+      setFormatRange,
+    } as unknown as SpreadsheetBackend
+    primeStoreWithProjection(store)
+
+    render(() => (
+      <SpreadsheetUiProvider backend={backend} store={store}>
+        <SpreadsheetFormatPainter />
+      </SpreadsheetUiProvider>
+    ))
+
+    store.setter(armFormatPainterAtom, { format: richFormat() })
+    store.setter(selectCellAtom, { sheetId: 'sheet-1', coord: { row: 1, col: 0 } })
+
+    await waitFor(() => {
+      expect(store.getter(formatPainterControllerAtom).error?.code).toBe(
+        'FORMAT_PAINTER_PORT_UNAVAILABLE',
+      )
+    })
+    expect(setFormatRange).not.toHaveBeenCalled()
+    expect(store.getter(formatPainterStateAtom)).toBe('armed')
+    expect(store.getter(formatPainterClipboardAtom)).not.toBeNull()
+    expect(store.getter(formatPainterPendingAtom)).toBe(false)
+  })
+
+  it('rejects a logical target that resolves to multiple physical ranges before mutation', async () => {
+    const store = createStore()
+    const { backend, setFormatRangeCalls, readVisibleProjectionCalls } = createRecordingBackend()
+    primeStoreWithProjection(store)
+    seedReadyVisibleProjection(store, {
+      status: 'ready',
+      request: {
+        kind: 'visible-window',
+        sheetId: 'sheet-1',
+        requestId: 2,
+        reason: 'test',
+        window: { rowStart: 0, rowEnd: 9, colStart: 0, colEnd: 9 },
+      },
+      result: {
+        ...makeProjectionResult('sheet-1'),
+        requestId: 2,
+        cells: [
+          {
+            row: 0,
+            col: 0,
+            originalRow: 0,
+            displayValue: 'A1',
+            valueKind: 'string',
+            format: richFormat(),
+          },
+          { row: 1, col: 0, originalRow: 10, displayValue: 'A2', valueKind: 'string', format: {} },
+          { row: 2, col: 0, originalRow: 20, displayValue: 'A3', valueKind: 'string', format: {} },
+        ],
+      },
+      error: undefined,
+    })
+
+    render(() => (
+      <SpreadsheetUiProvider backend={backend} store={store}>
+        <SpreadsheetFormatPainter />
+      </SpreadsheetUiProvider>
+    ))
+
+    store.setter(armFormatPainterAtom, { format: richFormat() })
+    store.setter(setSelectionAtom, {
+      kind: 'range',
+      sheetId: 'sheet-1',
+      anchor: { row: 1, col: 0 },
+      focus: { row: 2, col: 0 },
+    })
+
+    await waitFor(() => {
+      expect(store.getter(formatPainterControllerAtom).error?.code).toBe(
+        'FORMAT_PAINTER_NON_CONTIGUOUS_TARGET',
+      )
+    })
+    expect(setFormatRangeCalls).toHaveLength(0)
+    expect(readVisibleProjectionCalls).toHaveLength(0)
+    expect(store.getter(formatPainterStateAtom)).toBe('armed')
+  })
+
+  it('retries the latest sticky selection after the prior ticket fully settles', async () => {
+    const store = createStore()
+    const firstMutation = deferred<BackendMutationResult>()
+    const { backend, setFormatRangeCalls, readVisibleProjectionCalls } = createRecordingBackend()
+    backend.setFormatRange = async (request) => {
+      setFormatRangeCalls.push(request)
+      if (setFormatRangeCalls.length === 1) return firstMutation.promise
+      return {
+        sheetId: request.sheetId,
+        requestId: request.requestId,
+        affectedRange: { ...request.range },
+      }
+    }
+    primeStoreWithProjection(store)
+
+    render(() => (
+      <SpreadsheetUiProvider backend={backend} store={store}>
+        <SpreadsheetFormatPainter />
+      </SpreadsheetUiProvider>
+    ))
+
+    store.setter(armFormatPainterStickyAtom, { format: richFormat() })
+    store.setter(selectCellAtom, { sheetId: 'sheet-1', coord: { row: 1, col: 0 } })
+    await waitFor(() => {
+      expect(setFormatRangeCalls).toHaveLength(1)
+      expect(store.getter(formatPainterPendingAtom)).toBe(true)
+    })
+
+    store.setter(selectCellAtom, { sheetId: 'sheet-1', coord: { row: 2, col: 2 } })
+    await Promise.resolve()
+    expect(setFormatRangeCalls).toHaveLength(1)
+
+    const firstRequest = setFormatRangeCalls[0]!
+    firstMutation.resolve({
+      sheetId: firstRequest.sheetId,
+      requestId: firstRequest.requestId,
+      affectedRange: { ...firstRequest.range },
+    })
+
+    await waitFor(() => {
+      expect(setFormatRangeCalls).toHaveLength(2)
+      expect(readVisibleProjectionCalls).toHaveLength(2)
+      expect(store.getter(formatPainterPendingAtom)).toBe(false)
+    })
+    expect(setFormatRangeCalls.map((request) => request.requestId)).toEqual([1, 2])
+    expect(setFormatRangeCalls[1]!.range).toEqual({
+      rowStart: 2,
+      rowEnd: 2,
+      colStart: 2,
+      colEnd: 2,
+    })
+    expect(store.getter(formatPainterStateAtom)).toBe('sticky')
   })
 })
 
@@ -246,9 +496,14 @@ describe('SpreadsheetToolbar format painter button', () => {
     expect(store.getter(formatPainterStateAtom)).toBe('idle')
   })
 
-  it('selecting a different cell while armed applies the format and returns to idle', async () => {
+  it('separates the mutation receipt boundary from the refresh terminal', async () => {
     const store = createStore()
-    const { backend, setFormatRangeCalls } = createRecordingBackend()
+    const { backend, setFormatRangeCalls, readVisibleProjectionCalls } = createRecordingBackend()
+    const refresh = deferred<VisibleProjectionResult>()
+    backend.readVisibleProjection = async (request) => {
+      readVisibleProjectionCalls.push(request)
+      return refresh.promise
+    }
     primeStoreWithProjection(store)
 
     render(() => (
@@ -266,6 +521,7 @@ describe('SpreadsheetToolbar format painter button', () => {
     await waitFor(() => {
       expect(setFormatRangeCalls).toHaveLength(1)
     })
+    // First boundary: the mutation port has been invoked exactly once.
     expect(setFormatRangeCalls[0]!.range).toEqual({
       rowStart: 2,
       rowEnd: 2,
@@ -273,7 +529,19 @@ describe('SpreadsheetToolbar format painter button', () => {
       colEnd: 2,
     })
     expect(setFormatRangeCalls[0]!.format).toEqual(richFormat())
-    expect(store.getter(formatPainterStateAtom)).toBe('idle')
+
+    await waitFor(() => {
+      expect(readVisibleProjectionCalls).toHaveLength(1)
+      expect(store.getter(formatPainterControllerAtom).phase).toBe('local-acknowledged')
+      expect(store.getter(formatPainterPendingAtom)).toBe(true)
+    })
+
+    // Second boundary: only a settled refresh clears the immutable ticket.
+    refresh.resolve(makeProjectionResultForRequest(readVisibleProjectionCalls[0]!))
+    await waitFor(() => {
+      expect(store.getter(formatPainterPendingAtom)).toBe(false)
+      expect(store.getter(formatPainterStateAtom)).toBe('idle')
+    })
   })
 
   it('in sticky mode, two consecutive cell selections both apply and state stays sticky', async () => {
@@ -327,10 +595,9 @@ describe('SpreadsheetToolbar format painter button', () => {
     expect(store.getter(formatPainterClipboardAtom)).toBeNull()
   })
 
-  it('applyFormatPainterAtom returns false when the painter is idle', () => {
+  it('applyFormatPainterAtom resolves blocked when the painter is idle', async () => {
     const store = createStore()
-    const applied = store.setter(applyFormatPainterAtom)
-    expect(applied).toBe(false)
+    await expect(store.setter(applyFormatPainterAtom)).resolves.toBe('blocked')
   })
 
   it('exitFormatPainterAtom while sticky also clears clipboard', () => {

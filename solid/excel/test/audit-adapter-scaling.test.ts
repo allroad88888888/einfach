@@ -24,10 +24,9 @@
  *  - D-4  P-D  **FIXED** worker-workbook-backend deleteSheet drops every
  *         per-sheet host overlay (`dropSheetOverlayState`) — a reused
  *         sheet id starts clean.
- *  - D-7  P-A  **FIXED** worker-workbook-backend caches the filter/sort
- *         displayRows permutation per (content generation, spec, column
- *         band); the 0..EXCEL_MAX wide scan runs once per mutation, repeat
- *         viewport refreshes read a content-bounded source-row band.
+ *  - D-7  P-A  **FIXED** worker-workbook-backend omits the unsupported
+ *         filter/sort port. Canonical viewport reads stay window-bounded;
+ *         no host display-row state, wide scan, or fake revision exists.
  *  - D-8  P-A  **FIXED** worker-runtime-ts range readers enumerate
  *         window ∩ existing via `collectCellsInBounds` (coordinate probe
  *         for viewport windows, sparse map walk for huge ranges).
@@ -346,7 +345,7 @@ describe('audit D-4 · P-D · FIXED — worker backend deleteSheet drops per-she
     await backend.ready()
 
     // Stamp every per-sheet overlay table the backend keeps for sheet-2:
-    // validation, conditional format, filter/sort, and a sheet-scoped name.
+    // validation, conditional format, and a sheet-scoped name.
     await backend.setValidationRule?.({
       kind: 'set-validation-rule',
       sheetId: 'sheet-2',
@@ -359,12 +358,6 @@ describe('audit D-4 · P-D · FIXED — worker backend deleteSheet drops per-she
       sheetId: 'sheet-2',
       scope: { range: { rowStart: 0, rowEnd: 9, colStart: 0, colEnd: 0 } },
       rule: { kind: 'cell-value', operator: 'gt', value: '0', format: { bgColor: '#ff0000' } },
-    })
-    await backend.setFilterSort?.({
-      kind: 'set-filter-sort',
-      sheetId: 'sheet-2',
-      rules: [],
-      directives: [{ colIndex: 0, direction: 'asc' }],
     })
     await backend.setNamedRange?.({
       kind: 'set-named-range',
@@ -392,8 +385,7 @@ describe('audit D-4 · P-D · FIXED — worker backend deleteSheet drops per-she
     // FLIPPED PIN (was: `true` — the new empty sheet projected the dead
     // sheet's validation overlay). deleteSheet now routes through
     // `dropSheetOverlayState`, clearing validationRulesBySheetId,
-    // conditionalFormatRulesBySheetId, filterSortBySheetId, the D-7
-    // displayRows cache, and sheet-scoped namedRanges.
+    // conditionalFormatRulesBySheetId, and sheet-scoped namedRanges.
     expect(projection.cells.some((cell) => cell.validation)).toBe(false)
     expect(projection.cells.some((cell) => cell.conditionalFormat)).toBe(false)
 
@@ -411,8 +403,8 @@ describe('audit D-4 · P-D · FIXED — worker backend deleteSheet drops per-she
   })
 })
 
-describe('audit D-7 · P-A · FIXED — filter/sort wide scan runs once per mutation, not per viewport refresh', () => {
-  test('repeat reads hit the displayRows cache and request a content-bounded row band', async () => {
+describe('audit D-7 · P-A · FIXED — worker filter/sort capability truth', () => {
+  test('omits the unsupported port and keeps canonical reads window-bounded', async () => {
     const client = createWorkerWorkbook({ workerFactory: () => createInProcessWorker() })
     const readRanges: SparseRangeWire[] = []
     const spyClient: typeof client = {
@@ -425,10 +417,11 @@ describe('audit D-7 · P-A · FIXED — filter/sort wide scan runs once per muta
     const backend = createWorkerWorkbookSpreadsheetBackend({
       client: spyClient,
       sheets: ['One'],
+      revision: 11,
     })
     await backend.ready()
 
-    // 31 data rows (descending values so the asc sort actually permutes).
+    // Descending values make a leaked ascending host projection obvious.
     await backend.importCells?.({
       kind: 'import-cells',
       sheetId: 'sheet-1',
@@ -441,72 +434,32 @@ describe('audit D-7 · P-A · FIXED — filter/sort wide scan runs once per muta
     })
 
     const window = { rowStart: 0, rowEnd: 20, colStart: 0, colEnd: 5 }
-    await backend.readVisibleProjection(
+    const before = await backend.readVisibleProjection(
       createVisibleProjectionRequest({ sheetId: 'sheet-1', requestId: 1, window }),
     )
-    const plainRead = readRanges.at(-1)
-    expect(plainRead?.endRow).toBe(20)
 
-    await backend.setFilterSort?.({
-      kind: 'set-filter-sort',
-      sheetId: 'sheet-1',
-      rules: [],
-      directives: [{ colIndex: 0, direction: 'asc' }],
-      requestId: 2,
-    })
+    expect(backend.setFilterSort).toBeUndefined()
+    expect(
+      await backend.setFilterSort?.({
+        kind: 'set-filter-sort',
+        sheetId: 'sheet-1',
+        rules: [],
+        directives: [{ colIndex: 0, direction: 'asc' }],
+        requestId: 2,
+      }),
+    ).toBeUndefined()
 
-    // First read after the spec change: the wide scan is legitimate —
-    // the permutation needs every candidate row exactly once.
-    const t0 = now()
-    await backend.readVisibleProjection(
+    const after = await backend.readVisibleProjection(
       createVisibleProjectionRequest({ sheetId: 'sheet-1', requestId: 3, window }),
     )
-    const buildMs = now() - t0
-    const buildRead = readRanges.at(-1)
-    expect(buildRead?.endRow).toBe(1_048_575)
 
-    // Repeat refresh (scroll tick / re-render): FLIPPED PIN — was
-    // endRow=1_048_575 on EVERY read; now the cached permutation bounds
-    // the read to the source rows that project into the window (within
-    // existing content, ≤ row 30 here).
-    const t1 = now()
-    const refreshed = await backend.readVisibleProjection(
-      createVisibleProjectionRequest({ sheetId: 'sheet-1', requestId: 4, window }),
-    )
-    const refreshMs = now() - t1
-    const cachedRead = readRanges.at(-1)
-
-    // eslint-disable-next-line no-console
-    console.log(
-      `[audit D-7 FIXED] filter/sort reads: build endRow=${String(buildRead?.endRow)} ` +
-        `(${buildMs.toFixed(1)} ms) vs cached-refresh endRow=${String(cachedRead?.endRow)} ` +
-        `(${refreshMs.toFixed(1)} ms)`,
-    )
-
-    expect(cachedRead?.endRow).toBeLessThanOrEqual(30)
-    // The cached projection still shows the sorted ordering (ascending
-    // values 70..90 in window rows 1..20; header row 0 keeps value 100).
-    const row1 = refreshed.cells.find((cell) => cell.row === 1 && cell.col === 0)
-    expect(row1?.displayValue).toBe('70')
-
-    // A mutation invalidates the permutation: exactly ONE more wide scan,
-    // then refreshes are bounded again.
-    await backend.setCellInput({
-      kind: 'set-cell-input',
-      sheetId: 'sheet-1',
-      row: 40,
-      col: 0,
-      input: '1',
-      requestId: 5,
-    })
-    await backend.readVisibleProjection(
-      createVisibleProjectionRequest({ sheetId: 'sheet-1', requestId: 6, window }),
-    )
-    expect(readRanges.at(-1)?.endRow).toBe(1_048_575)
-    await backend.readVisibleProjection(
-      createVisibleProjectionRequest({ sheetId: 'sheet-1', requestId: 7, window }),
-    )
-    expect(readRanges.at(-1)?.endRow).toBeLessThanOrEqual(40)
+    expect(readRanges).toEqual([
+      { sheet: 0, startRow: 0, endRow: 20, startCol: 0, endCol: 5 },
+      { sheet: 0, startRow: 0, endRow: 20, startCol: 0, endCol: 5 },
+    ])
+    expect(after.revision).toBe(before.revision)
+    expect(after.cells.find((cell) => cell.row === 1 && cell.col === 0)?.displayValue).toBe('99')
+    expect(after.cells.some((cell) => cell.originalRow !== undefined)).toBe(false)
 
     backend.dispose()
   })

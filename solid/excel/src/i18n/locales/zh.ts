@@ -44,31 +44,38 @@ export const messages: Record<string, string> = {
   'demo.formulas.desc.afterDiv': '（除零错误）。F8→G8→H8→I8 链路会跨 4 层依赖传播。',
 
   'demo.budget.title': '月度预算',
-  'demo.budget.desc': '编辑「预算」（B 列）和「实际」（C 列）。「差额」列和汇总行会自动更新。差额为正表示预算结余，为负表示超支。',
+  'demo.budget.desc':
+    '编辑「预算」（B 列）和「实际」（C 列）。「差额」列和汇总行会自动更新。差额为正表示预算结余，为负表示超支。',
 
   'demo.grades.title': '成绩计算器',
-  'demo.grades.desc': '修改任意成绩 — 平均分、最高、最低及全班统计立刻重算。每位学生行使用 AVERAGE / MAX / MIN。',
+  'demo.grades.desc':
+    '修改任意成绩 — 平均分、最高、最低及全班统计立刻重算。每位学生行使用 AVERAGE / MAX / MIN。',
 
   'demo.sales.title': '销售看板',
-  'demo.sales.desc.before': '季度销售报表，自动汇总、平均与 KPI 计算。修改任意销售数字 — 看板实时更新。增长率按',
+  'demo.sales.desc.before':
+    '季度销售报表，自动汇总、平均与 KPI 计算。修改任意销售数字 — 看板实时更新。增长率按',
   'demo.sales.desc.after': '计算。',
 
   'demo.multi.title': '多 Sheet 工作簿',
   'demo.multi.desc.beforePlus': '点击 tab 切换 sheet。点击',
-  'demo.multi.desc.afterPlus': '新增 sheet。右键 tab 重命名 / 删除。每个 sheet 拥有独立的状态、撤销栈和选择。',
+  'demo.multi.desc.afterPlus':
+    '新增 sheet。右键 tab 重命名 / 删除。每个 sheet 拥有独立的状态、撤销栈和选择。',
 
   'demo.cross.title': '三 Sheet 依赖链',
   'demo.cross.desc.lazyProbe': '懒读探针：',
   'demo.cross.desc.cache': '，缓存',
 
   'demo.large.title': '大表格 — 行虚拟化',
-  'demo.large.desc': '1000 行 × 26 列。只有视口可见行（加少量 overscan）在 DOM 里 — 滚动可看到新行即时填充。方向键超出视口时，焦点格自动滚回视野。',
+  'demo.large.desc':
+    '1000 行 × 26 列。只有视口可见行（加少量 overscan）在 DOM 里 — 滚动可看到新行即时填充。方向键超出视口时，焦点格自动滚回视野。',
 
   'demo.worker.title': 'Worker 后端表格',
-  'demo.worker.desc': 'WASM 运行在 Web Worker 里；主线程只负责传递 diff。在格子里输入、写公式 — 行为和其它 demo 一致，只是计算挪到了另一线程。对密集计算负载有用（UI 不卡）。',
+  'demo.worker.desc':
+    'WASM 运行在 Web Worker 里；主线程只负责传递 diff。在格子里输入、写公式 — 行为和其它 demo 一致，只是计算挪到了另一线程。对密集计算负载有用（UI 不卡）。',
 
   'demo.million.title': '百万格 Worker Demo',
-  'demo.million.desc': '1000 × 1000 = 100 万个可寻址单元格，Web Worker 后端。只播种少量种子，其余保持稀疏。二维虚拟化只渲染视口范围。',
+  'demo.million.desc':
+    '1000 × 1000 = 100 万个可寻址单元格，Web Worker 后端。只播种少量种子，其余保持稀疏。二维虚拟化只渲染视口范围。',
   'demo.million.import.choose': '导入 CSV/TSV',
   'demo.million.import.cancel': '取消',
   'demo.million.import.status.running': '导入中',
@@ -119,7 +126,9 @@ export const messages: Record<string, string> = {
   'menuBar.format.conditional': '条件格式…',
   'menuBar.format.validation': '数据验证…',
   'menuBar.format.hideRow': '隐藏行',
+  'menuBar.format.unhideRow': '取消隐藏行',
   'menuBar.format.hideCol': '隐藏列',
+  'menuBar.format.unhideCol': '取消隐藏列',
   'menuBar.format.freezePanes': '冻结窗格',
   'menuBar.data.sortAsc': '升序排序',
   'menuBar.data.sortDesc': '降序排序',
@@ -449,12 +458,15 @@ export const messages: Record<string, string> = {
   'findReplace.scope.workbook': '工作簿',
   'findReplace.scope.selection': '当前选区',
   'findReplace.status.searching': '搜索中...',
+  'findReplace.status.refreshing': '刷新查找结果',
   'findReplace.status.failed': '搜索失败',
   'findReplace.status.noMatches': '无匹配项',
   'findReplace.status.count': '{current} / {total}',
   'findReplace.replaceAll': '全部替换',
-  'findReplace.replaceAll.capped': '已替换前 {replaced} 个（共 {total} 个匹配），再次点击“全部替换”继续',
+  'findReplace.replaceAll.capped':
+    '本地投影已确认 {acknowledged}/{total} 个匹配；尚未确认工作簿权威状态。',
   'findReplace.replace': '替换',
+  'findReplace.action.retryRefresh': '重试刷新',
   'findReplace.close': '关闭',
 
   // Go To dialog
@@ -552,6 +564,8 @@ export const messages: Record<string, string> = {
   'dataValidation.clear': '清除',
   'dataValidation.cancel': '取消',
   'dataValidation.save': '确定',
+  'nameBox.label': '名称框',
+  'nameBox.error': '请输入有效的单元格、区域或已定义名称。',
   'nameManager.title': '名称管理器',
   'nameManager.name': '名称',
   'nameManager.scope': '范围',
@@ -576,6 +590,31 @@ export const messages: Record<string, string> = {
   'status.aggregate.numericCount': '数值计数',
   'status.aggregate.min': '最小值',
   'status.aggregate.max': '最大值',
+  'status.aggregate.groupLabel': '选区聚合',
+  'status.aggregate.toggleLabel': '切换{aggregate}',
+  'status.aggregate.empty': '无聚合项',
+  'status.aggregate.truncated': '结果不完整',
+  'status.aggregate.summary': '选区聚合：{values}',
+  'status.aggregate.summaryEmpty': '选区聚合：无',
+  'status.aggregate.summaryTruncated': '{summary}。结果不完整。',
+  'status.selection.all': '全部',
+  'status.projection.label': '投影状态',
+  'status.projection.idle': '空闲',
+  'status.projection.loading': '加载中',
+  'status.projection.ready': '就绪',
+  'status.projection.error': '投影错误',
+  'status.projection.unknown': '未知',
+  'status.visibleCells': '{count} 个单元格',
+  'status.loadedValues': '已加载 {count} 个值',
+  'status.lastCommand.ready': '就绪',
+  'status.lastCommand.toolbar': '工具栏 {command}',
+  'status.lastCommand.menu': '菜单 {command}',
+  'status.lastCommand.clipboardCopy': '剪贴板复制',
+  'status.lastCommand.clipboardCut': '剪贴板剪切',
+  'status.lastCommand.clipboardPaste': '剪贴板粘贴',
+  'status.zoom.presetLabel': '将缩放设为 {percent}%',
+  'status.zoom.sliderLabel': '缩放级别',
+  'status.zoom.resetLabel': '将缩放重置为 100%',
   'status.viewMode.normal': '普通',
   'status.viewMode.pageBreak': '分页预览',
   'status.viewMode.pageLayout': '页面布局',
@@ -586,6 +625,16 @@ export const messages: Record<string, string> = {
 
   // 共享对话框元素
   'dialog.close.label': '关闭',
+
+  // 工作表保护解锁对话框
+  'protection.unlock.ariaLabel': '解锁受保护区域',
+  'protection.unlock.target.sheet': '工作表 {sheetId}',
+  'protection.unlock.target.range':
+    '工作表 {sheetId}，第 {rowStart}–{rowEnd} 行，第 {colStart}–{colEnd} 列',
+  'protection.unlock.password': '密码',
+  'protection.unlock.confirm': '解锁',
+  'protection.unlock.refresh': '刷新状态',
+  'protection.unlock.cancel': '取消',
 
   // 设置单元格格式 — 选项卡
   'formatCells.tab.number': '数字',

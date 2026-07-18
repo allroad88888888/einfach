@@ -1,57 +1,78 @@
-import { onCleanup, onMount, For, Show } from 'solid-js'
+import { createEffect, onCleanup, onMount, For, Show } from 'solid-js'
 import { useAtomValue } from '@einfach/solid'
 import {
   CLIPBOARD_ORIGIN_MARKER_PREFIX,
+  beginProjectionAtom,
   closeMenuAtom,
   copyClipboardAtom,
   createClipboardTsvPastePlan,
-  createRangeProjectionRequest,
+  createDeleteColumnsOperation,
+  createDeleteRowsOperation,
+  createInsertColumnsOperation,
+  createInsertRowsOperation,
   cutClipboardAtom,
   dispatchMenuCommandAtom,
   markClipboardReadyAtom,
+  menuIntentAtom,
   menuStateAtom,
+  openPasteSpecialAtom,
   pasteClipboardAtom,
+  pasteSpecialCapabilityAtom,
+  issueProjectionRequestIdAtom,
+  isViewportHiddenContextMenuCommand,
+  isViewportFreezeProjectionReady,
+  rejectProjectionAtom,
+  reportProjectionErrorAtom,
+  resolveProjectionAtom,
+  runViewportFreezeMutationAtom,
+  runViewportHiddenContextMenuCommandAtom,
+  runStructureOperationAtom,
   serializeClipboardTsv,
   setClipboardErrorAtom,
-  setViewportFreezeAtom,
+  supportsViewportFreezeAuthority,
   viewportFreezeAtom,
+  viewportFreezeProjectionAuthorityAtom,
+  viewportHiddenContextMenuCommandAvailabilityAtom,
   type CellCoord,
   type CellRange,
   type ClipboardTextData,
   type ClipboardTransferInput,
   type MenuCommandIntent,
   type MenuCommandKind,
+  type MenuCloseReason,
   type MenuTarget,
   type MenuTargetKind,
   type RangeProjectionResult,
   type RangeTsvChunkExportResult,
   type RangeTsvExportResult,
   type SpreadsheetError,
+  type StructureOperationIntent,
 } from '@einfach/spreadsheet-ui-core'
 import { useT } from '../../src/i18n'
 
-import {
-  advanceSpreadsheetProjectionRequestIdAtom,
-  refreshVisibleProjection,
-  spreadsheetProjectionSnapshotAtom,
-  useSpreadsheetBackend,
-  useSpreadsheetUiStore,
-} from '../provider'
+import { refreshVisibleProjection, useSpreadsheetBackend, useSpreadsheetUiStore } from '../provider'
 
 export interface SpreadsheetContextMenuProps {
   class?: string
   'data-testid'?: string
 }
 
-const commandLabelKeys: Record<MenuCommandKind, string> = {
+type ContextMenuCommandKind = MenuCommandKind | 'clipboard.pasteSpecial'
+
+const commandLabelKeys: Record<ContextMenuCommandKind, string> = {
   'clipboard.copy': 'contextMenu.command.copy',
   'clipboard.cut': 'contextMenu.command.cut',
   'clipboard.paste': 'contextMenu.command.paste',
+  'clipboard.pasteSpecial': 'menuBar.edit.pasteSpecial',
   'cell.clear': 'contextMenu.command.delete',
   'row.insert': 'contextMenu.command.insertRow',
   'row.delete': 'contextMenu.command.deleteRow',
+  'row.hide': 'menuBar.format.hideRow',
+  'row.unhide': 'menuBar.format.unhideRow',
   'column.insert': 'contextMenu.command.insertColumn',
   'column.delete': 'contextMenu.command.deleteColumn',
+  'column.hide': 'menuBar.format.hideCol',
+  'column.unhide': 'menuBar.format.unhideCol',
   'formatting.open': 'contextMenu.command.formatting',
   'view.freezeRowsHere': 'contextMenu.command.freezeRowsHere',
   'view.freezeColsHere': 'contextMenu.command.freezeColsHere',
@@ -59,11 +80,12 @@ const commandLabelKeys: Record<MenuCommandKind, string> = {
   'view.unfreeze': 'contextMenu.command.unfreeze',
 }
 
-const commandsByTargetKind: Record<MenuTargetKind, MenuCommandKind[]> = {
+const commandsByTargetKind: Record<MenuTargetKind, ContextMenuCommandKind[]> = {
   cell: [
     'clipboard.copy',
     'clipboard.cut',
     'clipboard.paste',
+    'clipboard.pasteSpecial',
     'cell.clear',
     'view.freezePanes',
     'view.freezeRowsHere',
@@ -74,16 +96,40 @@ const commandsByTargetKind: Record<MenuTargetKind, MenuCommandKind[]> = {
     'clipboard.copy',
     'clipboard.cut',
     'clipboard.paste',
+    'clipboard.pasteSpecial',
     'cell.clear',
     'view.freezePanes',
     'view.freezeRowsHere',
     'view.freezeColsHere',
     'view.unfreeze',
   ],
-  row: ['row.insert', 'row.delete', 'view.freezeRowsHere', 'view.unfreeze'],
-  column: ['column.insert', 'column.delete', 'view.freezeColsHere', 'view.unfreeze'],
+  row: [
+    'row.insert',
+    'row.delete',
+    'row.hide',
+    'row.unhide',
+    'view.freezeRowsHere',
+    'view.unfreeze',
+  ],
+  column: [
+    'column.insert',
+    'column.delete',
+    'column.hide',
+    'column.unhide',
+    'view.freezeColsHere',
+    'view.unfreeze',
+  ],
   all: ['row.insert', 'row.delete', 'column.insert', 'column.delete'],
   'sheet-tab': [],
+}
+
+function isViewportFreezeCommand(command: ContextMenuCommandKind): boolean {
+  return (
+    command === 'view.freezeRowsHere' ||
+    command === 'view.freezeColsHere' ||
+    command === 'view.freezePanes' ||
+    command === 'view.unfreeze'
+  )
 }
 
 const CLIPBOARD_CELL_LIMIT = 10_000
@@ -194,23 +240,39 @@ function clipboardError(message: string): SpreadsheetError {
 export function SpreadsheetContextMenu(props: SpreadsheetContextMenuProps) {
   const store = useSpreadsheetUiStore()
   const backend = useSpreadsheetBackend()
+  const menuIntent = useAtomValue(menuIntentAtom)
   const menuState = useAtomValue(menuStateAtom)
+  const pasteSpecialCapability = useAtomValue(pasteSpecialCapabilityAtom)
+  const viewportHiddenCommandAvailable = useAtomValue(
+    viewportHiddenContextMenuCommandAvailabilityAtom,
+  )
   let menuRoot: HTMLDivElement | undefined
+  let keyboardFocusReturnTarget: HTMLElement | null = null
 
-  function closeMenu(reason: 'dismissed' | 'committed' = 'dismissed') {
+  function closeMenu(reason: MenuCloseReason = 'dismissed') {
     store.setter(closeMenuAtom, reason)
   }
 
   async function readClipboardSource(sheetId: string, range: CellRange) {
-    const requestId = store.setter(advanceSpreadsheetProjectionRequestIdAtom)
-    const request = createRangeProjectionRequest({
+    const begin = store.setter(beginProjectionAtom, {
+      kind: 'range',
       sheetId,
-      requestId,
       reason: 'clipboard',
       range,
     })
+    if (begin.status !== 'started' || begin.request.kind !== 'range') return null
 
-    return backend.readRangeProjection(request)
+    const request = begin.request
+    try {
+      const result = await backend.readRangeProjection(request)
+      const outcome = store.setter(resolveProjectionAtom, { request, result })
+      return outcome.status === 'accepted' && outcome.result.kind === 'range'
+        ? outcome.result
+        : null
+    } catch (error: unknown) {
+      store.setter(rejectProjectionAtom, { request, error })
+      throw error
+    }
   }
 
   async function consumeClipboardSource(
@@ -218,7 +280,14 @@ export function SpreadsheetContextMenu(props: SpreadsheetContextMenuProps) {
     range: CellRange,
     onChunk: (chunk: string) => void | Promise<void>,
   ): Promise<RangeTsvChunkExportResult | RangeTsvExportResult | null> {
-    const requestId = store.setter(advanceSpreadsheetProjectionRequestIdAtom)
+    const requestId = store.setter(issueProjectionRequestIdAtom)
+    if (requestId === null) {
+      store.setter(
+        setClipboardErrorAtom,
+        clipboardError('Clipboard export could not allocate a request id.'),
+      )
+      return null
+    }
     const request = {
       kind: 'export-range-tsv' as const,
       sheetId,
@@ -409,6 +478,15 @@ export function SpreadsheetContextMenu(props: SpreadsheetContextMenuProps) {
     }
   }
 
+  async function dispatchStructureOperation(intent: StructureOperationIntent) {
+    await store.setter(runStructureOperationAtom, {
+      intent,
+      source: backend,
+      refreshProjection: (sheetId) =>
+        refreshVisibleProjection(store, backend, sheetId, 'selection'),
+    })
+  }
+
   async function executeCommand(intent: MenuCommandIntent) {
     const target = intent.target
     switch (intent.command) {
@@ -441,52 +519,57 @@ export function SpreadsheetContextMenu(props: SpreadsheetContextMenuProps) {
         break
       case 'row.insert':
         if (target.kind !== 'row') return
-        if (!backend.insertRows) {
-          throw new Error('Row insert is not supported by this spreadsheet backend.')
-        }
-        await backend.insertRows({
-          kind: 'insert-rows',
-          sheetId: target.sheetId,
-          rowIndex: target.rowIndex,
-          count: 1,
-        })
-        break
+        await dispatchStructureOperation(
+          createInsertRowsOperation({
+            sheetId: target.sheetId,
+            rowIndex: target.rowIndex,
+            count: 1,
+            source: 'selection',
+          }),
+        )
+        return
       case 'row.delete':
         if (target.kind !== 'row') return
-        if (!backend.deleteRows) {
-          throw new Error('Row delete is not supported by this spreadsheet backend.')
-        }
-        await backend.deleteRows({
-          kind: 'delete-rows',
-          sheetId: target.sheetId,
-          rowIndex: target.rowIndex,
-          count: 1,
-        })
-        break
+        await dispatchStructureOperation(
+          createDeleteRowsOperation({
+            sheetId: target.sheetId,
+            rowIndex: target.rowIndex,
+            count: 1,
+            source: 'selection',
+          }),
+        )
+        return
       case 'column.insert':
         if (target.kind !== 'column') return
-        if (!backend.insertColumns) {
-          throw new Error('Column insert is not supported by this spreadsheet backend.')
-        }
-        await backend.insertColumns({
-          kind: 'insert-columns',
-          sheetId: target.sheetId,
-          colIndex: target.colIndex,
-          count: 1,
-        })
-        break
+        await dispatchStructureOperation(
+          createInsertColumnsOperation({
+            sheetId: target.sheetId,
+            colIndex: target.colIndex,
+            count: 1,
+            source: 'selection',
+          }),
+        )
+        return
       case 'column.delete':
         if (target.kind !== 'column') return
-        if (!backend.deleteColumns) {
-          throw new Error('Column delete is not supported by this spreadsheet backend.')
-        }
-        await backend.deleteColumns({
-          kind: 'delete-columns',
-          sheetId: target.sheetId,
-          colIndex: target.colIndex,
-          count: 1,
+        await dispatchStructureOperation(
+          createDeleteColumnsOperation({
+            sheetId: target.sheetId,
+            colIndex: target.colIndex,
+            count: 1,
+            source: 'selection',
+          }),
+        )
+        return
+      case 'row.hide':
+      case 'row.unhide':
+      case 'column.hide':
+      case 'column.unhide':
+        await store.setter(runViewportHiddenContextMenuCommandAtom, {
+          source: backend,
+          command: intent.command,
         })
-        break
+        return
       case 'view.freezeRowsHere': {
         const rowIndex =
           target.kind === 'row'
@@ -497,7 +580,11 @@ export function SpreadsheetContextMenu(props: SpreadsheetContextMenuProps) {
                 ? target.range.rowStart
                 : null
         if (rowIndex === null) return
-        store.setter(setViewportFreezeAtom, { sheetId: target.sheetId, rows: rowIndex })
+        await store.setter(runViewportFreezeMutationAtom, {
+          source: backend,
+          sheetId: target.sheetId,
+          rows: rowIndex,
+        })
         return
       }
       case 'view.freezeColsHere': {
@@ -510,7 +597,11 @@ export function SpreadsheetContextMenu(props: SpreadsheetContextMenuProps) {
                 ? target.range.colStart
                 : null
         if (colIndex === null) return
-        store.setter(setViewportFreezeAtom, { sheetId: target.sheetId, cols: colIndex })
+        await store.setter(runViewportFreezeMutationAtom, {
+          source: backend,
+          sheetId: target.sheetId,
+          cols: colIndex,
+        })
         return
       }
       case 'view.freezePanes':
@@ -520,7 +611,8 @@ export function SpreadsheetContextMenu(props: SpreadsheetContextMenuProps) {
             target.kind === 'cell'
               ? { row: target.cell.row, col: target.cell.col }
               : { row: target.range.rowStart, col: target.range.colStart }
-          store.setter(setViewportFreezeAtom, {
+          await store.setter(runViewportFreezeMutationAtom, {
+            source: backend,
             sheetId: target.sheetId,
             rows: anchor.row,
             cols: anchor.col,
@@ -528,7 +620,12 @@ export function SpreadsheetContextMenu(props: SpreadsheetContextMenuProps) {
         }
         return
       case 'view.unfreeze':
-        store.setter(setViewportFreezeAtom, { sheetId: target.sheetId, rows: 0, cols: 0 })
+        await store.setter(runViewportFreezeMutationAtom, {
+          source: backend,
+          sheetId: target.sheetId,
+          rows: 0,
+          cols: 0,
+        })
         return
       default:
         return
@@ -537,18 +634,27 @@ export function SpreadsheetContextMenu(props: SpreadsheetContextMenuProps) {
   }
 
   function reportCommandError(error: unknown) {
-    const current = store.getter(spreadsheetProjectionSnapshotAtom)
-    store.setter(spreadsheetProjectionSnapshotAtom, {
-      ...current,
-      status: 'error',
-      error:
-        error instanceof Error
-          ? { code: 'BACKEND_ERROR', message: error.message }
-          : { code: 'BACKEND_ERROR', message: 'Spreadsheet command failed.' },
+    store.setter(reportProjectionErrorAtom, {
+      error,
+      fallbackMessage: 'Spreadsheet command failed.',
+      code: 'BACKEND_ERROR',
     })
   }
 
-  function dispatchCommand(command: MenuCommandKind) {
+  function dispatchCommand(command: ContextMenuCommandKind) {
+    if (command === 'clipboard.pasteSpecial') {
+      if (!store.getter(pasteSpecialCapabilityAtom)) return
+      store.setter(openPasteSpecialAtom)
+      closeMenu('committed')
+      return
+    }
+    if (isViewportFreezeCommand(command) && !supportsViewportFreezeAuthority(backend)) return
+    if (
+      isViewportHiddenContextMenuCommand(command) &&
+      !viewportHiddenCommandAvailable()(backend, command)
+    ) {
+      return
+    }
     const intent = store.setter(dispatchMenuCommandAtom, command)
     if (intent) {
       void executeCommand(intent)
@@ -567,6 +673,7 @@ export function SpreadsheetContextMenu(props: SpreadsheetContextMenuProps) {
     }
 
     if (!menuRoot.contains(event.target as Node)) {
+      keyboardFocusReturnTarget = null
       closeMenu()
     }
   }
@@ -577,10 +684,44 @@ export function SpreadsheetContextMenu(props: SpreadsheetContextMenuProps) {
     }
 
     if (event.key === 'Escape') {
+      const focusReturnTarget = keyboardFocusReturnTarget
+      keyboardFocusReturnTarget = null
       event.preventDefault()
-      closeMenu()
+      closeMenu('cancelled')
+      queueMicrotask(() => {
+        if (focusReturnTarget?.isConnected) {
+          focusReturnTarget.focus()
+        }
+      })
     }
   }
+
+  createEffect(() => {
+    const intent = menuIntent()
+    if (intent?.type !== 'menu.open') {
+      return
+    }
+    if (intent.source !== 'keyboard') {
+      keyboardFocusReturnTarget = null
+      return
+    }
+
+    const activeElement = document.activeElement
+    keyboardFocusReturnTarget = activeElement instanceof HTMLElement ? activeElement : null
+    queueMicrotask(() => {
+      const latestIntent = store.getter(menuIntentAtom)
+      if (
+        store.getter(menuStateAtom).status !== 'open' ||
+        latestIntent?.type !== 'menu.open' ||
+        latestIntent.source !== 'keyboard'
+      ) {
+        return
+      }
+      menuRoot
+        ?.querySelector<HTMLElement>('[role="menuitem"]:not([hidden]):not([disabled])')
+        ?.focus()
+    })
+  })
 
   onMount(() => {
     document.addEventListener('mousedown', onDocumentMouseDown, true)
@@ -597,12 +738,13 @@ export function SpreadsheetContextMenu(props: SpreadsheetContextMenuProps) {
 
   const t = useT()
   const freezeState = useAtomValue(viewportFreezeAtom)
+  const freezeProjectionAuthority = useAtomValue(viewportFreezeProjectionAuthorityAtom)
 
-  function labelFor(command: MenuCommandKind): string {
+  function labelFor(command: ContextMenuCommandKind): string {
     return t(commandLabelKeys[command])
   }
 
-  function tooltipFor(command: MenuCommandKind, target: MenuTarget): string | undefined {
+  function tooltipFor(command: ContextMenuCommandKind, target: MenuTarget): string | undefined {
     switch (command) {
       case 'view.freezeRowsHere': {
         const count =
@@ -633,10 +775,22 @@ export function SpreadsheetContextMenu(props: SpreadsheetContextMenuProps) {
     }
   }
 
-  function isCommandVisibleForTarget(command: MenuCommandKind, target: MenuTarget): boolean {
+  function isCommandVisibleForTarget(command: ContextMenuCommandKind, target: MenuTarget): boolean {
+    if (command === 'clipboard.pasteSpecial') return pasteSpecialCapability()
+    if (isViewportHiddenContextMenuCommand(command)) {
+      return viewportHiddenCommandAvailable()(backend, command)
+    }
+    if (isViewportFreezeCommand(command) && !supportsViewportFreezeAuthority(backend)) {
+      return false
+    }
+    const freezeProjectionReady = isViewportFreezeProjectionReady(
+      freezeProjectionAuthority(),
+      backend,
+      target.sheetId,
+    )
     const freeze = freezeState()
-    const rows = freeze.rowsBySheet[target.sheetId] ?? 0
-    const cols = freeze.colsBySheet[target.sheetId] ?? 0
+    const rows = freezeProjectionReady ? (freeze.rowsBySheet[target.sheetId] ?? 0) : 0
+    const cols = freezeProjectionReady ? (freeze.colsBySheet[target.sheetId] ?? 0) : 0
     const frozen = rows > 0 || cols > 0
     switch (command) {
       case 'view.freezeRowsHere':
@@ -665,7 +819,7 @@ export function SpreadsheetContextMenu(props: SpreadsheetContextMenuProps) {
 
   const commandList = () => {
     const target = menuState().target
-    if (!target) return [] as MenuCommandKind[]
+    if (!target) return [] as ContextMenuCommandKind[]
     return commandsByTargetKind[target.kind].filter((command) =>
       isCommandVisibleForTarget(command, target),
     )

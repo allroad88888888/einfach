@@ -1,24 +1,27 @@
 import { For, onCleanup, onMount, Show } from 'solid-js'
 import { useAtomValue } from '@einfach/solid'
 import {
-  createBeginSheetTabRenameIntent,
+  activateSheetTabAtom,
+  addSheetTabAtom,
+  beginSheetTabRenameAtom,
+  cancelSheetTabDeleteAtom,
+  commitSheetTabRenameAtom,
+  commitSheetTabReorderAtom,
+  confirmSheetTabDeleteAtom,
   createBeginSheetTabReorderIntent,
   createCancelSheetTabRenameIntent,
   createCancelSheetTabReorderIntent,
   createCloseSheetTabContextMenuIntent,
-  createCommitSheetTabRenameIntent,
-  createCommitSheetTabReorderIntent,
   createOpenSheetTabContextMenuIntent,
   createUpdateSheetTabRenameIntent,
   createUpdateSheetTabReorderIntent,
   dispatchSheetTabIntentAtom,
-  patchSheetTabsSheetNameAtom,
-  setSheetTabsSheetsAtom,
-  setWorkspaceActiveSheetAtom,
+  disposeSheetTabsAtom,
+  initializeSheetTabsAtom,
+  requestSheetTabDeleteAtom,
   sheetTabsAtom,
   sheetTabsSheetsAtom,
-  type SheetMutationResult,
-  type SpreadsheetSheetMetadata,
+  type SheetTabMutationKind,
   workspaceSessionAtom,
 } from '@einfach/spreadsheet-ui-core'
 
@@ -43,178 +46,40 @@ export function SpreadsheetSheetTabs(props: SpreadsheetSheetTabsProps) {
   const sheetTabs = useAtomValue(sheetTabsAtom)
   const sheets = useAtomValue(sheetTabsSheetsAtom)
   let renameInput: HTMLInputElement | null = null
-  let disposed = false
-  let sheetListRequestSeq = 0
   let reorderCleanup: (() => void) | null = null
 
   function setActiveSheet(sheetId: string) {
-    store.setter(setWorkspaceActiveSheetAtom, { sheetId })
+    store.setter(activateSheetTabAtom, { sheetId })
   }
 
-  function seedSheets() {
-    if (store.getter(sheetTabsSheetsAtom).length > 0) {
-      return
-    }
-
-    store.setter(setSheetTabsSheetsAtom, {
-      sheets: props.sheets.map((sheet, index) => ({
-        id: sheet.id,
-        name: sheet.name,
-        index: sheet.index ?? index,
-      })),
-    })
+  function commandDisabled(kind: SheetTabMutationKind): boolean {
+    const state = sheetTabs()
+    return state.phase !== 'ready' || state.mutation !== null || !state.capabilities[kind]
   }
 
-  function resolveFallbackActiveSheet(
-    sheetList: readonly SpreadsheetSheetMetadata[],
-    preferredSheetId?: string | null,
-  ): string | null {
-    if (preferredSheetId && sheetList.some((sheet) => sheet.id === preferredSheetId)) {
-      return preferredSheetId
-    }
-
-    const currentSheetId = store.getter(workspaceSessionAtom).activeSheetId
-    if (currentSheetId && sheetList.some((sheet) => sheet.id === currentSheetId)) {
-      return currentSheetId
-    }
-
-    return sheetList[0]?.id ?? null
-  }
-
-  function commitSheetList(
-    sheetList: readonly SpreadsheetSheetMetadata[],
-    revision?: SheetMutationResult['revision'],
-    preferredActiveSheetId?: string | null,
-  ) {
-    store.setter(setSheetTabsSheetsAtom, {
-      sheets: sheetList,
-      revision,
-    })
-
-    const activeSheetId = resolveFallbackActiveSheet(sheetList, preferredActiveSheetId)
-    if (activeSheetId !== store.getter(workspaceSessionAtom).activeSheetId) {
-      store.setter(setWorkspaceActiveSheetAtom, { sheetId: activeSheetId })
-    }
-  }
-
-  async function refreshSheets(preferredActiveSheetId?: string | null) {
-    if (!backend.listSheets) {
-      const sheetList = store.getter(sheetTabsSheetsAtom)
-      const activeSheetId = resolveFallbackActiveSheet(sheetList, preferredActiveSheetId)
-      if (activeSheetId !== store.getter(workspaceSessionAtom).activeSheetId) {
-        store.setter(setWorkspaceActiveSheetAtom, { sheetId: activeSheetId })
-      }
-      return
-    }
-
-    const requestSeq = ++sheetListRequestSeq
-    const result = await backend.listSheets()
-    if (disposed || requestSeq !== sheetListRequestSeq) {
-      return
-    }
-
-    commitSheetList(result.sheets, result.revision, preferredActiveSheetId)
-  }
-
-  function commitSheetMutationResult(
-    result: SheetMutationResult,
-    preferredActiveSheetId =
-      result.activeSheetId ?? result.createdSheet?.id ?? result.sheetId ?? null,
-  ) {
-    sheetListRequestSeq += 1
-    if (result.sheets) {
-      commitSheetList(
-        result.sheets,
-        result.revision,
-        preferredActiveSheetId,
-      )
-      return
-    }
-
-    void refreshSheets(preferredActiveSheetId)
-  }
-
-  function nextSheetName() {
-    const used = new Set(sheets().map((sheet) => sheet.name))
-    let index = sheets().length + 1
-    let name = `Sheet${index}`
-
-    while (used.has(name)) {
-      index += 1
-      name = `Sheet${index}`
-    }
-
-    return name
+  function commandTitle(kind: SheetTabMutationKind, label: string): string {
+    const state = sheetTabs()
+    if (state.phase === 'loading') return 'Loading the live sheet list'
+    if (state.mutation !== null) return 'Another sheet change is in progress'
+    if (!state.capabilities.list) return `${label} is unavailable without a live sheet list`
+    if (!state.capabilities[kind]) return `${label} is unavailable in this workbook backend`
+    return label
   }
 
   function closeContextMenu(reason: 'dismissed' | 'sheet-changed' | 'committed' | 'cancelled') {
     store.setter(dispatchSheetTabIntentAtom, createCloseSheetTabContextMenuIntent(reason))
   }
 
-  async function addSheet() {
-    if (!backend.addSheet) {
-      return
-    }
-
-    const result = await backend.addSheet({
-      kind: 'add-sheet',
-      name: nextSheetName(),
-    })
-    commitSheetMutationResult(result)
-  }
-
   function beginRename(sheetId: string, draftName: string) {
-    const intent = createBeginSheetTabRenameIntent({
+    store.setter(beginSheetTabRenameAtom, {
       sheetId,
       draftName,
       source: 'pointer',
     })
-
-    if (!intent) {
-      return
-    }
-
-    store.setter(dispatchSheetTabIntentAtom, intent)
-  }
-
-  async function commitRename(sheetId: string, draft: string) {
-    const intent = createCommitSheetTabRenameIntent({
-      sheetId,
-      name: draft,
-      source: 'pointer',
-    })
-
-    if (!intent) {
-      return
-    }
-
-    if (intent.type !== 'sheet-tab.rename.commit') {
-      return
-    }
-
-    if (backend.renameSheet) {
-      try {
-        const result = await backend.renameSheet({
-          kind: 'rename-sheet',
-          sheetId,
-          name: intent.name,
-        })
-        store.setter(dispatchSheetTabIntentAtom, intent)
-        commitSheetMutationResult(result)
-      } catch (error) {
-        window.alert(error instanceof Error ? error.message : String(error))
-      }
-      return
-    }
-
-    store.setter(dispatchSheetTabIntentAtom, intent)
-    store.setter(patchSheetTabsSheetNameAtom, { sheetId, name: intent.name })
   }
 
   function cancelRename(sheetId: string, reason: 'escape' | 'blur' = 'escape') {
-    const intent = createCancelSheetTabRenameIntent(sheetId, reason)
-
-    store.setter(dispatchSheetTabIntentAtom, intent)
+    store.setter(dispatchSheetTabIntentAtom, createCancelSheetTabRenameIntent(sheetId, reason))
   }
 
   function tabDropPlacement(event: PointerEvent, sheetId: string) {
@@ -223,9 +88,7 @@ export function SpreadsheetSheetTabs(props: SpreadsheetSheetTabsProps) {
       ?.closest<HTMLElement>('[data-sheet-tab-item]')
     const targetSheetId = target?.dataset.sheetId
 
-    if (!target || !targetSheetId || targetSheetId === sheetId) {
-      return null
-    }
+    if (!target || !targetSheetId || targetSheetId === sheetId) return null
 
     const rect = target.getBoundingClientRect()
     const targetIndex = sheets().findIndex((sheet) => sheet.id === targetSheetId)
@@ -239,9 +102,7 @@ export function SpreadsheetSheetTabs(props: SpreadsheetSheetTabsProps) {
   }
 
   function beginReorder(sheetId: string, event: PointerEvent) {
-    if (!backend.reorderSheet || sheets().length <= 1) {
-      return
-    }
+    if (commandDisabled('reorder') || sheets().length <= 1) return
 
     event.preventDefault()
     event.stopPropagation()
@@ -250,7 +111,7 @@ export function SpreadsheetSheetTabs(props: SpreadsheetSheetTabsProps) {
     try {
       ;(event.currentTarget as HTMLElement).setPointerCapture?.(event.pointerId)
     } catch {
-      // Synthetic pointer events in tests may not have an active pointer capture session.
+      // Synthetic pointer events may not have an active capture session.
     }
     store.setter(
       dispatchSheetTabIntentAtom,
@@ -260,12 +121,10 @@ export function SpreadsheetSheetTabs(props: SpreadsheetSheetTabsProps) {
       }),
     )
 
-    const onPointerMove = (moveEvent: PointerEvent) => {
-      updateReorder(sheetId, moveEvent)
-    }
+    const onPointerMove = (moveEvent: PointerEvent) => updateReorder(sheetId, moveEvent)
     const onPointerUp = (upEvent: PointerEvent) => {
       clearReorderListeners()
-      void commitReorder(sheetId, upEvent)
+      commitReorder(sheetId, upEvent)
     }
 
     reorderCleanup = () => {
@@ -279,14 +138,10 @@ export function SpreadsheetSheetTabs(props: SpreadsheetSheetTabsProps) {
 
   function updateReorder(sheetId: string, event: PointerEvent) {
     const reorder = store.getter(sheetTabsAtom).reorder
-    if (!reorder || reorder.sheetId !== sheetId) {
-      return
-    }
+    if (!reorder || reorder.sheetId !== sheetId) return
 
     const placement = tabDropPlacement(event, sheetId)
-    if (!placement) {
-      return
-    }
+    if (!placement) return
 
     store.setter(
       dispatchSheetTabIntentAtom,
@@ -297,49 +152,18 @@ export function SpreadsheetSheetTabs(props: SpreadsheetSheetTabsProps) {
     )
   }
 
-  async function commitReorder(sheetId: string, event: PointerEvent) {
+  function commitReorder(sheetId: string, event: PointerEvent) {
     const reorder = store.getter(sheetTabsAtom).reorder
-    if (!reorder || reorder.sheetId !== sheetId) {
-      return
-    }
+    if (!reorder || reorder.sheetId !== sheetId) return
 
     event.preventDefault()
     event.stopPropagation()
     try {
       ;(event.currentTarget as HTMLElement).releasePointerCapture?.(event.pointerId)
     } catch {
-      // See the matching setPointerCapture guard in beginReorder.
+      // See the matching setPointerCapture guard.
     }
-
-    const placement = {
-      beforeSheetId: reorder.beforeSheetId,
-      afterSheetId: reorder.afterSheetId,
-      targetIndex: reorder.targetIndex,
-    }
-
-    const intent = createCommitSheetTabReorderIntent({
-      sheetId,
-      ...placement,
-    })
-
-    if (!backend.reorderSheet) {
-      store.setter(dispatchSheetTabIntentAtom, createCancelSheetTabReorderIntent(sheetId, 'blur'))
-      return
-    }
-
-    try {
-      const activeSheetId = store.getter(workspaceSessionAtom).activeSheetId
-      const result = await backend.reorderSheet({
-        kind: 'reorder-sheet',
-        sheetId,
-        ...placement,
-      })
-      store.setter(dispatchSheetTabIntentAtom, intent)
-      commitSheetMutationResult(result, activeSheetId)
-    } catch (error) {
-      store.setter(dispatchSheetTabIntentAtom, createCancelSheetTabReorderIntent(sheetId, 'blur'))
-      window.alert(error instanceof Error ? error.message : String(error))
-    }
+    void store.setter(commitSheetTabReorderAtom, { sheetId })
   }
 
   function clearReorderListeners() {
@@ -349,18 +173,13 @@ export function SpreadsheetSheetTabs(props: SpreadsheetSheetTabsProps) {
   function cancelReorder(sheetId: string) {
     clearReorderListeners()
     const reorder = store.getter(sheetTabsAtom).reorder
-    if (reorder?.sheetId !== sheetId) {
-      return
-    }
-
+    if (reorder?.sheetId !== sheetId) return
     store.setter(dispatchSheetTabIntentAtom, createCancelSheetTabReorderIntent(sheetId, 'blur'))
   }
 
   function reorderDropSide(sheetId: string): 'before' | 'after' | null {
     const reorder = sheetTabs().reorder
-    if (!reorder) {
-      return null
-    }
+    if (!reorder) return null
     if (reorder.beforeSheetId === sheetId) return 'before'
     if (reorder.afterSheetId === sheetId) return 'after'
     return null
@@ -369,30 +188,20 @@ export function SpreadsheetSheetTabs(props: SpreadsheetSheetTabsProps) {
   function onRenameInput(sheetId: string, event: InputEvent) {
     const input = event.currentTarget as HTMLInputElement
     const intent = createUpdateSheetTabRenameIntent(sheetId, input.value)
-
-    if (!intent) {
-      return
-    }
-
-    store.setter(dispatchSheetTabIntentAtom, intent)
+    if (intent) store.setter(dispatchSheetTabIntentAtom, intent)
   }
 
   function onRenameInputKeyDown(event: KeyboardEvent) {
     const target = event.currentTarget as HTMLInputElement | null
-    if (!target || target.tagName !== 'INPUT') {
-      return
-    }
+    if (!target || target.tagName !== 'INPUT') return
 
     const sheetId = target.getAttribute('data-sheet-tab-rename-input')
     const rename = sheetTabs().rename
-
-    if (!sheetId || !rename || rename.sheetId !== sheetId) {
-      return
-    }
+    if (!sheetId || !rename || rename.sheetId !== sheetId) return
 
     if (event.key === 'Enter' || event.code === 'Enter' || event.keyCode === 13) {
       event.preventDefault()
-      void commitRename(sheetId, target.value)
+      void store.setter(commitSheetTabRenameAtom, { sheetId })
       return
     }
 
@@ -403,16 +212,9 @@ export function SpreadsheetSheetTabs(props: SpreadsheetSheetTabsProps) {
   }
 
   function bindRenameInput(node: HTMLInputElement | null) {
-    if (renameInput === node) {
-      return
-    }
-
-    if (renameInput) {
-      renameInput.removeEventListener('keydown', onRenameInputKeyDown)
-    }
-
+    if (renameInput === node) return
+    renameInput?.removeEventListener('keydown', onRenameInputKeyDown)
     renameInput = node
-
     if (renameInput) {
       renameInput.addEventListener('keydown', onRenameInputKeyDown)
       renameInput.focus()
@@ -422,70 +224,46 @@ export function SpreadsheetSheetTabs(props: SpreadsheetSheetTabsProps) {
 
   function openContextMenu(event: MouseEvent, sheetId: string) {
     event.preventDefault()
-    const intent = createOpenSheetTabContextMenuIntent({
-      sheetId,
-      x: event.clientX,
-      y: event.clientY,
-      source: 'context-menu',
-    })
-
-    store.setter(dispatchSheetTabIntentAtom, intent)
+    store.setter(
+      dispatchSheetTabIntentAtom,
+      createOpenSheetTabContextMenuIntent({
+        sheetId,
+        x: event.clientX,
+        y: event.clientY,
+        source: 'context-menu',
+      }),
+    )
   }
 
   function beginContextRename() {
     const contextMenu = sheetTabs().contextMenu
-    if (!contextMenu) {
-      return
-    }
-
+    if (!contextMenu) return
     const sheet = sheets().find((item) => item.id === contextMenu.sheetId)
     closeContextMenu('committed')
-    if (!sheet) {
-      return
-    }
-
-    beginRename(sheet.id, sheet.name)
+    if (sheet) beginRename(sheet.id, sheet.name)
   }
 
-  async function deleteContextSheet() {
+  function requestContextDelete() {
     const contextMenu = sheetTabs().contextMenu
-    if (!contextMenu || !backend.deleteSheet) {
-      return
-    }
-
-    const sheet = sheets().find((item) => item.id === contextMenu.sheetId)
-    closeContextMenu('committed')
-    if (!sheet) {
-      return
-    }
-
-    const confirmed = window.confirm(`Delete sheet "${sheet.name}"?`)
-    if (!confirmed) {
-      return
-    }
-
-    try {
-      const result = await backend.deleteSheet({
-        kind: 'delete-sheet',
-        sheetId: sheet.id,
-      })
-      commitSheetMutationResult(result)
-    } catch (error) {
-      window.alert(error instanceof Error ? error.message : String(error))
-    }
+    if (!contextMenu) return
+    store.setter(requestSheetTabDeleteAtom, { sheetId: contextMenu.sheetId })
   }
 
   onMount(() => {
-    seedSheets()
-    void refreshSheets()
+    void store.setter(initializeSheetTabsAtom, {
+      backend,
+      sheets: props.sheets.map((sheet, index) => ({
+        id: sheet.id,
+        name: sheet.name,
+        index: sheet.index ?? index,
+      })),
+    })
   })
 
   onCleanup(() => {
-    disposed = true
     clearReorderListeners()
-    if (renameInput) {
-      renameInput.removeEventListener('keydown', onRenameInputKeyDown)
-    }
+    renameInput?.removeEventListener('keydown', onRenameInputKeyDown)
+    store.setter(disposeSheetTabsAtom)
   })
 
   return (
@@ -493,7 +271,13 @@ export function SpreadsheetSheetTabs(props: SpreadsheetSheetTabsProps) {
       class={`sheet-tabs spreadsheet-sheet-tabs ${props.class ?? ''}`.trim()}
       role="tablist"
       data-testid={props['data-testid'] ?? 'spreadsheet-sheet-tabs'}
+      aria-busy={sheetTabs().phase === 'loading' || sheetTabs().mutation !== null}
     >
+      <Show when={sheetTabs().phase === 'loading'}>
+        <span role="status" data-testid="sheet-tabs-loading">
+          Loading sheets…
+        </span>
+      </Show>
       <For each={sheets()}>
         {(sheet) => {
           const isActive = () => workspace().activeSheetId === sheet.id
@@ -512,12 +296,14 @@ export function SpreadsheetSheetTabs(props: SpreadsheetSheetTabsProps) {
                 class="spreadsheet-sheet-tab-reorder"
                 data-testid={`sheet-tab-reorder-${sheet.id}`}
                 aria-label={`Move ${sheet.name}`}
-                title="Move sheet"
-                disabled={!backend.reorderSheet || sheets().length <= 1}
+                title={commandTitle('reorder', 'Move sheet')}
+                disabled={commandDisabled('reorder') || sheets().length <= 1}
                 onPointerDown={(event) => beginReorder(sheet.id, event)}
                 onPointerCancel={() => cancelReorder(sheet.id)}
               >
-                <span class="spreadsheet-sheet-tab-reorder-grip" aria-hidden="true">⠿</span>
+                <span class="spreadsheet-sheet-tab-reorder-grip" aria-hidden="true">
+                  ⠿
+                </span>
               </button>
               <Show
                 when={!isRenaming()}
@@ -527,6 +313,7 @@ export function SpreadsheetSheetTabs(props: SpreadsheetSheetTabsProps) {
                     type="text"
                     data-sheet-tab-rename-input={sheet.id}
                     value={sheetTabs().rename?.draftName ?? sheet.name}
+                    disabled={sheetTabs().mutation !== null}
                     onInput={(event) => onRenameInput(sheet.id, event)}
                     onBlur={() => cancelRename(sheet.id, 'blur')}
                     ref={bindRenameInput}
@@ -557,9 +344,9 @@ export function SpreadsheetSheetTabs(props: SpreadsheetSheetTabsProps) {
         class="sheet-tab-add spreadsheet-sheet-tab-add"
         data-testid="sheet-tab-add"
         aria-label="Add sheet"
-        title="Add sheet"
-        disabled={!backend.addSheet}
-        onClick={() => void addSheet()}
+        title={commandTitle('add', 'Add sheet')}
+        disabled={commandDisabled('add')}
+        onClick={() => void store.setter(addSheetTabAtom)}
       >
         +
       </button>
@@ -578,6 +365,8 @@ export function SpreadsheetSheetTabs(props: SpreadsheetSheetTabsProps) {
               type="button"
               role="menuitem"
               data-testid="sheet-tab-menu-rename"
+              title={commandTitle('rename', 'Rename sheet')}
+              disabled={commandDisabled('rename')}
               onClick={beginContextRename}
             >
               Rename
@@ -586,12 +375,48 @@ export function SpreadsheetSheetTabs(props: SpreadsheetSheetTabsProps) {
               type="button"
               role="menuitem"
               data-testid="sheet-tab-menu-delete"
-              disabled={!backend.deleteSheet || sheets().length <= 1}
-              onClick={() => void deleteContextSheet()}
+              title={commandTitle('delete', 'Delete sheet')}
+              disabled={commandDisabled('delete') || sheets().length <= 1}
+              onClick={requestContextDelete}
             >
               Delete
             </button>
           </div>
+        )}
+      </Show>
+      <Show when={sheetTabs().deleteConfirmation}>
+        {(confirmation) => (
+          <div
+            role="dialog"
+            aria-modal="true"
+            aria-labelledby="sheet-tab-delete-title"
+            data-testid="sheet-tab-delete-confirmation"
+          >
+            <p id="sheet-tab-delete-title">Delete sheet “{confirmation().sheetName}”?</p>
+            <button
+              type="button"
+              data-testid="sheet-tab-delete-cancel"
+              disabled={sheetTabs().mutation !== null}
+              onClick={() => store.setter(cancelSheetTabDeleteAtom)}
+            >
+              Cancel
+            </button>
+            <button
+              type="button"
+              data-testid="sheet-tab-delete-confirm"
+              disabled={sheetTabs().mutation !== null}
+              onClick={() => void store.setter(confirmSheetTabDeleteAtom)}
+            >
+              Delete
+            </button>
+          </div>
+        )}
+      </Show>
+      <Show when={sheetTabs().error}>
+        {(error) => (
+          <span role="alert" data-testid="sheet-tabs-error">
+            {error()}
+          </span>
         )}
       </Show>
     </div>

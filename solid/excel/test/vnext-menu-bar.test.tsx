@@ -1,6 +1,8 @@
 /** @jsxImportSource solid-js */
 
-import { afterEach, describe, expect, it, jest } from '@jest/globals'
+import { readFileSync } from 'node:fs'
+import { join } from 'node:path'
+import { afterEach, describe, expect, it } from '@jest/globals'
 import { createStore } from '@einfach/core'
 import { cleanup, fireEvent, render, waitFor } from '@solidjs/testing-library'
 import {
@@ -9,27 +11,60 @@ import {
   findReplaceOpenAtom,
   helpOverlayAtom,
   historyStackAtom,
+  hydrateViewportSizeProjectionAtom,
+  initializeSheetTabsAtom,
+  pushHistoryAtom,
   MENU_BAR_ITEMS,
   openTopMenuAtom,
   printPreviewOpenAtom,
+  removeDuplicatesCapabilityAtom,
+  removeDuplicatesErrorAtom,
+  removeDuplicatesLifecycleAtom,
   removeDuplicatesOpenAtom,
+  removeDuplicatesReadRequestIdAtom,
+  removeDuplicatesSessionAtom,
   selectionAtom,
+  setViewportHiddenAtom,
   setWorkspaceActiveSheetAtom,
+  sheetTabsAtom,
+  sheetTabsSheetsAtom,
+  openTextToColumnsAtom,
+  structureOperationLifecycleAtom,
+  textToColumnsEntrypointProjectionAtom,
+  textToColumnsOpenAtom,
+  textToColumnsSessionAtom,
+  textToColumnsSourceAtom,
   topMenuOpenAtom,
   validationRuleEditorAtom,
   viewportShowFormulaBarAtom,
   viewportShowGridlinesAtom,
   viewportShowHeadingsAtom,
+  viewportFreezeLifecycleAtom,
+  viewportHiddenAtom,
+  viewportHiddenLifecycleAtom,
+  workspaceSessionAtom,
+  type AddSheetRequest,
+  type BackendMutationResult,
   type DisplayCell,
+  type HideColumnsRequest,
+  type HideRowsRequest,
+  type InsertColumnsRequest,
+  type InsertRowsRequest,
   type RangeProjectionRequest,
   type RangeProjectionResult,
+  type RemoveDuplicatesControllerPort,
   type SpreadsheetBackend,
+  type SpreadsheetSheetMetadata,
+  type UnhideColumnsRequest,
+  type UnhideRowsRequest,
+  type VisibleProjectionRequest,
+  type ViewportSizeProjectionRequest,
+  type ViewportSizeProjectionResult,
 } from '@einfach/spreadsheet-ui-core'
-import {
-  removeDuplicatesSheetIdAtom,
-  SpreadsheetUiProvider,
-} from '../src-vnext/provider'
+import { SpreadsheetUiProvider } from '../src-vnext/provider'
 import { SpreadsheetMenuBar } from '../src-vnext/menu-bar'
+import { setLocale } from '../src/i18n'
+import { seedReadyVisibleProjection } from './projection-test-fixture'
 
 afterEach(cleanup)
 
@@ -56,6 +91,106 @@ function setupSelection(store: ReturnType<typeof createStore>) {
   })
 }
 
+function setupHiddenSelection(store: ReturnType<typeof createStore>) {
+  store.setter(setWorkspaceActiveSheetAtom, { sheetId: 'sheet-1' })
+  store.setter(selectionAtom, {
+    kind: 'range',
+    sheetId: 'sheet-1',
+    anchor: { row: 2, col: 3 },
+    focus: { row: 4, col: 5 },
+  })
+}
+
+async function activateFormatMenuItem(container: HTMLElement, itemId: string) {
+  fireEvent.click(container.querySelector('[data-testid="menu-bar-button-format"]')!)
+  await waitFor(() => {
+    expect(container.querySelector(`[data-testid="menu-bar-item-${itemId}"]`)).not.toBeNull()
+  })
+  fireEvent.click(container.querySelector(`[data-testid="menu-bar-item-${itemId}"]`)!)
+}
+
+function matchingTextToColumnsProjection(
+  request: RangeProjectionRequest,
+  cells: DisplayCell[] = [
+    {
+      row: request.range.rowStart,
+      col: request.range.colStart,
+      displayValue: 'alpha,beta',
+    },
+  ],
+): RangeProjectionResult {
+  return {
+    kind: 'range',
+    sheetId: request.sheetId,
+    range: { ...request.range },
+    requestId: request.requestId,
+    revision: 1,
+    cells,
+  }
+}
+
+function matchingRemoveDuplicatesProjection(
+  request: RangeProjectionRequest,
+  cells: DisplayCell[] = [
+    {
+      row: request.range.rowStart,
+      col: request.range.colStart,
+      displayValue: 'alpha',
+    },
+  ],
+): RangeProjectionResult {
+  return {
+    kind: 'range',
+    sheetId: request.sheetId,
+    range: { ...request.range },
+    requestId: request.requestId,
+    revision: 7,
+    cells,
+  }
+}
+
+function setupRemoveDuplicatesSelection(store: ReturnType<typeof createStore>) {
+  store.setter(setWorkspaceActiveSheetAtom, { sheetId: 'sheet-1' })
+  store.setter(selectionAtom, {
+    kind: 'range',
+    sheetId: 'sheet-1',
+    anchor: { row: 0, col: 0 },
+    focus: { row: 4, col: 1 },
+  })
+}
+
+type RemoveDuplicatesBackend = SpreadsheetBackend &
+  Pick<RemoveDuplicatesControllerPort, 'removeRowsExact'>
+
+function addRemoveDuplicatesExactCapability(backend: SpreadsheetBackend): RemoveDuplicatesBackend {
+  return {
+    ...backend,
+    async removeRowsExact() {
+      throw new Error('not used')
+    },
+  }
+}
+
+async function activateRemoveDuplicatesMenuItem(container: HTMLElement) {
+  fireEvent.click(container.querySelector('[data-testid="menu-bar-button-data"]')!)
+  await waitFor(() => {
+    expect(
+      container.querySelector('[data-testid="menu-bar-item-data.removeDuplicates"]'),
+    ).not.toBeNull()
+  })
+  fireEvent.click(container.querySelector('[data-testid="menu-bar-item-data.removeDuplicates"]')!)
+}
+
+function deferred<T>() {
+  let resolve!: (value: T) => void
+  let reject!: (error: unknown) => void
+  const promise = new Promise<T>((resolvePromise, rejectPromise) => {
+    resolve = resolvePromise
+    reject = rejectPromise
+  })
+  return { promise, resolve, reject }
+}
+
 describe('SpreadsheetMenuBar', () => {
   it('renders the seven top-level menu buttons in the expected order', () => {
     const store = createStore()
@@ -71,6 +206,24 @@ describe('SpreadsheetMenuBar', () => {
     expect(buttons).toHaveLength(7)
     const ids = MENU_BAR_ITEMS.map((m) => m.id)
     expect(ids).toEqual(['file', 'edit', 'insert', 'format', 'data', 'view', 'help'])
+  })
+
+  it('mounts the shared menu and dialogs as thin UI in both real-worker demos', () => {
+    for (const [file, testIdPrefix] of [
+      ['VNextWorkerDemo.tsx', 'vnext-worker'],
+      ['VNextWorkerTsDemo.tsx', 'vnext-worker-ts'],
+    ] as const) {
+      const source = readFileSync(join(process.cwd(), 'solid/excel/src-vnext/demos', file), 'utf8')
+
+      expect(source).toContain(`<SpreadsheetMenuBar data-testid="${testIdPrefix}-menu-bar" />`)
+      expect(source).toContain(`<SpreadsheetGoToDialog data-testid="${testIdPrefix}-go-to" />`)
+      expect(source).toContain(
+        `<SpreadsheetTextToColumnsDialog data-testid="${testIdPrefix}-text-to-columns" />`,
+      )
+      expect(source).not.toContain('openGoToAtom')
+      expect(source).not.toContain('runTextToColumnsEntrypointAtom')
+      expect(source).not.toContain('CustomEvent')
+    }
   })
 
   it('clicking File renders the File dropdown', () => {
@@ -93,22 +246,16 @@ describe('SpreadsheetMenuBar', () => {
     const store = createStore()
     const backend: SpreadsheetBackend = {
       ...createBaseBackend(),
-      async undoTransaction({ transactionId }) {
-        return { transactionId, ok: true, revision: 2 }
+      async undoTransaction({ transactionId, requestId }) {
+        return { transactionId, requestId, revision: 2 }
       },
     }
 
-    store.setter(historyStackAtom, {
-      entries: [
-        {
-          transactionId: 'tx1',
-          kind: 'cell.set-input',
-          sheetId: 'sheet-1',
-          projectionRevision: 1,
-        },
-      ],
-      cursor: 1,
-      inFlight: false,
+    store.setter(pushHistoryAtom, {
+      transactionId: 'tx1',
+      kind: 'cell.set-input',
+      sheetId: 'sheet-1',
+      projectionRevision: 1,
     })
 
     const { container } = render(() => (
@@ -136,17 +283,11 @@ describe('SpreadsheetMenuBar', () => {
     const store = createStore()
     const backend = createBaseBackend()
 
-    store.setter(historyStackAtom, {
-      entries: [
-        {
-          transactionId: 'tx1',
-          kind: 'cell.set-input',
-          sheetId: 'sheet-1',
-          projectionRevision: 1,
-        },
-      ],
-      cursor: 1,
-      inFlight: false,
+    store.setter(pushHistoryAtom, {
+      transactionId: 'tx1',
+      kind: 'cell.set-input',
+      sheetId: 'sheet-1',
+      projectionRevision: 1,
     })
 
     const { container } = render(() => (
@@ -181,7 +322,7 @@ describe('SpreadsheetMenuBar', () => {
     expect(store.getter(findReplaceOpenAtom)).toBe(true)
   })
 
-  it('File > Print Preview toggles printPreviewOpenAtom', () => {
+  it('keeps File > Print Preview visible by default and toggles printPreviewOpenAtom', () => {
     const store = createStore()
     const backend = createBaseBackend()
 
@@ -193,8 +334,71 @@ describe('SpreadsheetMenuBar', () => {
 
     expect(store.getter(printPreviewOpenAtom)).toBe(false)
     fireEvent.click(container.querySelector('[data-testid="menu-bar-button-file"]')!)
+    expect(
+      container.querySelector('[data-testid="menu-bar-item-file.printPreview"]'),
+    ).not.toBeNull()
     fireEvent.click(container.querySelector('[data-testid="menu-bar-item-file.printPreview"]')!)
     expect(store.getter(printPreviewOpenAtom)).toBe(true)
+  })
+
+  it('hides a host-gated File item without hiding its siblings or leaving separator artifacts', () => {
+    const store = createStore()
+    const backend = createBaseBackend()
+
+    const { container } = render(() => (
+      <SpreadsheetUiProvider backend={backend} store={store}>
+        <SpreadsheetMenuBar hiddenItemIds={['file.printPreview']} />
+      </SpreadsheetUiProvider>
+    ))
+
+    fireEvent.click(container.querySelector('[data-testid="menu-bar-button-file"]')!)
+
+    const dropdown = container.querySelector('[data-testid="menu-bar-dropdown-file"]')!
+    expect(dropdown.querySelector('[data-testid="menu-bar-item-file.printPreview"]')).toBeNull()
+    for (const itemId of ['file.new', 'file.open', 'file.save', 'file.close']) {
+      expect(dropdown.querySelector(`[data-testid="menu-bar-item-${itemId}"]`)).not.toBeNull()
+    }
+
+    const entries = Array.from(dropdown.children)
+    const roles = entries.map((entry) => entry.getAttribute('role'))
+    expect(roles[0]).not.toBe('separator')
+    expect(roles[roles.length - 1]).not.toBe('separator')
+    expect(roles.filter((role) => role === 'separator')).toHaveLength(1)
+    for (let index = 1; index < roles.length; index += 1) {
+      expect(roles[index - 1] === 'separator' && roles[index] === 'separator').toBe(false)
+    }
+    expect(store.getter(printPreviewOpenAtom)).toBe(false)
+  })
+
+  it.each([
+    {
+      edge: 'leading',
+      hiddenItemIds: ['file.new', 'file.open', 'file.save', 'file.printPreview'],
+      visibleItemIds: ['file.close'],
+    },
+    {
+      edge: 'trailing',
+      hiddenItemIds: ['file.printPreview', 'file.close'],
+      visibleItemIds: ['file.new', 'file.open', 'file.save'],
+    },
+  ])('removes $edge separators after host filtering', ({ hiddenItemIds, visibleItemIds }) => {
+    const store = createStore()
+    const backend = createBaseBackend()
+
+    const { container } = render(() => (
+      <SpreadsheetUiProvider backend={backend} store={store}>
+        <SpreadsheetMenuBar hiddenItemIds={hiddenItemIds} />
+      </SpreadsheetUiProvider>
+    ))
+
+    fireEvent.click(container.querySelector('[data-testid="menu-bar-button-file"]')!)
+    const dropdown = container.querySelector('[data-testid="menu-bar-dropdown-file"]')!
+    const visibleItems = Array.from(
+      dropdown.querySelectorAll('[data-testid^="menu-bar-item-"]'),
+    ).map((item) => item.getAttribute('data-testid')?.replace('menu-bar-item-', ''))
+
+    expect(visibleItems).toEqual(visibleItemIds)
+    expect(dropdown.querySelector('[role="separator"]')).toBeNull()
   })
 
   it('Esc closes an open menu', () => {
@@ -246,9 +450,9 @@ describe('SpreadsheetMenuBar', () => {
     ))
 
     fireEvent.click(container.querySelector('[data-testid="menu-bar-button-file"]')!)
-    const fileNew = container.querySelector('[data-testid="menu-bar-item-file.new"]') as
-      | HTMLButtonElement
-      | null
+    const fileNew = container.querySelector(
+      '[data-testid="menu-bar-item-file.new"]',
+    ) as HTMLButtonElement | null
     expect(fileNew).not.toBeNull()
     expect(fileNew!.disabled).toBe(true)
     // The title contains the placeholder message (translated copy) — assert
@@ -316,6 +520,219 @@ describe('SpreadsheetMenuBar', () => {
     expect(store.getter(topMenuOpenAtom)).toEqual({ kind: 'idle' })
   })
 
+  it.each([
+    ['insert.rowAbove', 'row', 2, 'row.insert'],
+    ['insert.rowBelow', 'row', 5, 'row.insert'],
+    ['insert.colLeft', 'column', 3, 'column.insert'],
+    ['insert.colRight', 'column', 6, 'column.insert'],
+  ] as Array<
+    [
+      itemId: string,
+      axis: 'row' | 'column',
+      expectedIndex: number,
+      expectedOperation: 'row.insert' | 'column.insert',
+    ]
+  >)(
+    'Insert > %s delegates the selected boundary to the Core structural lifecycle',
+    async (itemId, axis, expectedIndex, expectedOperation) => {
+      const store = createStore()
+      const insertRowsRequests: InsertRowsRequest[] = []
+      const insertColumnsRequests: InsertColumnsRequest[] = []
+      const readVisibleRequests: VisibleProjectionRequest[] = []
+      const backend: SpreadsheetBackend = {
+        ...createBaseBackend(),
+        async readVisibleProjection(request) {
+          readVisibleRequests.push(request)
+          return {
+            kind: 'visible-window',
+            sheetId: request.sheetId,
+            window: request.window,
+            requestId: request.requestId,
+            revision: 12,
+            cells: [],
+          }
+        },
+        async insertRows(request) {
+          insertRowsRequests.push(request)
+          return {
+            sheetId: request.sheetId,
+            requestId: request.requestId,
+            revision: 11,
+          }
+        },
+        async insertColumns(request) {
+          insertColumnsRequests.push(request)
+          return {
+            sheetId: request.sheetId,
+            requestId: request.requestId,
+            revision: 11,
+          }
+        },
+      }
+      const window = { rowStart: 0, rowEnd: 9, colStart: 0, colEnd: 9 }
+      store.setter(setWorkspaceActiveSheetAtom, { sheetId: 'sheet-1' })
+      store.setter(selectionAtom, {
+        kind: 'range',
+        sheetId: 'sheet-1',
+        anchor: { row: 2, col: 3 },
+        focus: { row: 4, col: 5 },
+      })
+      seedReadyVisibleProjection(store, {
+        status: 'ready',
+        request: {
+          kind: 'visible-window',
+          sheetId: 'sheet-1',
+          window,
+          requestId: 20,
+        },
+        result: {
+          kind: 'visible-window',
+          sheetId: 'sheet-1',
+          window,
+          requestId: 20,
+          revision: 10,
+          cells: [],
+        },
+      })
+
+      const { container } = render(() => (
+        <SpreadsheetUiProvider backend={backend} store={store}>
+          <SpreadsheetMenuBar />
+        </SpreadsheetUiProvider>
+      ))
+
+      fireEvent.click(container.querySelector('[data-testid="menu-bar-button-insert"]')!)
+      fireEvent.click(container.querySelector(`[data-testid="menu-bar-item-${itemId}"]`)!)
+
+      await waitFor(() => {
+        expect(store.getter(structureOperationLifecycleAtom)).toMatchObject({
+          status: 'completed',
+          operation: expectedOperation,
+          sheetId: 'sheet-1',
+          requestId: 1,
+          acknowledgedRevision: 11,
+        })
+      })
+      if (axis === 'row') {
+        expect(insertRowsRequests).toEqual([
+          {
+            kind: 'insert-rows',
+            sheetId: 'sheet-1',
+            rowIndex: expectedIndex,
+            count: 1,
+            requestId: 1,
+            revision: undefined,
+          },
+        ])
+        expect(insertColumnsRequests).toEqual([])
+      } else {
+        expect(insertColumnsRequests).toEqual([
+          {
+            kind: 'insert-columns',
+            sheetId: 'sheet-1',
+            colIndex: expectedIndex,
+            count: 1,
+            requestId: 1,
+            revision: undefined,
+          },
+        ])
+        expect(insertRowsRequests).toEqual([])
+      }
+      expect(readVisibleRequests).toHaveLength(1)
+      expect(readVisibleRequests[0]).toMatchObject({
+        kind: 'visible-window',
+        sheetId: 'sheet-1',
+        window,
+        reason: 'toolbar',
+      })
+      expect(store.getter(historyStackAtom).entries).toHaveLength(1)
+      expect(store.getter(historyStackAtom).entries[0]).toMatchObject({
+        kind: expectedOperation,
+        sheetId: 'sheet-1',
+        projectionRevision: 11,
+      })
+      expect(store.getter(topMenuOpenAtom)).toEqual({ kind: 'idle' })
+    },
+  )
+
+  it('Insert > Sheet delegates to the initialized Core sheet-tabs state machine', async () => {
+    const store = createStore()
+    const initialSheets: SpreadsheetSheetMetadata[] = [{ id: 'sheet-1', name: 'Sheet1', index: 0 }]
+    const nextSheets: SpreadsheetSheetMetadata[] = [
+      ...initialSheets,
+      { id: 'sheet-2', name: 'Sheet2', index: 1 },
+    ]
+    const addRequests: AddSheetRequest[] = []
+    let listCalls = 0
+    const backend: SpreadsheetBackend = {
+      ...createBaseBackend(),
+      async listSheets() {
+        listCalls += 1
+        return {
+          sheets: listCalls === 1 ? initialSheets : nextSheets,
+          revision: listCalls === 1 ? 3 : 4,
+        }
+      },
+      async addSheet(request) {
+        addRequests.push(request)
+        return {
+          requestId: request.requestId,
+          sheetId: 'sheet-2',
+          createdSheet: nextSheets[1],
+          revision: 4,
+        }
+      },
+    }
+    await store.setter(initializeSheetTabsAtom, { backend, sheets: initialSheets })
+
+    const { container } = render(() => (
+      <SpreadsheetUiProvider backend={backend} store={store}>
+        <SpreadsheetMenuBar />
+      </SpreadsheetUiProvider>
+    ))
+    fireEvent.click(container.querySelector('[data-testid="menu-bar-button-insert"]')!)
+    fireEvent.click(container.querySelector('[data-testid="menu-bar-item-insert.sheet"]')!)
+
+    await waitFor(() => {
+      expect(store.getter(sheetTabsAtom).lastMutation).toMatchObject({
+        kind: 'add',
+        outcome: 'acknowledged',
+      })
+    })
+    expect(addRequests).toHaveLength(1)
+    expect(addRequests[0]).toMatchObject({
+      kind: 'add-sheet',
+      name: 'Sheet2',
+      revision: 3,
+    })
+    expect(addRequests[0]?.requestId).toBeGreaterThan(0)
+    expect(listCalls).toBe(2)
+    expect(store.getter(sheetTabsSheetsAtom)).toEqual(nextSheets)
+    expect(store.getter(workspaceSessionAtom).activeSheetId).toBe('sheet-2')
+    expect(store.getter(historyStackAtom).entries).toEqual([])
+    expect(store.getter(topMenuOpenAtom)).toEqual({ kind: 'idle' })
+  })
+
+  it('keeps row, column, and sheet insertion entrypoints as thin Core adapters', () => {
+    const source = readFileSync(
+      join(process.cwd(), 'solid/excel/src-vnext/menu-bar/SpreadsheetMenuBar.tsx'),
+      'utf8',
+    )
+
+    expect(source).toContain('createInsertRowsOperation')
+    expect(source).toContain('createInsertColumnsOperation')
+    expect(source).toContain('runStructureOperationAtom')
+    expect(source).toContain('addSheetTabAtom')
+    expect(source).toContain('snap.range.rowStart')
+    expect(source).toContain('snap.range.rowEnd + 1')
+    expect(source).toContain('snap.range.colStart')
+    expect(source).toContain('snap.range.colEnd + 1')
+    expect(source).not.toMatch(/backend\s*\.\s*(insertRows|insertColumns|addSheet)\b/)
+    expect(source).not.toContain('pushHistoryAtom')
+    expect(source).not.toContain('nextHistoryTransactionId')
+    expect(source).not.toContain('createAddSheetOperation')
+  })
+
   it('Insert > Comment opens the comment session for the active cell', () => {
     const store = createStore()
     const backend = createBaseBackend()
@@ -356,6 +773,403 @@ describe('SpreadsheetMenuBar', () => {
     expect(store.getter(validationRuleEditorAtom).status).toBe('editing')
   })
 
+  it('Format > Hide Row delegates to Core and waits for canonical readback before projecting state', async () => {
+    const store = createStore()
+    setupHiddenSelection(store)
+    store.setter(setViewportHiddenAtom, {
+      sheetId: 'sheet-1',
+      rows: [0, 8],
+      cols: [1, 9],
+    })
+    const before = store.getter(viewportHiddenAtom)
+    const mutation = deferred<BackendMutationResult>()
+    const readback = deferred<ViewportSizeProjectionResult>()
+    let mutationRequest: HideRowsRequest | undefined
+    let readRequest: ViewportSizeProjectionRequest | undefined
+    const backend: SpreadsheetBackend = {
+      ...createBaseBackend(),
+      hideRows(request) {
+        mutationRequest = request
+        return mutation.promise
+      },
+      readViewportSizeProjection(request) {
+        readRequest = request
+        return readback.promise
+      },
+    }
+    const { container } = render(() => (
+      <SpreadsheetUiProvider backend={backend} store={store}>
+        <SpreadsheetMenuBar />
+      </SpreadsheetUiProvider>
+    ))
+
+    await activateFormatMenuItem(container, 'format.hideRow')
+    await waitFor(() => expect(mutationRequest).toBeDefined())
+    expect(mutationRequest).toEqual({
+      kind: 'hide-rows',
+      sheetId: 'sheet-1',
+      rowIndices: [2, 3, 4],
+      requestId: 1,
+    })
+    expect(store.getter(viewportHiddenLifecycleAtom).status).toBe('pending')
+    expect(store.getter(viewportHiddenAtom)).toBe(before)
+
+    mutation.resolve({ sheetId: 'sheet-1', requestId: 1, revision: 11 })
+    await waitFor(() => expect(readRequest).toBeDefined())
+    expect(readRequest).toEqual({
+      kind: 'viewport-size',
+      sheetId: 'sheet-1',
+      window: { rowStart: 2, rowEnd: 4, colStart: 3, colEnd: 5 },
+      requestId: 1,
+      revision: 11,
+    })
+    expect(store.getter(viewportHiddenAtom)).toBe(before)
+
+    readback.resolve({
+      kind: 'viewport-size',
+      sheetId: 'sheet-1',
+      window: { ...readRequest!.window },
+      requestId: readRequest!.requestId,
+      revision: 11,
+      rowHeights: [],
+      colWidths: [],
+      hiddenRowIndices: [2, 3, 4],
+      hiddenColIndices: [],
+    })
+    await waitFor(() => {
+      expect(store.getter(viewportHiddenLifecycleAtom).status).toBe('ready')
+    })
+    expect(store.getter(viewportHiddenAtom)).toEqual({
+      rowsBySheet: { 'sheet-1': [0, 2, 3, 4, 8] },
+      colsBySheet: { 'sheet-1': [1, 9] },
+    })
+  })
+
+  it('Format > Hide Column delegates the selected column window to Core', async () => {
+    const store = createStore()
+    setupHiddenSelection(store)
+    let mutationRequest: HideColumnsRequest | undefined
+    const backend: SpreadsheetBackend = {
+      ...createBaseBackend(),
+      async hideColumns(request) {
+        mutationRequest = request
+        return { sheetId: request.sheetId, requestId: request.requestId, revision: 5 }
+      },
+      async readViewportSizeProjection(request) {
+        return {
+          kind: 'viewport-size',
+          sheetId: request.sheetId,
+          window: { ...request.window },
+          requestId: request.requestId,
+          revision: request.revision ?? 5,
+          rowHeights: [],
+          colWidths: [],
+          hiddenRowIndices: [],
+          hiddenColIndices: [3, 4, 5],
+        }
+      },
+    }
+    const { container } = render(() => (
+      <SpreadsheetUiProvider backend={backend} store={store}>
+        <SpreadsheetMenuBar />
+      </SpreadsheetUiProvider>
+    ))
+
+    await activateFormatMenuItem(container, 'format.hideCol')
+    await waitFor(() => {
+      expect(store.getter(viewportHiddenLifecycleAtom).status).toBe('ready')
+    })
+    expect(mutationRequest).toEqual({
+      kind: 'hide-columns',
+      sheetId: 'sheet-1',
+      colIndices: [3, 4, 5],
+      requestId: 1,
+    })
+    expect(store.getter(viewportHiddenAtom)).toEqual({
+      rowsBySheet: { 'sheet-1': [] },
+      colsBySheet: { 'sheet-1': [3, 4, 5] },
+    })
+  })
+
+  it('Format > Hide Row reports unsupported without fabricating local hidden state', async () => {
+    const store = createStore()
+    setupHiddenSelection(store)
+    store.setter(setViewportHiddenAtom, { sheetId: 'sheet-1', rows: [0], cols: [1] })
+    const before = store.getter(viewportHiddenAtom)
+    const { container } = render(() => (
+      <SpreadsheetUiProvider backend={createBaseBackend()} store={store}>
+        <SpreadsheetMenuBar />
+      </SpreadsheetUiProvider>
+    ))
+
+    await activateFormatMenuItem(container, 'format.hideRow')
+    await waitFor(() => {
+      expect(store.getter(viewportHiddenLifecycleAtom).status).toBe('unsupported')
+    })
+    expect(store.getter(viewportHiddenAtom)).toBe(before)
+  })
+
+  it('Format > Unhide Rows and Unhide Columns use Core canonical intersections and full-window readback', async () => {
+    const store = createStore()
+    setupHiddenSelection(store)
+    const authorityWindow = { rowStart: 0, rowEnd: 9, colStart: 0, colEnd: 9 }
+    let rows = [1, 2, 4, 7]
+    let cols = [1, 3, 5, 8]
+    let revision = 20
+    const rowMutations: UnhideRowsRequest[] = []
+    const columnMutations: UnhideColumnsRequest[] = []
+    const reads: ViewportSizeProjectionRequest[] = []
+    const backend: SpreadsheetBackend = {
+      ...createBaseBackend(),
+      async unhideRows(request) {
+        rowMutations.push(request)
+        rows = rows.filter((index) => !request.rowIndices.includes(index))
+        revision += 1
+        return { sheetId: request.sheetId, requestId: request.requestId, revision }
+      },
+      async unhideColumns(request) {
+        columnMutations.push(request)
+        cols = cols.filter((index) => !request.colIndices.includes(index))
+        revision += 1
+        return { sheetId: request.sheetId, requestId: request.requestId, revision }
+      },
+      async readViewportSizeProjection(request) {
+        reads.push(request)
+        return {
+          kind: 'viewport-size',
+          sheetId: request.sheetId,
+          window: { ...request.window },
+          requestId: request.requestId,
+          revision: request.revision ?? revision,
+          rowHeights: [],
+          colWidths: [],
+          hiddenRowIndices: rows.filter(
+            (index) => index >= request.window.rowStart && index <= request.window.rowEnd,
+          ),
+          hiddenColIndices: cols.filter(
+            (index) => index >= request.window.colStart && index <= request.window.colEnd,
+          ),
+        }
+      },
+    }
+    await expect(
+      store.setter(hydrateViewportSizeProjectionAtom, {
+        source: backend,
+        sheetId: 'sheet-1',
+        window: authorityWindow,
+      }),
+    ).resolves.toBe('ready')
+
+    const { container } = render(() => (
+      <SpreadsheetUiProvider backend={backend} store={store}>
+        <SpreadsheetMenuBar />
+      </SpreadsheetUiProvider>
+    ))
+
+    await activateFormatMenuItem(container, 'format.unhideRow')
+    await waitFor(() => expect(rowMutations).toHaveLength(1))
+    await waitFor(() => expect(store.getter(viewportHiddenLifecycleAtom).status).toBe('ready'))
+    expect(rowMutations[0]).toEqual({
+      kind: 'unhide-rows',
+      sheetId: 'sheet-1',
+      rowIndices: [2, 4],
+      requestId: 2,
+      revision: 20,
+    })
+
+    await activateFormatMenuItem(container, 'format.unhideCol')
+    await waitFor(() => expect(columnMutations).toHaveLength(1))
+    await waitFor(() => expect(store.getter(viewportHiddenLifecycleAtom).status).toBe('ready'))
+    expect(columnMutations[0]).toEqual({
+      kind: 'unhide-columns',
+      sheetId: 'sheet-1',
+      colIndices: [3, 5],
+      requestId: 3,
+      revision: 21,
+    })
+
+    expect(reads).toHaveLength(3)
+    for (const request of reads) expect(request.window).toEqual(authorityWindow)
+    expect(reads.map((request) => request.revision)).toEqual([undefined, 21, 22])
+    expect(store.getter(viewportHiddenAtom)).toEqual({
+      rowsBySheet: { 'sheet-1': [1, 7] },
+      colsBySheet: { 'sheet-1': [1, 8] },
+    })
+  })
+
+  it('Format > Unhide is zero-transport without authority or without a canonical intersection', async () => {
+    const noAuthorityStore = createStore()
+    setupHiddenSelection(noAuthorityStore)
+    let noAuthorityReads = 0
+    let noAuthorityMutations = 0
+    const noAuthorityBackend: SpreadsheetBackend = {
+      ...createBaseBackend(),
+      async unhideRows(request) {
+        noAuthorityMutations += 1
+        return { sheetId: request.sheetId, requestId: request.requestId, revision: 1 }
+      },
+      async readViewportSizeProjection(request) {
+        noAuthorityReads += 1
+        return {
+          kind: 'viewport-size',
+          sheetId: request.sheetId,
+          window: { ...request.window },
+          requestId: request.requestId,
+          revision: request.revision ?? 1,
+          rowHeights: [],
+          colWidths: [],
+          hiddenRowIndices: [],
+          hiddenColIndices: [],
+        }
+      },
+    }
+    const noAuthorityView = render(() => (
+      <SpreadsheetUiProvider backend={noAuthorityBackend} store={noAuthorityStore}>
+        <SpreadsheetMenuBar />
+      </SpreadsheetUiProvider>
+    ))
+
+    await activateFormatMenuItem(noAuthorityView.container, 'format.unhideRow')
+    await waitFor(() =>
+      expect(noAuthorityStore.getter(viewportHiddenLifecycleAtom).status).toBe('blocked'),
+    )
+    expect(noAuthorityReads).toBe(0)
+    expect(noAuthorityMutations).toBe(0)
+
+    const emptyStore = createStore()
+    setupHiddenSelection(emptyStore)
+    let emptyReads = 0
+    let emptyMutations = 0
+    const emptyBackend: SpreadsheetBackend = {
+      ...createBaseBackend(),
+      async unhideRows(request) {
+        emptyMutations += 1
+        return { sheetId: request.sheetId, requestId: request.requestId, revision: 31 }
+      },
+      async readViewportSizeProjection(request) {
+        emptyReads += 1
+        return {
+          kind: 'viewport-size',
+          sheetId: request.sheetId,
+          window: { ...request.window },
+          requestId: request.requestId,
+          revision: request.revision ?? 30,
+          rowHeights: [],
+          colWidths: [],
+          hiddenRowIndices: [7],
+          hiddenColIndices: [],
+        }
+      },
+    }
+    await expect(
+      emptyStore.setter(hydrateViewportSizeProjectionAtom, {
+        source: emptyBackend,
+        sheetId: 'sheet-1',
+        window: { rowStart: 0, rowEnd: 9, colStart: 0, colEnd: 9 },
+      }),
+    ).resolves.toBe('ready')
+    const emptyView = render(() => (
+      <SpreadsheetUiProvider backend={emptyBackend} store={emptyStore}>
+        <SpreadsheetMenuBar />
+      </SpreadsheetUiProvider>
+    ))
+
+    await activateFormatMenuItem(emptyView.container, 'format.unhideRow')
+    await waitFor(() =>
+      expect(emptyStore.getter(viewportHiddenLifecycleAtom).status).toBe('blocked'),
+    )
+    expect(emptyReads).toBe(1)
+    expect(emptyMutations).toBe(0)
+  })
+
+  it('renders English and Chinese labels for both Format unhide entries', async () => {
+    setLocale('en')
+    try {
+      const store = createStore()
+      setupHiddenSelection(store)
+      const { container } = render(() => (
+        <SpreadsheetUiProvider backend={createBaseBackend()} store={store}>
+          <SpreadsheetMenuBar />
+        </SpreadsheetUiProvider>
+      ))
+      fireEvent.click(container.querySelector('[data-testid="menu-bar-button-format"]')!)
+
+      await waitFor(() => {
+        expect(
+          container.querySelector('[data-testid="menu-bar-item-format.unhideRow"]')?.textContent,
+        ).toContain('Unhide Rows')
+        expect(
+          container.querySelector('[data-testid="menu-bar-item-format.unhideCol"]')?.textContent,
+        ).toContain('Unhide Columns')
+      })
+
+      setLocale('zh')
+      await waitFor(() => {
+        expect(
+          container.querySelector('[data-testid="menu-bar-item-format.unhideRow"]')?.textContent,
+        ).toContain('取消隐藏行')
+        expect(
+          container.querySelector('[data-testid="menu-bar-item-format.unhideCol"]')?.textContent,
+        ).toContain('取消隐藏列')
+      })
+    } finally {
+      setLocale('zh')
+    }
+  })
+
+  it('keeps unhide menu routes as source-only Core resolver bridges', () => {
+    const source = readFileSync(
+      join(process.cwd(), 'solid/excel/src-vnext/menu-bar/SpreadsheetMenuBar.tsx'),
+      'utf8',
+    )
+    const routeStart = source.indexOf('function routeDispatch')
+    const unhideStart = source.indexOf("case 'unhide-rows':", routeStart)
+    const unhideEnd = source.indexOf("case 'freeze-panes':", unhideStart)
+    const unhideRoutes = source.slice(unhideStart, unhideEnd)
+
+    expect(unhideStart).toBeGreaterThanOrEqual(0)
+    expect(unhideEnd).toBeGreaterThan(unhideStart)
+    expect(unhideRoutes).toContain('runViewportHiddenSelectionMutationAtom')
+    expect(unhideRoutes).toContain("dispatch.kind === 'unhide-rows'")
+    expect(unhideRoutes).toContain("? 'unhide-rows'")
+    expect(unhideRoutes).toContain("'unhide-columns'")
+    expect(unhideRoutes).toContain('source: backend')
+    for (const forbidden of [
+      'selectionSnapshotAtom',
+      'viewportHiddenAtom',
+      'backend.unhideRows',
+      'backend.unhideColumns',
+      'setViewportHidden',
+      'sheetId:',
+      'indices:',
+      'window:',
+    ]) {
+      expect(unhideRoutes).not.toContain(forbidden)
+    }
+  })
+
+  it('keeps hidden row and column menu routes as thin Core command bridges', () => {
+    const source = readFileSync(
+      join(process.cwd(), 'solid/excel/src-vnext/menu-bar/SpreadsheetMenuBar.tsx'),
+      'utf8',
+    )
+    const routeStart = source.indexOf('function routeDispatch')
+    const hiddenStart = source.indexOf("case 'hide-rows':", routeStart)
+    const hiddenEnd = source.indexOf("case 'freeze-panes':", hiddenStart)
+    const hiddenRoutes = source.slice(hiddenStart, hiddenEnd)
+
+    expect(hiddenStart).toBeGreaterThanOrEqual(0)
+    expect(hiddenEnd).toBeGreaterThan(hiddenStart)
+    expect(hiddenRoutes).toContain('runViewportHiddenMutationAtom')
+    expect(hiddenRoutes).toContain("action: 'hide-rows'")
+    expect(hiddenRoutes).toContain("action: 'hide-columns'")
+    expect(hiddenRoutes).toContain('source: backend')
+    expect(hiddenRoutes).toContain('window: snap.range')
+    expect(source).not.toContain('setViewportHiddenAtom')
+    expect(hiddenRoutes).not.toContain('backend.hideRows')
+    expect(hiddenRoutes).not.toContain('backend.hideColumns')
+  })
+
   it('Data > Data Validation also opens the validation rule editor', () => {
     const store = createStore()
     const backend = createBaseBackend()
@@ -372,9 +1186,15 @@ describe('SpreadsheetMenuBar', () => {
     expect(store.getter(validationRuleEditorAtom).status).toBe('editing')
   })
 
-  it('Data > Sort Asc writes a sort directive on the active column', () => {
+  it('Data > Sort Asc writes a sort directive on the active column', async () => {
     const store = createStore()
-    const backend = createBaseBackend()
+    const backend: SpreadsheetBackend = {
+      ...createBaseBackend(),
+      async setFilterSort({ sheetId, requestId }) {
+        return { sheetId, requestId, revision: 1 }
+      },
+    }
+    store.setter(setWorkspaceActiveSheetAtom, { sheetId: 'sheet-1' })
     store.setter(selectionAtom, {
       kind: 'cell',
       sheetId: 'sheet-1',
@@ -389,16 +1209,28 @@ describe('SpreadsheetMenuBar', () => {
     ))
 
     fireEvent.click(container.querySelector('[data-testid="menu-bar-button-data"]')!)
-    fireEvent.click(container.querySelector('[data-testid="menu-bar-item-data.sortAsc"]')!)
+    const sortAsc = container.querySelector(
+      '[data-testid="menu-bar-item-data.sortAsc"]',
+    ) as HTMLButtonElement
+    await waitFor(() => expect(sortAsc.disabled).toBe(false))
+    fireEvent.click(sortAsc)
 
-    const state = store.getter(filterSortStateAtom)['sheet-1']
-    expect(state).toBeDefined()
-    expect(state!.directives).toEqual([{ colIndex: 3, direction: 'asc' }])
+    await waitFor(() => {
+      const state = store.getter(filterSortStateAtom)['sheet-1']
+      expect(state).toBeDefined()
+      expect(state!.directives).toEqual([{ colIndex: 3, direction: 'asc' }])
+    })
   })
 
-  it('Data > Sort Desc writes a descending sort directive', () => {
+  it('Data > Sort Desc writes a descending sort directive', async () => {
     const store = createStore()
-    const backend = createBaseBackend()
+    const backend: SpreadsheetBackend = {
+      ...createBaseBackend(),
+      async setFilterSort({ sheetId, requestId }) {
+        return { sheetId, requestId, revision: 1 }
+      },
+    }
+    store.setter(setWorkspaceActiveSheetAtom, { sheetId: 'sheet-1' })
     store.setter(selectionAtom, {
       kind: 'cell',
       sheetId: 'sheet-1',
@@ -413,10 +1245,17 @@ describe('SpreadsheetMenuBar', () => {
     ))
 
     fireEvent.click(container.querySelector('[data-testid="menu-bar-button-data"]')!)
-    fireEvent.click(container.querySelector('[data-testid="menu-bar-item-data.sortDesc"]')!)
+    const sortDesc = container.querySelector(
+      '[data-testid="menu-bar-item-data.sortDesc"]',
+    ) as HTMLButtonElement
+    await waitFor(() => expect(sortDesc.disabled).toBe(false))
+    fireEvent.click(sortDesc)
 
-    const state = store.getter(filterSortStateAtom)['sheet-1']
-    expect(state!.directives).toEqual([{ colIndex: 1, direction: 'desc' }])
+    await waitFor(() => {
+      const state = store.getter(filterSortStateAtom)['sheet-1']
+      expect(state).toBeDefined()
+      expect(state!.directives).toEqual([{ colIndex: 1, direction: 'desc' }])
+    })
   })
 
   it('View > Show Gridlines toggles the atom and mirrors aria-checked', () => {
@@ -469,6 +1308,67 @@ describe('SpreadsheetMenuBar', () => {
     expect(store.getter(viewportShowFormulaBarAtom)).toBe(false)
   })
 
+  it.each(['read', 'set'] as const)(
+    'View freeze commands are disabled and dispatch nothing when the %s port is missing',
+    (missingPort) => {
+      const store = createStore()
+      let readCalls = 0
+      let setCalls = 0
+      const backend: SpreadsheetBackend = {
+        ...createBaseBackend(),
+        readFreezeConfig:
+          missingPort === 'read'
+            ? undefined
+            : async (request) => {
+                readCalls += 1
+                return {
+                  kind: 'freeze-config',
+                  sheetId: request.sheetId,
+                  requestId: request.requestId,
+                  revision: 0,
+                  freeze: { rows: 0, cols: 0 },
+                }
+              },
+        setFreezeConfig:
+          missingPort === 'set'
+            ? undefined
+            : async (request) => {
+                setCalls += 1
+                return {
+                  sheetId: request.sheetId,
+                  requestId: request.requestId,
+                  revision: 1,
+                }
+              },
+      }
+      store.setter(setWorkspaceActiveSheetAtom, { sheetId: 'sheet-1' })
+      setupSelection(store)
+
+      const { container } = render(() => (
+        <SpreadsheetUiProvider backend={backend} store={store}>
+          <SpreadsheetMenuBar />
+        </SpreadsheetUiProvider>
+      ))
+
+      fireEvent.click(container.querySelector('[data-testid="menu-bar-button-view"]')!)
+      const freeze = container.querySelector(
+        '[data-testid="menu-bar-item-view.freeze"]',
+      ) as HTMLButtonElement
+      const unfreeze = container.querySelector(
+        '[data-testid="menu-bar-item-view.unfreeze"]',
+      ) as HTMLButtonElement
+      expect(freeze.disabled).toBe(true)
+      expect(unfreeze.disabled).toBe(true)
+      expect(freeze.title).toContain('unavailable')
+
+      fireEvent.click(freeze)
+      fireEvent.click(unfreeze)
+      expect(readCalls).toBe(0)
+      expect(setCalls).toBe(0)
+      expect(store.getter(viewportFreezeLifecycleAtom).status).toBe('idle')
+    },
+  )
+
   it('Help > Keyboard Shortcuts opens the shortcuts overlay', () => {
     const store = createStore()
     const backend = createBaseBackend()
@@ -518,9 +1418,7 @@ describe('SpreadsheetMenuBar', () => {
     ))
 
     fireEvent.click(container.querySelector('[data-testid="menu-bar-button-data"]')!)
-    expect(
-      container.querySelector('[data-testid="menu-bar-item-data.textToColumns"]'),
-    ).toBeNull()
+    expect(container.querySelector('[data-testid="menu-bar-item-data.textToColumns"]')).toBeNull()
   })
 
   it('Data > Text to Columns is visible when backend.importCellChunks is present', () => {
@@ -544,10 +1442,29 @@ describe('SpreadsheetMenuBar', () => {
     ).not.toBeNull()
   })
 
-  it('Data > Remove Duplicates is hidden when backend.removeRows is absent (capability gating)', () => {
+  it('Data > Text to Columns dispatches the Core entrypoint and preserves sparse rows', async () => {
     const store = createStore()
-    // Base backend deliberately omits removeRows.
-    const backend = createBaseBackend()
+    let request: RangeProjectionRequest | null = null
+    const backend: SpreadsheetBackend = {
+      ...createBaseBackend(),
+      async readRangeProjection(nextRequest) {
+        request = nextRequest
+        return matchingTextToColumnsProjection(nextRequest, [
+          { row: 0, col: 1, displayValue: 'alpha,beta' },
+          { row: 2, col: 1, displayValue: 'gamma,delta' },
+        ])
+      },
+      async importCellChunks() {
+        return { sheetId: 'sheet-1' }
+      },
+    }
+    store.setter(setWorkspaceActiveSheetAtom, { sheetId: 'sheet-1' })
+    store.setter(selectionAtom, {
+      kind: 'range',
+      sheetId: 'sheet-1',
+      anchor: { row: 0, col: 1 },
+      focus: { row: 2, col: 1 },
+    })
 
     const { container } = render(() => (
       <SpreadsheetUiProvider backend={backend} store={store}>
@@ -556,19 +1473,253 @@ describe('SpreadsheetMenuBar', () => {
     ))
 
     fireEvent.click(container.querySelector('[data-testid="menu-bar-button-data"]')!)
-    expect(
-      container.querySelector('[data-testid="menu-bar-item-data.removeDuplicates"]'),
-    ).toBeNull()
+    fireEvent.click(container.querySelector('[data-testid="menu-bar-item-data.textToColumns"]')!)
+
+    await waitFor(() => expect(store.getter(textToColumnsOpenAtom)).toBe(true))
+    const observedRequest = request as RangeProjectionRequest | null
+    if (observedRequest === null) throw new Error('expected Text to Columns projection request')
+    expect(observedRequest).toMatchObject({
+      kind: 'range',
+      sheetId: 'sheet-1',
+      range: { rowStart: 0, rowEnd: 2, colStart: 1, colEnd: 1 },
+      reason: 'toolbar',
+    })
+    expect(observedRequest.requestId).toBeGreaterThan(0)
+    expect(store.getter(textToColumnsSourceAtom)).toEqual([
+      { sourceRow: 0, text: 'alpha,beta' },
+      { sourceRow: 1, text: '' },
+      { sourceRow: 2, text: 'gamma,delta' },
+    ])
+    expect(store.getter(textToColumnsSessionAtom)).toMatchObject({
+      sheetId: 'sheet-1',
+      anchor: { row: 0, col: 1 },
+      sourceRange: { rowStart: 0, rowEnd: 2, colStart: 1, colEnd: 1 },
+    })
   })
 
-  it('Data > Remove Duplicates is visible when backend.removeRows is present', () => {
-    const store = createStore()
+  it('Data > Text to Columns binds invalid-target and active-session disabling to Core', () => {
     const backend: SpreadsheetBackend = {
       ...createBaseBackend(),
-      async removeRows() {
-        return { sheetId: 'sheet-1', removedRows: 0, revision: 1 }
+      async importCellChunks() {
+        return { sheetId: 'sheet-1' }
       },
     }
+
+    const invalidStore = createStore()
+    const invalidView = render(() => (
+      <SpreadsheetUiProvider backend={backend} store={invalidStore}>
+        <SpreadsheetMenuBar />
+      </SpreadsheetUiProvider>
+    ))
+    fireEvent.click(invalidView.container.querySelector('[data-testid="menu-bar-button-data"]')!)
+    const invalidItem = invalidView.container.querySelector(
+      '[data-testid="menu-bar-item-data.textToColumns"]',
+    ) as HTMLButtonElement
+    expect(invalidItem.disabled).toBe(true)
+    expect(invalidItem.title).toBe(
+      invalidStore.getter(textToColumnsEntrypointProjectionAtom).disabledReason,
+    )
+    invalidView.unmount()
+
+    const sessionStore = createStore()
+    setupSelection(sessionStore)
+    sessionStore.setter(setWorkspaceActiveSheetAtom, { sheetId: 'sheet-1' })
+    sessionStore.setter(openTextToColumnsAtom, {
+      sheetId: 'sheet-1',
+      anchor: { row: 0, col: 0 },
+      rows: [{ sourceRow: 0, text: 'active,session' }],
+    })
+    const sessionView = render(() => (
+      <SpreadsheetUiProvider backend={backend} store={sessionStore}>
+        <SpreadsheetMenuBar />
+      </SpreadsheetUiProvider>
+    ))
+    fireEvent.click(sessionView.container.querySelector('[data-testid="menu-bar-button-data"]')!)
+    const sessionItem = sessionView.container.querySelector(
+      '[data-testid="menu-bar-item-data.textToColumns"]',
+    ) as HTMLButtonElement
+    expect(sessionItem.disabled).toBe(true)
+    expect(sessionItem.title).toBe(
+      sessionStore.getter(textToColumnsEntrypointProjectionAtom).disabledReason,
+    )
+  })
+
+  it('Data > Text to Columns exposes loading, stale, and retry from the Core projection', async () => {
+    const store = createStore()
+    const first = deferred<RangeProjectionResult>()
+    let firstRequest: RangeProjectionRequest | null = null
+    let readCount = 0
+    const backend: SpreadsheetBackend = {
+      ...createBaseBackend(),
+      async readRangeProjection(request) {
+        readCount += 1
+        if (readCount === 1) {
+          firstRequest = request
+          return first.promise
+        }
+        return matchingTextToColumnsProjection(request)
+      },
+      async importCellChunks() {
+        return { sheetId: 'sheet-1' }
+      },
+    }
+    store.setter(setWorkspaceActiveSheetAtom, { sheetId: 'sheet-1' })
+    store.setter(selectionAtom, {
+      kind: 'range',
+      sheetId: 'sheet-1',
+      anchor: { row: 0, col: 0 },
+      focus: { row: 2, col: 0 },
+    })
+
+    const { container, getByTestId, queryByTestId } = render(() => (
+      <SpreadsheetUiProvider backend={backend} store={store}>
+        <SpreadsheetMenuBar />
+      </SpreadsheetUiProvider>
+    ))
+    fireEvent.click(container.querySelector('[data-testid="menu-bar-button-data"]')!)
+    fireEvent.click(container.querySelector('[data-testid="menu-bar-item-data.textToColumns"]')!)
+
+    expect(getByTestId('menu-bar-text-to-columns-loading')).not.toBeNull()
+    fireEvent.click(container.querySelector('[data-testid="menu-bar-button-data"]')!)
+    const loadingItem = container.querySelector(
+      '[data-testid="menu-bar-item-data.textToColumns"]',
+    ) as HTMLButtonElement
+    expect(loadingItem.disabled).toBe(true)
+    expect(loadingItem.title).toBe(
+      store.getter(textToColumnsEntrypointProjectionAtom).disabledReason,
+    )
+    expect(readCount).toBe(0)
+
+    await waitFor(() => expect(firstRequest).not.toBeNull())
+    expect(readCount).toBe(1)
+    store.setter(selectionAtom, {
+      kind: 'range',
+      sheetId: 'sheet-1',
+      anchor: { row: 5, col: 0 },
+      focus: { row: 6, col: 0 },
+    })
+    await waitFor(() => {
+      expect(
+        container
+          .querySelector('[data-testid="spreadsheet-menu-bar"]')
+          ?.getAttribute('data-text-to-columns-entrypoint-status'),
+      ).toBe('stale')
+      expect(getByTestId('menu-bar-text-to-columns-status')).not.toBeNull()
+    })
+    if (firstRequest === null) throw new Error('expected first projection request')
+    first.resolve(matchingTextToColumnsProjection(firstRequest))
+
+    await waitFor(() => expect(queryByTestId('menu-bar-text-to-columns-retry')).not.toBeNull())
+    expect(store.getter(textToColumnsOpenAtom)).toBe(false)
+    fireEvent.click(getByTestId('menu-bar-text-to-columns-retry'))
+    await waitFor(() => expect(store.getter(textToColumnsOpenAtom)).toBe(true))
+    expect(readCount).toBe(2)
+    expect(store.getter(textToColumnsSessionAtom)?.sourceRange).toEqual({
+      rowStart: 5,
+      rowEnd: 6,
+      colStart: 0,
+      colEnd: 0,
+    })
+  })
+
+  it('Data > Text to Columns exposes a transport error and retry recovery', async () => {
+    const store = createStore()
+    let readCount = 0
+    const backend: SpreadsheetBackend = {
+      ...createBaseBackend(),
+      async readRangeProjection(request) {
+        readCount += 1
+        if (readCount === 1) throw new Error('projection unavailable')
+        return matchingTextToColumnsProjection(request)
+      },
+      async importCellChunks() {
+        return { sheetId: 'sheet-1' }
+      },
+    }
+    setupSelection(store)
+    store.setter(setWorkspaceActiveSheetAtom, { sheetId: 'sheet-1' })
+
+    const { container, getByTestId } = render(() => (
+      <SpreadsheetUiProvider backend={backend} store={store}>
+        <SpreadsheetMenuBar />
+      </SpreadsheetUiProvider>
+    ))
+    fireEvent.click(container.querySelector('[data-testid="menu-bar-button-data"]')!)
+    fireEvent.click(container.querySelector('[data-testid="menu-bar-item-data.textToColumns"]')!)
+
+    await waitFor(() => {
+      expect(getByTestId('menu-bar-text-to-columns-status').textContent).toContain(
+        'projection unavailable',
+      )
+      expect(getByTestId('menu-bar-text-to-columns-retry')).not.toBeNull()
+    })
+    expect(store.getter(textToColumnsOpenAtom)).toBe(false)
+    fireEvent.click(getByTestId('menu-bar-text-to-columns-retry'))
+    await waitFor(() => expect(store.getter(textToColumnsOpenAtom)).toBe(true))
+    expect(readCount).toBe(2)
+  })
+
+  it('keeps the Text to Columns menu branch as a thin Core command adapter', () => {
+    const source = readFileSync(
+      join(process.cwd(), 'solid/excel/src-vnext/menu-bar/SpreadsheetMenuBar.tsx'),
+      'utf8',
+    )
+    const routeStart = source.indexOf('function routeDispatch')
+    const start = source.indexOf("case 'open-text-to-columns':", routeStart)
+    const end = source.indexOf("case 'open-remove-duplicates':", start)
+    expect(start).toBeGreaterThanOrEqual(0)
+    expect(end).toBeGreaterThan(start)
+    const branch = source.slice(start, end)
+
+    expect(branch).toContain('runTextToColumnsEntrypoint()')
+    expect(branch).not.toContain('readRangeProjection')
+    expect(branch).not.toContain('requestId: 0')
+    expect(branch).not.toContain('new Map')
+    expect(branch).not.toContain('openTextToColumnsAtom')
+    expect(branch).not.toMatch(/\basync\b/)
+    expect(source).not.toContain('createSignal')
+  })
+
+  it.each(['missing-range-read', 'legacy-removeRows-only'] as const)(
+    'Data > Remove Duplicates hides when the Core exact capability is %s',
+    async (capabilityCase) => {
+      const store = createStore()
+      const backend =
+        capabilityCase === 'missing-range-read'
+          ? ({
+              ...addRemoveDuplicatesExactCapability(createBaseBackend()),
+              readRangeProjection: undefined,
+            } as unknown as SpreadsheetBackend)
+          : ({
+              ...createBaseBackend(),
+              async removeRows() {
+                return { sheetId: 'sheet-1', removedRows: 0, revision: 1 }
+              },
+            } as SpreadsheetBackend)
+
+      const { container } = render(() => (
+        <SpreadsheetUiProvider backend={backend} store={store}>
+          <SpreadsheetMenuBar />
+        </SpreadsheetUiProvider>
+      ))
+
+      await waitFor(() => {
+        expect(store.getter(removeDuplicatesCapabilityAtom)).toEqual(
+          capabilityCase === 'missing-range-read'
+            ? { canRead: false, canRemove: true }
+            : { canRead: true, canRemove: false },
+        )
+      })
+      fireEvent.click(container.querySelector('[data-testid="menu-bar-button-data"]')!)
+      expect(
+        container.querySelector('[data-testid="menu-bar-item-data.removeDuplicates"]'),
+      ).toBeNull()
+    },
+  )
+
+  it('Data > Remove Duplicates is visible only with Core read + exact-remove capability', async () => {
+    const store = createStore()
+    const backend = addRemoveDuplicatesExactCapability(createBaseBackend())
 
     const { container } = render(() => (
       <SpreadsheetUiProvider backend={backend} store={store}>
@@ -576,119 +1727,252 @@ describe('SpreadsheetMenuBar', () => {
       </SpreadsheetUiProvider>
     ))
 
+    await waitFor(() => {
+      expect(store.getter(removeDuplicatesCapabilityAtom)).toEqual({
+        canRead: true,
+        canRemove: true,
+      })
+    })
     fireEvent.click(container.querySelector('[data-testid="menu-bar-button-data"]')!)
     expect(
       container.querySelector('[data-testid="menu-bar-item-data.removeDuplicates"]'),
     ).not.toBeNull()
   })
 
-  it(
-    // HIGH bug: projection-failure mass deletion. If readRangeProjection
-    // rejects, the menubar must NOT open the dialog (otherwise the user
-    // sees an empty-cells dialog and a confirm would treat every row in
-    // the range as a blank-tuple duplicate, wiping the selection).
-    'Data > Remove Duplicates does not open the dialog when readRangeProjection rejects',
-    async () => {
+  it('Data > Remove Duplicates dispatches one source-only Core hydration with an exact request', async () => {
+    const store = createStore()
+    let capturedRequest: RangeProjectionRequest | undefined
+    const backend = addRemoveDuplicatesExactCapability({
+      ...createBaseBackend(),
+      async readRangeProjection(request) {
+        capturedRequest = request
+        return matchingRemoveDuplicatesProjection(request)
+      },
+    })
+    setupRemoveDuplicatesSelection(store)
+
+    const { container } = render(() => (
+      <SpreadsheetUiProvider backend={backend} store={store}>
+        <SpreadsheetMenuBar />
+      </SpreadsheetUiProvider>
+    ))
+    await activateRemoveDuplicatesMenuItem(container)
+
+    await waitFor(() => {
+      expect(store.getter(removeDuplicatesLifecycleAtom).status).toBe('editing')
+    })
+    expect(capturedRequest).toMatchObject({
+      kind: 'range',
+      sheetId: 'sheet-1',
+      range: { rowStart: 0, rowEnd: 4, colStart: 0, colEnd: 1 },
+      reason: 'selection',
+    })
+    expect(capturedRequest?.requestId).toBeGreaterThan(0)
+    expect(store.getter(removeDuplicatesSessionAtom)).toMatchObject({
+      sheetId: 'sheet-1',
+      range: { startRow: 0, endRow: 4, startCol: 0, endCol: 1 },
+      projectionRevision: 7,
+    })
+  })
+
+  it.each([
+    ['empty', [] as DisplayCell[]],
+    [
+      'sparse',
+      [
+        { row: 0, col: 0, displayValue: 'header' },
+        { row: 3, col: 1, displayValue: 'only one later cell' },
+      ] as DisplayCell[],
+    ],
+  ])('Data > Remove Duplicates accepts an exact %s projection', async (_label, cells) => {
+    const store = createStore()
+    const backend = addRemoveDuplicatesExactCapability({
+      ...createBaseBackend(),
+      async readRangeProjection(request) {
+        return matchingRemoveDuplicatesProjection(request, cells)
+      },
+    })
+    setupRemoveDuplicatesSelection(store)
+
+    const { container } = render(() => (
+      <SpreadsheetUiProvider backend={backend} store={store}>
+        <SpreadsheetMenuBar />
+      </SpreadsheetUiProvider>
+    ))
+    await activateRemoveDuplicatesMenuItem(container)
+
+    await waitFor(() => {
+      expect(store.getter(removeDuplicatesLifecycleAtom).status).toBe('editing')
+    })
+    expect(store.getter(removeDuplicatesSessionAtom)?.cells).toEqual(cells)
+  })
+
+  it.each(['rejection', 'truncated acknowledgement'] as const)(
+    'Data > Remove Duplicates projects the Core read failure for a transport %s',
+    async (failure) => {
       const store = createStore()
-      const warnSpy = jest.spyOn(console, 'warn').mockImplementation(() => {})
-      const readSpy = jest.fn(async (_req: RangeProjectionRequest) => {
-        throw new Error('projection unavailable')
-      }) as unknown as SpreadsheetBackend['readRangeProjection']
-      const backend: SpreadsheetBackend = {
+      const backend = addRemoveDuplicatesExactCapability({
         ...createBaseBackend(),
-        readRangeProjection: readSpy,
-        async removeRows() {
-          return { sheetId: 'sheet-1', removedRows: 0, revision: 1 }
+        async readRangeProjection(request) {
+          if (failure === 'rejection') throw new Error('projection unavailable')
+          return {
+            ...matchingRemoveDuplicatesProjection(request),
+            truncated: true,
+          }
         },
-      }
-      store.setter(setWorkspaceActiveSheetAtom, { sheetId: 'sheet-1' })
-      store.setter(selectionAtom, {
-        kind: 'range',
-        sheetId: 'sheet-1',
-        anchor: { row: 0, col: 0 },
-        focus: { row: 4, col: 1 },
       })
+      setupRemoveDuplicatesSelection(store)
 
       const { container } = render(() => (
         <SpreadsheetUiProvider backend={backend} store={store}>
           <SpreadsheetMenuBar />
         </SpreadsheetUiProvider>
       ))
+      await activateRemoveDuplicatesMenuItem(container)
 
-      expect(store.getter(removeDuplicatesOpenAtom)).toBe(false)
-      expect(store.getter(removeDuplicatesSheetIdAtom)).toBeNull()
-
-      fireEvent.click(container.querySelector('[data-testid="menu-bar-button-data"]')!)
-      fireEvent.click(
-        container.querySelector('[data-testid="menu-bar-item-data.removeDuplicates"]')!,
-      )
-
-      // Wait for the warn-spy to confirm the rejection path ran.
       await waitFor(() => {
-        expect(warnSpy).toHaveBeenCalled()
+        expect(store.getter(removeDuplicatesLifecycleAtom).status).toBe('read-failed')
       })
-
-      // Dialog stayed closed; the captured sheetId atom was never written.
-      expect(store.getter(removeDuplicatesOpenAtom)).toBe(false)
-      expect(store.getter(removeDuplicatesSheetIdAtom)).toBeNull()
-
-      warnSpy.mockRestore()
+      expect(store.getter(removeDuplicatesOpenAtom)).toBe(true)
+      expect(store.getter(removeDuplicatesSessionAtom)).toBeNull()
+      expect(store.getter(removeDuplicatesErrorAtom)).toContain(
+        'could not load a complete projection',
+      )
+      if (failure === 'rejection') {
+        expect(store.getter(removeDuplicatesErrorAtom)).toContain('projection unavailable')
+      }
     },
   )
 
-  it(
-    // HIGH bug: same root cause as the rejection path. If the projection
-    // resolves with `{cells: []}` (empty range / blank rows), we still
-    // must not open — the algorithm has nothing to compare and the user
-    // would otherwise be a confirm-click away from deleting the range.
-    'Data > Remove Duplicates does not open the dialog when readRangeProjection returns no cells',
-    async () => {
+  it.each(['selection', 'workspace-sheet'] as const)(
+    'Data > Remove Duplicates ignores a late exact acknowledgement after %s drift',
+    async (drift) => {
       const store = createStore()
-      const warnSpy = jest.spyOn(console, 'warn').mockImplementation(() => {})
-      const readSpy = jest.fn(async (_req: RangeProjectionRequest) => {
-        const result: RangeProjectionResult = {
+      const read = deferred<RangeProjectionResult>()
+      let capturedRequest: RangeProjectionRequest | undefined
+      const backend = addRemoveDuplicatesExactCapability({
+        ...createBaseBackend(),
+        readRangeProjection(request) {
+          capturedRequest = request
+          return read.promise
+        },
+      })
+      setupRemoveDuplicatesSelection(store)
+
+      const { container } = render(() => (
+        <SpreadsheetUiProvider backend={backend} store={store}>
+          <SpreadsheetMenuBar />
+        </SpreadsheetUiProvider>
+      ))
+      await activateRemoveDuplicatesMenuItem(container)
+      await waitFor(() => expect(capturedRequest).toBeDefined())
+
+      if (drift === 'selection') {
+        store.setter(selectionAtom, {
           kind: 'range',
           sheetId: 'sheet-1',
-          range: { rowStart: 0, rowEnd: 4, colStart: 0, colEnd: 1 },
-          requestId: 0,
-          revision: 1,
-          cells: [] as DisplayCell[],
-        }
-        return result
-      }) as unknown as SpreadsheetBackend['readRangeProjection']
-      const backend: SpreadsheetBackend = {
-        ...createBaseBackend(),
-        readRangeProjection: readSpy,
-        async removeRows() {
-          return { sheetId: 'sheet-1', removedRows: 0, revision: 1 }
-        },
+          anchor: { row: 1, col: 0 },
+          focus: { row: 4, col: 1 },
+        })
+      } else {
+        store.setter(setWorkspaceActiveSheetAtom, { sheetId: 'sheet-2' })
       }
-      store.setter(setWorkspaceActiveSheetAtom, { sheetId: 'sheet-1' })
-      store.setter(selectionAtom, {
-        kind: 'range',
-        sheetId: 'sheet-1',
-        anchor: { row: 0, col: 0 },
-        focus: { row: 4, col: 1 },
-      })
-
-      const { container } = render(() => (
-        <SpreadsheetUiProvider backend={backend} store={store}>
-          <SpreadsheetMenuBar />
-        </SpreadsheetUiProvider>
-      ))
-
-      fireEvent.click(container.querySelector('[data-testid="menu-bar-button-data"]')!)
-      fireEvent.click(
-        container.querySelector('[data-testid="menu-bar-item-data.removeDuplicates"]')!,
-      )
+      read.resolve(matchingRemoveDuplicatesProjection(capturedRequest!))
 
       await waitFor(() => {
-        expect(warnSpy).toHaveBeenCalled()
+        expect(store.getter(removeDuplicatesLifecycleAtom).status).toBe('read-stale')
       })
-      expect(store.getter(removeDuplicatesOpenAtom)).toBe(false)
-      expect(store.getter(removeDuplicatesSheetIdAtom)).toBeNull()
-
-      warnSpy.mockRestore()
+      expect(store.getter(removeDuplicatesSessionAtom)).toBeNull()
+      expect(store.getter(removeDuplicatesErrorAtom)).toContain('changed while')
     },
   )
+
+  it('Data > Remove Duplicates retry allocates a fresh Core request identity', async () => {
+    const store = createStore()
+    const requestIds: number[] = []
+    const backend = addRemoveDuplicatesExactCapability({
+      ...createBaseBackend(),
+      async readRangeProjection(request) {
+        requestIds.push(request.requestId)
+        if (requestIds.length === 1) throw new Error('temporary read failure')
+        return matchingRemoveDuplicatesProjection(request)
+      },
+    })
+    setupRemoveDuplicatesSelection(store)
+
+    const { container } = render(() => (
+      <SpreadsheetUiProvider backend={backend} store={store}>
+        <SpreadsheetMenuBar />
+      </SpreadsheetUiProvider>
+    ))
+    await activateRemoveDuplicatesMenuItem(container)
+    await waitFor(() => {
+      expect(store.getter(removeDuplicatesLifecycleAtom).status).toBe('read-failed')
+    })
+    const firstRequestId = store.getter(removeDuplicatesReadRequestIdAtom)
+
+    await activateRemoveDuplicatesMenuItem(container)
+    await waitFor(() => {
+      expect(store.getter(removeDuplicatesLifecycleAtom).status).toBe('editing')
+    })
+    expect(requestIds).toHaveLength(2)
+    expect(requestIds[0]).toBe(firstRequestId)
+    expect(requestIds[1]).toBeGreaterThan(requestIds[0])
+    expect(store.getter(removeDuplicatesReadRequestIdAtom)).toBe(requestIds[1])
+  })
+
+  it('keeps every Remove Duplicates entry as a thin Core source adapter', () => {
+    const menuSource = readFileSync(
+      join(process.cwd(), 'solid/excel/src-vnext/menu-bar/SpreadsheetMenuBar.tsx'),
+      'utf8',
+    )
+    const menuHelperStart = menuSource.indexOf('function runRemoveDuplicatesEntrypoint')
+    const menuHelperEnd = menuSource.indexOf('function getActiveSheetId', menuHelperStart)
+    const menuRouteStart = menuSource.indexOf('function routeDispatch')
+    const menuBranchStart = menuSource.indexOf("case 'open-remove-duplicates':", menuRouteStart)
+    const menuBranchEnd = menuSource.indexOf("case 'open-format-cells':", menuBranchStart)
+    expect(menuHelperStart).toBeGreaterThanOrEqual(0)
+    expect(menuHelperEnd).toBeGreaterThan(menuHelperStart)
+    expect(menuBranchStart).toBeGreaterThanOrEqual(0)
+    expect(menuBranchEnd).toBeGreaterThan(menuBranchStart)
+    const menuAdapter =
+      menuSource.slice(menuHelperStart, menuHelperEnd) +
+      menuSource.slice(menuBranchStart, menuBranchEnd)
+
+    expect(menuAdapter).toContain('openRemoveDuplicatesFromSelectionAtom')
+    expect(menuAdapter).toContain('{ source: backend }')
+    expect(menuAdapter).toContain('runRemoveDuplicatesEntrypoint()')
+    expect(menuAdapter).not.toContain('readRangeProjection')
+    expect(menuAdapter).not.toContain('requestId: 0')
+    expect(menuAdapter).not.toContain('new Map')
+    expect(menuAdapter).not.toContain('openRemoveDuplicatesAtom')
+    expect(menuAdapter).not.toContain('removeDuplicatesSheetIdAtom')
+    expect(menuAdapter).not.toMatch(/\basync\b/)
+    expect(menuSource).toContain('captureRemoveDuplicatesCapabilityAtom')
+    expect(menuSource).toContain('useAtomValue(removeDuplicatesCapabilityAtom)')
+
+    const demoSource = readFileSync(
+      join(process.cwd(), 'solid/excel/src-vnext/demos/VNextWave5Demo.tsx'),
+      'utf8',
+    )
+    const demoStart = demoSource.indexOf('function triggerRemoveDuplicatesForSelection')
+    const demoEnd = demoSource.indexOf('onMount', demoStart)
+    expect(demoStart).toBeGreaterThanOrEqual(0)
+    expect(demoEnd).toBeGreaterThan(demoStart)
+    const demoAdapter = demoSource.slice(demoStart, demoEnd)
+    expect(demoAdapter).toContain('openRemoveDuplicatesFromSelectionAtom')
+    expect(demoAdapter).toContain('{ source: backend }')
+    expect(demoAdapter).not.toContain('readRangeProjection')
+    expect(demoAdapter).not.toContain('requestId: 0')
+    expect(demoAdapter).not.toContain('openRemoveDuplicatesAtom')
+    expect(demoAdapter).not.toContain('removeDuplicatesSheetIdAtom')
+    expect(demoAdapter).not.toMatch(/\basync\b/)
+
+    const providerSource = readFileSync(
+      join(process.cwd(), 'solid/excel/src-vnext/provider/atoms.ts'),
+      'utf8',
+    )
+    expect(providerSource).not.toContain('removeDuplicatesSupportedAtom')
+    expect(providerSource).not.toContain('removeDuplicatesSheetIdAtom')
+  })
 })

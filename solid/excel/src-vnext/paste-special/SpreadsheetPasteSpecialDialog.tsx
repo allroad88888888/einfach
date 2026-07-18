@@ -4,24 +4,23 @@ import { Show, createEffect, onCleanup } from 'solid-js'
 import { useAtomValue } from '@einfach/solid'
 import { useT } from '../../src/i18n'
 import {
-  clipboardStateAtom,
+  PASTE_SPECIAL_UNSUPPORTED_KIND_ERROR,
   closePasteSpecialAtom,
-  nextHistoryTransactionId,
+  confirmPasteSpecialAtom,
+  isPasteSpecialKindSupported,
   patchPasteSpecialOptionsAtom,
+  pasteSpecialCanCloseAtom,
+  pasteSpecialCanConfirmAtom,
+  pasteSpecialCanEditAtom,
+  pasteSpecialErrorAtom,
+  pasteSpecialLifecycleAtom,
   pasteSpecialOpenAtom,
   pasteSpecialOptionsAtom,
-  pushHistoryAtom,
-  selectionSnapshotAtom,
-  workspaceSessionAtom,
+  pasteSpecialSessionAtom,
   type PasteSpecialKind,
   type PasteSpecialOp,
 } from '@einfach/spreadsheet-ui-core'
-import {
-  pasteSpecialSupportedAtom,
-  refreshVisibleProjection,
-  useSpreadsheetBackend,
-  useSpreadsheetUiStore,
-} from '../provider'
+import { refreshVisibleProjection, useSpreadsheetBackend, useSpreadsheetUiStore } from '../provider'
 
 // Pull in the dialog stylesheet as a side-effect import. Vite picks the
 // dynamic-import target up statically and bundles the CSS into the chunk;
@@ -47,23 +46,20 @@ const PASTE_KINDS: readonly PasteSpecialKind[] = [
   'comments',
 ]
 
-const PASTE_OPS: readonly PasteSpecialOp[] = [
-  'none',
-  'add',
-  'subtract',
-  'multiply',
-  'divide',
-]
+const PASTE_OPS: readonly PasteSpecialOp[] = ['none', 'add', 'subtract', 'multiply', 'divide']
 
-export function SpreadsheetPasteSpecialDialog(
-  props: SpreadsheetPasteSpecialDialogProps,
-) {
+export function SpreadsheetPasteSpecialDialog(props: SpreadsheetPasteSpecialDialogProps) {
   const t = useT()
   const store = useSpreadsheetUiStore()
   const backend = useSpreadsheetBackend()
   const isOpen = useAtomValue(pasteSpecialOpenAtom)
   const options = useAtomValue(pasteSpecialOptionsAtom)
-  const supported = useAtomValue(pasteSpecialSupportedAtom)
+  const session = useAtomValue(pasteSpecialSessionAtom)
+  const lifecycle = useAtomValue(pasteSpecialLifecycleAtom)
+  const error = useAtomValue(pasteSpecialErrorAtom)
+  const canEdit = useAtomValue(pasteSpecialCanEditAtom)
+  const canClose = useAtomValue(pasteSpecialCanCloseAtom)
+  const canConfirm = useAtomValue(pasteSpecialCanConfirmAtom)
 
   // Reset-on-open is owned by `openPasteSpecialAtom` (a write-only
   // command atom that flips open + writes defaults in a single setter).
@@ -79,7 +75,7 @@ export function SpreadsheetPasteSpecialDialog(
     function onKeyDown(event: KeyboardEvent) {
       if (event.key === 'Escape') {
         event.stopPropagation()
-        store.setter(closePasteSpecialAtom)
+        if (canClose()) store.setter(closePasteSpecialAtom)
       }
     }
     document.addEventListener('keydown', onKeyDown)
@@ -87,74 +83,13 @@ export function SpreadsheetPasteSpecialDialog(
   })
 
   async function handleConfirm() {
-    const opts = options()
-    // Capability re-check: the menu hides this surface when the backend
-    // omits `pasteRange`, but a stale dialog could still be open during
-    // a backend swap. Close on miss + warn.
-    if (!supported() || !backend.pasteRange) {
-      // eslint-disable-next-line no-console
-      console.warn(
-        '[paste-special] backend.pasteRange unavailable at confirm; closing dialog.',
-      )
-      store.setter(closePasteSpecialAtom)
-      return
-    }
-
-    const clipboard = store.getter(clipboardStateAtom)
-    const snapshot = store.getter(selectionSnapshotAtom)
-    const workspace = store.getter(workspaceSessionAtom)
-    const sheetId = snapshot.selection.sheetId || workspace.activeSheetId || ''
-
-    if (!sheetId || !clipboard.source || !clipboard.payload) {
-      // eslint-disable-next-line no-console
-      console.warn(
-        '[paste-special] clipboard source or active selection missing; closing dialog.',
-      )
-      store.setter(closePasteSpecialAtom)
-      return
-    }
-
-    const targetRange = { ...snapshot.range }
-    try {
-      const result = await backend.pasteRange({
-        kind: 'paste-range',
-        sheetId,
-        target: targetRange,
-        source: {
-          sheetId: clipboard.source.sheetId,
-          range: { ...clipboard.source.range },
-          payload: clipboard.payload,
-        },
-        pasteKind: opts.kind,
-        op: opts.op,
-        transpose: opts.transpose,
-        skipBlanks: opts.skipBlanks,
-      })
-
-      // Record a history entry so Ctrl+Z can revert the paste. The host's
-      // dispatchUndo will call `backend.undoTransaction` (when present)
-      // and the static reference backend pops the most recent mutation.
-      const projectionRevision =
-        typeof result?.revision === 'number'
-          ? result.revision
-          : Number(result?.revision ?? 0) || 0
-      store.setter(pushHistoryAtom, {
-        transactionId: nextHistoryTransactionId(),
-        kind: 'cells.import',
-        sheetId,
-        projectionRevision,
-        affectedRange: result?.affectedRange ?? targetRange,
-      })
-
-      // Repaint the viewport now that backend cells changed. Mirrors how
-      // the plain Ctrl+V handler in SpreadsheetGrid finishes the flow.
-      await refreshVisibleProjection(store, backend, sheetId, 'toolbar')
-    } catch (error) {
-      // eslint-disable-next-line no-console
-      console.warn('[paste-special] backend.pasteRange threw:', error)
-    } finally {
-      store.setter(closePasteSpecialAtom)
-    }
+    const currentSession = session()
+    if (currentSession === null) return
+    await store.setter(confirmPasteSpecialAtom, {
+      source: backend,
+      sessionId: currentSession.sessionId,
+      refreshProjection: (sheetId) => refreshVisibleProjection(store, backend, sheetId, 'toolbar'),
+    })
   }
 
   function handleCancel() {
@@ -166,8 +101,14 @@ export function SpreadsheetPasteSpecialDialog(
       <div
         class={`paste-special-dialog ${props.class ?? ''}`.trim()}
         data-testid={props['data-testid'] ?? 'paste-special-dialog'}
+        data-lifecycle={lifecycle().status}
         role="dialog"
         aria-label={t('pasteSpecial.title')}
+        aria-busy={
+          lifecycle().status === 'pending' ||
+          lifecycle().status === 'local-acknowledged' ||
+          lifecycle().status === 'refreshing'
+        }
       >
         <div class="ps-header">
           <span class="ps-title">{t('pasteSpecial.title')}</span>
@@ -176,6 +117,7 @@ export function SpreadsheetPasteSpecialDialog(
             class="dialog-close-x"
             data-testid="paste-special-close-x"
             aria-label={t('pasteSpecial.cancel')}
+            disabled={!canClose()}
             onClick={handleCancel}
           >
             ×
@@ -185,21 +127,30 @@ export function SpreadsheetPasteSpecialDialog(
         <div class="ps-body">
           <fieldset class="ps-fieldset" data-testid="paste-special-kind-group">
             <legend class="ps-legend">{t('pasteSpecial.kind.legend')}</legend>
-            {PASTE_KINDS.map((kind) => (
-              <label class="ps-radio">
-                <input
-                  type="radio"
-                  name="paste-special-kind"
-                  data-testid={`paste-special-kind-${kind}`}
-                  checked={options().kind === kind}
-                  onChange={() =>
-                    store.setter(patchPasteSpecialOptionsAtom, { kind })
-                  }
-                />
-                {t(`pasteSpecial.kind.${kind}`)}
-              </label>
-            ))}
+            {PASTE_KINDS.map((kind) => {
+              const supportedKind = isPasteSpecialKindSupported(kind)
+              return (
+                <label
+                  class="ps-radio"
+                  title={supportedKind ? undefined : PASTE_SPECIAL_UNSUPPORTED_KIND_ERROR}
+                >
+                  <input
+                    type="radio"
+                    name="paste-special-kind"
+                    data-testid={`paste-special-kind-${kind}`}
+                    checked={options().kind === kind}
+                    disabled={!canEdit() || !supportedKind}
+                    onChange={() => store.setter(patchPasteSpecialOptionsAtom, { kind })}
+                  />
+                  {t(`pasteSpecial.kind.${kind}`)}
+                </label>
+              )
+            })}
           </fieldset>
+
+          <p data-testid="paste-special-unsupported-explanation">
+            {PASTE_SPECIAL_UNSUPPORTED_KIND_ERROR}
+          </p>
 
           <div class="ps-field">
             <label class="ps-field-label" for="paste-special-op">
@@ -210,6 +161,7 @@ export function SpreadsheetPasteSpecialDialog(
               class="ps-select"
               data-testid="paste-special-op-select"
               value={options().op}
+              disabled={!canEdit()}
               onChange={(event) =>
                 store.setter(patchPasteSpecialOptionsAtom, {
                   op: event.currentTarget.value as PasteSpecialOp,
@@ -228,6 +180,7 @@ export function SpreadsheetPasteSpecialDialog(
                 type="checkbox"
                 data-testid="paste-special-transpose"
                 checked={options().transpose}
+                disabled={!canEdit()}
                 onChange={(event) =>
                   store.setter(patchPasteSpecialOptionsAtom, {
                     transpose: event.currentTarget.checked,
@@ -241,6 +194,7 @@ export function SpreadsheetPasteSpecialDialog(
                 type="checkbox"
                 data-testid="paste-special-skip-blanks"
                 checked={options().skipBlanks}
+                disabled={!canEdit()}
                 onChange={(event) =>
                   store.setter(patchPasteSpecialOptionsAtom, {
                     skipBlanks: event.currentTarget.checked,
@@ -250,6 +204,12 @@ export function SpreadsheetPasteSpecialDialog(
               {t('pasteSpecial.skipBlanks')}
             </label>
           </div>
+
+          <Show when={error()}>
+            <p role="alert" data-testid="paste-special-error">
+              {error()}
+            </p>
+          </Show>
         </div>
 
         <div class="ps-footer">
@@ -257,6 +217,7 @@ export function SpreadsheetPasteSpecialDialog(
             type="button"
             class="ps-btn"
             data-testid="paste-special-cancel-button"
+            disabled={!canClose()}
             onClick={handleCancel}
           >
             {t('pasteSpecial.cancel')}
@@ -265,6 +226,7 @@ export function SpreadsheetPasteSpecialDialog(
             type="button"
             class="ps-btn ps-btn-primary"
             data-testid="paste-special-confirm-button"
+            disabled={!canConfirm()}
             onClick={() => void handleConfirm()}
           >
             {t('pasteSpecial.confirm')}

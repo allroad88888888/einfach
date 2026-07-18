@@ -1,4 +1,5 @@
 export * from './types'
+export * from './named-range-capability-port'
 export * from './static-backend'
 export * from './worker-workbook-backend'
 export * from './worker-protocol'

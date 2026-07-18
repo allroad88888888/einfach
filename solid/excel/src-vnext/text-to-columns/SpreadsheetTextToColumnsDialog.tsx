@@ -4,24 +4,29 @@ import { For, Show, createEffect, createMemo, onCleanup } from 'solid-js'
 import { useAtomValue } from '@einfach/solid'
 import { useT } from '../../src/i18n'
 import {
+  captureTextToColumnsCapabilityAtom,
   closeTextToColumnsAtom,
-  confirmTextToColumnsAtom,
-  DEFAULT_DELIMITED_CONFIG,
-  DEFAULT_FIXED_CONFIG,
-  makeStepThreeState,
-  makeStepTwoState,
-  previewColumnCount,
-  textToColumnsAnchorAtom,
+  dispatchTextToColumnsIntentAtom,
+  runTextToColumnsFinishAtom,
+  textToColumnsCanCloseAtom,
+  textToColumnsCanEditAtom,
+  textToColumnsCanFinishAtom,
+  textToColumnsCanGoBackAtom,
+  textToColumnsCanGoNextAtom,
+  textToColumnsColumnCountAtom,
+  textToColumnsErrorAtom,
+  textToColumnsHasSourceAtom,
+  textToColumnsLifecycleAtom,
+  textToColumnsNextBlockReasonAtom,
   textToColumnsOpenAtom,
   textToColumnsPreviewAtom,
-  textToColumnsSheetIdAtom,
-  textToColumnsSourceAtom,
+  textToColumnsSessionAtom,
   textToColumnsWizardAtom,
-  type ImportCellChunksRequest,
   type TextToColumnsColumnFormat,
   type TextToColumnsDelimitedConfig,
   type TextToColumnsDelimiter,
   type TextToColumnsFixedConfig,
+  type TextToColumnsIntent,
   type TextToColumnsTextQualifier,
   type TextToColumnsWizardState,
 } from '@einfach/spreadsheet-ui-core'
@@ -49,37 +54,35 @@ export function SpreadsheetTextToColumnsDialog(props: SpreadsheetTextToColumnsDi
   const isOpen = useAtomValue(textToColumnsOpenAtom)
   const wizard = useAtomValue(textToColumnsWizardAtom)
   const preview = useAtomValue(textToColumnsPreviewAtom)
-  const source = useAtomValue(textToColumnsSourceAtom)
+  const session = useAtomValue(textToColumnsSessionAtom)
+  const lifecycle = useAtomValue(textToColumnsLifecycleAtom)
+  const error = useAtomValue(textToColumnsErrorAtom)
+  const hasSource = useAtomValue(textToColumnsHasSourceAtom)
+  const columnCount = useAtomValue(textToColumnsColumnCountAtom)
+  const nextBlockReason = useAtomValue(textToColumnsNextBlockReasonAtom)
+  const canEdit = useAtomValue(textToColumnsCanEditAtom)
+  const canClose = useAtomValue(textToColumnsCanCloseAtom)
+  const canGoBack = useAtomValue(textToColumnsCanGoBackAtom)
+  const canGoNext = useAtomValue(textToColumnsCanGoNextAtom)
+  const canFinish = useAtomValue(textToColumnsCanFinishAtom)
 
-  // Reset wizard state on every false→true open edge so a stale Step 3
-  // does not leak into the next session.
-  createEffect<boolean>((wasOpen) => {
-    const open = isOpen()
-    if (open && !wasOpen) {
-      // openTextToColumnsAtom already wrote step-1; this is a defensive
-      // re-initialize for hosts that flip the open atom directly.
-      const current = store.getter(textToColumnsWizardAtom)
-      if (current.step !== 'step-1') {
-        store.setter(textToColumnsWizardAtom, { step: 'step-1', mode: 'delimited' })
-      }
-    }
-    return open
-  }, false)
+  // The adapter reports method presence; Core owns the resulting eligibility.
+  createEffect(() => {
+    store.setter(captureTextToColumnsCapabilityAtom, backend)
+  })
 
   createEffect(() => {
     if (!isOpen()) return
     function onKeyDown(event: KeyboardEvent) {
       if (event.key === 'Escape') {
         event.stopPropagation()
-        store.setter(closeTextToColumnsAtom)
+        if (canClose()) store.setter(closeTextToColumnsAtom)
       }
     }
     document.addEventListener('keydown', onKeyDown)
     onCleanup(() => document.removeEventListener('keydown', onKeyDown))
   })
 
-  const isSingleColumn = createMemo(() => source().length > 0)
-  const columnCount = createMemo(() => previewColumnCount(preview()))
   const stepLabel = createMemo(() => {
     const w = wizard()
     if (w.step === 'step-1') return t('textToColumns.step1.title')
@@ -88,171 +91,40 @@ export function SpreadsheetTextToColumnsDialog(props: SpreadsheetTextToColumnsDi
     return t('textToColumns.step3.title')
   })
 
-  /**
-   * `Next` is disabled when the wizard step has not collected enough
-   * configuration to produce a meaningful split. Step 2 delimited needs
-   * at least one delimiter (or an explicit `otherChar`); step 2 fixed
-   * needs at least one breakpoint. Without this guard the user can
-   * advance to step 3 with a single-token-per-row split and produce a
-   * useless commit.
-   */
-  const nextDisabled = createMemo(() => {
-    const w = wizard()
-    if (w.step === 'step-3') return true
-    if (w.step === 'step-2-delimited') {
-      const cfg = w.delimited
-      const hasOther = cfg.delimiters.has('other') && cfg.otherChar.length > 0
-      const hasNonOther = Array.from(cfg.delimiters).some((d) => d !== 'other')
-      return !(hasNonOther || hasOther)
-    }
-    if (w.step === 'step-2-fixed') {
-      return w.fixed.breakpoints.length === 0
-    }
-    return false
-  })
-
   const nextDisabledReason = createMemo(() => {
-    const w = wizard()
-    if (w.step === 'step-2-delimited' && nextDisabled()) {
+    if (nextBlockReason() === 'delimiter-required') {
       return t('textToColumns.step2.delimited.needOne')
     }
-    if (w.step === 'step-2-fixed' && nextDisabled()) {
+    if (nextBlockReason() === 'breakpoint-required') {
       return t('textToColumns.step2.fixed.needOne')
     }
     return undefined
   })
 
-  function setWizard(next: TextToColumnsWizardState) {
-    store.setter(textToColumnsWizardAtom, next)
+  function dispatch(intent: TextToColumnsIntent) {
+    store.setter(dispatchTextToColumnsIntentAtom, intent)
   }
 
   function handleClose() {
-    store.setter(closeTextToColumnsAtom)
+    if (canClose()) store.setter(closeTextToColumnsAtom)
   }
 
   function handleBack() {
-    const w = wizard()
-    if (w.step === 'step-1') return
-    if (w.step === 'step-2-delimited' || w.step === 'step-2-fixed') {
-      setWizard({ step: 'step-1', mode: w.mode })
-      return
-    }
-    // Back from step 3 to step 2.
-    setWizard(makeStepTwoState(w.mode, w.delimited, w.fixed))
+    dispatch({ kind: 'back' })
   }
 
   function handleNext() {
-    if (nextDisabled()) return
-    const w = wizard()
-    if (w.step === 'step-1') {
-      setWizard(makeStepTwoState(w.mode))
-      return
-    }
-    if (w.step === 'step-2-delimited') {
-      const cols = columnCount()
-      setWizard(makeStepThreeState('delimited', cols, w.delimited, DEFAULT_FIXED_CONFIG))
-      return
-    }
-    if (w.step === 'step-2-fixed') {
-      const cols = columnCount()
-      setWizard(makeStepThreeState('fixed', cols, DEFAULT_DELIMITED_CONFIG, w.fixed))
-      return
-    }
+    dispatch({ kind: 'next' })
   }
 
   async function handleFinish() {
-    if (!isSingleColumn()) return
-    const plan = store.setter(confirmTextToColumnsAtom)
-    if (!plan) return
-    const sheetId = store.getter(textToColumnsSheetIdAtom)
-    const anchor = store.getter(textToColumnsAnchorAtom)
-    if (!sheetId || !anchor) return
-    const cells = plan.cells
-
-    async function* chunks() {
-      // Single chunk — the source is bounded by the column selection. The
-      // backend honors per-cell `preserveAsText: true` so literal `=A1`
-      // and `00123` survive.
-      yield cells
-    }
-
-    const request: ImportCellChunksRequest = {
-      kind: 'import-cell-chunks',
-      sheetId,
-      chunks: chunks(),
-      range: plan.sourceRange,
-    }
-    try {
-      await backend.importCellChunks?.(request)
-      await refreshVisibleProjection(store, backend, sheetId)
-    } catch {
-      // Swallow at this layer — host-level error surfaces would be a
-      // future addition. The dialog still closes so the user is not
-      // trapped.
-    }
-    store.setter(closeTextToColumnsAtom)
-  }
-
-  // --- step 2 delimited handlers ---
-
-  function toggleDelimiter(delim: TextToColumnsDelimiter) {
-    const w = wizard()
-    if (w.step !== 'step-2-delimited') return
-    const next = new Set(w.delimited.delimiters)
-    if (next.has(delim)) next.delete(delim)
-    else next.add(delim)
-    const delimited: TextToColumnsDelimitedConfig = { ...w.delimited, delimiters: next }
-    setWizard({ ...w, delimited })
-  }
-
-  function setOtherChar(value: string) {
-    const w = wizard()
-    if (w.step !== 'step-2-delimited') return
-    const delimited: TextToColumnsDelimitedConfig = {
-      ...w.delimited,
-      otherChar: value.charAt(0) ?? '',
-    }
-    setWizard({ ...w, delimited })
-  }
-
-  function setTreatConsecutive(value: boolean) {
-    const w = wizard()
-    if (w.step !== 'step-2-delimited') return
-    const delimited: TextToColumnsDelimitedConfig = {
-      ...w.delimited,
-      treatConsecutiveAsOne: value,
-    }
-    setWizard({ ...w, delimited })
-  }
-
-  function setTextQualifier(value: TextToColumnsTextQualifier) {
-    const w = wizard()
-    if (w.step !== 'step-2-delimited') return
-    const delimited: TextToColumnsDelimitedConfig = { ...w.delimited, textQualifier: value }
-    setWizard({ ...w, delimited })
-  }
-
-  // --- step 2 fixed handlers ---
-
-  function setFixedBreakpoints(text: string) {
-    const w = wizard()
-    if (w.step !== 'step-2-fixed') return
-    const bps = text
-      .split(/[\s,]+/)
-      .map((s) => Number.parseInt(s, 10))
-      .filter((n) => Number.isFinite(n) && n > 0)
-    const fixed: TextToColumnsFixedConfig = { breakpoints: bps }
-    setWizard({ ...w, fixed })
-  }
-
-  // --- step 3 handlers ---
-
-  function setColumnFormat(colIndex: number, format: TextToColumnsColumnFormat) {
-    const w = wizard()
-    if (w.step !== 'step-3') return
-    const formats = w.formats.slice()
-    formats[colIndex] = format
-    setWizard({ ...w, formats })
+    const current = session()
+    if (current === null) return
+    await store.setter(runTextToColumnsFinishAtom, {
+      source: backend,
+      sessionId: current.sessionId,
+      refreshProjection: (sheetId) => refreshVisibleProjection(store, backend, sheetId),
+    })
   }
 
   return (
@@ -261,8 +133,14 @@ export function SpreadsheetTextToColumnsDialog(props: SpreadsheetTextToColumnsDi
         class={`text-to-columns-dialog ${props.class ?? ''}`.trim()}
         data-testid={props['data-testid'] ?? 'text-to-columns-dialog'}
         data-step={wizard().step}
+        data-lifecycle={lifecycle().status}
         role="dialog"
         aria-label={t('textToColumns.title')}
+        aria-busy={
+          lifecycle().status === 'pending' ||
+          lifecycle().status === 'local-acknowledged' ||
+          lifecycle().status === 'refreshing'
+        }
       >
         <div class="ttc-header">
           <span class="ttc-title">{t('textToColumns.title')}</span>
@@ -274,6 +152,7 @@ export function SpreadsheetTextToColumnsDialog(props: SpreadsheetTextToColumnsDi
             class="dialog-close-x"
             data-testid="dialog-close-x"
             aria-label={t('dialog.close.label')}
+            disabled={!canClose()}
             onClick={handleClose}
           >
             ×
@@ -281,35 +160,36 @@ export function SpreadsheetTextToColumnsDialog(props: SpreadsheetTextToColumnsDi
         </div>
 
         <div class="ttc-body">
-          <Show when={!isSingleColumn()}>
+          <Show when={!hasSource()}>
             <div class="ttc-error" data-testid="ttc-no-source-error" role="alert">
               {t('textToColumns.error.singleColumn')}
+            </div>
+          </Show>
+          <Show when={error().length > 0}>
+            <div class="ttc-error" data-testid="ttc-mutation-error" role="alert">
+              {error()}
             </div>
           </Show>
 
           <Show when={wizard().step === 'step-1'}>
             <Step1
               mode={(wizard() as Extract<TextToColumnsWizardState, { step: 'step-1' }>).mode}
-              onMode={(m) =>
-                setWizard({
-                  step: 'step-1',
-                  mode: m,
-                })
-              }
+              disabled={!canEdit()}
+              onMode={(mode) => dispatch({ kind: 'set-mode', mode })}
             />
           </Show>
 
           <Show when={wizard().step === 'step-2-delimited'}>
             <Step2Delimited
               config={
-                (
-                  wizard() as Extract<TextToColumnsWizardState, { step: 'step-2-delimited' }>
-                ).delimited
+                (wizard() as Extract<TextToColumnsWizardState, { step: 'step-2-delimited' }>)
+                  .delimited
               }
-              onToggle={toggleDelimiter}
-              onOther={setOtherChar}
-              onTreatConsecutive={setTreatConsecutive}
-              onQualifier={setTextQualifier}
+              disabled={!canEdit()}
+              onToggle={(delimiter) => dispatch({ kind: 'toggle-delimiter', delimiter })}
+              onOther={(value) => dispatch({ kind: 'set-other-char', value })}
+              onTreatConsecutive={(value) => dispatch({ kind: 'set-treat-consecutive', value })}
+              onQualifier={(value) => dispatch({ kind: 'set-text-qualifier', value })}
             />
           </Show>
 
@@ -318,17 +198,19 @@ export function SpreadsheetTextToColumnsDialog(props: SpreadsheetTextToColumnsDi
               config={
                 (wizard() as Extract<TextToColumnsWizardState, { step: 'step-2-fixed' }>).fixed
               }
-              onBreakpoints={setFixedBreakpoints}
+              disabled={!canEdit()}
+              onBreakpoints={(value) => dispatch({ kind: 'set-fixed-breakpoints', value })}
             />
           </Show>
 
           <Show when={wizard().step === 'step-3'}>
             <Step3
-              formats={
-                (wizard() as Extract<TextToColumnsWizardState, { step: 'step-3' }>).formats
-              }
+              formats={(wizard() as Extract<TextToColumnsWizardState, { step: 'step-3' }>).formats}
               columnCount={columnCount()}
-              onFormat={setColumnFormat}
+              disabled={!canEdit()}
+              onFormat={(columnIndex, format) =>
+                dispatch({ kind: 'set-column-format', columnIndex, format })
+              }
             />
           </Show>
 
@@ -361,7 +243,7 @@ export function SpreadsheetTextToColumnsDialog(props: SpreadsheetTextToColumnsDi
             type="button"
             class="ttc-btn"
             data-testid="ttc-back-button"
-            disabled={wizard().step === 'step-1'}
+            disabled={!canGoBack()}
             onClick={handleBack}
           >
             {t('textToColumns.back')}
@@ -370,18 +252,14 @@ export function SpreadsheetTextToColumnsDialog(props: SpreadsheetTextToColumnsDi
             type="button"
             class="ttc-btn"
             data-testid="ttc-next-button"
-            disabled={nextDisabled()}
+            disabled={!canGoNext()}
             title={nextDisabledReason()}
             onClick={handleNext}
           >
             {t('textToColumns.next')}
           </button>
           <Show when={nextDisabledReason()}>
-            <span
-              class="ttc-next-disabled-hint"
-              data-testid="ttc-next-disabled-hint"
-              role="status"
-            >
+            <span class="ttc-next-disabled-hint" data-testid="ttc-next-disabled-hint" role="status">
               {nextDisabledReason()}
             </span>
           </Show>
@@ -389,6 +267,7 @@ export function SpreadsheetTextToColumnsDialog(props: SpreadsheetTextToColumnsDi
             type="button"
             class="ttc-btn"
             data-testid="ttc-cancel-button"
+            disabled={!canClose()}
             onClick={handleClose}
           >
             {t('textToColumns.cancel')}
@@ -397,7 +276,7 @@ export function SpreadsheetTextToColumnsDialog(props: SpreadsheetTextToColumnsDi
             type="button"
             class="ttc-btn ttc-btn-primary"
             data-testid="ttc-finish-button"
-            disabled={!isSingleColumn() || wizard().step !== 'step-3'}
+            disabled={!canFinish()}
             onClick={() => void handleFinish()}
           >
             {t('textToColumns.finish')}
@@ -410,6 +289,7 @@ export function SpreadsheetTextToColumnsDialog(props: SpreadsheetTextToColumnsDi
 
 interface Step1Props {
   mode: 'delimited' | 'fixed'
+  disabled: boolean
   onMode: (mode: 'delimited' | 'fixed') => void
 }
 
@@ -424,6 +304,7 @@ function Step1(props: Step1Props) {
           name="ttc-mode"
           data-testid="ttc-mode-delimited"
           checked={props.mode === 'delimited'}
+          disabled={props.disabled}
           onChange={() => props.onMode('delimited')}
         />
         {t('textToColumns.step1.delimited')}
@@ -434,6 +315,7 @@ function Step1(props: Step1Props) {
           name="ttc-mode"
           data-testid="ttc-mode-fixed"
           checked={props.mode === 'fixed'}
+          disabled={props.disabled}
           onChange={() => props.onMode('fixed')}
         />
         {t('textToColumns.step1.fixed')}
@@ -444,6 +326,7 @@ function Step1(props: Step1Props) {
 
 interface Step2DelimitedProps {
   config: TextToColumnsDelimitedConfig
+  disabled: boolean
   onToggle: (delim: TextToColumnsDelimiter) => void
   onOther: (value: string) => void
   onTreatConsecutive: (value: boolean) => void
@@ -463,6 +346,7 @@ function Step2Delimited(props: Step2DelimitedProps) {
                 type="checkbox"
                 data-testid={`ttc-delim-${delim}`}
                 checked={props.config.delimiters.has(delim)}
+                disabled={props.disabled}
                 onChange={() => props.onToggle(delim)}
               />
               {t(`textToColumns.step2.delimited.${delim}`)}
@@ -478,6 +362,7 @@ function Step2Delimited(props: Step2DelimitedProps) {
           data-testid="ttc-delim-other-char"
           value={props.config.otherChar}
           maxLength={1}
+          disabled={props.disabled}
           onInput={(e) => props.onOther(e.currentTarget.value)}
         />
       </label>
@@ -486,6 +371,7 @@ function Step2Delimited(props: Step2DelimitedProps) {
           type="checkbox"
           data-testid="ttc-consecutive"
           checked={props.config.treatConsecutiveAsOne}
+          disabled={props.disabled}
           onChange={(e) => props.onTreatConsecutive(e.currentTarget.checked)}
         />
         {t('textToColumns.step2.delimited.consecutive')}
@@ -496,11 +382,10 @@ function Step2Delimited(props: Step2DelimitedProps) {
           class="ttc-select"
           data-testid="ttc-qualifier"
           value={props.config.textQualifier}
-          onChange={(e) =>
-            props.onQualifier(e.currentTarget.value as TextToColumnsTextQualifier)
-          }
+          disabled={props.disabled}
+          onChange={(e) => props.onQualifier(e.currentTarget.value as TextToColumnsTextQualifier)}
         >
-          <option value="&quot;">{'"'}</option>
+          <option value='"'>{'"'}</option>
           <option value="'">{"'"}</option>
           <option value="none">{t('textToColumns.step2.delimited.qualifier.none')}</option>
         </select>
@@ -511,6 +396,7 @@ function Step2Delimited(props: Step2DelimitedProps) {
 
 interface Step2FixedProps {
   config: TextToColumnsFixedConfig
+  disabled: boolean
   onBreakpoints: (raw: string) => void
 }
 
@@ -526,6 +412,7 @@ function Step2Fixed(props: Step2FixedProps) {
           class="ttc-input"
           data-testid="ttc-breakpoints"
           value={props.config.breakpoints.join(',')}
+          disabled={props.disabled}
           onInput={(e) => props.onBreakpoints(e.currentTarget.value)}
           placeholder="3,7,11"
         />
@@ -538,6 +425,7 @@ function Step2Fixed(props: Step2FixedProps) {
 interface Step3Props {
   formats: readonly TextToColumnsColumnFormat[]
   columnCount: number
+  disabled: boolean
   onFormat: (colIndex: number, format: TextToColumnsColumnFormat) => void
 }
 
@@ -563,6 +451,7 @@ function Step3(props: Step3Props) {
                 class="ttc-select"
                 data-testid={`ttc-format-${col}`}
                 value={props.formats[col] ?? 'general'}
+                disabled={props.disabled}
                 onChange={(e) =>
                   props.onFormat(col, e.currentTarget.value as TextToColumnsColumnFormat)
                 }

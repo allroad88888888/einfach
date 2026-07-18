@@ -1,7 +1,19 @@
 import { describe, expect, it } from '@jest/globals'
+import { createStore } from '@einfach/core'
 import {
   createRangeProjectionRequest,
   createVisibleProjectionRequest,
+  dispatchRemoveDuplicatesIntentAtom,
+  historyStackAtom,
+  openRemoveDuplicatesFromSelectionAtom,
+  removeDuplicatesLifecycleAtom,
+  removeDuplicatesPreviewAtom,
+  removeDuplicatesSessionAtom,
+  runRemoveDuplicatesConfirmAtom,
+  selectionAtom,
+  setWorkspaceActiveSheetAtom,
+  type RemoveDuplicatesControllerPort,
+  type RemoveRowsExactRequest,
 } from '@einfach/spreadsheet-ui-core'
 import type {
   CellFormatJSON,
@@ -20,7 +32,9 @@ import type {
 } from '../src-vnext/adapter'
 import {
   createWorkerWorkbook,
+  createStaticNamedRangeCapabilityPort,
   createStaticSpreadsheetBackend,
+  createWorkerNamedRangeCapabilityPort,
   createWorkerWorkbookSpreadsheetBackend,
   matrixToDisplayCells,
   matrixToVisibleProjectionResult,
@@ -712,6 +726,39 @@ function createFakeWorkerWorkbookClient(): FakeWorkerWorkbookClient {
 }
 
 describe('vnext adapter', () => {
+  it('publishes named-range capability facts through explicit runtime ports', async () => {
+    const staticCapabilities =
+      await createStaticNamedRangeCapabilityPort().readNamedRangeCapabilities()
+    const workerTsCapabilities =
+      await createWorkerNamedRangeCapabilityPort('worker-ts').readNamedRangeCapabilities()
+    const workerWasmCapabilities =
+      await createWorkerNamedRangeCapabilityPort('worker-wasm').readNamedRangeCapabilities()
+
+    expect(staticCapabilities).toMatchObject({
+      runtime: 'static-session',
+      scopes: ['workbook', 'sheet'],
+      bindings: { range: true, constant: true, lambda: true },
+      delete: true,
+      listAuthority: 'static-session-registry',
+      mutationAck: 'session-registry-accepted',
+    })
+    expect(workerTsCapabilities).toMatchObject({
+      runtime: 'worker-ts',
+      scopes: ['workbook'],
+      bindings: { range: true, constant: true, lambda: true },
+      delete: true,
+      listAuthority: 'adapter-post-ack-overlay',
+      mutationAck: 'engine-accepted',
+    })
+    expect(workerWasmCapabilities).toMatchObject({
+      runtime: 'worker-wasm',
+      scopes: [],
+      bindings: { range: false, constant: false, lambda: false },
+      delete: false,
+      rangeSemantics: 'unsupported',
+    })
+  })
+
   it('consumes worker protocol TSV chunks without returning an aggregate array', async () => {
     const worker = createFakeProtocolWorker()
     const workbook = createWorkerWorkbook({ workerFactory: () => worker })
@@ -1049,164 +1096,65 @@ describe('vnext adapter', () => {
     expect(projected.cells.some((cell) => cell.displayValue === 'East')).toBe(false)
   })
 
-  it('produces matching display rows for static and worker backends under identical filter/sort state', async () => {
-    const matrix: (string | number)[][] = [
-      ['Region', 'Q1'],
-      ['North', 120],
-      ['South', 80],
-      ['East', 200],
-      ['West', 140],
-    ]
-
-    const staticBackend = createStaticSpreadsheetBackend({ revision: 1, matrix })
+  it('advertises worker filter/sort as unsupported and keeps reads canonical and window-bounded', async () => {
     const client = createFakeWorkerWorkbookClient()
-    const workerBackend = createWorkerWorkbookSpreadsheetBackend({
+    const backend = createWorkerWorkbookSpreadsheetBackend({
       client,
       sheets: [{ id: 'sheet-1', name: 'Sheet1' }],
-      revision: 1,
+      revision: 7,
     })
-    await workerBackend.ready()
+    await backend.ready()
 
-    matrix.forEach((row, rowIndex) => {
-      row.forEach((value, colIndex) => {
-        const isText = typeof value === 'string'
-        client.putCell({
-          sheet: 0,
-          addr: toCellAddressForTest(rowIndex, colIndex),
-          display: String(value),
-          type: isText ? 'text' : 'number',
-          isError: false,
-          formula: '',
-        })
+    const seedCells = [
+      ['A1', 'Region', 'text'],
+      ['B1', 'Q1', 'text'],
+      ['A2', 'North', 'text'],
+      ['B2', '120', 'number'],
+      ['A3', 'South', 'text'],
+      ['B3', '80', 'number'],
+      ['A4', 'East', 'text'],
+      ['B4', '200', 'number'],
+    ]
+    seedCells.forEach(([addr, display, type]) => {
+      client.putCell({
+        sheet: 0,
+        addr,
+        display,
+        type: type as CellSnapshotWire['type'],
+        isError: false,
+        formula: '',
       })
     })
 
-    const filterSortRequest = {
-      kind: 'set-filter-sort' as const,
-      sheetId: 'sheet-1',
-      rules: [{ kind: 'range' as const, colIndex: 1, min: 100 }],
-      directives: [{ colIndex: 1, direction: 'desc' as const }],
-    }
-
-    await staticBackend.setFilterSort?.(filterSortRequest)
-    await workerBackend.setFilterSort?.(filterSortRequest)
-
-    const staticProjected = await staticBackend.readVisibleProjection(
-      createVisibleProjectionRequest({
+    expect(backend.setFilterSort).toBeUndefined()
+    expect(
+      await backend.setFilterSort?.({
+        kind: 'set-filter-sort',
         sheetId: 'sheet-1',
+        rules: [],
+        directives: [{ colIndex: 1, direction: 'desc' }],
         requestId: 100,
-        window: { rowStart: 0, rowEnd: 4, colStart: 0, colEnd: 1 },
       }),
-    )
-    const workerProjected = await workerBackend.readVisibleProjection(
+    ).toBeUndefined()
+
+    const projected = await backend.readVisibleProjection(
       createVisibleProjectionRequest({
         sheetId: 'sheet-1',
         requestId: 101,
-        window: { rowStart: 0, rowEnd: 4, colStart: 0, colEnd: 1 },
+        window: { rowStart: 0, rowEnd: 2, colStart: 0, colEnd: 1 },
       }),
     )
 
-    const staticRegions = staticProjected.cells
-      .filter((cell) => cell.col === 0)
-      .sort((left, right) => left.row - right.row)
-      .map((cell) => cell.displayValue)
-    const workerRegions = workerProjected.cells
-      .filter((cell) => cell.col === 0)
-      .sort((left, right) => left.row - right.row)
-      .map((cell) => cell.displayValue)
+    expect(client.calls.readSparseRange).toEqual([
+      { sheet: 0, startRow: 0, endRow: 2, startCol: 0, endCol: 1 },
+    ])
+    expect(projected.revision).toBe(7)
+    expect(
+      projected.cells.filter((cell) => cell.col === 0).map((cell) => cell.displayValue),
+    ).toEqual(['Region', 'North', 'South'])
+    expect(projected.cells.some((cell) => cell.originalRow !== undefined)).toBe(false)
 
-    expect(staticRegions).toEqual(workerRegions)
-    expect(staticRegions).toEqual(['Region', 'East', 'West', 'North'])
-
-    const staticOriginalRows = staticProjected.cells
-      .filter((cell) => cell.col === 0 && cell.row > 0)
-      .sort((left, right) => left.row - right.row)
-      .map((cell) => cell.originalRow)
-    const workerOriginalRows = workerProjected.cells
-      .filter((cell) => cell.col === 0 && cell.row > 0)
-      .sort((left, right) => left.row - right.row)
-      .map((cell) => cell.originalRow)
-
-    expect(staticOriginalRows).toEqual(workerOriginalRows)
-
-    workerBackend.dispose()
-  })
-
-  it('matches static and worker filter/sort when sorted top rows are sourced from outside the viewport', async () => {
-    // 10 data rows + header. Window only sees rows 0..4 (5 rows). Sort desc should
-    // surface the top 4 Q1 values, which live at source rows 6/8/4/10 — most of
-    // them outside the viewport. Before the worker scope fix this test would have
-    // returned a different result than static because worker only saw rows 0..4.
-    const matrix: (string | number)[][] = [
-      ['Region', 'Q1'],
-      ['R1', 30],
-      ['R2', 50],
-      ['R3', 20],
-      ['R4', 180],
-      ['R5', 40],
-      ['R6', 200],
-      ['R7', 10],
-      ['R8', 190],
-      ['R9', 60],
-      ['R10', 170],
-    ]
-
-    const staticBackend = createStaticSpreadsheetBackend({ revision: 1, matrix })
-    const client = createFakeWorkerWorkbookClient()
-    const workerBackend = createWorkerWorkbookSpreadsheetBackend({
-      client,
-      sheets: [{ id: 'sheet-1', name: 'Sheet1' }],
-      revision: 1,
-    })
-    await workerBackend.ready()
-
-    matrix.forEach((row, rowIndex) => {
-      row.forEach((value, colIndex) => {
-        const isText = typeof value === 'string'
-        client.putCell({
-          sheet: 0,
-          addr: toCellAddressForTest(rowIndex, colIndex),
-          display: String(value),
-          type: isText ? 'text' : 'number',
-          isError: false,
-          formula: '',
-        })
-      })
-    })
-
-    const filterSortRequest = {
-      kind: 'set-filter-sort' as const,
-      sheetId: 'sheet-1',
-      rules: [],
-      directives: [{ colIndex: 1, direction: 'desc' as const }],
-    }
-
-    await staticBackend.setFilterSort?.(filterSortRequest)
-    await workerBackend.setFilterSort?.(filterSortRequest)
-
-    const window = { rowStart: 0, rowEnd: 4, colStart: 0, colEnd: 1 }
-    const staticProjected = await staticBackend.readVisibleProjection(
-      createVisibleProjectionRequest({ sheetId: 'sheet-1', requestId: 100, window }),
-    )
-    const workerProjected = await workerBackend.readVisibleProjection(
-      createVisibleProjectionRequest({ sheetId: 'sheet-1', requestId: 101, window }),
-    )
-
-    const collect = (cells: readonly { row: number; col: number; displayValue: string; originalRow?: number }[]) =>
-      cells
-        .filter((cell) => cell.col === 0)
-        .sort((left, right) => left.row - right.row)
-        .map((cell) => ({ row: cell.row, value: cell.displayValue, source: cell.originalRow }))
-
-    const staticRegions = collect(staticProjected.cells)
-    const workerRegions = collect(workerProjected.cells)
-
-    expect(workerRegions).toEqual(staticRegions)
-    // Top-down within the 5-row window: header, then sorted top 4 = source rows 6, 8, 4, 10
-    expect(staticRegions.map((r) => r.value)).toEqual(['Region', 'R6', 'R8', 'R4', 'R10'])
-    expect(staticRegions.map((r) => r.source)).toEqual([0, 6, 8, 4, 10])
-
-    workerBackend.dispose()
+    backend.dispose()
   })
 
   it('persists named range mutations in the static backend', async () => {
@@ -1215,14 +1163,26 @@ describe('vnext adapter', () => {
     expect(backend.deleteNamedRange).toBeDefined()
     expect(backend.listNamedRanges).toBeDefined()
 
-    await backend.setNamedRange?.({
+    const setResult = await backend.setNamedRange?.({
       kind: 'set-named-range',
       name: 'SalesTotal',
       scope: 'workbook',
       refersTo: { kind: 'range', sheetId: 'sheet-1', address: 'A1:B2' },
+      requestId: 41,
+    })
+    expect(setResult).toMatchObject({
+      requestId: 41,
+      revision: 2,
+      outcome: 'w0-acknowledged',
+      authority: 'static-session-registry',
     })
 
     const listed = await backend.listNamedRanges?.({ kind: 'list-named-ranges' })
+    expect(listed).toMatchObject({
+      revision: 2,
+      authority: 'static-session-registry',
+      definitionReadback: 'full',
+    })
     expect(listed?.names).toEqual([
       {
         name: 'SalesTotal',
@@ -1231,13 +1191,205 @@ describe('vnext adapter', () => {
       },
     ])
 
-    await backend.deleteNamedRange?.({
+    const missingDelete = await backend.deleteNamedRange?.({
       kind: 'delete-named-range',
-      name: 'SalesTotal',
+      name: 'Missing',
       scope: 'workbook',
+      requestId: 42,
+    })
+    expect(missingDelete).toMatchObject({
+      requestId: 42,
+      revision: 2,
+      outcome: 'confirmed-not-applied',
+      authority: 'static-session-registry',
+    })
+
+    const deleteResult = await backend.deleteNamedRange?.({
+      kind: 'delete-named-range',
+      name: 'salestotal',
+      scope: 'workbook',
+      requestId: 43,
+    })
+    expect(deleteResult).toMatchObject({
+      requestId: 43,
+      revision: 3,
+      outcome: 'w0-acknowledged',
+      authority: 'static-session-registry',
     })
     const afterDelete = await backend.listNamedRanges?.({ kind: 'list-named-ranges' })
     expect(afterDelete?.names).toEqual([])
+  })
+
+  it('publishes worker named ranges only after an engine ACK', async () => {
+    const baseClient = createFakeWorkerWorkbookClient()
+    let resolveDefine!: (accepted: boolean) => void
+    let signalDefineStarted!: () => void
+    let binding: Parameters<WorkerWorkbookClient['defineName']>[1] | undefined
+    const defineStarted = new Promise<void>((resolve) => {
+      signalDefineStarted = resolve
+    })
+    const client: WorkerWorkbookClient = {
+      ...baseClient,
+      defineName(_name, nextBinding) {
+        binding = nextBinding
+        signalDefineStarted()
+        return new Promise<boolean>((resolve) => {
+          resolveDefine = resolve
+        })
+      },
+    }
+    const backend = createWorkerWorkbookSpreadsheetBackend({
+      client,
+      sheets: [{ id: 'sheet-1', name: 'Sheet1' }],
+      revision: 7,
+    })
+    await backend.ready()
+
+    const pending = backend.setNamedRange!({
+      kind: 'set-named-range',
+      name: 'Q1Sales',
+      scope: 'workbook',
+      refersTo: { kind: 'range', sheetId: 'sheet-1', address: 'B2:B4' },
+      requestId: 51,
+    })
+    await defineStarted
+
+    expect(binding).toEqual({
+      kind: 'range',
+      sheetName: 'Sheet1',
+      start: 'B2',
+      end: 'B4',
+    })
+    expect((await backend.listNamedRanges!({ kind: 'list-named-ranges' })).names).toEqual([])
+
+    resolveDefine(true)
+    await expect(pending).resolves.toMatchObject({
+      requestId: 51,
+      revision: 8,
+      outcome: 'w0-acknowledged',
+      authority: 'worker-engine-ack',
+      canonical: false,
+    })
+    await expect(backend.listNamedRanges!({ kind: 'list-named-ranges' })).resolves.toMatchObject({
+      authority: 'adapter-post-ack-overlay',
+      definitionReadback: 'full',
+      canonical: false,
+      names: [
+        {
+          name: 'Q1Sales',
+          scope: 'workbook',
+          refersTo: { kind: 'range', sheetId: 'sheet-1', address: 'B2:B4' },
+        },
+      ],
+    })
+
+    backend.dispose()
+  })
+
+  it('does not publish worker named-range mutations rejected by the engine', async () => {
+    const baseClient = createFakeWorkerWorkbookClient()
+    let defineAccepted = false
+    const client: WorkerWorkbookClient = {
+      ...baseClient,
+      async defineName() {
+        return defineAccepted
+      },
+      async undefineName() {
+        return false
+      },
+    }
+    const backend = createWorkerWorkbookSpreadsheetBackend({
+      client,
+      sheets: [{ id: 'sheet-1', name: 'Sheet1' }],
+      revision: 3,
+    })
+    await backend.ready()
+
+    const request = {
+      kind: 'set-named-range' as const,
+      name: 'EngineOwned',
+      scope: 'workbook' as const,
+      refersTo: { kind: 'constant' as const, value: '42' },
+      requestId: 61,
+    }
+    await expect(backend.setNamedRange!(request)).resolves.toMatchObject({
+      requestId: 61,
+      revision: 3,
+      outcome: 'confirmed-not-applied',
+      authority: 'worker-engine-ack',
+    })
+    expect((await backend.listNamedRanges!({ kind: 'list-named-ranges' })).names).toEqual([])
+
+    defineAccepted = true
+    await expect(backend.setNamedRange!({ ...request, requestId: 62 })).resolves.toMatchObject({
+      requestId: 62,
+      revision: 4,
+      outcome: 'w0-acknowledged',
+    })
+    await expect(
+      backend.deleteNamedRange!({
+        kind: 'delete-named-range',
+        name: 'engineowned',
+        scope: 'workbook',
+        requestId: 63,
+      }),
+    ).resolves.toMatchObject({
+      requestId: 63,
+      revision: 4,
+      outcome: 'confirmed-not-applied',
+    })
+    expect((await backend.listNamedRanges!({ kind: 'list-named-ranges' })).names).toHaveLength(1)
+
+    backend.dispose()
+  })
+
+  it('drops a late worker named-range ACK after backend disposal', async () => {
+    const baseClient = createFakeWorkerWorkbookClient()
+    let resolveDefine!: (accepted: boolean) => void
+    let signalDefineStarted!: () => void
+    const defineStarted = new Promise<void>((resolve) => {
+      signalDefineStarted = resolve
+    })
+    const client: WorkerWorkbookClient = {
+      ...baseClient,
+      defineName() {
+        signalDefineStarted()
+        return new Promise<boolean>((resolve) => {
+          resolveDefine = resolve
+        })
+      },
+    }
+    const backend = createWorkerWorkbookSpreadsheetBackend({
+      client,
+      sheets: [{ id: 'sheet-1', name: 'Sheet1' }],
+    })
+    await backend.ready()
+
+    const pending = backend.setNamedRange!({
+      kind: 'set-named-range',
+      name: 'LateName',
+      scope: 'workbook',
+      refersTo: { kind: 'constant', value: '1' },
+      requestId: 71,
+    })
+    await defineStarted
+    backend.dispose()
+    resolveDefine(true)
+
+    await expect(pending).rejects.toMatchObject({ code: 'BACKEND_DISPOSED' })
+    expect((await backend.listNamedRanges!({ kind: 'list-named-ranges' })).names).toEqual([])
+  })
+
+  it('does not advertise protection ports without a real worker-engine contract', () => {
+    const backend = createWorkerWorkbookSpreadsheetBackend({
+      client: createFakeWorkerWorkbookClient(),
+      sheets: [{ id: 'sheet-1', name: 'Sheet1' }],
+    })
+
+    expect(backend.setSheetProtection).toBeUndefined()
+    expect(backend.setRangeLock).toBeUndefined()
+    expect(backend.readSheetProtection).toBeUndefined()
+    backend.dispose()
   })
 
   it('preserves projected rich values in static reads', async () => {
@@ -1446,7 +1598,7 @@ describe('vnext adapter', () => {
     ])
   })
 
-  it('projects static backend merge metadata after merge and unmerge mutations', async () => {
+  it('returns exact static merge acknowledgements and projects merge metadata', async () => {
     const backend = createStaticSpreadsheetBackend({
       revision: 1,
       matrix: [
@@ -1459,10 +1611,17 @@ describe('vnext adapter', () => {
     const mutation = await backend.mergeRange?.({
       kind: 'merge-range',
       sheetId: 'sheet-1',
+      requestId: 23,
       range: { rowStart: 0, rowEnd: 1, colStart: 0, colEnd: 1 },
     })
 
-    expect(mutation?.affectedRange).toEqual({ rowStart: 0, rowEnd: 1, colStart: 0, colEnd: 1 })
+    expect(mutation).toEqual({
+      kind: 'merge-range',
+      sheetId: 'sheet-1',
+      requestId: 23,
+      revision: 2,
+      affectedRange: { rowStart: 0, rowEnd: 1, colStart: 0, colEnd: 1 },
+    })
 
     const merged = await backend.readVisibleProjection(
       createVisibleProjectionRequest({
@@ -1481,15 +1640,23 @@ describe('vnext adapter', () => {
       ]),
     )
 
-    await backend.unmergeRange?.({
+    const unmergeMutation = await backend.unmergeRange?.({
       kind: 'unmerge-range',
       sheetId: 'sheet-1',
+      requestId: 25,
       range: { rowStart: 0, rowEnd: 1, colStart: 0, colEnd: 1 },
+    })
+    expect(unmergeMutation).toEqual({
+      kind: 'unmerge-range',
+      sheetId: 'sheet-1',
+      requestId: 25,
+      revision: 3,
+      affectedRange: { rowStart: 0, rowEnd: 1, colStart: 0, colEnd: 1 },
     })
     const unmerged = await backend.readVisibleProjection(
       createVisibleProjectionRequest({
         sheetId: 'sheet-1',
-        requestId: 25,
+        requestId: 26,
         window: { rowStart: 0, rowEnd: 1, colStart: 0, colEnd: 1 },
       }),
     )
@@ -1568,6 +1735,71 @@ describe('vnext adapter', () => {
       { row: 1, col: 1, displayValue: 'B1', valueKind: 'string' },
       { row: 2, col: 0, displayValue: 'A1', valueKind: 'string' },
       { row: 2, col: 1, displayValue: 'B1', valueKind: 'string' },
+    ])
+  })
+
+  it('shifts repeated source formulas per target through static fill projection readback', async () => {
+    const sourceFormula = '=B1+$C1+D$1+$E$1+"A1"'
+    const backend = createStaticSpreadsheetBackend({
+      revision: 12,
+      cells: [
+        {
+          row: 0,
+          col: 0,
+          displayValue: sourceFormula,
+          valueKind: 'string',
+          formula: sourceFormula,
+          format: { bold: true },
+        },
+        {
+          row: 1,
+          col: 0,
+          displayValue: 'plain',
+          valueKind: 'string',
+          format: { italic: true },
+        },
+      ],
+    })
+
+    await backend.fillRange?.({
+      kind: 'fill-range',
+      sheetId: 'sheet-1',
+      requestId: 21,
+      sourceRange: { rowStart: 0, rowEnd: 1, colStart: 0, colEnd: 0 },
+      targetRange: { rowStart: 0, rowEnd: 5, colStart: 0, colEnd: 0 },
+      direction: 'down',
+    })
+
+    const result = await backend.readRangeProjection(
+      createRangeProjectionRequest({
+        sheetId: 'sheet-1',
+        requestId: 22,
+        range: { rowStart: 0, rowEnd: 5, colStart: 0, colEnd: 0 },
+        reason: 'test',
+      }),
+    )
+
+    expect(
+      result.cells.map((cell) => ({
+        row: cell.row,
+        input: cell.formula ?? cell.displayValue,
+        format: cell.format,
+      })),
+    ).toEqual([
+      { row: 0, input: sourceFormula, format: { bold: true } },
+      { row: 1, input: 'plain', format: { italic: true } },
+      {
+        row: 2,
+        input: '=B3+$C3+D$1+$E$1+"A1"',
+        format: { bold: true },
+      },
+      { row: 3, input: 'plain', format: { italic: true } },
+      {
+        row: 4,
+        input: '=B5+$C5+D$1+$E$1+"A1"',
+        format: { bold: true },
+      },
+      { row: 5, input: 'plain', format: { italic: true } },
     ])
   })
 
@@ -1801,6 +2033,8 @@ describe('vnext adapter', () => {
       window: { rowStart: 0, rowEnd: 2, colStart: 0, colEnd: 2 },
       rowHeights: [{ rowIndex: 1, heightPx: 36 }],
       colWidths: [{ colIndex: 1, widthPx: 129 }],
+      hiddenRowIndices: [],
+      hiddenColIndices: [],
     })
 
     await expect(
@@ -1814,10 +2048,231 @@ describe('vnext adapter', () => {
       sheetId: 'sheet-2',
       rowHeights: [],
       colWidths: [],
+      hiddenRowIndices: [],
+      hiddenColIndices: [],
     })
   })
 
-  it('projects static backend formats only inside requested windows', async () => {
+  it('stores canonical hidden indices per sheet and projects only the requested viewport window', async () => {
+    const backend = createStaticSpreadsheetBackend({
+      revision: 10,
+      matrix: [['A1']],
+      sheets: ['Sheet1', 'Sheet2'],
+    })
+
+    await expect(
+      backend.hideRows!({
+        kind: 'hide-rows',
+        sheetId: 'sheet-1',
+        requestId: 40,
+        revision: 10,
+        rowIndices: [5, 2, 2, 0],
+      }),
+    ).resolves.toEqual({ sheetId: 'sheet-1', requestId: 40, revision: 11 })
+    await expect(
+      backend.hideColumns!({
+        kind: 'hide-columns',
+        sheetId: 'sheet-1',
+        requestId: 41,
+        revision: 11,
+        colIndices: [4, 1, 1],
+      }),
+    ).resolves.toEqual({ sheetId: 'sheet-1', requestId: 41, revision: 12 })
+
+    await expect(
+      backend.readViewportSizeProjection!({
+        kind: 'viewport-size',
+        sheetId: 'sheet-1',
+        requestId: 42,
+        revision: 12,
+        window: { rowStart: 1, rowEnd: 4, colStart: 0, colEnd: 2 },
+      }),
+    ).resolves.toEqual({
+      kind: 'viewport-size',
+      sheetId: 'sheet-1',
+      requestId: 42,
+      revision: 12,
+      window: { rowStart: 1, rowEnd: 4, colStart: 0, colEnd: 2 },
+      rowHeights: [],
+      colWidths: [],
+      hiddenRowIndices: [2],
+      hiddenColIndices: [1],
+    })
+    await expect(
+      backend.readViewportSizeProjection!({
+        kind: 'viewport-size',
+        sheetId: 'sheet-2',
+        requestId: 43,
+        window: { rowStart: 0, rowEnd: 10, colStart: 0, colEnd: 10 },
+      }),
+    ).resolves.toMatchObject({
+      sheetId: 'sheet-2',
+      revision: 12,
+      hiddenRowIndices: [],
+      hiddenColIndices: [],
+    })
+
+    await expect(
+      backend.unhideRows!({
+        kind: 'unhide-rows',
+        sheetId: 'sheet-1',
+        requestId: 44,
+        revision: 12,
+        rowIndices: [5, 2, 2],
+      }),
+    ).resolves.toEqual({ sheetId: 'sheet-1', requestId: 44, revision: 13 })
+    await expect(
+      backend.unhideColumns!({
+        kind: 'unhide-columns',
+        sheetId: 'sheet-1',
+        requestId: 45,
+        revision: 13,
+        colIndices: [4, 1, 4],
+      }),
+    ).resolves.toEqual({ sheetId: 'sheet-1', requestId: 45, revision: 14 })
+
+    await expect(
+      backend.readViewportSizeProjection!({
+        kind: 'viewport-size',
+        sheetId: 'sheet-1',
+        window: { rowStart: 0, rowEnd: 10, colStart: 0, colEnd: 10 },
+      }),
+    ).resolves.toMatchObject({
+      revision: 14,
+      hiddenRowIndices: [0],
+      hiddenColIndices: [],
+    })
+  })
+
+  it('rejects an old mutation ACK revision before returning newer viewport-size facts', async () => {
+    const backend = createStaticSpreadsheetBackend({ revision: 20, matrix: [['A1']] })
+    const hiddenRowsAck = await backend.hideRows!({
+      kind: 'hide-rows',
+      sheetId: 'sheet-1',
+      requestId: 46,
+      revision: 20,
+      rowIndices: [2],
+    })
+    const hiddenColumnsAck = await backend.hideColumns!({
+      kind: 'hide-columns',
+      sheetId: 'sheet-1',
+      requestId: 47,
+      revision: hiddenRowsAck.revision,
+      colIndices: [3],
+    })
+
+    await expect(
+      backend.readViewportSizeProjection!({
+        kind: 'viewport-size',
+        sheetId: 'sheet-1',
+        requestId: 48,
+        revision: hiddenRowsAck.revision,
+        window: { rowStart: 0, rowEnd: 5, colStart: 0, colEnd: 5 },
+      }),
+    ).rejects.toThrow('viewport size revision conflict')
+    await expect(
+      backend.readViewportSizeProjection!({
+        kind: 'viewport-size',
+        sheetId: 'sheet-1',
+        requestId: 49,
+        revision: hiddenColumnsAck.revision,
+        window: { rowStart: 0, rowEnd: 5, colStart: 0, colEnd: 5 },
+      }),
+    ).resolves.toMatchObject({
+      requestId: 49,
+      revision: hiddenColumnsAck.revision,
+      hiddenRowIndices: [2],
+      hiddenColIndices: [3],
+    })
+  })
+
+  it('rejects malformed and stale hidden-index mutations before state, revision, or history changes', async () => {
+    const backend = createStaticSpreadsheetBackend({ revision: 7, matrix: [['A1']] })
+
+    await expect(
+      backend.hideRows!({
+        kind: 'hide-rows',
+        sheetId: 'sheet-1',
+        rowIndices: [3, -1],
+        revision: 7,
+      }),
+    ).rejects.toThrow('indices must be non-negative safe integers')
+    await expect(
+      backend.hideColumns!({
+        kind: 'hide-columns',
+        sheetId: 'sheet-1',
+        colIndices: [4],
+        revision: 6,
+      }),
+    ).rejects.toThrow('revision conflict')
+    await expect(
+      backend.hideRows!({
+        kind: 'hide-rows',
+        sheetId: 'missing-sheet',
+        rowIndices: [1],
+        revision: 7,
+      }),
+    ).rejects.toThrow('unknown sheet')
+
+    await expect(
+      backend.unhideRows!({
+        kind: 'unhide-rows',
+        sheetId: 'sheet-1',
+        requestId: 46,
+        rowIndices: [3, 3],
+        revision: 7,
+      }),
+    ).resolves.toEqual({ sheetId: 'sheet-1', requestId: 46, revision: 7 })
+    await expect(
+      backend.readViewportSizeProjection!({
+        kind: 'viewport-size',
+        sheetId: 'sheet-1',
+        window: { rowStart: 0, rowEnd: 10, colStart: 0, colEnd: 10 },
+      }),
+    ).resolves.toMatchObject({
+      revision: 7,
+      hiddenRowIndices: [],
+      hiddenColIndices: [],
+    })
+    await expect(
+      backend.undoTransaction!({ kind: 'undo-transaction', transactionId: 'hidden-noop' }),
+    ).rejects.toThrow('nothing to undo')
+  })
+
+  it('preflights an unadvanceable hidden-index revision while preserving exact no-op acknowledgements', async () => {
+    const backend = createStaticSpreadsheetBackend({ revision: 'opaque-v1', matrix: [['A1']] })
+
+    await expect(
+      backend.unhideColumns!({
+        kind: 'unhide-columns',
+        sheetId: 'sheet-1',
+        requestId: 47,
+        revision: 'opaque-v1',
+        colIndices: [],
+      }),
+    ).resolves.toEqual({ sheetId: 'sheet-1', requestId: 47, revision: 'opaque-v1' })
+    await expect(
+      backend.hideColumns!({
+        kind: 'hide-columns',
+        sheetId: 'sheet-1',
+        requestId: 48,
+        revision: 'opaque-v1',
+        colIndices: [1],
+      }),
+    ).rejects.toThrow('cannot advance projection revision')
+    await expect(
+      backend.readViewportSizeProjection!({
+        kind: 'viewport-size',
+        sheetId: 'sheet-1',
+        window: { rowStart: 0, rowEnd: 2, colStart: 0, colEnd: 2 },
+      }),
+    ).resolves.toMatchObject({ revision: 'opaque-v1', hiddenColIndices: [] })
+    await expect(
+      backend.undoTransaction!({ kind: 'undo-transaction', transactionId: 'hidden-opaque' }),
+    ).rejects.toThrow('nothing to undo')
+  })
+
+  it('returns an exact static format acknowledgement and projects the requested window', async () => {
     const backend = createStaticSpreadsheetBackend({
       cells: [
         {
@@ -1846,11 +2301,17 @@ describe('vnext adapter', () => {
       }),
     )
 
-    expect(mutation?.affectedRange).toEqual({
-      rowStart: 1,
-      rowEnd: 999_999,
-      colStart: 1,
-      colEnd: 999_999,
+    expect(mutation).toEqual({
+      kind: 'set-format-range',
+      sheetId: 'sheet-1',
+      requestId: 14,
+      revision: 1,
+      affectedRange: {
+        rowStart: 1,
+        rowEnd: 999_999,
+        colStart: 1,
+        colEnd: 999_999,
+      },
     })
     expect(result.cells).toEqual([
       {
@@ -1894,6 +2355,88 @@ describe('vnext adapter', () => {
     expect(result.cells).toEqual([{ row: 0, col: 0, displayValue: 'A1', valueKind: 'string' }])
   })
 
+  it('projects canonical raw numbers before static literal and formula display formatting', async () => {
+    const backend = createStaticSpreadsheetBackend({
+      cells: [
+        {
+          row: 0,
+          col: 0,
+          displayValue: '1,234.50',
+          valueKind: 'number',
+          numericValue: 1_234.5,
+        },
+        {
+          row: 0,
+          col: 1,
+          displayValue: '=A1*2',
+          valueKind: 'string',
+          numericValue: 999,
+          formula: '=A1*2',
+        },
+        {
+          row: 0,
+          col: 2,
+          displayValue: '1234.5',
+          valueKind: 'string',
+          numericValue: 999,
+        },
+        { row: 0, col: 3, displayValue: '7.5', valueKind: 'number' },
+        {
+          row: 0,
+          col: 4,
+          displayValue: '=CONCAT("raw"," text")',
+          valueKind: 'number',
+          numericValue: 999,
+          formula: '=CONCAT("raw"," text")',
+        },
+      ],
+    })
+    await backend.setFormatRange?.({
+      kind: 'set-format-range',
+      sheetId: 'sheet-1',
+      range: { rowStart: 0, rowEnd: 0, colStart: 0, colEnd: 1 },
+      format: { numberFormat: { kind: 'custom', pattern: '#,##0.00" kg"' } },
+    })
+
+    const result = await backend.readRangeProjection(
+      createRangeProjectionRequest({
+        sheetId: 'sheet-1',
+        requestId: 43,
+        reason: 'test',
+        range: { rowStart: 0, rowEnd: 0, colStart: 0, colEnd: 4 },
+      }),
+    )
+
+    expect(result.cells).toEqual([
+      {
+        row: 0,
+        col: 0,
+        displayValue: '1,234.50 kg',
+        valueKind: 'number',
+        numericValue: 1_234.5,
+        format: { numberFormat: { kind: 'custom', pattern: '#,##0.00" kg"' } },
+      },
+      {
+        row: 0,
+        col: 1,
+        displayValue: '2,469.00 kg',
+        valueKind: 'number',
+        numericValue: 2_469,
+        formula: '=A1*2',
+        format: { numberFormat: { kind: 'custom', pattern: '#,##0.00" kg"' } },
+      },
+      { row: 0, col: 2, displayValue: '1234.5', valueKind: 'string' },
+      { row: 0, col: 3, displayValue: '7.5', valueKind: 'number', numericValue: 7.5 },
+      {
+        row: 0,
+        col: 4,
+        displayValue: 'raw text',
+        valueKind: 'string',
+        formula: '=CONCAT("raw"," text")',
+      },
+    ])
+  })
+
   it('adapts worker workbook sparse reads into visible projections', async () => {
     const client = createFakeWorkerWorkbookClient()
     const backend = createWorkerWorkbookSpreadsheetBackend({
@@ -1906,6 +2449,14 @@ describe('vnext adapter', () => {
     })
 
     await backend.ready()
+    client.putCell({
+      sheet: 1,
+      addr: 'A1',
+      display: '1234.5',
+      type: 'text',
+      isError: false,
+      formula: '',
+    })
     client.putCell({
       sheet: 1,
       addr: 'B2',
@@ -1939,10 +2490,17 @@ describe('vnext adapter', () => {
     })
     expect(result.cells).toEqual([
       {
+        row: 0,
+        col: 0,
+        displayValue: '1234.5',
+        valueKind: 'string',
+      },
+      {
         row: 1,
         col: 1,
         displayValue: '42',
         valueKind: 'number',
+        numericValue: 42,
         formula: '=Sheet1!A1+1',
       },
     ])
@@ -1986,6 +2544,7 @@ describe('vnext adapter', () => {
         col: 0,
         displayValue: '1,234.50 kg',
         valueKind: 'number',
+        numericValue: 1_234.5,
         format: { numberFormat: { kind: 'custom', pattern: '#,##0.00" kg"' } },
       },
     ])
@@ -1993,7 +2552,45 @@ describe('vnext adapter', () => {
     backend.dispose()
   })
 
-  it('applies worker backend toolbar overlays instead of silently no-oping', async () => {
+  it('returns the strict toolbar acknowledgement kind for worker number formats', async () => {
+    const client = createFakeWorkerWorkbookClient()
+    const backend = createWorkerWorkbookSpreadsheetBackend({
+      client,
+      sheets: ['Sheet1'],
+      revision: 5,
+    })
+
+    await backend.ready()
+    const mutation = await backend.setFormatRange!({
+      kind: 'set-format-range',
+      sheetId: 'sheet-1',
+      requestId: 14,
+      range: { rowStart: 3, rowEnd: 3, colStart: 1, colEnd: 1 },
+      format: { numberFormat: { kind: 'decimal', digits: 2, thousands: true } },
+    })
+
+    expect(client.calls.setFormatRange).toEqual([
+      {
+        sheet: 0,
+        startRow: 3,
+        startCol: 1,
+        endRow: 3,
+        endCol: 1,
+        fmt: { numberFormat: { kind: 'decimal', digits: 2, thousands: true } },
+      },
+    ])
+    expect(mutation).toEqual({
+      kind: 'set-format-range',
+      sheetId: 'sheet-1',
+      requestId: 14,
+      revision: 6,
+      affectedRange: { rowStart: 3, rowEnd: 3, colStart: 1, colEnd: 1 },
+    })
+
+    backend.dispose()
+  })
+
+  it('applies supported worker backend toolbar overlays instead of silently no-oping', async () => {
     const client = createFakeWorkerWorkbookClient()
     const backend = createWorkerWorkbookSpreadsheetBackend({
       client,
@@ -2047,13 +2644,6 @@ describe('vnext adapter', () => {
         format: { bgColor: '#fef3c7' },
       },
     })
-    await backend.setFilterSort?.({
-      kind: 'set-filter-sort',
-      sheetId: 'sheet-1',
-      rules: [],
-      directives: [{ colIndex: 1, direction: 'desc' }],
-    })
-
     const names = await backend.listNamedRanges?.({ kind: 'list-named-ranges' })
     expect(names?.names).toEqual([
       {
@@ -2071,17 +2661,20 @@ describe('vnext adapter', () => {
       }),
     )
 
-    expect(projected.cells.filter((cell) => cell.col === 0).map((cell) => cell.displayValue))
-      .toEqual(['Region', 'East', 'North', 'South', 'Total'])
-    expect(projected.cells.find((cell) => cell.row === 2 && cell.col === 1)?.validation)
-      .toMatchObject({
-        code: 'validation.list',
-        severity: 'warning',
-      })
-    expect(projected.cells.find((cell) => cell.row === 1 && cell.col === 1)?.conditionalFormat)
-      .toMatchObject({
-        bgColor: '#fef3c7',
-      })
+    expect(
+      projected.cells.filter((cell) => cell.col === 0).map((cell) => cell.displayValue),
+    ).toEqual(['Region', 'North', 'South', 'East', 'Total'])
+    expect(
+      projected.cells.find((cell) => cell.row === 1 && cell.col === 1)?.validation,
+    ).toMatchObject({
+      code: 'validation.list',
+      severity: 'warning',
+    })
+    expect(
+      projected.cells.find((cell) => cell.row === 1 && cell.col === 1)?.conditionalFormat,
+    ).toMatchObject({
+      bgColor: '#fef3c7',
+    })
 
     backend.dispose()
   })
@@ -2605,6 +3198,7 @@ describe('vnext adapter', () => {
       { sheet: 0, startRow: 1, startCol: 1, endRow: 1, endCol: 1 },
     ])
     expect(mutation).toEqual({
+      kind: 'set-format-range',
       sheetId: 'sheet-1',
       requestId: 16,
       revision: 3,
@@ -2918,6 +3512,66 @@ describe('vnext adapter', () => {
       { id: 'sheet-1', name: 'Sheet1', index: 1 },
     ])
 
+    backend.dispose()
+  })
+
+  it('defers reorder dirty observers until stable sheet ids use refreshed worker indices', async () => {
+    const client = createFakeWorkerWorkbookClient()
+    const moveSheet = client.moveSheet.bind(client)
+    client.moveSheet = async (from, to) => {
+      const moved = await moveSheet(from, to)
+      client.emitDirty([{ sheet: to, addr: 'C2' }])
+      return moved
+    }
+    const backend = createWorkerWorkbookSpreadsheetBackend({
+      client,
+      sheets: [
+        { id: 'sheet-1', name: 'Sheet1' },
+        { id: 'sheet-2', name: 'Sheet2' },
+        { id: 'sheet-3', name: 'Sheet3' },
+      ],
+      revision: 20,
+    })
+    await backend.ready()
+    ;[13, 12, 11].forEach((value, sheet) => {
+      client.putCell({
+        sheet,
+        addr: 'C2',
+        display: String(value),
+        type: 'number',
+        isError: false,
+        formula: '',
+      })
+    })
+
+    const observerReads: Array<Promise<string | undefined>> = []
+    const unsubscribe = backend.subscribeContentChanges?.(() => {
+      observerReads.push(
+        backend
+          .readRangeProjection(
+            createRangeProjectionRequest({
+              sheetId: 'sheet-1',
+              requestId: 91,
+              reason: 'test',
+              range: { rowStart: 1, rowEnd: 1, colStart: 2, colEnd: 2 },
+            }),
+          )
+          .then((projection) => projection.cells[0]?.displayValue),
+      )
+    })
+
+    const result = await backend.reorderSheet?.({
+      kind: 'reorder-sheet',
+      sheetId: 'sheet-3',
+      beforeSheetId: 'sheet-1',
+      requestId: 90,
+    })
+
+    expect(result?.sheets?.map((sheet) => sheet.id)).toEqual(['sheet-3', 'sheet-1', 'sheet-2'])
+    await expect(Promise.all(observerReads)).resolves.toEqual(['13'])
+    expect(client.calls.readSparseRange.at(-1)?.sheet).toBe(1)
+
+    unsubscribe?.()
     backend.dispose()
   })
 
@@ -3702,6 +4356,608 @@ describe('vnext adapter', () => {
 
     backend.dispose()
   })
+
+  it('worker backend does not advertise exact row removal unless the host opts in', () => {
+    const defaultBackend = createWorkerWorkbookSpreadsheetBackend({
+      client: createFakeWorkerWorkbookClient(),
+      sheets: ['Sheet1'],
+    })
+    const disabledBackend = createWorkerWorkbookSpreadsheetBackend({
+      client: createFakeWorkerWorkbookClient(),
+      sheets: ['Sheet1'],
+      removeRowsExactCapability: false,
+    })
+
+    expect(defaultBackend.removeRowsExact).toBeUndefined()
+    expect(disabledBackend.removeRowsExact).toBeUndefined()
+
+    defaultBackend.dispose()
+    disabledBackend.dispose()
+  })
+
+  it('worker backend exact row removal returns a new-revision witness only after every band ACKs', async () => {
+    const client = createFakeWorkerWorkbookClient()
+    const backend = createWorkerWorkbookSpreadsheetBackend({
+      client,
+      sheets: ['Sheet1'],
+      revision: 7,
+      removeRowsExactCapability: 'worker-engine-delete-rows',
+    })
+    await backend.ready()
+
+    const result = await backend.removeRowsExact!({
+      kind: 'remove-rows',
+      requestId: 81,
+      sheetId: 'sheet-1',
+      targetRange: { rowStart: 0, rowEnd: 8, colStart: 3, colEnd: 4 },
+      rows: [2, 3, 6],
+      revision: 7,
+    })
+
+    expect(client.calls.deleteRows).toEqual([
+      { sheet: 0, rowIndex: 6, count: 1 },
+      { sheet: 0, rowIndex: 2, count: 2 },
+    ])
+    expect(result).toEqual({
+      requestId: 81,
+      sheetId: 'sheet-1',
+      targetRange: { rowStart: 0, rowEnd: 8, colStart: 3, colEnd: 4 },
+      removedRowIndices: [2, 3, 6],
+      removedRows: 3,
+      affectedRange: { startRow: 2, endRow: 8, startCol: 3, endCol: 4 },
+      revision: 8,
+    })
+
+    backend.dispose()
+  })
+
+  it('worker backend exact row removal rejects partial transport without returning an exact ACK', async () => {
+    const client = createFakeWorkerWorkbookClient()
+    let attemptCount = 0
+    const original = client.deleteRows
+    client.deleteRows = async (sheet, rowIndex, count) => {
+      attemptCount += 1
+      if (attemptCount === 2) throw new Error('worker rejected second band')
+      return original(sheet, rowIndex, count)
+    }
+    const backend = createWorkerWorkbookSpreadsheetBackend({
+      client,
+      sheets: ['Sheet1'],
+      revision: 5,
+      removeRowsExactCapability: 'worker-engine-delete-rows',
+    })
+    await backend.ready()
+
+    await expect(
+      backend.removeRowsExact!({
+        kind: 'remove-rows',
+        requestId: 82,
+        sheetId: 'sheet-1',
+        targetRange: { rowStart: 0, rowEnd: 8, colStart: 0, colEnd: 2 },
+        rows: [2, 4, 6],
+        revision: 5,
+      }),
+    ).rejects.toMatchObject({
+      partial: true,
+      removedRows: 1,
+      revision: 6,
+    })
+    expect(client.calls.deleteRows).toEqual([{ sheet: 0, rowIndex: 6, count: 1 }])
+
+    backend.dispose()
+  })
+
+  it('turns a false Worker delete ACK into Core outcome-unknown without an exact witness', async () => {
+    const client = createFakeWorkerWorkbookClient()
+    const values = [
+      ['Region', 'Score'],
+      ['North', '100'],
+      ['South', '200'],
+      ['North', '300'],
+      ['East', '400'],
+    ]
+    values.forEach((row, rowIndex) => {
+      row.forEach((display, colIndex) => {
+        client.putCell({
+          sheet: 0,
+          addr: toCellAddressForTest(rowIndex, colIndex),
+          display,
+          type: 'text',
+          isError: false,
+          formula: '',
+        })
+      })
+    })
+    client.deleteRows = async (sheet, rowIndex, count) => {
+      client.calls.deleteRows.push({ sheet, rowIndex, count })
+      return false
+    }
+    const backend = createWorkerWorkbookSpreadsheetBackend({
+      client,
+      sheets: ['Sheet1'],
+      revision: 5,
+      removeRowsExactCapability: 'worker-engine-delete-rows',
+    })
+    await backend.ready()
+    let falseAckError: unknown
+    const source: RemoveDuplicatesControllerPort = {
+      readRangeProjection: (request) => backend.readRangeProjection(request),
+      async removeRowsExact(request) {
+        try {
+          return await backend.removeRowsExact!(request)
+        } catch (error) {
+          falseAckError = error
+          throw error
+        }
+      },
+    }
+
+    const store = createStore()
+    store.setter(setWorkspaceActiveSheetAtom, { sheetId: 'sheet-1' })
+    store.setter(selectionAtom, {
+      kind: 'range',
+      sheetId: 'sheet-1',
+      anchor: { row: 0, col: 0 },
+      focus: { row: 4, col: 1 },
+    })
+    await expect(
+      store.setter(openRemoveDuplicatesFromSelectionAtom, { source }),
+    ).resolves.toBe('editing')
+    store.setter(dispatchRemoveDuplicatesIntentAtom, {
+      kind: 'toggle-key-column',
+      column: 1,
+    })
+    expect(store.getter(removeDuplicatesPreviewAtom)?.duplicateRows).toEqual([3])
+
+    const sessionId = store.getter(removeDuplicatesSessionAtom)!.sessionId
+    await expect(
+      store.setter(runRemoveDuplicatesConfirmAtom, {
+        source,
+        sessionId,
+        refreshProjection: async () => {},
+      }),
+    ).resolves.toBe('outcome-unknown')
+    expect(falseAckError).toMatchObject({
+      partial: true,
+      removedRows: 0,
+      cause: { code: 'DELETE_ROWS_NOT_ACCEPTED' },
+    })
+    expect(store.getter(removeDuplicatesLifecycleAtom).status).toBe('outcome-unknown')
+    expect(store.getter(historyStackAtom).entries).toHaveLength(0)
+    expect(client.calls.deleteRows).toEqual([{ sheet: 0, rowIndex: 3, count: 1 }])
+
+    backend.dispose()
+  })
+
+  it('worker backend exact row removal rejects a stale witness before issuing delete RPCs', async () => {
+    const client = createFakeWorkerWorkbookClient()
+    const backend = createWorkerWorkbookSpreadsheetBackend({
+      client,
+      sheets: ['Sheet1'],
+      revision: 9,
+      removeRowsExactCapability: 'worker-engine-delete-rows',
+    })
+    await backend.ready()
+
+    await expect(
+      backend.removeRowsExact!({
+        kind: 'remove-rows',
+        requestId: 83,
+        sheetId: 'sheet-1',
+        targetRange: { rowStart: 0, rowEnd: 4, colStart: 0, colEnd: 1 },
+        rows: [2],
+        revision: 8,
+      }),
+    ).rejects.toMatchObject({ code: 'INVALID_REMOVE_ROWS_EXACT_REQUEST' })
+    expect(client.calls.deleteRows).toEqual([])
+
+    backend.dispose()
+  })
+})
+
+describe('static backend exact row removal', () => {
+  function exactRequest(overrides: Partial<RemoveRowsExactRequest> = {}): RemoveRowsExactRequest {
+    return {
+      kind: 'remove-rows',
+      requestId: 91,
+      sheetId: 'sheet-1',
+      targetRange: { rowStart: 0, rowEnd: 6, colStart: 0, colEnd: 1 },
+      rows: [2, 4],
+      revision: 7,
+      ...overrides,
+    }
+  }
+
+  async function readRows(
+    backend: ReturnType<typeof createStaticSpreadsheetBackend>,
+    requestId = 900,
+  ) {
+    return backend.readRangeProjection(
+      createRangeProjectionRequest({
+        sheetId: 'sheet-1',
+        requestId,
+        reason: 'test',
+        range: { rowStart: 0, rowEnd: 6, colStart: 0, colEnd: 1 },
+      }),
+    )
+  }
+
+  function undoRequest(transactionId = 'remove-rows-exact') {
+    return { kind: 'undo-transaction' as const, transactionId }
+  }
+
+  it('advertises the capability, returns an exact ACK, shifts data, and records one undo entry', async () => {
+    const originalRows = ['header', 'one', 'drop-two', 'three', 'drop-four', 'five', 'six']
+    const backend = createStaticSpreadsheetBackend({
+      revision: 7,
+      matrix: originalRows.map((value) => [value]),
+    })
+
+    expect(typeof backend.removeRowsExact).toBe('function')
+    const result = await backend.removeRowsExact(exactRequest())
+
+    expect(result).toEqual({
+      requestId: 91,
+      sheetId: 'sheet-1',
+      targetRange: { rowStart: 0, rowEnd: 6, colStart: 0, colEnd: 1 },
+      removedRowIndices: [2, 4],
+      removedRows: 2,
+      affectedRange: { startRow: 2, endRow: 6, startCol: 0, endCol: 1 },
+      revision: 8,
+    })
+    expect(result.revision).not.toBe(7)
+
+    const removed = await readRows(backend)
+    expect(removed.revision).toBe(8)
+    expect(removed.cells.filter((cell) => cell.col === 0).map((cell) => cell.displayValue)).toEqual(
+      ['header', 'one', 'three', 'five', 'six'],
+    )
+
+    await expect(backend.undoTransaction!(undoRequest())).resolves.toMatchObject({ revision: 9 })
+    const restored = await readRows(backend, 901)
+    expect(restored.revision).toBe(9)
+    expect(
+      restored.cells.filter((cell) => cell.col === 0).map((cell) => cell.displayValue),
+    ).toEqual(originalRows)
+    await expect(
+      backend.undoTransaction!(undoRequest('remove-rows-exact-second-undo')),
+    ).rejects.toThrow('nothing to undo')
+  })
+
+  it('keeps cell formats, range formats, row heights, and hidden rows aligned through remove and undo', async () => {
+    const backend = createStaticSpreadsheetBackend({
+      revision: 20,
+      cells: [
+        { row: 0, col: 0, displayValue: 'header', valueKind: 'string' },
+        {
+          row: 1,
+          col: 0,
+          displayValue: 'drop',
+          valueKind: 'string',
+          format: { bold: true },
+        },
+        {
+          row: 2,
+          col: 0,
+          displayValue: 'keep',
+          valueKind: 'string',
+        },
+        {
+          row: 2,
+          col: 1,
+          displayValue: 'keep-side',
+          valueKind: 'string',
+          format: { italic: true },
+        },
+        { row: 3, col: 0, displayValue: 'tail', valueKind: 'string' },
+      ],
+    })
+    await backend.setFormatRange!({
+      kind: 'set-format-range',
+      sheetId: 'sheet-1',
+      range: { rowStart: 2, rowEnd: 3, colStart: 0, colEnd: 0 },
+      format: { bgColor: '#ffd966' },
+    })
+    await backend.setRowHeight!({
+      kind: 'set-row-height',
+      sheetId: 'sheet-1',
+      rowIndex: 2,
+      heightPx: 37,
+    })
+    await backend.hideRows!({
+      kind: 'hide-rows',
+      sheetId: 'sheet-1',
+      rowIndices: [3],
+      revision: 22,
+    })
+
+    await expect(
+      backend.removeRowsExact(
+        exactRequest({
+          requestId: 92,
+          targetRange: { rowStart: 0, rowEnd: 3, colStart: 0, colEnd: 0 },
+          rows: [1],
+          revision: 23,
+        }),
+      ),
+    ).resolves.toMatchObject({
+      requestId: 92,
+      sheetId: 'sheet-1',
+      removedRowIndices: [1],
+      removedRows: 1,
+      revision: 24,
+    })
+
+    const shifted = await readRows(backend, 902)
+    expect(shifted.cells.find((cell) => cell.row === 1 && cell.col === 0)).toMatchObject({
+      displayValue: 'keep',
+      format: { bgColor: '#ffd966' },
+    })
+    expect(shifted.cells.find((cell) => cell.row === 1 && cell.col === 1)).toMatchObject({
+      displayValue: 'keep-side',
+      format: { italic: true },
+    })
+    expect(shifted.cells.find((cell) => cell.row === 2 && cell.col === 0)).toMatchObject({
+      displayValue: 'tail',
+      format: { bgColor: '#ffd966' },
+    })
+    await expect(
+      backend.readViewportSizeProjection!({
+        kind: 'viewport-size',
+        sheetId: 'sheet-1',
+        requestId: 903,
+        window: { rowStart: 0, rowEnd: 6, colStart: 0, colEnd: 1 },
+      }),
+    ).resolves.toMatchObject({
+      revision: 24,
+      rowHeights: [{ rowIndex: 1, heightPx: 37 }],
+      hiddenRowIndices: [2],
+    })
+
+    await backend.undoTransaction!(undoRequest('remove-rows-exact-metadata'))
+    const restored = await readRows(backend, 904)
+    expect(restored.revision).toBe(25)
+    expect(restored.cells.find((cell) => cell.row === 1 && cell.col === 0)).toMatchObject({
+      displayValue: 'drop',
+      format: { bold: true },
+    })
+    expect(restored.cells.find((cell) => cell.row === 2 && cell.col === 0)).toMatchObject({
+      displayValue: 'keep',
+      format: { bgColor: '#ffd966' },
+    })
+    expect(restored.cells.find((cell) => cell.row === 2 && cell.col === 1)).toMatchObject({
+      displayValue: 'keep-side',
+      format: { italic: true },
+    })
+    await expect(
+      backend.readViewportSizeProjection!({
+        kind: 'viewport-size',
+        sheetId: 'sheet-1',
+        requestId: 905,
+        window: { rowStart: 0, rowEnd: 6, colStart: 0, colEnd: 1 },
+      }),
+    ).resolves.toMatchObject({
+      revision: 25,
+      rowHeights: [{ rowIndex: 2, heightPx: 37 }],
+      hiddenRowIndices: [3],
+    })
+  })
+
+  it('drops fully deleted range-format layers, shrinks boundary overlaps, and restores both on undo', async () => {
+    const fullyDeletedColor = '#ff0000'
+    const boundaryOverlapColor = '#0000ff'
+    const backend = createStaticSpreadsheetBackend({ revision: 30, matrix: [] })
+    await backend.setFormatRange!({
+      kind: 'set-format-range',
+      sheetId: 'sheet-1',
+      range: { rowStart: 1, rowEnd: 1, colStart: 0, colEnd: 0 },
+      format: { bgColor: fullyDeletedColor },
+    })
+    await backend.setFormatRange!({
+      kind: 'set-format-range',
+      sheetId: 'sheet-1',
+      range: { rowStart: 1, rowEnd: 2, colStart: 1, colEnd: 1 },
+      format: { bgColor: boundaryOverlapColor },
+    })
+
+    await backend.removeRowsExact(
+      exactRequest({
+        requestId: 94,
+        targetRange: { rowStart: 0, rowEnd: 3, colStart: 0, colEnd: 1 },
+        rows: [1],
+        revision: 32,
+      }),
+    )
+
+    const shifted = await readRows(backend, 911)
+    expect(
+      shifted.cells
+        .filter((cell) => cell.format?.bgColor === fullyDeletedColor)
+        .map((cell) => [cell.row, cell.col]),
+    ).toEqual([])
+    expect(
+      shifted.cells
+        .filter((cell) => cell.format?.bgColor === boundaryOverlapColor)
+        .map((cell) => [cell.row, cell.col]),
+    ).toEqual([[1, 1]])
+
+    await backend.undoTransaction!(undoRequest('remove-rows-exact-range-formats'))
+    const restored = await readRows(backend, 912)
+    expect(
+      restored.cells
+        .filter((cell) => cell.format?.bgColor === fullyDeletedColor)
+        .map((cell) => [cell.row, cell.col]),
+    ).toEqual([[1, 0]])
+    expect(
+      restored.cells
+        .filter((cell) => cell.format?.bgColor === boundaryOverlapColor)
+        .map((cell) => [cell.row, cell.col]),
+    ).toEqual([
+      [1, 1],
+      [2, 1],
+    ])
+  })
+
+  it('precisely contracts a range-format layer across a multi-row deletion and undo', async () => {
+    const color = '#00aa00'
+    const backend = createStaticSpreadsheetBackend({ revision: 40, matrix: [] })
+    await backend.setFormatRange!({
+      kind: 'set-format-range',
+      sheetId: 'sheet-1',
+      range: { rowStart: 2, rowEnd: 3, colStart: 0, colEnd: 0 },
+      format: { bgColor: color },
+    })
+
+    await backend.deleteRows!({
+      kind: 'delete-rows',
+      sheetId: 'sheet-1',
+      rowIndex: 1,
+      count: 2,
+    })
+    const shifted = await readRows(backend, 913)
+    expect(
+      shifted.cells
+        .filter((cell) => cell.format?.bgColor === color)
+        .map((cell) => [cell.row, cell.col]),
+    ).toEqual([[1, 0]])
+
+    await backend.undoTransaction!(undoRequest('delete-rows-range-formats'))
+    const restored = await readRows(backend, 914)
+    expect(
+      restored.cells
+        .filter((cell) => cell.format?.bgColor === color)
+        .map((cell) => [cell.row, cell.col]),
+    ).toEqual([
+      [2, 0],
+      [3, 0],
+    ])
+  })
+
+  it('precisely contracts a range-format layer across a multi-column deletion and undo', async () => {
+    const color = '#aa00aa'
+    const backend = createStaticSpreadsheetBackend({ revision: 50, matrix: [] })
+    await backend.setFormatRange!({
+      kind: 'set-format-range',
+      sheetId: 'sheet-1',
+      range: { rowStart: 0, rowEnd: 0, colStart: 2, colEnd: 3 },
+      format: { bgColor: color },
+    })
+
+    const readColumns = (requestId: number) =>
+      backend.readRangeProjection(
+        createRangeProjectionRequest({
+          sheetId: 'sheet-1',
+          requestId,
+          reason: 'test',
+          range: { rowStart: 0, rowEnd: 0, colStart: 0, colEnd: 4 },
+        }),
+      )
+    await backend.deleteColumns!({
+      kind: 'delete-columns',
+      sheetId: 'sheet-1',
+      colIndex: 1,
+      count: 2,
+    })
+    const shifted = await readColumns(915)
+    expect(
+      shifted.cells
+        .filter((cell) => cell.format?.bgColor === color)
+        .map((cell) => [cell.row, cell.col]),
+    ).toEqual([[0, 1]])
+
+    await backend.undoTransaction!(undoRequest('delete-columns-range-formats'))
+    const restored = await readColumns(916)
+    expect(
+      restored.cells
+        .filter((cell) => cell.format?.bgColor === color)
+        .map((cell) => [cell.row, cell.col]),
+    ).toEqual([
+      [0, 2],
+      [0, 3],
+    ])
+  })
+
+  const invalidRequests: Array<[string, (request: RemoveRowsExactRequest) => unknown]> = [
+    ['wrong kind', (request) => ({ ...request, kind: 'delete-rows' })],
+    ['negative requestId', (request) => ({ ...request, requestId: -1 })],
+    ['unsafe requestId', (request) => ({ ...request, requestId: Number.MAX_SAFE_INTEGER + 1 })],
+    [
+      'fractional target range',
+      (request) => ({ ...request, targetRange: { ...request.targetRange, rowStart: 0.5 } }),
+    ],
+    ['unordered rows', (request) => ({ ...request, rows: [4, 2] })],
+    ['duplicate rows', (request) => ({ ...request, rows: [2, 2] })],
+    ['out-of-range rows', (request) => ({ ...request, rows: [7] })],
+    ['stale revision', (request) => ({ ...request, revision: 6 })],
+    ['empty rows', (request) => ({ ...request, rows: [] })],
+    ['missing revision', (request) => ({ ...request, revision: undefined })],
+    ['unknown sheet identity', (request) => ({ ...request, sheetId: 'missing-sheet' })],
+  ]
+
+  it.each(invalidRequests)(
+    '%s is rejected before any state, revision, or history write',
+    async (_label, makeInvalid) => {
+      const backend = createStaticSpreadsheetBackend({
+        revision: 7,
+        matrix: [['header'], ['one'], ['two'], ['three'], ['four'], ['five'], ['six']],
+      })
+      const before = await readRows(backend, 906)
+
+      await expect(
+        backend.removeRowsExact(makeInvalid(exactRequest()) as RemoveRowsExactRequest),
+      ).rejects.toMatchObject({ code: 'INVALID_REMOVE_ROWS_EXACT_REQUEST' })
+
+      expect(await readRows(backend, 907)).toEqual({ ...before, requestId: 907 })
+      await expect(
+        backend.undoTransaction!(undoRequest(`invalid-remove-rows-exact-${_label}`)),
+      ).rejects.toThrow('nothing to undo')
+    },
+  )
+
+  const invalidCurrentRevisions: Array<[string, string | number]> = [
+    ['opaque', 'opaque-v1'],
+    ['unadvanceable', 2 ** 53],
+  ]
+
+  it.each(invalidCurrentRevisions)(
+    '%s current revision is rejected before any write',
+    async (_label, revision) => {
+      const backend = createStaticSpreadsheetBackend({ revision, matrix: [['keep'], ['drop']] })
+      const before = await readRows(backend, 908)
+
+      await expect(
+        backend.removeRowsExact(
+          exactRequest({
+            requestId: 93,
+            targetRange: { rowStart: 0, rowEnd: 1, colStart: 0, colEnd: 0 },
+            rows: [1],
+            revision,
+          }),
+        ),
+      ).rejects.toMatchObject({ code: 'INVALID_REMOVE_ROWS_EXACT_REQUEST' })
+
+      expect(await readRows(backend, 909)).toEqual({ ...before, requestId: 909 })
+      await expect(
+        backend.undoTransaction!(undoRequest(`invalid-remove-rows-exact-revision-${_label}`)),
+      ).rejects.toThrow('nothing to undo')
+    },
+  )
+
+  it('rejects legacy removeRows with an opaque revision before facts or history change', async () => {
+    const backend = createStaticSpreadsheetBackend({
+      revision: 'opaque-v1',
+      matrix: [['keep-a'], ['drop'], ['keep-b']],
+    })
+    const before = await readRows(backend, 917)
+
+    await expect(
+      backend.removeRows!({ kind: 'remove-rows', sheetId: 'sheet-1', rows: [1] }),
+    ).rejects.toThrow('cannot advance projection revision opaque-v1')
+    expect(await readRows(backend, 918)).toEqual({ ...before, requestId: 918 })
+    await expect(
+      backend.undoTransaction!(undoRequest('legacy-remove-rows-opaque')),
+    ).rejects.toThrow('nothing to undo')
+  })
 })
 
 describe('static backend undo/redo (reverse-delta history, audit D-2)', () => {
@@ -3720,6 +4976,43 @@ describe('static backend undo/redo (reverse-delta history, audit D-2)', () => {
       }),
     )
     return result.cells.find((c) => c.row === row && c.col === col)?.displayValue
+  }
+
+  async function readCellFact(
+    backend: ReturnType<typeof createStaticSpreadsheetBackend>,
+    row = 0,
+    col = 0,
+  ) {
+    const result = await backend.readRangeProjection(
+      createRangeProjectionRequest({
+        sheetId: 'sheet-1',
+        requestId: 998,
+        reason: 'test',
+        range: { rowStart: row, rowEnd: row, colStart: col, colEnd: col },
+      }),
+    )
+    return {
+      displayValue: result.cells.find((cell) => cell.row === row && cell.col === col)
+        ?.displayValue,
+      revision: result.revision,
+    }
+  }
+
+  async function readHiddenProjection(
+    backend: ReturnType<typeof createStaticSpreadsheetBackend>,
+    sheetId = 'sheet-1',
+  ) {
+    const result = await backend.readViewportSizeProjection!({
+      kind: 'viewport-size',
+      sheetId,
+      requestId: 997,
+      window: { rowStart: 0, rowEnd: 100, colStart: 0, colEnd: 100 },
+    })
+    return {
+      rows: result.hiddenRowIndices,
+      cols: result.hiddenColIndices,
+      revision: result.revision,
+    }
   }
 
   function undoReq(id = 't-1') {
@@ -3749,6 +5042,284 @@ describe('static backend undo/redo (reverse-delta history, audit D-2)', () => {
     // Undo again — deltas must survive a full undo→redo→undo cycle.
     await backend.undoTransaction!(undoReq())
     expect(await readCellDisplay(backend, 'sheet-1', 0, 0)).toBe('old')
+  })
+
+  it('undo and redo restore canonical hidden rows and columns while a no-op preserves redo', async () => {
+    const backend = createStaticSpreadsheetBackend({ revision: 1, matrix: [['A1']] })
+    await backend.hideRows!({
+      kind: 'hide-rows',
+      sheetId: 'sheet-1',
+      rowIndices: [4, 2, 4],
+      revision: 1,
+    })
+    await backend.hideColumns!({
+      kind: 'hide-columns',
+      sheetId: 'sheet-1',
+      colIndices: [3, 1, 3],
+      revision: 2,
+    })
+    expect(await readHiddenProjection(backend)).toEqual({
+      rows: [2, 4],
+      cols: [1, 3],
+      revision: 3,
+    })
+
+    await backend.undoTransaction!(undoReq('hidden-cols'))
+    expect(await readHiddenProjection(backend)).toEqual({ rows: [2, 4], cols: [], revision: 4 })
+    await backend.undoTransaction!(undoReq('hidden-rows'))
+    expect(await readHiddenProjection(backend)).toEqual({ rows: [], cols: [], revision: 5 })
+
+    await backend.redoTransaction!(redoReq('hidden-rows'))
+    expect(await readHiddenProjection(backend)).toEqual({ rows: [2, 4], cols: [], revision: 6 })
+    await expect(
+      backend.unhideColumns!({
+        kind: 'unhide-columns',
+        sheetId: 'sheet-1',
+        requestId: 49,
+        colIndices: [99],
+        revision: 6,
+      }),
+    ).resolves.toEqual({ sheetId: 'sheet-1', requestId: 49, revision: 6 })
+    await backend.redoTransaction!(redoReq('hidden-cols'))
+    expect(await readHiddenProjection(backend)).toEqual({
+      rows: [2, 4],
+      cols: [1, 3],
+      revision: 7,
+    })
+  })
+
+  it.each([
+    ['opaque revision', 'opaque-v1'],
+    ['2**53 revision', 2 ** 53],
+    ['Number.MAX_VALUE revision', Number.MAX_VALUE],
+  ] as Array<[string, string | number]>)(
+    'rejects a history-producing mutation before facts or history change for %s',
+    async (_label, revision) => {
+      const backend = createStaticSpreadsheetBackend({ revision, matrix: [['old']] })
+      const mutate = () =>
+        backend.setCellInput({
+          kind: 'set-cell-input',
+          sheetId: 'sheet-1',
+          row: 0,
+          col: 0,
+          input: 'new',
+        })
+
+      await expect(mutate()).rejects.toThrow('cannot advance projection revision')
+      await expect(mutate()).rejects.toThrow('cannot advance projection revision')
+      expect(await readCellFact(backend)).toEqual({ displayValue: 'old', revision })
+      await expect(backend.undoTransaction!(undoReq())).rejects.toThrow('nothing to undo')
+    },
+  )
+
+  it('keeps undo facts, revision, and history intact when its numeric witness cannot advance', async () => {
+    const backend = createStaticSpreadsheetBackend({
+      revision: Number.MAX_SAFE_INTEGER,
+      matrix: [['old']],
+    })
+    await backend.setCellInput({
+      kind: 'set-cell-input',
+      sheetId: 'sheet-1',
+      row: 0,
+      col: 0,
+      input: 'new',
+    })
+    expect(await readCellFact(backend)).toEqual({
+      displayValue: 'new',
+      revision: 2 ** 53,
+    })
+
+    await expect(backend.undoTransaction!(undoReq())).rejects.toThrow(
+      'cannot advance projection revision',
+    )
+    expect(await readCellFact(backend)).toEqual({
+      displayValue: 'new',
+      revision: 2 ** 53,
+    })
+    // The same revision error (rather than "nothing to undo") proves the
+    // failed operation did not consume the undo entry.
+    await expect(backend.undoTransaction!(undoReq())).rejects.toThrow(
+      'cannot advance projection revision',
+    )
+  })
+
+  it('keeps redo facts, revision, and history intact when its numeric witness cannot advance', async () => {
+    const backend = createStaticSpreadsheetBackend({
+      revision: Number.MAX_SAFE_INTEGER - 1,
+      matrix: [['old']],
+    })
+    await backend.setCellInput({
+      kind: 'set-cell-input',
+      sheetId: 'sheet-1',
+      row: 0,
+      col: 0,
+      input: 'new',
+    })
+    await backend.undoTransaction!(undoReq())
+    expect(await readCellFact(backend)).toEqual({
+      displayValue: 'old',
+      revision: 2 ** 53,
+    })
+
+    await expect(backend.redoTransaction!(redoReq())).rejects.toThrow(
+      'cannot advance projection revision',
+    )
+    expect(await readCellFact(backend)).toEqual({
+      displayValue: 'old',
+      revision: 2 ** 53,
+    })
+    // The redo entry likewise stays available after a failed preflight.
+    await expect(backend.redoTransaction!(redoReq())).rejects.toThrow(
+      'cannot advance projection revision',
+    )
+  })
+
+  it('does not let 200 empty imports consume history or hide the preceding edit', async () => {
+    const backend = createStaticSpreadsheetBackend({ revision: 1, matrix: [['old']] })
+    await backend.setCellInput({
+      kind: 'set-cell-input',
+      sheetId: 'sheet-1',
+      row: 0,
+      col: 0,
+      input: 'new',
+    })
+
+    for (let index = 0; index < 200; index += 1) {
+      const result = await backend.importCells!({
+        kind: 'import-cells',
+        sheetId: 'sheet-1',
+        cells: [],
+        range: { rowStart: 0, rowEnd: 0, colStart: 0, colEnd: 0 },
+      })
+      expect(result.revision).toBe(2)
+    }
+
+    await backend.undoTransaction!(undoReq())
+    expect(await readCellDisplay(backend, 'sheet-1', 0, 0)).toBe('old')
+    await expect(backend.undoTransaction!(undoReq())).rejects.toThrow('nothing to undo')
+  })
+
+  it('preserves redo across same-order reorder, empty import, and rejected sheet mutations', async () => {
+    const backend = createStaticSpreadsheetBackend({
+      revision: 1,
+      sheets: ['Sheet1', 'Sheet2'],
+      matrix: [['old']],
+    })
+    await backend.setCellInput({
+      kind: 'set-cell-input',
+      sheetId: 'sheet-1',
+      row: 0,
+      col: 0,
+      input: 'new',
+    })
+    await backend.undoTransaction!(undoReq())
+
+    const reorderResult = await backend.reorderSheet!({
+      kind: 'reorder-sheet',
+      sheetId: 'sheet-1',
+      beforeSheetId: 'sheet-2',
+    })
+    expect(reorderResult.revision).toBe(3)
+    expect(reorderResult.sheets?.map((sheet) => sheet.id)).toEqual(['sheet-1', 'sheet-2'])
+
+    await backend.importCells!({
+      kind: 'import-cells',
+      sheetId: 'sheet-1',
+      cells: [],
+      range: { rowStart: 0, rowEnd: 0, colStart: 0, colEnd: 0 },
+    })
+    await expect(
+      backend.renameSheet!({ kind: 'rename-sheet', sheetId: 'sheet-1', name: '   ' }),
+    ).rejects.toThrow('sheet name cannot be empty')
+    await expect(
+      backend.addSheet!({ kind: 'add-sheet', name: 'Sheet1' }),
+    ).rejects.toThrow('sheet name already exists')
+    await expect(
+      backend.reorderSheet!({ kind: 'reorder-sheet', sheetId: 'missing-sheet' }),
+    ).rejects.toThrow('unknown sheet')
+    expect(await readCellFact(backend)).toEqual({ displayValue: 'old', revision: 3 })
+
+    await backend.redoTransaction!(redoReq())
+    expect(await readCellDisplay(backend, 'sheet-1', 0, 0)).toBe('new')
+  })
+
+  it('treats a fresh same-order reorder as a no-op with no undo entry', async () => {
+    const backend = createStaticSpreadsheetBackend({
+      revision: 7,
+      sheets: ['Sheet1', 'Sheet2'],
+    })
+
+    const result = await backend.reorderSheet!({
+      kind: 'reorder-sheet',
+      sheetId: 'sheet-1',
+      beforeSheetId: 'sheet-2',
+    })
+
+    expect(result.revision).toBe(7)
+    expect(result.sheets?.map((sheet) => sheet.id)).toEqual(['sheet-1', 'sheet-2'])
+    await expect(backend.undoTransaction!(undoReq())).rejects.toThrow('nothing to undo')
+  })
+
+  it('treats an empty cell-chunk stream as a no-op and preserves redo', async () => {
+    const backend = createStaticSpreadsheetBackend({ revision: 1, matrix: [['old']] })
+    await backend.setCellInput({
+      kind: 'set-cell-input',
+      sheetId: 'sheet-1',
+      row: 0,
+      col: 0,
+      input: 'new',
+    })
+    await backend.undoTransaction!(undoReq())
+
+    const result = await backend.importCellChunks!({
+      kind: 'import-cell-chunks',
+      sheetId: 'sheet-1',
+      chunks: [[], []],
+      range: { rowStart: 0, rowEnd: 0, colStart: 0, colEnd: 0 },
+    })
+    expect(result.revision).toBe(3)
+
+    await backend.redoTransaction!(redoReq())
+    expect(await readCellDisplay(backend, 'sheet-1', 0, 0)).toBe('new')
+  })
+
+  it('rolls back streamed chunks atomically when a later iterator step fails', async () => {
+    const backend = createStaticSpreadsheetBackend({
+      revision: 1,
+      matrix: [['old-a', 'old-b']],
+    })
+    await backend.setCellInput({
+      kind: 'set-cell-input',
+      sheetId: 'sheet-1',
+      row: 0,
+      col: 0,
+      input: 'redo-a',
+    })
+    await backend.undoTransaction!(undoReq())
+
+    async function* failingChunks() {
+      yield [{ row: 0, col: 0, input: 'partial-a' }]
+      yield [{ row: 0, col: 1, input: 'partial-b' }]
+      throw new Error('chunk source failed')
+    }
+
+    await expect(
+      backend.importCellChunks!({
+        kind: 'import-cell-chunks',
+        sheetId: 'sheet-1',
+        chunks: failingChunks(),
+        range: { rowStart: 0, rowEnd: 0, colStart: 0, colEnd: 1 },
+      }),
+    ).rejects.toThrow('chunk source failed')
+
+    expect(await readCellDisplay(backend, 'sheet-1', 0, 0)).toBe('old-a')
+    expect(await readCellDisplay(backend, 'sheet-1', 0, 1)).toBe('old-b')
+    expect((await readCellFact(backend)).revision).toBe(3)
+    await expect(backend.undoTransaction!(undoReq())).rejects.toThrow('nothing to undo')
+
+    await backend.redoTransaction!(redoReq())
+    expect(await readCellDisplay(backend, 'sheet-1', 0, 0)).toBe('redo-a')
+    expect(await readCellDisplay(backend, 'sheet-1', 0, 1)).toBe('old-b')
   })
 
   it('undo restores a cell created on a previously empty coordinate (delete on undo)', async () => {
@@ -3803,6 +5374,74 @@ describe('static backend undo/redo (reverse-delta history, audit D-2)', () => {
 
     await backend.redoTransaction!(redoReq())
     expect(await readCellDisplay(backend, 'sheet-1', 3, 0)).toBe('bottom')
+  })
+
+  it('shifts hidden indices through structural inserts, deletes, and exact row removal with undo/redo', async () => {
+    const backend = createStaticSpreadsheetBackend({ revision: 1, matrix: [['A1']] })
+    await backend.hideRows!({
+      kind: 'hide-rows',
+      sheetId: 'sheet-1',
+      rowIndices: [6, 1, 3],
+      revision: 1,
+    })
+    await backend.hideColumns!({
+      kind: 'hide-columns',
+      sheetId: 'sheet-1',
+      colIndices: [7, 0, 4],
+      revision: 2,
+    })
+    await backend.insertRows!({
+      kind: 'insert-rows',
+      sheetId: 'sheet-1',
+      rowIndex: 2,
+      count: 2,
+    })
+    await backend.insertColumns!({
+      kind: 'insert-columns',
+      sheetId: 'sheet-1',
+      colIndex: 4,
+      count: 2,
+    })
+    await backend.deleteRows!({
+      kind: 'delete-rows',
+      sheetId: 'sheet-1',
+      rowIndex: 4,
+      count: 3,
+    })
+    await backend.deleteColumns!({
+      kind: 'delete-columns',
+      sheetId: 'sheet-1',
+      colIndex: 5,
+      count: 3,
+    })
+    expect(await readHiddenProjection(backend)).toEqual({
+      rows: [1, 5],
+      cols: [0, 6],
+      revision: 7,
+    })
+
+    await backend.removeRows!({
+      kind: 'remove-rows',
+      sheetId: 'sheet-1',
+      rows: [4, 0, 4],
+    })
+    expect(await readHiddenProjection(backend)).toEqual({
+      rows: [0, 3],
+      cols: [0, 6],
+      revision: 8,
+    })
+    await backend.undoTransaction!(undoReq('hidden-remove-rows'))
+    expect(await readHiddenProjection(backend)).toEqual({
+      rows: [1, 5],
+      cols: [0, 6],
+      revision: 9,
+    })
+    await backend.redoTransaction!(redoReq('hidden-remove-rows'))
+    expect(await readHiddenProjection(backend)).toEqual({
+      rows: [0, 3],
+      cols: [0, 6],
+      revision: 10,
+    })
   })
 
   it('undo removes a format applied by setFormatRange', async () => {
@@ -3874,6 +5513,53 @@ describe('static backend undo/redo (reverse-delta history, audit D-2)', () => {
     expect(await readCellDisplay(backend, 'sheet-2', 0, 0)).toBe('keep-me')
     const names = await backend.listNamedRanges!({ kind: 'list-named-ranges' })
     expect(names.names.map((n) => n.name)).toEqual(['OnTwo'])
+  })
+
+  it('cleans hidden metadata on sheet deletion and restores it exactly through undo and redo', async () => {
+    const backend = createStaticSpreadsheetBackend({
+      revision: 1,
+      sheets: ['Sheet1', 'Sheet2'],
+    })
+    await backend.hideRows!({
+      kind: 'hide-rows',
+      sheetId: 'sheet-2',
+      rowIndices: [2],
+      revision: 1,
+    })
+    await backend.hideColumns!({
+      kind: 'hide-columns',
+      sheetId: 'sheet-2',
+      colIndices: [3],
+      revision: 2,
+    })
+    await backend.deleteSheet!({ kind: 'delete-sheet', sheetId: 'sheet-2' })
+    expect((await backend.listSheets!()).sheets.map((sheet) => sheet.id)).toEqual(['sheet-1'])
+    expect(await readHiddenProjection(backend, 'sheet-2')).toEqual({
+      rows: [],
+      cols: [],
+      revision: 4,
+    })
+
+    await backend.undoTransaction!(undoReq('hidden-delete-sheet'))
+    expect(await readHiddenProjection(backend, 'sheet-2')).toEqual({
+      rows: [2],
+      cols: [3],
+      revision: 5,
+    })
+    await backend.redoTransaction!(redoReq('hidden-delete-sheet'))
+    expect(await readHiddenProjection(backend, 'sheet-2')).toEqual({
+      rows: [],
+      cols: [],
+      revision: 6,
+    })
+
+    const replacement = await backend.addSheet!({ kind: 'add-sheet', name: 'Replacement' })
+    expect(replacement.createdSheet?.id).toBe('sheet-2')
+    expect(await readHiddenProjection(backend, 'sheet-2')).toEqual({
+      rows: [],
+      cols: [],
+      revision: 7,
+    })
   })
 
   it('a new mutation clears the redo stack', async () => {

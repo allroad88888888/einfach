@@ -1,32 +1,32 @@
-import { For, Show, createEffect, createMemo, createSignal, onCleanup } from 'solid-js'
+import { For, Show, createEffect, createMemo, onCleanup } from 'solid-js'
 import { useAtomValue } from '@einfach/solid'
 import { useT } from '../../src/i18n'
 import {
   closeGoToAtom,
   confirmGoToAtom,
   goToErrorAtom,
+  goToErrorMessageAtom,
+  goToErrorParamsAtom,
   goToHistoryAtom,
   goToInputAtom,
   goToLocatorAtom,
   goToModeAtom,
   goToOpenAtom,
-  GO_TO_REGION_CAP,
-  GO_TO_SCAN_MAX_CELLS,
+  goToSpecialCapabilityAtom,
+  goToSpecialPendingAtom,
+  goToSpecialWarningAtom,
   nameRegistryCacheAtom,
   parseGoToReference,
-  runGoToSpecialScan,
+  runGoToSpecialScanAtom,
   selectionSnapshotAtom,
-  setGoToErrorAtom,
+  setGoToErrorDetailsAtom,
   setGoToInputAtom,
   setGoToLocatorAtom,
   setGoToModeAtom,
+  setGoToSpecialCapabilityAtom,
   setWorkspaceActiveSheetAtom,
   sheetTabsSheetsAtom,
-  viewportHiddenAtom,
-  viewportMetricsAtom,
   workspaceSessionAtom,
-  type CellRange,
-  type GoToCandidateCell,
   type GoToLocator,
   type GoToLocatorKind,
   type GoToValueKindFilter,
@@ -92,31 +92,30 @@ export function SpreadsheetGoToDialog(props: SpreadsheetGoToDialogProps) {
   const locator = useAtomValue(goToLocatorAtom)
   const history = useAtomValue(goToHistoryAtom)
   const errorCode = useAtomValue(goToErrorAtom)
-
-  const [errorParams, setErrorParams] = createSignal<Record<string, unknown> | null>(null)
-  // null = no truncation; number = the cap that fired (region cap or cell cap).
-  const [truncatedLimit, setTruncatedLimit] = createSignal<number | null>(null)
-  const [truncatedReason, setTruncatedReason] = createSignal<'regions' | 'cells' | null>(
-    null,
-  )
-  const [busy, setBusy] = createSignal(false)
+  const errorParams = useAtomValue(goToErrorParamsAtom)
+  const errorMessage = useAtomValue(goToErrorMessageAtom)
+  const specialCapability = useAtomValue(goToSpecialCapabilityAtom)
+  const specialPending = useAtomValue(goToSpecialPendingAtom)
+  const specialWarning = useAtomValue(goToSpecialWarningAtom)
 
   let inputRef: HTMLInputElement | undefined
 
-  // Open-edge reset: clear input + error, default to "simple" tab.
+  // Core owns open-session reset; the adapter only projects the DOM focus edge.
   createEffect<boolean>((wasOpen) => {
     const open = isOpen()
     if (open && !wasOpen) {
-      store.setter(setGoToModeAtom, 'simple')
-      store.setter(setGoToInputAtom, '')
-      store.setter(setGoToErrorAtom, null)
-      setErrorParams(null)
-      setTruncatedLimit(null)
-      setTruncatedReason(null)
       queueMicrotask(() => inputRef?.focus())
     }
     return open
   }, false)
+
+  // Capture only the host capability; execution and lifecycle remain in Core.
+  createEffect(() => {
+    store.setter(
+      setGoToSpecialCapabilityAtom,
+      typeof backend.readRangeProjection === 'function' ? 'available' : 'unavailable',
+    )
+  })
 
   // Esc closes.
   createEffect(() => {
@@ -132,6 +131,8 @@ export function SpreadsheetGoToDialog(props: SpreadsheetGoToDialogProps) {
   })
 
   const errorText = createMemo(() => {
+    const message = errorMessage()
+    if (message) return message
     const code = errorCode()
     if (!code) return ''
     const params = errorParams() ?? {}
@@ -157,12 +158,15 @@ export function SpreadsheetGoToDialog(props: SpreadsheetGoToDialogProps) {
         : reason === 'unknown-name'
           ? 'goTo.error.unknownName'
           : 'goTo.error.invalidAddress'
-    setErrorParams({ input: raw })
-    store.setter(setGoToErrorAtom, code)
+    store.setter(setGoToErrorDetailsAtom, {
+      code,
+      params: { input: raw },
+      message: null,
+    })
   }
 
   function runSimpleConfirm() {
-    if (busy()) return
+    if (specialPending()) return
     const raw = inputValue().trim()
     if (raw.length === 0) {
       reportParseError('empty', raw)
@@ -198,116 +202,16 @@ export function SpreadsheetGoToDialog(props: SpreadsheetGoToDialogProps) {
     })
   }
 
-  async function runSpecialConfirm() {
-    if (busy()) return
-    setBusy(true)
-    setTruncatedLimit(null)
-    setTruncatedReason(null)
-    try {
-      const snap = store.getter(selectionSnapshotAtom)
-      const sheets = store.getter(sheetTabsSheetsAtom)
-      const activeSheetId =
-        snap.selection.sheetId ||
-        store.getter(workspaceSessionAtom).activeSheetId ||
-        sheets[0]?.id ||
-        ''
-      if (!activeSheetId) {
-        store.setter(setGoToErrorAtom, 'goTo.error.invalidAddress')
-        return
-      }
-      const metrics = store.getter(viewportMetricsAtom)
-      const usedRangeRaw = computeUsedRange(metrics.rowCount, metrics.colCount)
-      const usedRange = clipRectToCellBudget(usedRangeRaw)
-      const usedRangeWasClipped =
-        usedRange.rowEnd !== usedRangeRaw.rowEnd ||
-        usedRange.colEnd !== usedRangeRaw.colEnd
-      const result = await backend.readRangeProjection({
-        kind: 'range',
-        sheetId: activeSheetId,
-        range: usedRange,
-        requestId: nextRequestId(),
-        reason: 'diagnostics',
-      })
-      const candidates: GoToCandidateCell[] = result.cells.map((c) => ({
-        row: c.row,
-        col: c.col,
-        displayValue: c.displayValue ?? '',
-        valueKind: c.valueKind,
-        formula: c.formula,
-        commentThreadId: c.commentThreadId,
-        conditionalFormat: c.conditionalFormat,
-        validation: c.validation,
-        originalRow: c.originalRow,
-      }))
-      const hiddenState = store.getter(viewportHiddenAtom)
-      const hiddenRows = hiddenState.rowsBySheet[activeSheetId] ?? []
-      const hiddenCols = hiddenState.colsBySheet[activeSheetId] ?? []
-      // Row/column differences scope to the *current selection* rect, not
-      // the used range — they fall back to the used range when no rect-like
-      // selection is active.
-      const selectionRect = snap.range
-      // For row/column differences, the comparison anchor in Excel is the
-      // active cell of the selection — which Excel keeps at the cell the
-      // user originally clicked (the selection's `anchor`), even after a
-      // Shift+click extends the selection. Our `snap.activeCell` derives
-      // from the selection's focus instead (Shift+click on D5 leaves focus
-      // = D5), so we pass the rect's top-left corner explicitly so the
-      // engine compares against the first column / first row of the
-      // selection rather than the last cell the pointer landed on.
-      // Pinned by `go-to.spec.ts:253` 'row differences scoped to selection
-      // rect, not the used range' (anchor column expected to be B, not D).
-      const isDifferencesLocator =
-        locator().kind === 'row-differences' || locator().kind === 'column-differences'
-      const scanActiveCell = isDifferencesLocator
-        ? {
-            sheetId: activeSheetId,
-            row: selectionRect.rowStart,
-            col: selectionRect.colStart,
-          }
-        : snap.activeCell
-      const scan = runGoToSpecialScan(locator(), {
-        sheetId: activeSheetId,
-        activeCell: scanActiveCell,
-        cells: candidates,
-        searchRect: usedRange,
-        selectionRect,
-        hiddenRows,
-        hiddenCols,
-      })
-      if (scan.totalMatchCount === 0) {
-        // Surface "no matches" inline but keep the dialog open and leave
-        // the existing selection untouched.
-        store.setter(setGoToErrorAtom, 'goTo.error.noMatches')
-        setErrorParams(null)
-        return
-      }
-      if (scan.truncated) {
-        // Region cap fired during coalescing.
-        setTruncatedLimit(GO_TO_REGION_CAP)
-        setTruncatedReason('regions')
-      } else if (usedRangeWasClipped) {
-        // Search rect was clipped to fit the cell budget.
-        setTruncatedLimit(GO_TO_SCAN_MAX_CELLS)
-        setTruncatedReason('cells')
-      }
-      store.setter(confirmGoToAtom, {
-        kind: 'special-result',
-        sheetId: activeSheetId,
-        result: scan,
-      })
-    } catch (err) {
-      store.setter(setGoToErrorAtom, 'goTo.error.invalidAddress')
-      setErrorParams({ input: err instanceof Error ? err.message : String(err) })
-    } finally {
-      setBusy(false)
-    }
+  function runSpecialConfirm() {
+    if (specialPending() || specialCapability() === 'unavailable') return
+    void store.setter(runGoToSpecialScanAtom, { port: backend })
   }
 
   function onConfirm() {
     if (mode() === 'simple') {
       runSimpleConfirm()
     } else {
-      void runSpecialConfirm()
+      runSpecialConfirm()
     }
   }
 
@@ -326,6 +230,9 @@ export function SpreadsheetGoToDialog(props: SpreadsheetGoToDialogProps) {
         class={`go-to-dialog ${props.class ?? ''}`.trim()}
         data-testid={props['data-testid'] ?? 'go-to-dialog'}
         data-active-tab={mode()}
+        data-special-capability={specialCapability()}
+        data-special-pending={String(specialPending())}
+        data-special-warning={specialWarning()?.reason ?? 'none'}
         role="dialog"
         aria-label={t('goTo.title')}
       >
@@ -349,6 +256,7 @@ export function SpreadsheetGoToDialog(props: SpreadsheetGoToDialogProps) {
             role="tab"
             aria-selected={mode() === 'simple'}
             data-testid="go-to-tab-simple"
+            disabled={specialPending()}
             onClick={() => setMode('simple')}
           >
             {t('goTo.simple')}
@@ -359,6 +267,7 @@ export function SpreadsheetGoToDialog(props: SpreadsheetGoToDialogProps) {
             role="tab"
             aria-selected={mode() === 'special'}
             data-testid="go-to-tab-special"
+            disabled={specialPending()}
             onClick={() => setMode('special')}
           >
             {t('goTo.special')}
@@ -418,7 +327,7 @@ export function SpreadsheetGoToDialog(props: SpreadsheetGoToDialogProps) {
 
         <Show when={mode() === 'special'}>
           <div class="gt-body gt-body-special" data-testid="go-to-special-pane">
-            <fieldset class="gt-locator-group">
+            <fieldset class="gt-locator-group" disabled={specialPending()}>
               <legend class="gt-field-label">{t('goTo.special')}</legend>
               <For each={LOCATOR_KIND_ORDER}>
                 {(kind) => {
@@ -427,11 +336,7 @@ export function SpreadsheetGoToDialog(props: SpreadsheetGoToDialogProps) {
                   return (
                     <label
                       class={`gt-radio${disabled ? ' gt-radio-disabled' : ''}`}
-                      title={
-                        disabled
-                          ? t('goTo.locator.disabled.dependencyGraph')
-                          : undefined
-                      }
+                      title={disabled ? t('goTo.locator.disabled.dependencyGraph') : undefined}
                     >
                       <input
                         type="radio"
@@ -451,8 +356,7 @@ export function SpreadsheetGoToDialog(props: SpreadsheetGoToDialogProps) {
 
             <Show
               when={
-                locatorKindOf(locator()) === 'formulas' ||
-                locatorKindOf(locator()) === 'constants'
+                locatorKindOf(locator()) === 'formulas' || locatorKindOf(locator()) === 'constants'
               }
             >
               <label class="gt-subtype">
@@ -460,6 +364,7 @@ export function SpreadsheetGoToDialog(props: SpreadsheetGoToDialogProps) {
                 <select
                   class="gt-select"
                   data-testid="go-to-subtype-select"
+                  disabled={specialPending()}
                   value={String(locatorValueKind(locator()) ?? '')}
                   onChange={(e) => {
                     const value = e.currentTarget.value
@@ -467,23 +372,23 @@ export function SpreadsheetGoToDialog(props: SpreadsheetGoToDialogProps) {
                   }}
                 >
                   <For each={VALUE_KIND_FILTERS}>
-                    {(opt) => (
-                      <option value={String(opt.value ?? '')}>{t(opt.label)}</option>
-                    )}
+                    {(opt) => <option value={String(opt.value ?? '')}>{t(opt.label)}</option>}
                   </For>
                 </select>
               </label>
             </Show>
 
-            <Show when={truncatedLimit() !== null}>
-              <div class="gt-truncated" data-testid="go-to-truncated">
-                <Show
-                  when={truncatedReason() === 'regions'}
-                  fallback={t('goTo.truncated.cells', { limit: truncatedLimit()! })}
-                >
-                  {t('goTo.truncated.regions', { limit: truncatedLimit()! })}
-                </Show>
-              </div>
+            <Show when={specialWarning()} keyed>
+              {(warning) => (
+                <div class="gt-truncated" data-testid="go-to-truncated">
+                  <Show
+                    when={warning.reason === 'regions'}
+                    fallback={t('goTo.truncated.cells', { limit: warning.limit })}
+                  >
+                    {t('goTo.truncated.regions', { limit: warning.limit })}
+                  </Show>
+                </div>
+              )}
             </Show>
           </div>
         </Show>
@@ -507,7 +412,9 @@ export function SpreadsheetGoToDialog(props: SpreadsheetGoToDialogProps) {
             type="button"
             class="gt-btn gt-btn-primary"
             data-testid="go-to-confirm-button"
-            disabled={busy()}
+            disabled={
+              specialPending() || (mode() === 'special' && specialCapability() === 'unavailable')
+            }
             onClick={onConfirm}
           >
             {t('goTo.confirm')}
@@ -516,45 +423,4 @@ export function SpreadsheetGoToDialog(props: SpreadsheetGoToDialogProps) {
       </div>
     </Show>
   )
-}
-
-// Track a monotonic request id for diagnostic readRangeProjection calls so
-// the backend can detect stale work. Kept local to the file because the
-// dialog is the only caller.
-let _requestId = 100_000
-function nextRequestId(): number {
-  _requestId += 1
-  return _requestId
-}
-
-function computeUsedRange(rowCount: number, colCount: number): CellRange {
-  // The grid metrics expose the addressable rect; the locator engine will
-  // walk every coord in this rect for blanks/visible-only, so this is the
-  // unclipped envelope. Clipping to the cell budget happens in
-  // `clipRectToCellBudget` below.
-  const rows = Math.max(1, rowCount || 1)
-  const cols = Math.max(1, colCount || 1)
-  return {
-    rowStart: 0,
-    rowEnd: rows - 1,
-    colStart: 0,
-    colEnd: cols - 1,
-  }
-}
-
-// Clip a rect so its cell-count is <= GO_TO_SCAN_MAX_CELLS. Preserves the
-// full column span and trims the row span; the truncation banner flags this
-// so the user knows the search didn't see the entire workbook.
-function clipRectToCellBudget(rect: CellRange): CellRange {
-  const cols = rect.colEnd - rect.colStart + 1
-  const rows = rect.rowEnd - rect.rowStart + 1
-  if (cols <= 0 || rows <= 0) return rect
-  const maxRows = Math.max(1, Math.floor(GO_TO_SCAN_MAX_CELLS / cols))
-  if (rows <= maxRows) return rect
-  return {
-    rowStart: rect.rowStart,
-    rowEnd: rect.rowStart + maxRows - 1,
-    colStart: rect.colStart,
-    colEnd: rect.colEnd,
-  }
 }

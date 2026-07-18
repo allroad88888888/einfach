@@ -1,21 +1,17 @@
-import { Show, createEffect, createSignal, onCleanup } from 'solid-js'
+import { Show, createEffect, onCleanup } from 'solid-js'
 import { useAtomValue } from '@einfach/solid'
 import { useT } from '../../src/i18n'
 import {
   closeValidationRuleEditorAtom,
-  selectionSnapshotAtom,
+  runDataValidationMutationAtom,
+  updateValidationRuleFormAtom,
   validationRuleEditorAtom,
-  workspaceSessionAtom,
+  validationRuleFormAtom,
   type CellRange,
   type ValidationMode,
-  type ValidationRule,
   type ValidationRuleKind,
 } from '@einfach/spreadsheet-ui-core'
-import {
-  refreshVisibleProjection,
-  useSpreadsheetBackend,
-  useSpreadsheetUiStore,
-} from '../provider'
+import { refreshVisibleProjection, useSpreadsheetBackend, useSpreadsheetUiStore } from '../provider'
 
 // Pull in the dialog stylesheet as a side-effect import. Vite picks the
 // dynamic-import target up statically and bundles the CSS into the chunk;
@@ -55,6 +51,7 @@ export function SpreadsheetDataValidationDialog(props: SpreadsheetDataValidation
   const store = useSpreadsheetUiStore()
   const backend = useSpreadsheetBackend()
   const editor = useAtomValue(validationRuleEditorAtom)
+  const form = useAtomValue(validationRuleFormAtom)
 
   const isEditing = () => editor().status === 'editing'
 
@@ -70,91 +67,28 @@ export function SpreadsheetDataValidationDialog(props: SpreadsheetDataValidation
     onCleanup(() => document.removeEventListener('keydown', onKeyDown))
   })
 
-  const [kind, setKind] = createSignal<ValidationRuleKind>('list')
-  const [mode, setMode] = createSignal<ValidationMode>('warn')
-  const [listValues, setListValues] = createSignal('')
-  const [rangeMin, setRangeMin] = createSignal('')
-  const [rangeMax, setRangeMax] = createSignal('')
-  const [regexPattern, setRegexPattern] = createSignal('')
-  const [formulaText, setFormulaText] = createSignal('')
-
-  function resetDraftFields() {
-    const e = editor()
-    const draft = e.status === 'editing' ? e.draft : undefined
-    setKind(draft?.kind ?? 'list')
-    setMode(e.status === 'editing' ? e.mode ?? 'warn' : 'warn')
-    setListValues(draft?.kind === 'list' ? draft.values.join(', ') : '')
-    setRangeMin(draft?.kind === 'range' && draft.min !== undefined ? String(draft.min) : '')
-    setRangeMax(draft?.kind === 'range' && draft.max !== undefined ? String(draft.max) : '')
-    setRegexPattern(draft?.kind === 'regex' ? draft.pattern : '')
-    setFormulaText(draft?.kind === 'formula' ? draft.formula : '')
-  }
-
-  createEffect((wasEditing: boolean) => {
-    const editing = isEditing()
-    if (editing && !wasEditing) resetDraftFields()
-    if (!editing && wasEditing) resetDraftFields()
-    return editing
-  }, false)
-
-  function resolveSheetId(): string {
-    if (props.sheetId && props.sheetId.length > 0) return props.sheetId
-    const workspaceSheetId = store.getter(workspaceSessionAtom).activeSheetId
-    if (workspaceSheetId && workspaceSheetId.length > 0) return workspaceSheetId
-    return store.getter(selectionSnapshotAtom).selection.sheetId
-  }
-
-  function buildRule(): ValidationRule {
-    const k = kind()
-    if (k === 'list') {
-      return {
-        kind: 'list',
-        values: listValues()
-          .split(',')
-          .map((v) => v.trim())
-          .filter(Boolean),
-        dropdown: true,
-      }
-    }
-    if (k === 'range') {
-      const min = rangeMin() !== '' ? Number(rangeMin()) : undefined
-      const max = rangeMax() !== '' ? Number(rangeMax()) : undefined
-      return { kind: 'range', min, max }
-    }
-    if (k === 'regex') {
-      return { kind: 'regex', pattern: regexPattern() }
-    }
-    return { kind: 'formula', formula: formulaText() }
-  }
-
   async function handleSave() {
-    const e = editor()
-    if (e.status !== 'editing' || !e.range) return
-    const sheetId = resolveSheetId()
-    if (!sheetId) return
-    await backend.setValidationRule?.({
-      kind: 'set-validation-rule',
-      sheetId,
-      range: e.range,
-      rule: buildRule(),
-      mode: mode(),
+    await store.setter(runDataValidationMutationAtom, {
+      action: 'save',
+      sheetId: props.sheetId,
+      setRule: backend.setValidationRule
+        ? (request) => backend.setValidationRule!(request)
+        : undefined,
+      acceptAcknowledgedResult: (result) =>
+        refreshVisibleProjection(store, backend, result.sheetId),
     })
-    store.setter(closeValidationRuleEditorAtom)
-    await refreshVisibleProjection(store, backend, sheetId)
   }
 
   async function handleClear() {
-    const e = editor()
-    if (e.status !== 'editing' || !e.range) return
-    const sheetId = resolveSheetId()
-    if (!sheetId) return
-    await backend.clearValidationRule?.({
-      kind: 'clear-validation-rule',
-      sheetId,
-      range: e.range,
+    await store.setter(runDataValidationMutationAtom, {
+      action: 'clear',
+      sheetId: props.sheetId,
+      clearRule: backend.clearValidationRule
+        ? (request) => backend.clearValidationRule!(request)
+        : undefined,
+      acceptAcknowledgedResult: (result) =>
+        refreshVisibleProjection(store, backend, result.sheetId),
     })
-    store.setter(closeValidationRuleEditorAtom)
-    await refreshVisibleProjection(store, backend, sheetId)
   }
 
   function handleCancel() {
@@ -167,6 +101,7 @@ export function SpreadsheetDataValidationDialog(props: SpreadsheetDataValidation
         class={`validation-dialog spreadsheet-validation-dialog ${props.class ?? ''}`.trim()}
         data-testid={props['data-testid'] ?? 'validation-dialog'}
         role="dialog"
+        aria-busy={editor().pending}
         aria-label={t('dataValidation.title')}
       >
         <div class="dv-dialog-header">
@@ -196,9 +131,12 @@ export function SpreadsheetDataValidationDialog(props: SpreadsheetDataValidation
               <select
                 class="validation-kind-select"
                 data-testid="validation-kind-select"
-                value={kind()}
+                value={form().kind}
+                disabled={editor().pending}
                 onChange={(e) => {
-                  setKind((e.target as HTMLSelectElement).value as ValidationRuleKind)
+                  store.setter(updateValidationRuleFormAtom, {
+                    kind: (e.target as HTMLSelectElement).value as ValidationRuleKind,
+                  })
                 }}
               >
                 <option value="list">{t('dataValidation.rule.list')}</option>
@@ -209,7 +147,7 @@ export function SpreadsheetDataValidationDialog(props: SpreadsheetDataValidation
             </label>
           </div>
 
-          <Show when={kind() === 'list'}>
+          <Show when={form().kind === 'list'}>
             <div class="dv-form-row">
               <label>
                 {t('dataValidation.values')}
@@ -217,16 +155,19 @@ export function SpreadsheetDataValidationDialog(props: SpreadsheetDataValidation
                   type="text"
                   class="validation-list-values"
                   data-testid="validation-list-values"
-                  value={listValues()}
+                  value={form().listValues}
+                  disabled={editor().pending}
                   onInput={(e) => {
-                    setListValues((e.target as HTMLInputElement).value)
+                    store.setter(updateValidationRuleFormAtom, {
+                      listValues: (e.target as HTMLInputElement).value,
+                    })
                   }}
                 />
               </label>
             </div>
           </Show>
 
-          <Show when={kind() === 'range'}>
+          <Show when={form().kind === 'range'}>
             <div class="dv-form-row">
               <label>{t('dataValidation.minMax')}</label>
               <div class="dv-range-pair">
@@ -236,9 +177,12 @@ export function SpreadsheetDataValidationDialog(props: SpreadsheetDataValidation
                   data-testid="validation-range-min"
                   aria-label={t('dataValidation.min')}
                   placeholder={t('dataValidation.min')}
-                  value={rangeMin()}
+                  value={form().rangeMin}
+                  disabled={editor().pending}
                   onInput={(e) => {
-                    setRangeMin((e.target as HTMLInputElement).value)
+                    store.setter(updateValidationRuleFormAtom, {
+                      rangeMin: (e.target as HTMLInputElement).value,
+                    })
                   }}
                 />
                 <input
@@ -247,16 +191,19 @@ export function SpreadsheetDataValidationDialog(props: SpreadsheetDataValidation
                   data-testid="validation-range-max"
                   aria-label={t('dataValidation.max')}
                   placeholder={t('dataValidation.max')}
-                  value={rangeMax()}
+                  value={form().rangeMax}
+                  disabled={editor().pending}
                   onInput={(e) => {
-                    setRangeMax((e.target as HTMLInputElement).value)
+                    store.setter(updateValidationRuleFormAtom, {
+                      rangeMax: (e.target as HTMLInputElement).value,
+                    })
                   }}
                 />
               </div>
             </div>
           </Show>
 
-          <Show when={kind() === 'regex'}>
+          <Show when={form().kind === 'regex'}>
             <div class="dv-form-row">
               <label>
                 {t('dataValidation.pattern')}
@@ -264,16 +211,19 @@ export function SpreadsheetDataValidationDialog(props: SpreadsheetDataValidation
                   type="text"
                   class="validation-regex-pattern"
                   data-testid="validation-regex-pattern"
-                  value={regexPattern()}
+                  value={form().regexPattern}
+                  disabled={editor().pending}
                   onInput={(e) => {
-                    setRegexPattern((e.target as HTMLInputElement).value)
+                    store.setter(updateValidationRuleFormAtom, {
+                      regexPattern: (e.target as HTMLInputElement).value,
+                    })
                   }}
                 />
               </label>
             </div>
           </Show>
 
-          <Show when={kind() === 'formula'}>
+          <Show when={form().kind === 'formula'}>
             <div class="dv-form-row">
               <label>
                 {t('dataValidation.formula')}
@@ -281,9 +231,12 @@ export function SpreadsheetDataValidationDialog(props: SpreadsheetDataValidation
                   type="text"
                   class="validation-formula-text"
                   data-testid="validation-formula-text"
-                  value={formulaText()}
+                  value={form().formulaText}
+                  disabled={editor().pending}
                   onInput={(e) => {
-                    setFormulaText((e.target as HTMLInputElement).value)
+                    store.setter(updateValidationRuleFormAtom, {
+                      formulaText: (e.target as HTMLInputElement).value,
+                    })
                   }}
                 />
               </label>
@@ -296,9 +249,12 @@ export function SpreadsheetDataValidationDialog(props: SpreadsheetDataValidation
               <select
                 class="validation-mode-select"
                 data-testid="validation-mode-select"
-                value={mode()}
+                value={form().mode}
+                disabled={editor().pending}
                 onChange={(e) => {
-                  setMode((e.target as HTMLSelectElement).value as ValidationMode)
+                  store.setter(updateValidationRuleFormAtom, {
+                    mode: (e.target as HTMLSelectElement).value as ValidationMode,
+                  })
                 }}
               >
                 <option value="warn">{t('dataValidation.mode.warn')}</option>
@@ -308,12 +264,19 @@ export function SpreadsheetDataValidationDialog(props: SpreadsheetDataValidation
           </div>
         </div>
 
+        <Show when={editor().error}>
+          <div class="dv-error" data-testid="validation-error-text" role="alert">
+            {editor().error}
+          </div>
+        </Show>
+
         <div class="dv-dialog-footer">
           <button
             type="button"
             class="validation-clear-button"
             data-testid="validation-clear-button"
             data-variant="danger"
+            disabled={editor().pending}
             onClick={() => {
               void handleClear()
             }}
@@ -333,6 +296,7 @@ export function SpreadsheetDataValidationDialog(props: SpreadsheetDataValidation
             class="validation-save-button"
             data-testid="validation-save-button"
             data-variant="primary"
+            disabled={editor().pending}
             onClick={() => {
               void handleSave()
             }}

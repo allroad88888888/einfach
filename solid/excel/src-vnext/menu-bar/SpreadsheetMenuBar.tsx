@@ -1,45 +1,55 @@
-import { For, Show, createMemo, onCleanup, onMount } from 'solid-js'
+import { For, Show, createEffect, createMemo, onCleanup, onMount } from 'solid-js'
 import { useAtomValue } from '@einfach/solid'
 import { useT } from '../../src/i18n'
 import {
+  addSheetTabAtom,
   closeFindReplaceAtom,
   closeHelpOverlayAtom,
   closeTopMenuAtom,
   copyClipboardAtom,
+  captureFilterSortCapabilityAtom,
+  captureRemoveDuplicatesCapabilityAtom,
+  createInsertColumnsOperation,
+  createInsertRowsOperation,
   cutClipboardAtom,
-  dispatchSortAtom,
   dispatchToolbarFormatCommandAtom,
+  filterSortEntrypointProjectionAtom,
   findMenuByAccessKey,
   helpOverlayAtom,
   isMenuItemDescriptor,
-  issueFilterSortSyncTicketAtom,
   MENU_BAR_ITEMS,
-  nextHistoryTransactionId,
   openCommentSessionAtom,
   openConditionalFormatEditorAtom,
-  openFilterDropdownAtom,
+  openFilterDropdownFromEntrypointAtom,
   openFindReplaceAtom,
   openFormatCellsAtom,
   openGoToAtom,
   openHelpOverlayAtom,
   openNameManagerAtom,
   openPasteSpecialAtom,
-  openRemoveDuplicatesAtom,
-  openTextToColumnsAtom,
+  openRemoveDuplicatesFromSelectionAtom,
   openTopMenuAtom,
   openValidationRuleEditorAtom,
+  pasteSpecialCapabilityAtom,
   pasteClipboardAtom,
-  pushHistoryAtom,
+  reportCopyAsStatusAtom,
+  retryFilterSortRefreshAtom,
+  removeDuplicatesCapabilityAtom,
+  runFilterSortEntrypointAtom,
+  runViewportHiddenMutationAtom,
+  runViewportHiddenSelectionMutationAtom,
+  runViewportFreezeMutationAtom,
+  runStructureOperationAtom,
+  runTextToColumnsEntrypointAtom,
   selectAllAtom,
   selectionSnapshotAtom,
-  setFilterSortErrorAtom,
-  setViewportFreezeAtom,
-  setViewportHiddenAtom,
+  supportsViewportFreezeAuthority,
   toggleFormulaBarAtom,
   toggleGridlinesAtom,
   toggleHeadingsAtom,
   togglePrintPreviewAtom,
   topMenuOpenAtom,
+  textToColumnsEntrypointProjectionAtom,
   viewportShowFormulaBarAtom,
   viewportShowGridlinesAtom,
   viewportShowHeadingsAtom,
@@ -47,19 +57,16 @@ import {
   type MenuBarEntry,
   type MenuItemDescriptor,
   type MenuItemDispatch,
+  type StructureOperationIntent,
   type TopMenuDescriptor,
   type TopMenuId,
 } from '@einfach/spreadsheet-ui-core'
 
 import {
-  copyAsErrorAtom,
   dispatchCopyAs,
   dispatchRedo,
   dispatchUndo,
-  pasteSpecialSupportedAtom,
   refreshVisibleProjection,
-  removeDuplicatesSheetIdAtom,
-  removeDuplicatesSupportedAtom,
   textToColumnsSupportedAtom,
   useSpreadsheetBackend,
   useSpreadsheetUiStore,
@@ -68,6 +75,7 @@ import {
 export interface SpreadsheetMenuBarProps {
   class?: string
   'data-testid'?: string
+  hiddenItemIds?: readonly string[]
 }
 
 export function SpreadsheetMenuBar(props: SpreadsheetMenuBarProps) {
@@ -78,10 +86,17 @@ export function SpreadsheetMenuBar(props: SpreadsheetMenuBarProps) {
   const showGridlines = useAtomValue(viewportShowGridlinesAtom)
   const showHeadings = useAtomValue(viewportShowHeadingsAtom)
   const showFormulaBar = useAtomValue(viewportShowFormulaBarAtom)
-  const pasteSpecialSupported = useAtomValue(pasteSpecialSupportedAtom)
+  const pasteSpecialCapability = useAtomValue(pasteSpecialCapabilityAtom)
   const textToColumnsSupported = useAtomValue(textToColumnsSupportedAtom)
-  const removeDuplicatesSupported = useAtomValue(removeDuplicatesSupportedAtom)
+  const removeDuplicatesCapability = useAtomValue(removeDuplicatesCapabilityAtom)
+  const filterSortEntrypoint = useAtomValue(filterSortEntrypointProjectionAtom)
+  const textToColumnsEntrypoint = useAtomValue(textToColumnsEntrypointProjectionAtom)
   let rootRef: HTMLDivElement | undefined
+
+  createEffect(() => {
+    store.setter(captureFilterSortCapabilityAtom, backend)
+    store.setter(captureRemoveDuplicatesCapabilityAtom, backend)
+  })
 
   function checkedForDispatch(dispatch: MenuItemDispatch): boolean | undefined {
     switch (dispatch.kind) {
@@ -96,12 +111,30 @@ export function SpreadsheetMenuBar(props: SpreadsheetMenuBarProps) {
     }
   }
 
+  function disabledReasonForDispatch(dispatch: MenuItemDispatch): string | null {
+    switch (dispatch.kind) {
+      case 'freeze-panes':
+      case 'unfreeze-panes':
+        return supportsViewportFreezeAuthority(backend)
+          ? null
+          : 'Freeze panes are unavailable for this workbook backend.'
+      case 'open-filter-dropdown':
+      case 'sort-asc':
+      case 'sort-desc':
+        return filterSortEntrypoint().disabledReason
+      case 'open-text-to-columns':
+        return textToColumnsEntrypoint().disabledReason
+      default:
+        return null
+    }
+  }
+
   /**
    * Resolve a capability-gated menu item. Known keys today:
    *   - `'pasteSpecial'`  → host backend implements `pasteRange`
    *   - `'textToColumns'` → host backend implements `importCellChunks`
-   *   - `'removeRows'`    → host backend implements `removeRows`
-   *                         (Data → Remove Duplicates)
+   *   - `'removeRows'`    → Core reports exact range-read and row-removal
+   *                         capabilities (Data → Remove Duplicates)
    * Returning false makes the dropdown entry hide entirely (vs.
    * show-as-disabled for the placeholder case).
    */
@@ -109,11 +142,11 @@ export function SpreadsheetMenuBar(props: SpreadsheetMenuBarProps) {
     if (!key) return false
     switch (key) {
       case 'pasteSpecial':
-        return pasteSpecialSupported()
+        return pasteSpecialCapability()
       case 'textToColumns':
         return textToColumnsSupported()
       case 'removeRows':
-        return removeDuplicatesSupported()
+        return removeDuplicatesCapability().canRead && removeDuplicatesCapability().canRemove
       default:
         return false
     }
@@ -175,9 +208,31 @@ export function SpreadsheetMenuBar(props: SpreadsheetMenuBarProps) {
   }
 
   function dispatchItem(item: MenuItemDescriptor) {
-    if (item.isAvailable === 'placeholder') return
+    if (item.isAvailable === 'placeholder' || disabledReasonForDispatch(item.dispatch)) return
     routeDispatch(item.dispatch)
     store.setter(closeTopMenuAtom)
+  }
+
+  function retryFilterSortRefresh() {
+    void store.setter(retryFilterSortRefreshAtom, {
+      refreshProjection: (sheetId) => refreshVisibleProjection(store, backend, sheetId),
+    })
+  }
+
+  function runTextToColumnsEntrypoint() {
+    void store.setter(runTextToColumnsEntrypointAtom, { source: backend })
+  }
+
+  function runRemoveDuplicatesEntrypoint() {
+    void store.setter(openRemoveDuplicatesFromSelectionAtom, { source: backend })
+  }
+
+  function runStructureOperation(intent: StructureOperationIntent) {
+    void store.setter(runStructureOperationAtom, {
+      intent,
+      source: backend,
+      refreshProjection: (sheetId) => refreshVisibleProjection(store, backend, sheetId),
+    })
   }
 
   function getActiveSheetId(): string | null {
@@ -208,6 +263,7 @@ export function SpreadsheetMenuBar(props: SpreadsheetMenuBarProps) {
         return
       }
       case 'edit.pasteSpecial':
+        if (!store.getter(pasteSpecialCapabilityAtom)) return
         store.setter(openPasteSpecialAtom)
         return
       case 'edit.copyAs': {
@@ -219,7 +275,7 @@ export function SpreadsheetMenuBar(props: SpreadsheetMenuBarProps) {
         // unhandled promise (Firefox / file:// can reject the backend
         // projection if the worker is mid-restart).
         void dispatchCopyAs(store, backend, { sheetId, range: snap.range }).catch(() => {
-          store.setter(copyAsErrorAtom, { kind: 'failed' })
+          store.setter(reportCopyAsStatusAtom, { kind: 'failed' })
         })
         return
       }
@@ -263,98 +319,11 @@ export function SpreadsheetMenuBar(props: SpreadsheetMenuBarProps) {
         store.setter(openValidationRuleEditorAtom, {})
         return
       case 'open-text-to-columns': {
-        const snap = store.getter(selectionSnapshotAtom)
-        const sheetId = snap.selection.sheetId || getActiveSheetId() || ''
-        if (!sheetId) return
-        // Text to Columns requires a single source column. Surface the
-        // dialog regardless — the dialog itself shows the disable
-        // message when the selection spans multiple columns. We still
-        // forward the (single-col) range so the dialog can hydrate.
-        const range = snap.range
-        const colIndex = range.colStart
-        void (async () => {
-          const rows: { sourceRow: number; text: string }[] = []
-          if (range.colStart === range.colEnd) {
-            const projection = await backend.readRangeProjection({
-              kind: 'range',
-              sheetId,
-              range,
-              requestId: 0,
-              reason: 'toolbar',
-            })
-            const byRow = new Map<number, string>()
-            for (const cell of projection.cells) {
-              if (cell.col === colIndex) byRow.set(cell.row, cell.displayValue ?? '')
-            }
-            for (let r = range.rowStart; r <= range.rowEnd; r += 1) {
-              rows.push({ sourceRow: r, text: byRow.get(r) ?? '' })
-            }
-          }
-          store.setter(openTextToColumnsAtom, {
-            sheetId,
-            anchor: { row: range.rowStart, col: colIndex },
-            rows,
-          })
-        })()
+        runTextToColumnsEntrypoint()
         return
       }
       case 'open-remove-duplicates': {
-        const snap = store.getter(selectionSnapshotAtom)
-        const sheetId = snap.selection.sheetId || getActiveSheetId() || ''
-        if (!sheetId) return
-        const range = snap.range
-        // Sheet-absolute rectangle for the algorithm. Mirrors the
-        // CellRange shape (rowStart/rowEnd/colStart/colEnd) using the
-        // remove-duplicates module's own field names.
-        const rdRange = {
-          startRow: range.rowStart,
-          endRow: range.rowEnd,
-          startCol: range.colStart,
-          endCol: range.colEnd,
-        }
-        // Fetch the projection cells inside the range up-front so the
-        // dialog's preview can run the pure scanner without waiting on
-        // I/O when the user toggles columns. On rejection OR empty
-        // result we do NOT open the dialog (HIGH bug: projection-failure
-        // mass deletion — a stale empty-cells dialog would otherwise let
-        // the user "confirm" deleting every row in the selection as
-        // blank-tuple duplicates).
-        void (async () => {
-          let cells: import('@einfach/spreadsheet-ui-core').DisplayCell[] = []
-          try {
-            const projection = await backend.readRangeProjection({
-              kind: 'range',
-              sheetId,
-              range,
-              requestId: 0,
-              reason: 'toolbar',
-            })
-            cells = projection.cells
-          } catch (error) {
-            // eslint-disable-next-line no-console
-            console.warn(
-              '[remove-duplicates] readRangeProjection rejected; not opening dialog:',
-              error,
-            )
-            return
-          }
-          if (cells.length === 0) {
-            // eslint-disable-next-line no-console
-            console.warn(
-              '[remove-duplicates] readRangeProjection returned no cells; not opening dialog.',
-            )
-            return
-          }
-          // Two-write transaction: capture the sheetId snapshot BEFORE
-          // flipping the open flag (HIGH bug: wrong-sheet deletion race).
-          // Both writes run synchronously inside the same microtask — no
-          // user interaction can interleave between them — and the dialog
-          // never observes a `open=true` state without a paired sheetId
-          // because it does not subscribe to the open flag transitions
-          // (the consumer body just reads on render).
-          store.setter(removeDuplicatesSheetIdAtom, sheetId)
-          store.setter(openRemoveDuplicatesAtom, rdRange, cells)
-        })()
+        runRemoveDuplicatesEntrypoint()
         return
       }
       case 'open-format-cells': {
@@ -368,78 +337,46 @@ export function SpreadsheetMenuBar(props: SpreadsheetMenuBarProps) {
         return
       }
       case 'open-filter-dropdown': {
-        const snap = store.getter(selectionSnapshotAtom)
-        const sheetId = snap.selection.sheetId || getActiveSheetId() || ''
-        if (!sheetId) return
-        store.setter(openFilterDropdownAtom, {
-          sheetId,
-          colIndex: snap.range.colStart,
+        store.setter(openFilterDropdownFromEntrypointAtom, {
+          source: backend,
+          entrypoint: 'menu-bar',
         })
         return
       }
       case 'insert-row-above':
       case 'insert-row-below': {
         const sheetId = getActiveSheetId()
-        if (!sheetId || !backend.insertRows) return
+        if (!sheetId) return
         const snap = store.getter(selectionSnapshotAtom)
         const rowIndex =
           dispatch.kind === 'insert-row-above' ? snap.range.rowStart : snap.range.rowEnd + 1
-        void (async () => {
-          const result = await backend.insertRows!({
-            kind: 'insert-rows',
+        runStructureOperation(
+          createInsertRowsOperation({
             sheetId,
             rowIndex,
             count: 1,
-          })
-          const rev =
-            typeof result?.revision === 'number'
-              ? result.revision
-              : Number(result?.revision ?? 0) || 0
-          store.setter(pushHistoryAtom, {
-            transactionId: nextHistoryTransactionId(),
-            kind: 'row.insert',
-            sheetId,
-            projectionRevision: rev,
-            affectedRange: result?.affectedRange,
-          })
-          await refreshVisibleProjection(store, backend, sheetId)
-        })()
+          }),
+        )
         return
       }
       case 'insert-column-left':
       case 'insert-column-right': {
         const sheetId = getActiveSheetId()
-        if (!sheetId || !backend.insertColumns) return
+        if (!sheetId) return
         const snap = store.getter(selectionSnapshotAtom)
         const colIndex =
           dispatch.kind === 'insert-column-left' ? snap.range.colStart : snap.range.colEnd + 1
-        void (async () => {
-          const result = await backend.insertColumns!({
-            kind: 'insert-columns',
+        runStructureOperation(
+          createInsertColumnsOperation({
             sheetId,
             colIndex,
             count: 1,
-          })
-          const rev =
-            typeof result?.revision === 'number'
-              ? result.revision
-              : Number(result?.revision ?? 0) || 0
-          store.setter(pushHistoryAtom, {
-            transactionId: nextHistoryTransactionId(),
-            kind: 'column.insert',
-            sheetId,
-            projectionRevision: rev,
-            affectedRange: result?.affectedRange,
-          })
-          await refreshVisibleProjection(store, backend, sheetId)
-        })()
+          }),
+        )
         return
       }
       case 'insert-sheet': {
-        if (!backend.addSheet) return
-        void (async () => {
-          await backend.addSheet!({ kind: 'add-sheet' })
-        })()
+        void store.setter(addSheetTabAtom)
         return
       }
       case 'toggle-bold': {
@@ -478,7 +415,13 @@ export function SpreadsheetMenuBar(props: SpreadsheetMenuBarProps) {
         const snap = store.getter(selectionSnapshotAtom)
         const rows: number[] = []
         for (let r = snap.range.rowStart; r <= snap.range.rowEnd; r += 1) rows.push(r)
-        store.setter(setViewportHiddenAtom, { sheetId, rows })
+        void store.setter(runViewportHiddenMutationAtom, {
+          source: backend,
+          sheetId,
+          action: 'hide-rows',
+          indices: rows,
+          window: snap.range,
+        })
         return
       }
       case 'hide-cols': {
@@ -487,14 +430,28 @@ export function SpreadsheetMenuBar(props: SpreadsheetMenuBarProps) {
         const snap = store.getter(selectionSnapshotAtom)
         const cols: number[] = []
         for (let c = snap.range.colStart; c <= snap.range.colEnd; c += 1) cols.push(c)
-        store.setter(setViewportHiddenAtom, { sheetId, cols })
+        void store.setter(runViewportHiddenMutationAtom, {
+          source: backend,
+          sheetId,
+          action: 'hide-columns',
+          indices: cols,
+          window: snap.range,
+        })
         return
       }
+      case 'unhide-rows':
+      case 'unhide-cols':
+        void store.setter(runViewportHiddenSelectionMutationAtom, {
+          source: backend,
+          action: dispatch.kind === 'unhide-rows' ? 'unhide-rows' : 'unhide-columns',
+        })
+        return
       case 'freeze-panes': {
         const sheetId = getActiveSheetId()
         if (!sheetId) return
         const snap = store.getter(selectionSnapshotAtom)
-        store.setter(setViewportFreezeAtom, {
+        void store.setter(runViewportFreezeMutationAtom, {
+          source: backend,
           sheetId,
           rows: snap.activeCell.row,
           cols: snap.activeCell.col,
@@ -504,39 +461,23 @@ export function SpreadsheetMenuBar(props: SpreadsheetMenuBarProps) {
       case 'unfreeze-panes': {
         const sheetId = getActiveSheetId()
         if (!sheetId) return
-        store.setter(setViewportFreezeAtom, { sheetId, rows: 0, cols: 0 })
+        void store.setter(runViewportFreezeMutationAtom, {
+          source: backend,
+          sheetId,
+          rows: 0,
+          cols: 0,
+        })
         return
       }
       case 'sort-asc':
       case 'sort-desc': {
-        const sheetId = getActiveSheetId()
-        if (!sheetId) return
-        const snap = store.getter(selectionSnapshotAtom)
-        const colIndex = snap.range.colStart
         const direction = dispatch.kind === 'sort-asc' ? 'asc' : 'desc'
-        const next = store.setter(dispatchSortAtom, {
-          sheetId,
-          colIndex,
+        void store.setter(runFilterSortEntrypointAtom, {
+          source: backend,
+          entrypoint: 'menu-bar',
           direction,
+          refreshProjection: (sheetId) => refreshVisibleProjection(store, backend, sheetId),
         })
-        if (backend.setFilterSort) {
-          const ticket = store.setter(issueFilterSortSyncTicketAtom) as number
-          void (async () => {
-            try {
-              await backend.setFilterSort!({
-                kind: 'set-filter-sort',
-                sheetId,
-                rules: next.rules,
-                directives: next.directives,
-              })
-              store.setter(setFilterSortErrorAtom, null)
-              void ticket
-              await refreshVisibleProjection(store, backend, sheetId)
-            } catch (err) {
-              store.setter(setFilterSortErrorAtom, err)
-            }
-          })()
-        }
         return
       }
       case 'toggle-formula-bar':
@@ -573,6 +514,10 @@ export function SpreadsheetMenuBar(props: SpreadsheetMenuBarProps) {
         class={`spreadsheet-menu-bar ${props.class ?? ''}`.trim()}
         role="menubar"
         data-testid={props['data-testid'] ?? 'spreadsheet-menu-bar'}
+        data-filter-sort-status={filterSortEntrypoint().status}
+        data-filter-sort-error={filterSortEntrypoint().error || undefined}
+        data-text-to-columns-entrypoint-status={textToColumnsEntrypoint().status}
+        data-text-to-columns-entrypoint-error={textToColumnsEntrypoint().error || undefined}
       >
         <For each={MENU_BAR_ITEMS}>
           {(menu) => (
@@ -583,11 +528,52 @@ export function SpreadsheetMenuBar(props: SpreadsheetMenuBarProps) {
               onHover={() => handleTopButtonHover(menu.id)}
               onItemActivate={dispatchItem}
               getChecked={checkedForDispatch}
+              getDisabledReason={disabledReasonForDispatch}
               resolveCapability={resolveCapability}
+              hiddenItemIds={props.hiddenItemIds}
             />
           )}
         </For>
       </div>
+      <Show when={filterSortEntrypoint().error}>
+        {(error) => (
+          <span role="status" data-testid="menu-bar-filter-sort-status">
+            {error()}
+          </span>
+        )}
+      </Show>
+      <Show when={filterSortEntrypoint().status === 'refresh-failed'}>
+        <button
+          type="button"
+          data-testid="menu-bar-filter-sort-refresh-retry"
+          aria-label="Retry filter and sort refresh"
+          onClick={retryFilterSortRefresh}
+        >
+          ↻
+        </button>
+      </Show>
+      <Show when={textToColumnsEntrypoint().status === 'loading'}>
+        <span role="status" data-testid="menu-bar-text-to-columns-loading">
+          Loading Text to Columns source…
+        </span>
+      </Show>
+      <Show when={textToColumnsEntrypoint().error}>
+        {(error) => (
+          <span role="status" data-testid="menu-bar-text-to-columns-status">
+            {error()}
+          </span>
+        )}
+      </Show>
+      <Show when={textToColumnsEntrypoint().canRetry}>
+        <button
+          type="button"
+          data-testid="menu-bar-text-to-columns-retry"
+          aria-label="Retry loading Text to Columns source"
+          onClick={runTextToColumnsEntrypoint}
+        >
+          ↻
+        </button>
+      </Show>
       <HelpOverlayDialog kind={helpOverlay()} onClose={() => store.setter(closeHelpOverlayAtom)} />
     </>
   )
@@ -600,11 +586,16 @@ interface MenuBarTopButtonProps {
   onHover: () => void
   onItemActivate: (item: MenuItemDescriptor) => void
   getChecked: (dispatch: MenuItemDispatch) => boolean | undefined
+  getDisabledReason: (dispatch: MenuItemDispatch) => string | null
   resolveCapability: (key: string | undefined) => boolean
+  hiddenItemIds?: readonly string[]
 }
 
 function MenuBarTopButton(props: MenuBarTopButtonProps) {
   const t = useT()
+  const entries = createMemo(() =>
+    filterHostVisibleEntries(props.menu.items, props.hiddenItemIds ?? []),
+  )
   return (
     <div class="menu-bar-top" data-testid={`menu-bar-top-${props.menu.id}`}>
       <button
@@ -625,12 +616,13 @@ function MenuBarTopButton(props: MenuBarTopButtonProps) {
           role="menu"
           data-testid={`menu-bar-dropdown-${props.menu.id}`}
         >
-          <For each={props.menu.items}>
+          <For each={entries()}>
             {(entry) => (
               <MenuBarDropdownEntry
                 entry={entry}
                 onActivate={props.onItemActivate}
                 getChecked={props.getChecked}
+                getDisabledReason={props.getDisabledReason}
                 resolveCapability={props.resolveCapability}
               />
             )}
@@ -641,10 +633,39 @@ function MenuBarTopButton(props: MenuBarTopButtonProps) {
   )
 }
 
+function filterHostVisibleEntries(
+  entries: readonly MenuBarEntry[],
+  hiddenItemIds: readonly string[],
+): readonly MenuBarEntry[] {
+  if (hiddenItemIds.length === 0) return entries
+
+  const hiddenIds = new Set(hiddenItemIds)
+  const filtered: MenuBarEntry[] = []
+  let pendingSeparator: MenuBarEntry | null = null
+
+  for (const entry of entries) {
+    if (isMenuItemDescriptor(entry) && hiddenIds.has(entry.id)) continue
+
+    if (!isMenuItemDescriptor(entry)) {
+      if (filtered.length > 0 && pendingSeparator === null) pendingSeparator = entry
+      continue
+    }
+
+    if (pendingSeparator) {
+      filtered.push(pendingSeparator)
+      pendingSeparator = null
+    }
+    filtered.push(entry)
+  }
+
+  return filtered
+}
+
 interface MenuBarDropdownEntryProps {
   entry: MenuBarEntry
   onActivate: (item: MenuItemDescriptor) => void
   getChecked: (dispatch: MenuItemDispatch) => boolean | undefined
+  getDisabledReason: (dispatch: MenuItemDispatch) => string | null
   resolveCapability: (key: string | undefined) => boolean
 }
 
@@ -674,6 +695,7 @@ function MenuBarDropdownEntry(props: MenuBarDropdownEntryProps) {
           item={props.entry as MenuItemDescriptor}
           onActivate={props.onActivate}
           getChecked={props.getChecked}
+          getDisabledReason={props.getDisabledReason}
         />
       </Show>
     </Show>
@@ -684,9 +706,11 @@ function DropdownItemButton(props: {
   item: MenuItemDescriptor
   onActivate: (item: MenuItemDescriptor) => void
   getChecked: (dispatch: MenuItemDispatch) => boolean | undefined
+  getDisabledReason: (dispatch: MenuItemDispatch) => string | null
 }) {
   const t = useT()
-  const isDisabled = () => props.item.isAvailable === 'placeholder'
+  const disabledReason = () => props.getDisabledReason(props.item.dispatch)
+  const isDisabled = () => props.item.isAvailable === 'placeholder' || disabledReason() !== null
   const checked = () => props.getChecked(props.item.dispatch)
   const hasCheck = () => checked() !== undefined
   return (
@@ -700,11 +724,12 @@ function DropdownItemButton(props: {
       disabled={isDisabled()}
       aria-checked={hasCheck() ? (checked() ? 'true' : 'false') : undefined}
       title={
-        isDisabled()
+        disabledReason() ??
+        (isDisabled()
           ? props.item.placeholderMessage
             ? t(props.item.placeholderMessage)
             : ''
-          : (props.item.shortcut ?? '')
+          : (props.item.shortcut ?? ''))
       }
       onClick={() => props.onActivate(props.item)}
     >
@@ -753,9 +778,7 @@ function HelpOverlayDialog(props: HelpOverlayDialogProps) {
         }}
       >
         <h2 class="spreadsheet-help-overlay-title" id="spreadsheet-help-overlay-title">
-          {props.kind === 'shortcuts'
-            ? t('help.shortcuts.title')
-            : t('help.about.title')}
+          {props.kind === 'shortcuts' ? t('help.shortcuts.title') : t('help.about.title')}
         </h2>
         <Show
           when={props.kind === 'shortcuts'}

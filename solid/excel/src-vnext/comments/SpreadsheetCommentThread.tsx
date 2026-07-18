@@ -4,7 +4,10 @@ import { useT } from '../../src/i18n'
 import {
   closeCommentSessionAtom,
   commentEditorDraftAtom,
+  commentMutationStateAtom,
+  commentMutationSubmissionBlockedAtom,
   commentSessionAtom,
+  runCommentMutationAtom,
   setCommentDraftAtom,
 } from '@einfach/spreadsheet-ui-core'
 import { useSpreadsheetBackend, useSpreadsheetUiStore } from '../provider/hooks'
@@ -20,6 +23,8 @@ export function SpreadsheetCommentThread(props: SpreadsheetCommentThreadProps) {
   const backend = useSpreadsheetBackend()
   const session = useAtomValue(commentSessionAtom)
   const draft = useAtomValue(commentEditorDraftAtom)
+  const mutation = useAtomValue(commentMutationStateAtom)
+  const submissionBlocked = useAtomValue(commentMutationSubmissionBlockedAtom)
 
   createEffect(() => {
     if (session() === null) return
@@ -47,27 +52,12 @@ export function SpreadsheetCommentThread(props: SpreadsheetCommentThreadProps) {
     return `${label}${s.cell.row + 1}`
   }
 
-  async function handlePost() {
-    const s = session()
-    if (!s) return
-    await backend.postComment?.({
-      kind: 'post-comment',
-      sheetId: s.sheetId,
-      cell: s.cell,
-      threadId: s.threadId,
-      body: draft(),
-    })
-    store.setter(closeCommentSessionAtom)
+  function handlePost() {
+    void store.setter(runCommentMutationAtom, { action: 'post', source: backend })
   }
 
-  async function handleResolve() {
-    const s = session()
-    if (!s?.threadId) return
-    await backend.resolveCommentThread?.({
-      kind: 'resolve-comment-thread',
-      sheetId: s.sheetId,
-      threadId: s.threadId,
-    })
+  function handleResolve() {
+    void store.setter(runCommentMutationAtom, { action: 'resolve', source: backend })
   }
 
   function handleClose() {
@@ -81,6 +71,7 @@ export function SpreadsheetCommentThread(props: SpreadsheetCommentThreadProps) {
         data-testid={props['data-testid'] ?? 'comment-thread'}
         role="dialog"
         aria-label="Comment thread"
+        aria-busy={mutation().phase === 'PendingPublished'}
       >
         <button
           type="button"
@@ -98,6 +89,9 @@ export function SpreadsheetCommentThread(props: SpreadsheetCommentThreadProps) {
           class="comment-thread-textarea spreadsheet-comment-thread-textarea"
           data-testid="comment-thread-textarea"
           value={draft()}
+          disabled={
+            mutation().phase === 'PendingPublished' || mutation().phase === 'OutcomeUnknownBlocked'
+          }
           onInput={(e) => {
             store.setter(setCommentDraftAtom, (e.target as HTMLTextAreaElement).value)
           }}
@@ -106,9 +100,8 @@ export function SpreadsheetCommentThread(props: SpreadsheetCommentThreadProps) {
           type="button"
           class="comment-post-button"
           data-testid="comment-post-button"
-          onClick={() => {
-            void handlePost()
-          }}
+          disabled={submissionBlocked()}
+          onClick={handlePost}
         >
           Post
         </button>
@@ -117,12 +110,16 @@ export function SpreadsheetCommentThread(props: SpreadsheetCommentThreadProps) {
             type="button"
             class="comment-resolve-button"
             data-testid="comment-resolve-button"
-            onClick={() => {
-              void handleResolve()
-            }}
+            disabled={submissionBlocked()}
+            onClick={handleResolve}
           >
             Resolve thread
           </button>
+        </Show>
+        <Show when={mutation().error !== null}>
+          <p class="comment-mutation-error" data-testid="comment-mutation-error" role="alert">
+            {mutation().error}
+          </p>
         </Show>
         <button
           type="button"

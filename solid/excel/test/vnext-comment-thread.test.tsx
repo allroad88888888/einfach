@@ -11,8 +11,9 @@ import type {
   RangeProjectionRequest,
 } from '@einfach/spreadsheet-ui-core'
 import {
-  commentSessionAtom,
   commentEditorDraftAtom,
+  commentMutationStateAtom,
+  commentSessionAtom,
   openCommentSessionAtom,
   setCommentDraftAtom,
 } from '@einfach/spreadsheet-ui-core'
@@ -63,6 +64,16 @@ function createFakeBackend() {
   }
 
   return { backend, postCommentRequests, resolveThreadRequests }
+}
+
+function deferred<T>() {
+  let resolve!: (value: T) => void
+  let reject!: (reason?: unknown) => void
+  const promise = new Promise<T>((resolvePromise, rejectPromise) => {
+    resolve = resolvePromise
+    reject = rejectPromise
+  })
+  return { promise, resolve, reject }
 }
 
 describe('SpreadsheetCommentThread', () => {
@@ -128,6 +139,189 @@ describe('SpreadsheetCommentThread', () => {
     await waitFor(() => expect(store.getter(commentSessionAtom)).toBeNull())
   })
 
+  it('publishes pending before the port, disables duplicate submission, then accepts exact local evidence', async () => {
+    const store = createStore()
+    const { backend: baseBackend } = createFakeBackend()
+    const gate = deferred<{ sheetId: string; requestId: number }>()
+    const requests: PostCommentRequest[] = []
+    let phaseAtPort: string | null = null
+    const backend: SpreadsheetBackend = {
+      ...baseBackend,
+      postComment(request) {
+        phaseAtPort = store.getter(commentMutationStateAtom).phase
+        requests.push(request)
+        return gate.promise
+      },
+    }
+
+    store.setter(openCommentSessionAtom, {
+      sheetId: 'sheet-pending',
+      cell: { row: 3, col: 4 },
+    })
+    store.setter(setCommentDraftAtom, 'Pending body')
+
+    const { getByTestId } = render(() => (
+      <SpreadsheetUiProvider backend={backend} store={store}>
+        <SpreadsheetCommentThread />
+      </SpreadsheetUiProvider>
+    ))
+
+    const postButton = getByTestId('comment-post-button') as HTMLButtonElement
+    fireEvent.click(postButton)
+    fireEvent.click(postButton)
+
+    await waitFor(() => expect(requests).toHaveLength(1))
+    expect(phaseAtPort).toBe('PendingPublished')
+    expect(postButton.disabled).toBe(true)
+    expect((getByTestId('comment-thread-textarea') as HTMLTextAreaElement).disabled).toBe(true)
+
+    const request = requests[0]
+    expect(request.requestId).toEqual(expect.any(Number))
+    gate.resolve({ sheetId: request.sheetId, requestId: request.requestId! })
+
+    await waitFor(() => expect(store.getter(commentSessionAtom)).toBeNull())
+    expect(store.getter(commentMutationStateAtom).phase).toBe('LocalAcknowledged')
+  })
+
+  it('shows a pre-dispatch missing-port error without discarding the session or draft', async () => {
+    const store = createStore()
+    const { backend: baseBackend } = createFakeBackend()
+    const backend: SpreadsheetBackend = { ...baseBackend, postComment: undefined }
+
+    store.setter(openCommentSessionAtom, {
+      sheetId: 'sheet-no-port',
+      cell: { row: 4, col: 5 },
+    })
+    store.setter(setCommentDraftAtom, 'Keep this draft')
+
+    const { getByTestId } = render(() => (
+      <SpreadsheetUiProvider backend={backend} store={store}>
+        <SpreadsheetCommentThread />
+      </SpreadsheetUiProvider>
+    ))
+
+    fireEvent.click(getByTestId('comment-post-button'))
+
+    await waitFor(() => expect(getByTestId('comment-mutation-error')).toBeTruthy())
+    expect(store.getter(commentMutationStateAtom).phase).toBe('ErrorOpen')
+    expect(store.getter(commentSessionAtom)).toMatchObject({
+      sheetId: 'sheet-no-port',
+      cell: { row: 4, col: 5 },
+    })
+    expect(store.getter(commentEditorDraftAtom)).toBe('Keep this draft')
+  })
+
+  it('keeps a rejected dispatch open, reports unknown outcome, and blocks retry', async () => {
+    const store = createStore()
+    const { backend: baseBackend } = createFakeBackend()
+    const backend: SpreadsheetBackend = {
+      ...baseBackend,
+      postComment() {
+        return Promise.reject(new Error('offline'))
+      },
+    }
+
+    store.setter(openCommentSessionAtom, {
+      sheetId: 'sheet-reject',
+      cell: { row: 6, col: 7 },
+    })
+    store.setter(setCommentDraftAtom, 'Uncertain body')
+
+    const { getByTestId } = render(() => (
+      <SpreadsheetUiProvider backend={backend} store={store}>
+        <SpreadsheetCommentThread />
+      </SpreadsheetUiProvider>
+    ))
+
+    const postButton = getByTestId('comment-post-button') as HTMLButtonElement
+    fireEvent.click(postButton)
+
+    await waitFor(() =>
+      expect(store.getter(commentMutationStateAtom).phase).toBe('OutcomeUnknownBlocked'),
+    )
+    expect(getByTestId('comment-mutation-error')).toBeTruthy()
+    expect(postButton.disabled).toBe(true)
+    expect(store.getter(commentSessionAtom)?.sheetId).toBe('sheet-reject')
+    expect(store.getter(commentEditorDraftAtom)).toBe('Uncertain body')
+  })
+
+  it('treats a mismatched acknowledgement as unknown instead of closing the editor', async () => {
+    const store = createStore()
+    const { backend: baseBackend } = createFakeBackend()
+    const backend: SpreadsheetBackend = {
+      ...baseBackend,
+      async postComment(request) {
+        return { sheetId: request.sheetId, requestId: request.requestId! + 1 }
+      },
+    }
+
+    store.setter(openCommentSessionAtom, {
+      sheetId: 'sheet-mismatch',
+      cell: { row: 8, col: 9 },
+    })
+    store.setter(setCommentDraftAtom, 'Do not lose me')
+
+    const { getByTestId } = render(() => (
+      <SpreadsheetUiProvider backend={backend} store={store}>
+        <SpreadsheetCommentThread />
+      </SpreadsheetUiProvider>
+    ))
+
+    fireEvent.click(getByTestId('comment-post-button'))
+
+    await waitFor(() =>
+      expect(store.getter(commentMutationStateAtom).phase).toBe('OutcomeUnknownBlocked'),
+    )
+    expect(getByTestId('comment-mutation-error')).toBeTruthy()
+    expect(store.getter(commentSessionAtom)?.sheetId).toBe('sheet-mismatch')
+    expect(store.getter(commentEditorDraftAtom)).toBe('Do not lose me')
+  })
+
+  it('does not let a late acknowledgement close or overwrite a reopened session', async () => {
+    const store = createStore()
+    const { backend: baseBackend } = createFakeBackend()
+    const gate = deferred<{ sheetId: string; requestId: number }>()
+    let request: PostCommentRequest | null = null
+    const backend: SpreadsheetBackend = {
+      ...baseBackend,
+      postComment(nextRequest) {
+        request = nextRequest
+        return gate.promise
+      },
+    }
+
+    store.setter(openCommentSessionAtom, {
+      sheetId: 'sheet-old',
+      cell: { row: 0, col: 0 },
+    })
+    store.setter(setCommentDraftAtom, 'Old draft')
+
+    const { getByTestId } = render(() => (
+      <SpreadsheetUiProvider backend={backend} store={store}>
+        <SpreadsheetCommentThread />
+      </SpreadsheetUiProvider>
+    ))
+
+    fireEvent.click(getByTestId('comment-post-button'))
+    await waitFor(() => expect(request).not.toBeNull())
+    fireEvent.click(getByTestId('comment-close-button'))
+    store.setter(openCommentSessionAtom, {
+      sheetId: 'sheet-new',
+      cell: { row: 10, col: 11 },
+    })
+    store.setter(setCommentDraftAtom, 'New draft')
+
+    const oldRequest = request!
+    gate.resolve({ sheetId: oldRequest.sheetId, requestId: oldRequest.requestId! })
+
+    await waitFor(() => expect(store.getter(commentMutationStateAtom).phase).toBe('Idle'))
+    expect(store.getter(commentSessionAtom)).toMatchObject({
+      sheetId: 'sheet-new',
+      cell: { row: 10, col: 11 },
+    })
+    expect(store.getter(commentEditorDraftAtom)).toBe('New draft')
+  })
+
   it('Close button closes the session without calling postComment', async () => {
     const store = createStore()
     const { backend, postCommentRequests } = createFakeBackend()
@@ -180,7 +374,7 @@ describe('SpreadsheetCommentThread', () => {
       threadId: 'thread-abc',
     })
 
-    const { getByTestId } = render(() => (
+    const { getByTestId, queryByTestId } = render(() => (
       <SpreadsheetUiProvider backend={backend} store={store}>
         <SpreadsheetCommentThread />
       </SpreadsheetUiProvider>
@@ -195,6 +389,11 @@ describe('SpreadsheetCommentThread', () => {
       sheetId: 'sheet-1',
       threadId: 'thread-abc',
     })
+    await waitFor(() =>
+      expect(store.getter(commentMutationStateAtom).phase).toBe('LocalAcknowledged'),
+    )
+    expect(store.getter(commentSessionAtom)).toBeNull()
+    expect(queryByTestId('comment-thread')).toBeNull()
   })
 
   it('Resolve button not shown when no threadId', async () => {

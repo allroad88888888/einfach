@@ -2,6 +2,8 @@
 
 Solid.js spreadsheet surface for the Einfach vnext stack. The package wires `@einfach/spreadsheet-ui-core` atoms into Solid components, ships static and worker-backed adapters, and bundles a WASM build of the Rust formula engine.
 
+The audited implementation plan for online-Excel parity is maintained in [docs/online-excel-parity/README.md](./docs/online-excel-parity/README.md). It covers feature groups 2–6 and 13 plus comments/notes/tasks; data analysis and printing are explicitly deferred.
+
 ## vnext architecture
 
 ```
@@ -35,27 +37,27 @@ Layering rules: components read atoms via `@einfach/solid`; mutations dispatch a
 
 ## Components under `src-vnext/`
 
-| Folder | Surface |
-|---|---|
-| `provider/` | `SpreadsheetUiProvider`, `SpreadsheetUiContext`, `useSpreadsheetBackend`, `useSpreadsheetUiStore` |
-| `adapter/` | `static-backend`, `worker-workbook-backend`, `worker-protocol`, `worker-runtime`, `worker-factory`, range-TSV helper |
-| `grid/` | `SpreadsheetGrid` — virtualized cells, selection rendering, fill handle |
-| `formula-bar/` | `SpreadsheetFormulaBar` |
-| `toolbar/` | `SpreadsheetToolbar` plus toolbar command types |
-| `status-bar/` | `SpreadsheetStatusBar` |
-| `sheet-tabs/` | `SpreadsheetSheetTabs` |
-| `context-menu/` | `SpreadsheetContextMenu` |
-| `find-replace/` | `SpreadsheetFindReplaceDialog` (canonical dialog pattern) |
-| `conditional-formatting/` | `SpreadsheetConditionalFormatDialog` |
-| `data-validation/` | `SpreadsheetDataValidationDialog` |
-| `named-ranges/` | `SpreadsheetNameManagerDialog` |
-| `comments/` | `SpreadsheetCommentThread` |
-| `print/` | `SpreadsheetPrintPreviewOverlay` |
-| `filter-sort/` | `SpreadsheetFilterDropdown` |
-| `presence/` | `SpreadsheetPresenceOverlay` |
-| `protection/` | `SpreadsheetProtectionUnlockDialog` |
-| `history/` | `SpreadsheetHistoryTimeline` |
-| `demos/` | `VNextSmokeDemo` (static), `VNextWorkerDemo` (worker + WASM) |
+| Folder                    | Surface                                                                                                              |
+| ------------------------- | -------------------------------------------------------------------------------------------------------------------- |
+| `provider/`               | `SpreadsheetUiProvider`, `SpreadsheetUiContext`, `useSpreadsheetBackend`, `useSpreadsheetUiStore`                    |
+| `adapter/`                | `static-backend`, `worker-workbook-backend`, `worker-protocol`, `worker-runtime`, `worker-factory`, range-TSV helper |
+| `grid/`                   | `SpreadsheetGrid` — virtualized cells, selection rendering, fill handle                                              |
+| `formula-bar/`            | `SpreadsheetFormulaBar`                                                                                              |
+| `toolbar/`                | `SpreadsheetToolbar` plus toolbar command types                                                                      |
+| `status-bar/`             | `SpreadsheetStatusBar`                                                                                               |
+| `sheet-tabs/`             | `SpreadsheetSheetTabs`                                                                                               |
+| `context-menu/`           | `SpreadsheetContextMenu`                                                                                             |
+| `find-replace/`           | `SpreadsheetFindReplaceDialog`（现有实现，属于状态迁移目标）                                                         |
+| `conditional-formatting/` | `SpreadsheetConditionalFormatDialog`                                                                                 |
+| `data-validation/`        | `SpreadsheetDataValidationDialog`                                                                                    |
+| `named-ranges/`           | `SpreadsheetNameManagerDialog`                                                                                       |
+| `comments/`               | `SpreadsheetCommentThread`                                                                                           |
+| `print/`                  | `SpreadsheetPrintPreviewOverlay`                                                                                     |
+| `filter-sort/`            | `SpreadsheetFilterDropdown`                                                                                          |
+| `presence/`               | `SpreadsheetPresenceOverlay`                                                                                         |
+| `protection/`             | `SpreadsheetProtectionUnlockDialog`                                                                                  |
+| `history/`                | `SpreadsheetHistoryTimeline`                                                                                         |
+| `demos/`                  | `VNextSmokeDemo` (static), `VNextWorkerDemo` (worker + WASM)                                                         |
 
 Public exports flow through `src-vnext/public.ts`. Import via the `@einfach/solid-excel/vnext` subpath:
 
@@ -63,9 +65,9 @@ Public exports flow through `src-vnext/public.ts`. Import via the `@einfach/soli
 import { SpreadsheetUiProvider, SpreadsheetGrid } from '@einfach/solid-excel/vnext'
 ```
 
-### Dialog pattern
+### Dialog state pattern
 
-All `*Dialog.tsx` components mirror the same shape: read an open-atom via `useAtomValue`, hold per-instance form state in `createSignal`, and reset on the open transition inside `createEffect`. See `src-vnext/find-replace/SpreadsheetFindReplaceDialog.tsx` for the canonical example.
+Some existing `*Dialog.tsx` components still read an open atom via `useAtomValue` but keep form state in `createSignal`. Treat that as migration debt, not as the pattern for new work. New or migrated dialogs must keep product, form draft, dirty, validation, pending, and error state in Einfach source/derived/command atoms; Solid-local state is limited to DOM references, one-off measurements, and animation handles. The feature plans linked above define the required state ownership and transitions.
 
 ### Provider caveat
 

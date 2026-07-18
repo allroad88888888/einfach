@@ -14,10 +14,9 @@ import { test, expect, type Page } from '@playwright/test'
  *   - fixed-width mode end-to-end
  *   - preview token cap (P2 #5)
  *
- * Pattern: the Wave 5 demo omits the menubar; the production code path is
- * exercised via the menu-bar dispatch unit test. Here we use a window
- * CustomEvent (`spreadsheet:open-text-to-columns`) that the demo wires to
- * its `triggerTextToColumnsForSelection` helper.
+ * Pattern: the visible Wave 5 menu is the production entrypoint. These
+ * focused flows retain the `spreadsheet:open-text-to-columns` CustomEvent
+ * only as a direct-flow / compatibility test hook wired to the demo helper.
  */
 
 const WAVE5_GRID = '[data-testid="wave5-grid"]'
@@ -51,6 +50,18 @@ async function openTextToColumnsForSelection(page: Page) {
   return dialog
 }
 
+async function openTextToColumnsFromDataMenu(page: Page) {
+  await page.getByTestId('menu-bar-button-data').click()
+  await expect(page.getByTestId('menu-bar-dropdown-data')).toBeVisible()
+  const menuItem = page.getByTestId('menu-bar-item-data.textToColumns')
+  await expect(menuItem).toBeVisible()
+  await expect(menuItem).toBeEnabled()
+  await menuItem.click()
+  const dialog = page.getByTestId('wave5-text-to-columns')
+  await expect(dialog).toBeVisible()
+  return dialog
+}
+
 test.describe('text-to-columns — delimited comma split', () => {
   test('selecting a column, splitting on comma, finishing rewrites the cells', async ({
     page,
@@ -68,7 +79,7 @@ test.describe('text-to-columns — delimited comma split', () => {
     await cell(page, 'G2').click()
     await cell(page, 'G3').click({ modifiers: ['Shift'] })
 
-    const dialog = await openTextToColumnsForSelection(page)
+    const dialog = await openTextToColumnsFromDataMenu(page)
 
     // Step 1 -> Step 2 (delimited is default).
     await page.getByTestId('ttc-next-button').click()
@@ -296,7 +307,6 @@ test.describe('text-to-columns — preview token cap (P2 #5 regression)', () => 
   })
 })
 
-// TODO(B3-#6 capability gating menu hidden): no demo currently renders
-// `SpreadsheetMenuBar`, so we cannot drive a "Data → Text to Columns"
-// dropdown to assert it is hidden. Once a menubar-backed demo lands,
-// re-instate this with a fixture backend that omits `importCellChunks`.
+// Capability gating remains covered by the fixture-backed menu-bar unit
+// tests. Wave 5 now exposes the visible production entrypoint; this spec
+// keeps the CustomEvent only as a direct-flow / compatibility test hook.

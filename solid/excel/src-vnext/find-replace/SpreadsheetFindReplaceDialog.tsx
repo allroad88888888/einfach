@@ -1,24 +1,31 @@
-import { Show, createEffect, createSignal, onCleanup } from 'solid-js'
-import { useAtomValue } from '@einfach/solid'
+import { Show, createEffect, onCleanup } from 'solid-js'
+import { useAtomValue, useSetAtom } from '@einfach/solid'
 import { useT } from '../../src/i18n'
-import type { CellRange, FindReplaceScope } from '@einfach/spreadsheet-ui-core'
+import type {
+  FindReplaceScope,
+  ReplaceMatchesRequest,
+  ReplaceMatchesResult,
+} from '@einfach/spreadsheet-ui-core'
 import {
-  advanceFindCursorAtom,
+  captureFindReplaceCapabilityAtom,
   closeFindReplaceAtom,
-  commitFindReplaceQueryAtom,
-  EXCEL_MAX_COLS,
-  EXCEL_MAX_ROWS,
+  findReplaceCapabilityProjectionAtom,
   findReplaceCursorAtom,
+  findReplaceErrorAtom,
+  findReplaceFormAtom,
+  findReplaceMutationBlockedAtom,
   findReplaceOpenAtom,
-  markReplaceAllCappedAtom,
+  findReplacePendingAtom,
+  findReplaceRefreshRecoveryAtom,
   replaceAllCappedAtom,
-  scrollToCellAtom,
+  runFindReplaceMutationAtom,
+  runFindReplaceRefreshRecoveryAtom,
+  runFindReplaceSearchAtom,
   selectionSnapshotAtom,
-  setFindMatchesAtom,
-  setFindReplaceErrorAtom,
-  setSelectionAtom,
+  stepFindReplaceAtom,
+  syncFindReplaceTargetAtom,
+  updateFindReplaceFormAtom,
   workspaceSessionAtom,
-  MAX_FIND_PAGE,
 } from '@einfach/spreadsheet-ui-core'
 import { useSpreadsheetBackend, useSpreadsheetUiStore } from '../provider/hooks'
 import { refreshVisibleProjection } from '../provider/projection-refresh'
@@ -29,197 +36,91 @@ export interface SpreadsheetFindReplaceDialogProps {
   'data-testid'?: string
 }
 
-type FindReplaceTab = 'find' | 'replace'
-
 export function SpreadsheetFindReplaceDialog(props: SpreadsheetFindReplaceDialogProps) {
   const t = useT()
   const store = useSpreadsheetUiStore()
   const backend = useSpreadsheetBackend()
+  const searchRange = backend.searchRange?.bind(backend)
+  const replaceMatches = backend.replaceMatches?.bind(backend)
+  const capability = useAtomValue(findReplaceCapabilityProjectionAtom)
   const isOpen = useAtomValue(findReplaceOpenAtom)
   const cursor = useAtomValue(findReplaceCursorAtom)
+  const error = useAtomValue(findReplaceErrorAtom)
+  const form = useAtomValue(findReplaceFormAtom)
+  const mutationBlocked = useAtomValue(findReplaceMutationBlockedAtom)
+  const pending = useAtomValue(findReplacePendingAtom)
+  const refreshRecovery = useAtomValue(findReplaceRefreshRecoveryAtom)
   const replaceAllCapped = useAtomValue(replaceAllCappedAtom)
+  const selectionSnapshot = useAtomValue(selectionSnapshotAtom)
+  const workspaceSession = useAtomValue(workspaceSessionAtom)
+  const closeDialog = useSetAtom(closeFindReplaceAtom)
+  const runMutation = useSetAtom(runFindReplaceMutationAtom)
+  const runRefreshRecovery = useSetAtom(runFindReplaceRefreshRecoveryAtom)
+  const runSearchCommand = useSetAtom(runFindReplaceSearchAtom)
+  const step = useSetAtom(stepFindReplaceAtom)
+  const syncTarget = useSetAtom(syncFindReplaceTargetAtom)
+  const updateForm = useSetAtom(updateFindReplaceFormAtom)
 
-  const [activeTab, setActiveTab] = createSignal<FindReplaceTab>('find')
-  const [needle, setNeedle] = createSignal('')
-  const [replacement, setReplacement] = createSignal('')
-  const [caseSensitive, setCaseSensitive] = createSignal(false)
-  const [wholeMatch, setWholeMatch] = createSignal(false)
-  const [regex, setRegex] = createSignal(false)
-  const [searchFormulas, setSearchFormulas] = createSignal(false)
-  const [scope, setScope] = createSignal<FindReplaceScope>('sheet')
+  createEffect(() => {
+    store.setter(captureFindReplaceCapabilityAtom, backend)
+  })
 
-  createEffect<boolean>((wasOpen) => {
-    const open = isOpen()
-    if (open && !wasOpen) {
-      setActiveTab('find')
-      setNeedle('')
-      setReplacement('')
-      setCaseSensitive(false)
-      setWholeMatch(false)
-      setRegex(false)
-      setSearchFormulas(false)
-      setScope('sheet')
-    }
-    return open
-  }, false)
+  createEffect(() => {
+    if (!isOpen()) return
+    workspaceSession()
+    selectionSnapshot()
+    syncTarget()
+  })
 
   createEffect(() => {
     if (!isOpen()) return
     function onKeyDown(event: KeyboardEvent) {
       if (event.key === 'Escape') {
         event.stopPropagation()
-        store.setter(closeFindReplaceAtom)
+        closeDialog()
       }
     }
     document.addEventListener('keydown', onKeyDown)
     onCleanup(() => document.removeEventListener('keydown', onKeyDown))
   })
 
-  function buildQuery() {
-    return {
-      needle: needle(),
-      replacement: replacement() || undefined,
-      options: {
-        caseSensitive: caseSensitive(),
-        wholeMatch: wholeMatch(),
-        regex: regex(),
-        searchFormulas: searchFormulas(),
-        scope: scope(),
-      },
-    }
-  }
-
-  function resolveSearchScope(): { sheetId: string; range: CellRange } {
-    const snapshot = store.getter(selectionSnapshotAtom)
-    const workspace = store.getter(workspaceSessionAtom)
-    const sheetId = snapshot.selection.sheetId || workspace.activeSheetId || ''
-    const fullSheetRange: CellRange = {
-      rowStart: 0,
-      rowEnd: EXCEL_MAX_ROWS - 1,
-      colStart: 0,
-      colEnd: EXCEL_MAX_COLS - 1,
-    }
-    if (scope() === 'current-selection') {
-      return { sheetId, range: snapshot.range }
-    }
-    return { sheetId, range: fullSheetRange }
-  }
-
-  async function runSearch() {
-    if (!backend.searchRange) return
-    const query = buildQuery()
-    store.setter(commitFindReplaceQueryAtom, query)
-    const { sheetId, range } = resolveSearchScope()
-    try {
-      const result = await backend.searchRange({
-        kind: 'search-range',
-        sheetId,
-        range,
-        query,
-        pageStart: 0,
-        pageSize: MAX_FIND_PAGE,
-      })
-      store.setter(setFindMatchesAtom, result)
-      focusCurrentMatch()
-    } catch (err) {
-      store.setter(setFindReplaceErrorAtom, {
-        code: 'BACKEND_ERROR',
-        message: err instanceof Error ? err.message : String(err),
-      })
-    }
-  }
-
-  function focusCurrentMatch() {
-    const c = store.getter(findReplaceCursorAtom)
-    const match = c.pageMatches[c.currentIndex]
-    if (!match) return
-    store.setter(setSelectionAtom, {
-      kind: 'cell',
-      sheetId: match.sheetId,
-      anchor: match.coord,
-      focus: match.coord,
+  function runSearch() {
+    if (!capability().findEnabled) return
+    return runSearchCommand({
+      searchRange,
     })
-    store.setter(scrollToCellAtom, { coord: match.coord })
   }
 
-  async function handleFindStep(direction: 1 | -1) {
-    const c = store.getter(findReplaceCursorAtom)
-    if (c.totalCount === 0 || c.pageMatches.length === 0) {
-      if (needle().length > 0) {
-        await runSearch()
-      }
-      return
-    }
-    store.setter(advanceFindCursorAtom, direction)
-    focusCurrentMatch()
+  function handleFindStep(direction: 1 | -1) {
+    if (!capability().findEnabled) return
+    return step({
+      direction,
+      searchRange,
+    })
   }
 
-  async function handleReplaceCurrent() {
-    if (!backend.replaceMatches) return
-    const c = cursor()
-    const match = c.pageMatches[c.currentIndex]
-    if (!match) return
-    try {
-      await backend.replaceMatches({
-        kind: 'replace-matches',
-        coords: [
-          {
-            sheetId: match.sheetId,
-            coord: match.coord,
-            matchStart: match.matchStart,
-            matchEnd: match.matchEnd,
-          },
-        ],
-        replacement: replacement(),
-      })
-    } catch (err) {
-      store.setter(setFindReplaceErrorAtom, {
-        code: 'BACKEND_ERROR',
-        message: err instanceof Error ? err.message : String(err),
-      })
-      return
-    }
-    // The grid renders from a cached visible-projection atom and the dialog
-    // bypasses the toolbar's command pipeline, so a manual refresh is needed
-    // to flush the rewritten cells to the DOM after the mutation lands.
-    await refreshVisibleProjection(store, backend, match.sheetId)
-    await runSearch()
+  function acceptAcknowledgedResult(_result: ReplaceMatchesResult, request: ReplaceMatchesRequest) {
+    const sheetId = request.coords[0]?.sheetId
+    if (sheetId === undefined) return
+    return refreshVisibleProjection(store, backend, sheetId)
   }
 
-  async function handleReplaceAll() {
-    if (!backend.replaceMatches) return
-    const c = cursor()
-    if (c.pageMatches.length === 0) return
-    const sheetId = c.pageMatches[0].sheetId
-    // pageMatches is capped at MAX_FIND_PAGE (500) — a larger totalCount
-    // means this replace-all only rewrites the current page (audit D-12).
-    const replacedCount = c.pageMatches.length
-    const totalCount = c.totalCount
-    try {
-      await backend.replaceMatches({
-        kind: 'replace-matches',
-        coords: c.pageMatches.map((m) => ({
-          sheetId: m.sheetId,
-          coord: m.coord,
-          matchStart: m.matchStart,
-          matchEnd: m.matchEnd,
-        })),
-        replacement: replacement(),
-      })
-    } catch (err) {
-      store.setter(setFindReplaceErrorAtom, {
-        code: 'BACKEND_ERROR',
-        message: err instanceof Error ? err.message : String(err),
-      })
-      return
-    }
-    await refreshVisibleProjection(store, backend, sheetId)
-    await runSearch()
-    // Mark AFTER runSearch: commitFindReplaceQueryAtom clears the notice,
-    // so setting it here lets it survive until the next user-driven search.
-    if (totalCount > replacedCount) {
-      store.setter(markReplaceAllCappedAtom, { replacedCount, totalCount })
-    }
+  function handleReplace(action: 'replace-current' | 'replace-all') {
+    if (!capability().replaceEnabled) return
+    return runMutation({
+      action,
+      replaceMatches,
+      searchRange,
+      acceptAcknowledgedResult,
+    })
+  }
+
+  function handleRefreshRecovery() {
+    if (!capability().findEnabled) return
+    return runRefreshRecovery({
+      searchRange,
+      acceptAcknowledgedResult,
+    })
   }
 
   function statusText() {
@@ -235,9 +136,11 @@ export function SpreadsheetFindReplaceDialog(props: SpreadsheetFindReplaceDialog
   }
 
   function errorText() {
-    const c = cursor()
-    if (c.status !== 'error') return ''
-    return c.error?.message ?? ''
+    return error()?.message ?? ''
+  }
+
+  function replaceDisabled() {
+    return pending() || mutationBlocked() || !capability().replaceEnabled
   }
 
   return (
@@ -245,7 +148,8 @@ export function SpreadsheetFindReplaceDialog(props: SpreadsheetFindReplaceDialog
       <div
         class={`find-replace-dialog ${props.class ?? ''}`.trim()}
         data-testid={props['data-testid'] ?? 'find-replace-dialog'}
-        data-active-tab={activeTab()}
+        data-active-tab={form().activeTab}
+        data-capability={capability().capability}
         role="dialog"
         aria-label={t('findReplace.title')}
       >
@@ -256,7 +160,7 @@ export function SpreadsheetFindReplaceDialog(props: SpreadsheetFindReplaceDialog
             class="dialog-close-x"
             data-testid="dialog-close-x"
             aria-label={t('dialog.close.label')}
-            onClick={() => store.setter(closeFindReplaceAtom)}
+            onClick={closeDialog}
           >
             ×
           </button>
@@ -267,9 +171,9 @@ export function SpreadsheetFindReplaceDialog(props: SpreadsheetFindReplaceDialog
             type="button"
             class="fr-tab"
             role="tab"
-            aria-selected={activeTab() === 'find'}
+            aria-selected={form().activeTab === 'find'}
             data-testid="find-tab"
-            onClick={() => setActiveTab('find')}
+            onClick={() => updateForm({ activeTab: 'find' })}
           >
             {t('findReplace.findTab')}
           </button>
@@ -277,9 +181,10 @@ export function SpreadsheetFindReplaceDialog(props: SpreadsheetFindReplaceDialog
             type="button"
             class="fr-tab"
             role="tab"
-            aria-selected={activeTab() === 'replace'}
+            aria-selected={form().activeTab === 'replace'}
             data-testid="replace-tab"
-            onClick={() => setActiveTab('replace')}
+            disabled={!capability().replaceEnabled}
+            onClick={() => updateForm({ activeTab: 'replace' })}
           >
             {t('findReplace.replaceTab')}
           </button>
@@ -295,8 +200,8 @@ export function SpreadsheetFindReplaceDialog(props: SpreadsheetFindReplaceDialog
               class="fr-input"
               data-testid="find-needle-input"
               type="text"
-              value={needle()}
-              onInput={(e) => setNeedle(e.currentTarget.value)}
+              value={form().needle}
+              onInput={(e) => updateForm({ needle: e.currentTarget.value })}
               onKeyDown={(e) => {
                 if (e.key === 'Enter') {
                   e.preventDefault()
@@ -311,6 +216,7 @@ export function SpreadsheetFindReplaceDialog(props: SpreadsheetFindReplaceDialog
                 data-testid="find-prev-button"
                 aria-label={t('findReplace.prev')}
                 title={t('findReplace.prev')}
+                disabled={pending() || !capability().findEnabled}
                 onClick={() => void handleFindStep(-1)}
               >
                 ↑
@@ -321,6 +227,7 @@ export function SpreadsheetFindReplaceDialog(props: SpreadsheetFindReplaceDialog
                 data-testid="find-next-button"
                 aria-label={t('findReplace.next')}
                 title={t('findReplace.next')}
+                disabled={pending() || !capability().findEnabled}
                 onClick={() => void handleFindStep(1)}
               >
                 ↓
@@ -337,8 +244,9 @@ export function SpreadsheetFindReplaceDialog(props: SpreadsheetFindReplaceDialog
               class="fr-input"
               data-testid="find-replacement-input"
               type="text"
-              value={replacement()}
-              onInput={(e) => setReplacement(e.currentTarget.value)}
+              value={form().replacement}
+              disabled={!capability().replaceEnabled}
+              onInput={(e) => updateForm({ replacement: e.currentTarget.value })}
             />
           </div>
 
@@ -347,8 +255,8 @@ export function SpreadsheetFindReplaceDialog(props: SpreadsheetFindReplaceDialog
               <input
                 type="checkbox"
                 data-testid="find-opt-case-sensitive"
-                checked={caseSensitive()}
-                onChange={(e) => setCaseSensitive(e.currentTarget.checked)}
+                checked={form().caseSensitive}
+                onChange={(e) => updateForm({ caseSensitive: e.currentTarget.checked })}
               />
               {t('findReplace.caseSensitive')}
             </label>
@@ -356,8 +264,8 @@ export function SpreadsheetFindReplaceDialog(props: SpreadsheetFindReplaceDialog
               <input
                 type="checkbox"
                 data-testid="find-opt-whole-match"
-                checked={wholeMatch()}
-                onChange={(e) => setWholeMatch(e.currentTarget.checked)}
+                checked={form().wholeMatch}
+                onChange={(e) => updateForm({ wholeMatch: e.currentTarget.checked })}
               />
               {t('findReplace.wholeMatch')}
             </label>
@@ -365,8 +273,8 @@ export function SpreadsheetFindReplaceDialog(props: SpreadsheetFindReplaceDialog
               <input
                 type="checkbox"
                 data-testid="find-opt-formulas"
-                checked={searchFormulas()}
-                onChange={(e) => setSearchFormulas(e.currentTarget.checked)}
+                checked={form().searchFormulas}
+                onChange={(e) => updateForm({ searchFormulas: e.currentTarget.checked })}
               />
               {t('findReplace.searchFormulas')}
             </label>
@@ -374,8 +282,8 @@ export function SpreadsheetFindReplaceDialog(props: SpreadsheetFindReplaceDialog
               <input
                 type="checkbox"
                 data-testid="find-opt-regex"
-                checked={regex()}
-                onChange={(e) => setRegex(e.currentTarget.checked)}
+                checked={form().regex}
+                onChange={(e) => updateForm({ regex: e.currentTarget.checked })}
               />
               {t('findReplace.regex')}
             </label>
@@ -389,11 +297,13 @@ export function SpreadsheetFindReplaceDialog(props: SpreadsheetFindReplaceDialog
               id="find-scope-select"
               class="fr-select"
               data-testid="find-scope-select"
-              value={scope()}
-              onChange={(e) => setScope(e.currentTarget.value as FindReplaceScope)}
+              value={form().scope}
+              onChange={(e) => updateForm({ scope: e.currentTarget.value as FindReplaceScope })}
             >
               <option value="sheet">{t('findReplace.scope.sheet')}</option>
-              <option value="workbook">{t('findReplace.scope.workbook')}</option>
+              <option value="workbook" disabled>
+                {t('findReplace.scope.workbook')}
+              </option>
               <option value="current-selection">{t('findReplace.scope.selection')}</option>
             </select>
           </div>
@@ -405,7 +315,7 @@ export function SpreadsheetFindReplaceDialog(props: SpreadsheetFindReplaceDialog
         <Show when={replaceAllCapped()}>
           <div class="fr-capped" data-testid="replace-all-capped-text" role="status">
             {t('findReplace.replaceAll.capped', {
-              replaced: replaceAllCapped()?.replacedCount ?? 0,
+              acknowledged: replaceAllCapped()?.acknowledgedProjectionCount ?? 0,
               total: replaceAllCapped()?.totalCount ?? 0,
             })}
           </div>
@@ -415,14 +325,36 @@ export function SpreadsheetFindReplaceDialog(props: SpreadsheetFindReplaceDialog
             {errorText()}
           </div>
         </Show>
+        <Show when={refreshRecovery().status !== 'idle'}>
+          <div
+            class="fr-status"
+            data-testid="find-refresh-status"
+            data-phase={refreshRecovery().phase ?? undefined}
+            role="status"
+          >
+            {t('findReplace.status.refreshing')}
+          </div>
+        </Show>
 
         <div class="fr-footer">
+          <Show when={refreshRecovery().status === 'required'}>
+            <button
+              type="button"
+              class="fr-btn"
+              data-testid="find-refresh-retry-button"
+              disabled={!capability().findEnabled}
+              onClick={() => void handleRefreshRecovery()}
+            >
+              {t('findReplace.action.retryRefresh')}
+            </button>
+          </Show>
           <button
             type="button"
             class="fr-btn"
             data-testid="replace-all-button"
             data-replace-only="true"
-            onClick={() => void handleReplaceAll()}
+            disabled={replaceDisabled()}
+            onClick={() => void handleReplace('replace-all')}
           >
             {t('findReplace.replaceAll')}
           </button>
@@ -431,7 +363,8 @@ export function SpreadsheetFindReplaceDialog(props: SpreadsheetFindReplaceDialog
             class="fr-btn"
             data-testid="replace-button"
             data-replace-only="true"
-            onClick={() => void handleReplaceCurrent()}
+            disabled={replaceDisabled()}
+            onClick={() => void handleReplace('replace-current')}
           >
             {t('findReplace.replace')}
           </button>
@@ -439,7 +372,7 @@ export function SpreadsheetFindReplaceDialog(props: SpreadsheetFindReplaceDialog
             type="button"
             class="fr-btn fr-btn-primary"
             data-testid="find-close-button"
-            onClick={() => store.setter(closeFindReplaceAtom)}
+            onClick={closeDialog}
           >
             {t('findReplace.close')}
           </button>

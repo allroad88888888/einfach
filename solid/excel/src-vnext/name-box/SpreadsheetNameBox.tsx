@@ -1,17 +1,23 @@
 /** @jsxImportSource solid-js */
 
-import { createEffect, createSignal, onCleanup } from 'solid-js'
+import { onCleanup } from 'solid-js'
 import { useAtomValue } from '@einfach/solid'
+import { useT } from '../../src/i18n'
 import {
+  blurNameBoxAtom,
   commitNameBoxAtom,
+  focusNameBoxAtom,
   nameBoxDisplayAtom,
   nameBoxErrorAtom,
+  nameBoxFocusedAtom,
   nameBoxInputAtom,
+  nameBoxLastCommittedAtom,
   nameBoxModeAtom,
-  rangeToA1,
   revertNameBoxAtom,
   scrollToCellAtom,
   selectionSnapshotAtom,
+  setWorkspaceActiveSheetAtom,
+  updateNameBoxInputAtom,
   workspaceSessionAtom,
   type NameBoxCommitTarget,
 } from '@einfach/spreadsheet-ui-core'
@@ -25,86 +31,68 @@ export interface SpreadsheetNameBoxProps {
 export function SpreadsheetNameBox(props: SpreadsheetNameBoxProps) {
   const store = useSpreadsheetUiStore()
   const backend = useSpreadsheetBackend()
+  const t = useT()
   const display = useAtomValue(nameBoxDisplayAtom)
   const mode = useAtomValue(nameBoxModeAtom)
   const error = useAtomValue(nameBoxErrorAtom)
-  const inputValue = useAtomValue(nameBoxInputAtom)
+  const focused = useAtomValue(nameBoxFocusedAtom)
+  const input = useAtomValue(nameBoxInputAtom)
 
-  const [focused, setFocused] = createSignal(false)
-  const [lastCommittedValue, setLastCommittedValue] = createSignal('')
+  // These tokens belong only to the mounted DOM node. Product state and the
+  // authoritative edit-session witness remain in spreadsheet-ui-core.
   let inputRef: HTMLInputElement | undefined
+  let domSessionId: number | undefined
+  let handledBlurSessionId: number | undefined
 
-  // Keep the input atom in sync with the display whenever the user is not
-  // actively typing. This drives both the initial render and the
-  // post-selection-change refresh.
-  createEffect(() => {
-    if (mode() === 'idle' && !focused()) {
-      const next = display()
-      const current = store.getter(nameBoxInputAtom)
-      if (current !== next) {
-        store.setter(nameBoxInputAtom, next)
-      }
-      setLastCommittedValue(next)
+  onCleanup(() => {
+    const sessionId = domSessionId
+    if (sessionId !== undefined) {
+      store.setter(blurNameBoxAtom, { sessionId })
     }
+    inputRef = undefined
+    domSessionId = undefined
+    handledBlurSessionId = undefined
   })
 
+  function renderedValue(): string {
+    return focused() ? input() : display()
+  }
+
   function onInput(event: InputEvent) {
-    const target = event.target as HTMLInputElement | null
-    if (!target) return
-    store.setter(nameBoxInputAtom, target.value)
-    if (store.getter(nameBoxModeAtom) !== 'typing') {
-      store.setter(nameBoxModeAtom, 'typing')
+    const target = event.currentTarget as HTMLInputElement | null
+    const sessionId = domSessionId
+    if (!target || sessionId === undefined) return
+    const accepted = store.setter(updateNameBoxInputAtom, {
+      input: target.value,
+      sessionId,
+    })
+    if (!accepted) {
+      target.value = renderedValue()
     }
   }
 
-  async function maybeDefineName(target: NameBoxCommitTarget) {
-    if (target.kind !== 'define-name') return
-    if (!backend.setNamedRange) {
-      store.setter(nameBoxErrorAtom, true)
-      store.setter(nameBoxInputAtom, store.getter(nameBoxDisplayAtom))
-      return
-    }
-    try {
-      await backend.setNamedRange({
-        kind: 'set-named-range',
-        name: target.name,
-        scope: 'workbook',
-        refersTo: {
-          kind: 'range',
-          sheetId: target.sheetId,
-          address: rangeToA1(target.range),
-        },
-      })
-    } catch {
-      store.setter(nameBoxErrorAtom, true)
-      store.setter(nameBoxInputAtom, store.getter(nameBoxDisplayAtom))
-    }
-  }
-
-  async function commitCurrent() {
-    const raw = store.getter(nameBoxInputAtom)
+  function commitCurrent(sessionId: number): NameBoxCommitTarget {
     const snapshot = store.getter(selectionSnapshotAtom)
     const workspace = store.getter(workspaceSessionAtom)
-    // Fall back to the workspace's active sheet when the selection has no
-    // sheet bound yet (e.g. immediately after page load, before the user
-    // clicks anywhere). Otherwise a name-box jump silently no-ops.
+    // The workspace sheet is the canonical fallback before a selection has
+    // acquired its sheet witness (for example, immediately after mount).
     const sheetId =
       snapshot.selection.sheetId && snapshot.selection.sheetId.length > 0
         ? snapshot.selection.sheetId
-        : workspace.activeSheetId ?? ''
+        : (workspace.activeSheetId ?? '')
+    const activeSheetId = workspace.activeSheetId ?? sheetId
     const target = store.setter(commitNameBoxAtom, {
-      input: raw,
+      input: store.getter(nameBoxInputAtom),
       sheetId,
+      source: backend,
+      sessionId,
     })
-    if (target.kind === 'define-name') {
-      await maybeDefineName(target)
-    } else if (target.kind === 'cell' || target.kind === 'range' || target.kind === 'named-range') {
-      // Scroll the virtualized grid so the resolved cell/range top-left
-      // is in the viewport. Without this the name-box jump only mutates
-      // selection state — the user can land on a cell that's off-screen
-      // (and, for a virtualized grid, not even in the DOM). The viewport
-      // window handles the actual scroll offset via its window metrics
-      // atom; nothing is dispatched if the cell is already visible.
+
+    if (target.kind === 'named-range' && target.sheetId !== activeSheetId) {
+      store.setter(setWorkspaceActiveSheetAtom, { sheetId: target.sheetId })
+    }
+
+    if (target.kind === 'cell' || target.kind === 'range' || target.kind === 'named-range') {
       const coord =
         target.kind === 'cell'
           ? target.coord
@@ -117,67 +105,75 @@ export function SpreadsheetNameBox(props: SpreadsheetNameBoxProps) {
         store.setter(scrollToCellAtom, { coord })
       }
     }
-    setLastCommittedValue(store.getter(nameBoxInputAtom))
+    return target
   }
 
-  function revertCurrent() {
-    store.setter(revertNameBoxAtom)
-    setLastCommittedValue(store.getter(nameBoxInputAtom))
+  function focusGridAfterCommit() {
+    const grid = inputRef
+      ?.closest('.demo-page, [data-testid$="-demo"]')
+      ?.querySelector('.spreadsheet-grid') as HTMLElement | null
+    grid?.focus()
+  }
+
+  function finishHandledSession(sessionId: number) {
+    store.setter(blurNameBoxAtom, { sessionId })
+    if (domSessionId === sessionId) {
+      domSessionId = undefined
+      handledBlurSessionId = undefined
+    }
   }
 
   function onKeyDown(event: KeyboardEvent) {
+    const sessionId = domSessionId
+    if (sessionId === undefined) return
+
     if (event.key === 'Enter' || event.code === 'Enter') {
       event.preventDefault()
-      void commitCurrent().then(() => {
-        inputRef?.blur()
-        // After committing a name-box jump, return focus to the grid so the
-        // user's next keystroke (Ctrl+C, arrow, F2…) lands on the grid root,
-        // not the body. The grid is the closest spreadsheet-grid ancestor.
-        const grid = inputRef?.closest('.demo-page, [data-testid$="-demo"]')?.querySelector(
-          '.spreadsheet-grid',
-        ) as HTMLElement | null
-        grid?.focus()
-      })
+      handledBlurSessionId = sessionId
+      const target = commitCurrent(sessionId)
+      inputRef?.blur()
+      finishHandledSession(sessionId)
+      if (!(target.kind === 'invalid' && target.reason === 'stale-session')) {
+        focusGridAfterCommit()
+      }
       return
     }
     if (event.key === 'Escape' || event.key === 'Esc' || event.code === 'Escape') {
       event.preventDefault()
-      revertCurrent()
+      handledBlurSessionId = sessionId
+      store.setter(revertNameBoxAtom, { sessionId })
       inputRef?.blur()
+      finishHandledSession(sessionId)
     }
   }
 
   function onFocus(event: FocusEvent) {
-    setFocused(true)
-    store.setter(nameBoxModeAtom, 'typing')
-    setLastCommittedValue(store.getter(nameBoxInputAtom))
+    domSessionId = store.setter(focusNameBoxAtom)
+    handledBlurSessionId = undefined
     const target = event.currentTarget as HTMLInputElement | null
     target?.select()
   }
 
   function onBlur() {
-    setFocused(false)
-    const current = store.getter(nameBoxInputAtom)
-    if (current === lastCommittedValue()) {
-      // Unchanged blur is a no-op; restore canonical display.
-      store.setter(nameBoxModeAtom, 'idle')
-      store.setter(nameBoxInputAtom, store.getter(nameBoxDisplayAtom))
-      return
-    }
-    if (current.trim().length === 0) {
-      store.setter(nameBoxModeAtom, 'idle')
-      store.setter(nameBoxInputAtom, store.getter(nameBoxDisplayAtom))
-      return
-    }
-    void commitCurrent()
-  }
+    const sessionId = domSessionId
+    if (sessionId === undefined) return
 
-  function bindInputRef(node: HTMLInputElement | undefined | null) {
-    if (!node || inputRef === node) return
-    inputRef = node
-    onCleanup(() => {
-      if (inputRef === node) inputRef = undefined
-    })
+    if (handledBlurSessionId === sessionId) {
+      handledBlurSessionId = undefined
+    } else {
+      const current = store.getter(nameBoxInputAtom)
+      const unchanged = current === store.getter(nameBoxLastCommittedAtom)
+      if (unchanged || current.trim().length === 0) {
+        store.setter(revertNameBoxAtom, { sessionId })
+      } else {
+        commitCurrent(sessionId)
+      }
+    }
+
+    store.setter(blurNameBoxAtom, { sessionId })
+    if (domSessionId === sessionId) {
+      domSessionId = undefined
+    }
   }
 
   const className = () => {
@@ -186,6 +182,7 @@ export function SpreadsheetNameBox(props: SpreadsheetNameBoxProps) {
     if (error()) parts.push('name-box--error')
     return parts.join(' ').trim()
   }
+  const errorMessageId = () => `${props['data-testid'] ?? 'name-box'}-error-message`
 
   return (
     <div
@@ -198,14 +195,28 @@ export function SpreadsheetNameBox(props: SpreadsheetNameBoxProps) {
         class="name-box-input spreadsheet-name-box-input"
         data-testid="name-box-input"
         type="text"
-        aria-label="Name box"
-        value={inputValue()}
+        aria-label={t('nameBox.label')}
+        aria-invalid={error() ? 'true' : undefined}
+        aria-describedby={error() ? errorMessageId() : undefined}
+        value={renderedValue()}
         onInput={onInput}
         onKeyDown={onKeyDown}
         onFocus={onFocus}
         onBlur={onBlur}
-        ref={(node) => bindInputRef(node)}
+        ref={(node) => {
+          inputRef = node
+        }}
       />
+      {error() ? (
+        <span
+          id={errorMessageId()}
+          class="spreadsheet-name-box-error-message"
+          data-testid="name-box-error"
+          role="alert"
+        >
+          {t('nameBox.error')}
+        </span>
+      ) : null}
     </div>
   )
 }

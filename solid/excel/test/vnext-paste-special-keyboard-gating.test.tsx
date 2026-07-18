@@ -5,16 +5,21 @@ import { createStore } from '@einfach/core'
 import { cleanup, fireEvent, render, waitFor } from '@solidjs/testing-library'
 import type {
   DisplayCell,
+  PasteRangeRequest,
   SpreadsheetBackend,
   VisibleProjectionRequest,
   VisibleProjectionResult,
 } from '@einfach/spreadsheet-ui-core'
 import {
+  capturePasteSpecialCapabilityAtom,
   copyClipboardAtom,
+  pasteSpecialCapabilityAtom,
   pasteSpecialOpenAtom,
   setWorkspaceActiveSheetAtom,
+  topMenuOpenAtom,
 } from '@einfach/spreadsheet-ui-core'
 import { SpreadsheetGrid } from '../src-vnext/grid'
+import { SpreadsheetMenuBar } from '../src-vnext/menu-bar'
 import { SpreadsheetUiProvider } from '../src-vnext/provider'
 
 afterEach(cleanup)
@@ -38,7 +43,10 @@ function buildCells(window: VisibleProjectionRequest['window']): DisplayCell[] {
   return cells
 }
 
-function createBackend(opts: { withPasteRange: boolean }): SpreadsheetBackend {
+function createBackend(opts: {
+  withPasteRange: boolean
+  pasteRangeRequests?: PasteRangeRequest[]
+}): SpreadsheetBackend {
   const backend: SpreadsheetBackend = {
     async readVisibleProjection(request) {
       const result: VisibleProjectionResult = {
@@ -69,13 +77,16 @@ function createBackend(opts: { withPasteRange: boolean }): SpreadsheetBackend {
     },
   }
   if (opts.withPasteRange) {
-    backend.pasteRange = async (request) => ({
-      kind: 'paste-range',
-      sheetId: request.sheetId,
-      requestId: request.requestId,
-      revision: request.revision,
-      affectedRange: request.target,
-    })
+    backend.pasteRange = async (request) => {
+      opts.pasteRangeRequests?.push(request)
+      return {
+        kind: 'paste-range',
+        sheetId: request.sheetId,
+        requestId: request.requestId,
+        revision: request.revision,
+        affectedRange: request.target,
+      }
+    }
   }
   return backend
 }
@@ -106,7 +117,8 @@ function seedClipboardSource(store: ReturnType<typeof createStore>) {
 describe('Ctrl+Alt+V dispatcher gating', () => {
   it('does not open the dialog when backend lacks pasteRange capability', async () => {
     const store = createStore()
-    const backend = createBackend({ withPasteRange: false })
+    const pasteRangeRequests: PasteRangeRequest[] = []
+    const backend = createBackend({ withPasteRange: false, pasteRangeRequests })
     seedClipboardSource(store)
 
     const { container } = render(() => (
@@ -127,11 +139,13 @@ describe('Ctrl+Alt+V dispatcher gating', () => {
 
     // Capability missing → dialog never opens.
     expect(store.getter(pasteSpecialOpenAtom)).toBe(false)
+    expect(pasteRangeRequests).toHaveLength(0)
   })
 
   it('does not open the dialog when the clipboard has no copyable payload', async () => {
     const store = createStore()
-    const backend = createBackend({ withPasteRange: true })
+    const pasteRangeRequests: PasteRangeRequest[] = []
+    const backend = createBackend({ withPasteRange: true, pasteRangeRequests })
     // Note: NO copyClipboardAtom seed — clipboard.source / payload remain null.
     store.setter(setWorkspaceActiveSheetAtom, { sheetId: 'sheet-1' })
 
@@ -152,11 +166,13 @@ describe('Ctrl+Alt+V dispatcher gating', () => {
     })
 
     expect(store.getter(pasteSpecialOpenAtom)).toBe(false)
+    expect(pasteRangeRequests).toHaveLength(0)
   })
 
   it('opens the dialog when capability + clipboard payload are both present', async () => {
     const store = createStore()
-    const backend = createBackend({ withPasteRange: true })
+    const pasteRangeRequests: PasteRangeRequest[] = []
+    const backend = createBackend({ withPasteRange: true, pasteRangeRequests })
     seedClipboardSource(store)
 
     const { container } = render(() => (
@@ -176,5 +192,117 @@ describe('Ctrl+Alt+V dispatcher gating', () => {
     })
 
     expect(store.getter(pasteSpecialOpenAtom)).toBe(true)
+    expect(pasteRangeRequests).toHaveLength(0)
+  })
+
+  it('ignores a supported shortcut event that an upstream handler already prevented', async () => {
+    const store = createStore()
+    const pasteRangeRequests: PasteRangeRequest[] = []
+    const backend = createBackend({ withPasteRange: true, pasteRangeRequests })
+    seedClipboardSource(store)
+
+    const { container } = render(() => (
+      <SpreadsheetUiProvider backend={backend} store={store}>
+        <SpreadsheetGrid sheetId="sheet-1" viewport={VIEWPORT} data-testid="grid" />
+      </SpreadsheetUiProvider>
+    ))
+
+    await waitFor(() => {
+      expect(container.querySelectorAll('td.spreadsheet-grid-cell').length).toBeGreaterThan(0)
+    })
+
+    const event = new KeyboardEvent('keydown', {
+      key: 'v',
+      ctrlKey: true,
+      altKey: true,
+      bubbles: true,
+      cancelable: true,
+    })
+    event.preventDefault()
+    expect(event.defaultPrevented).toBe(true)
+    container.querySelector<HTMLElement>('[data-testid="grid"]')!.dispatchEvent(event)
+
+    expect(store.getter(pasteSpecialOpenAtom)).toBe(false)
+    expect(pasteRangeRequests).toHaveLength(0)
+  })
+})
+
+describe('Edit > Paste Special capability gating', () => {
+  it('hides the menu item when the canonical capability is false', () => {
+    const store = createStore()
+    const pasteRangeRequests: PasteRangeRequest[] = []
+    const backend = createBackend({ withPasteRange: false, pasteRangeRequests })
+    seedClipboardSource(store)
+
+    const { container } = render(() => (
+      <SpreadsheetUiProvider backend={backend} store={store}>
+        <SpreadsheetMenuBar />
+      </SpreadsheetUiProvider>
+    ))
+
+    fireEvent.click(container.querySelector('[data-testid="menu-bar-button-edit"]')!)
+
+    expect(store.getter(pasteSpecialCapabilityAtom)).toBe(false)
+    expect(container.querySelector('[data-testid="menu-bar-item-edit.pasteSpecial"]')).toBeNull()
+    expect(store.getter(pasteSpecialOpenAtom)).toBe(false)
+    expect(pasteRangeRequests).toHaveLength(0)
+  })
+
+  it('opens from the menu when the canonical capability is true without invoking transport', async () => {
+    const store = createStore()
+    const pasteRangeRequests: PasteRangeRequest[] = []
+    const backend = createBackend({ withPasteRange: true, pasteRangeRequests })
+    seedClipboardSource(store)
+
+    const { container } = render(() => (
+      <SpreadsheetUiProvider backend={backend} store={store}>
+        <SpreadsheetMenuBar />
+      </SpreadsheetUiProvider>
+    ))
+
+    fireEvent.click(container.querySelector('[data-testid="menu-bar-button-edit"]')!)
+    await waitFor(() => {
+      expect(
+        container.querySelector('[data-testid="menu-bar-item-edit.pasteSpecial"]'),
+      ).not.toBeNull()
+    })
+    fireEvent.click(container.querySelector('[data-testid="menu-bar-item-edit.pasteSpecial"]')!)
+
+    expect(store.getter(pasteSpecialOpenAtom)).toBe(true)
+    expect(pasteRangeRequests).toHaveLength(0)
+  })
+
+  it('fails closed when capability is revoked during a stale menu activation', async () => {
+    const store = createStore()
+    const pasteRangeRequests: PasteRangeRequest[] = []
+    const backend = createBackend({ withPasteRange: true, pasteRangeRequests })
+    seedClipboardSource(store)
+
+    const { container } = render(() => (
+      <SpreadsheetUiProvider backend={backend} store={store}>
+        <SpreadsheetMenuBar />
+      </SpreadsheetUiProvider>
+    ))
+
+    fireEvent.click(container.querySelector('[data-testid="menu-bar-button-edit"]')!)
+    let pasteSpecialItem: HTMLElement | null = null
+    await waitFor(() => {
+      pasteSpecialItem = container.querySelector<HTMLElement>(
+        '[data-testid="menu-bar-item-edit.pasteSpecial"]',
+      )
+      expect(pasteSpecialItem).not.toBeNull()
+    })
+
+    pasteSpecialItem!.addEventListener(
+      'click',
+      () => store.setter(capturePasteSpecialCapabilityAtom, {}),
+      { capture: true, once: true },
+    )
+    fireEvent.click(pasteSpecialItem!)
+
+    expect(store.getter(pasteSpecialCapabilityAtom)).toBe(false)
+    expect(store.getter(topMenuOpenAtom)).toEqual({ kind: 'idle' })
+    expect(store.getter(pasteSpecialOpenAtom)).toBe(false)
+    expect(pasteRangeRequests).toHaveLength(0)
   })
 })

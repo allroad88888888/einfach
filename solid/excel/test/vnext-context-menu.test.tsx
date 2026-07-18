@@ -22,13 +22,17 @@ import type {
 } from '@einfach/spreadsheet-ui-core'
 import {
   clipboardStateAtom,
+  historyStackAtom,
   menuCommandIntentAtom,
   menuStateAtom,
   openMenuAtom,
+  readViewportFreezeCanonicalAtom,
+  structureOperationLifecycleAtom,
   viewportFreezeAtom,
 } from '@einfach/spreadsheet-ui-core'
 import { SpreadsheetContextMenu } from '../src-vnext/context-menu'
 import { spreadsheetProjectionSnapshotAtom, SpreadsheetUiProvider } from '../src-vnext/provider'
+import { seedReadyVisibleProjection } from './projection-test-fixture'
 
 let restoreClipboard: (() => void) | null = null
 
@@ -78,6 +82,12 @@ function createFakeBackend() {
   const readRangeRequests: RangeProjectionRequest[] = []
   const exportRangeTsvRequests: RangeTsvExportRequest[] = []
   const consumeExportRangeTsvChunksRequests: RangeTsvExportRequest[] = []
+  const setFreezeConfigRequests: Parameters<
+    NonNullable<SpreadsheetBackend['setFreezeConfig']>
+  >[0][] = []
+  let structuralRevision = 0
+  let freezeRevision = 0
+  let freeze = { rows: 0, cols: 0 }
   const rangeCells = [
     { row: 0, col: 0, displayValue: 'A1' },
     { row: 0, col: 1, displayValue: '2', formula: '=A1+1' },
@@ -192,7 +202,7 @@ function createFakeBackend() {
       return {
         sheetId: request.sheetId,
         requestId: request.requestId,
-        revision: request.revision,
+        revision: ++structuralRevision,
       }
     },
     async deleteRows(request) {
@@ -200,7 +210,7 @@ function createFakeBackend() {
       return {
         sheetId: request.sheetId,
         requestId: request.requestId,
-        revision: request.revision,
+        revision: ++structuralRevision,
       }
     },
     async insertColumns(request) {
@@ -208,7 +218,7 @@ function createFakeBackend() {
       return {
         sheetId: request.sheetId,
         requestId: request.requestId,
-        revision: request.revision,
+        revision: ++structuralRevision,
       }
     },
     async deleteColumns(request) {
@@ -216,7 +226,29 @@ function createFakeBackend() {
       return {
         sheetId: request.sheetId,
         requestId: request.requestId,
-        revision: request.revision,
+        revision: ++structuralRevision,
+      }
+    },
+    async readFreezeConfig(request) {
+      return {
+        kind: 'freeze-config',
+        sheetId: request.sheetId,
+        requestId: request.requestId,
+        revision: freezeRevision,
+        freeze: { ...freeze },
+      }
+    },
+    async setFreezeConfig(request) {
+      setFreezeConfigRequests.push(request)
+      if (request.revision !== undefined && request.revision !== freezeRevision) {
+        throw new Error('freeze revision conflict')
+      }
+      freeze = { ...request.freeze }
+      freezeRevision += 1
+      return {
+        sheetId: request.sheetId,
+        requestId: request.requestId,
+        revision: freezeRevision,
       }
     },
   }
@@ -236,7 +268,22 @@ function createFakeBackend() {
     readRangeRequests,
     exportRangeTsvRequests,
     consumeExportRangeTsvChunksRequests,
+    setFreezeConfigRequests,
+    seedFreeze(next: { rows: number; cols: number }) {
+      freeze = { ...next }
+      freezeRevision += 1
+    },
   }
+}
+
+async function hydrateFreeze(
+  store: ReturnType<typeof createStore>,
+  backend: SpreadsheetBackend,
+) {
+  await store.setter(readViewportFreezeCanonicalAtom, {
+    source: backend,
+    sheetId: 'sheet-1',
+  })
 }
 
 describe('vNext SpreadsheetContextMenu', () => {
@@ -274,12 +321,85 @@ describe('vNext SpreadsheetContextMenu', () => {
     expect(queryByTestId('context-menu-command-column.delete')).toBeNull()
   })
 
+  it('focuses the first keyboard-opened item and restores the opener on Escape', async () => {
+    const store = createStore()
+    const { backend } = createFakeBackend()
+
+    const { getByTestId, queryByTestId } = render(() => (
+      <>
+        <button type="button" data-testid="menu-opener">
+          Open menu
+        </button>
+        <SpreadsheetUiProvider backend={backend} store={store}>
+          <SpreadsheetContextMenu />
+        </SpreadsheetUiProvider>
+      </>
+    ))
+
+    const opener = getByTestId('menu-opener') as HTMLButtonElement
+    opener.focus()
+    store.setter(openMenuAtom, {
+      surface: 'cell',
+      target: {
+        kind: 'cell',
+        sheetId: 'sheet-1',
+        cell: { row: 1, col: 2 },
+      },
+      position: { x: 14, y: 8 },
+      source: 'keyboard',
+    })
+
+    const firstMenuItem = await waitFor(() => getByTestId('context-menu-command-clipboard.copy'))
+    await waitFor(() => expect(document.activeElement).toBe(firstMenuItem))
+
+    fireEvent.keyDown(firstMenuItem, { key: 'Escape' })
+
+    await waitFor(() => {
+      expect(queryByTestId('spreadsheet-context-menu')).toBeNull()
+      expect(store.getter(menuStateAtom).status).toBe('closed')
+      expect(document.activeElement).toBe(opener)
+    })
+  })
+
+  it('does not steal focus when the menu is opened from a pointer', async () => {
+    const store = createStore()
+    const { backend } = createFakeBackend()
+
+    const { getByTestId } = render(() => (
+      <>
+        <button type="button" data-testid="menu-opener">
+          Open menu
+        </button>
+        <SpreadsheetUiProvider backend={backend} store={store}>
+          <SpreadsheetContextMenu />
+        </SpreadsheetUiProvider>
+      </>
+    ))
+
+    const opener = getByTestId('menu-opener') as HTMLButtonElement
+    opener.focus()
+    store.setter(openMenuAtom, {
+      surface: 'cell',
+      target: {
+        kind: 'cell',
+        sheetId: 'sheet-1',
+        cell: { row: 1, col: 2 },
+      },
+      position: { x: 14, y: 8 },
+      source: 'pointer',
+    })
+
+    await waitFor(() => expect(getByTestId('spreadsheet-context-menu')).toBeTruthy())
+    await Promise.resolve()
+    expect(document.activeElement).toBe(opener)
+  })
+
   it('dispatches a menu.command intent when Delete is clicked', async () => {
     const store = createStore()
     const { backend, setCellInputRequests, readVisibleRequests } = createFakeBackend()
     const window = { rowStart: 0, rowEnd: 4, colStart: 0, colEnd: 4 }
 
-    store.setter(spreadsheetProjectionSnapshotAtom, {
+    seedReadyVisibleProjection(store, {
       status: 'ready',
       request: {
         kind: 'visible-window',
@@ -392,7 +512,7 @@ describe('vNext SpreadsheetContextMenu', () => {
     const window = { rowStart: 0, rowEnd: 4, colStart: 0, colEnd: 4 }
     const range = { rowStart: 0, rowEnd: 1, colStart: 0, colEnd: 2 }
 
-    store.setter(spreadsheetProjectionSnapshotAtom, {
+    seedReadyVisibleProjection(store, {
       status: 'ready',
       request: {
         kind: 'visible-window',
@@ -446,6 +566,63 @@ describe('vNext SpreadsheetContextMenu', () => {
       window,
       reason: 'selection',
     })
+    await waitFor(() => expect(store.getter(menuStateAtom).status).toBe('closed'))
+  })
+
+  it('reports a rejected non-structural clear through the existing projection error channel', async () => {
+    const store = createStore()
+    const { backend, readVisibleRequests } = createFakeBackend()
+    const window = { rowStart: 0, rowEnd: 4, colStart: 0, colEnd: 4 }
+    const range = { rowStart: 0, rowEnd: 1, colStart: 0, colEnd: 2 }
+    backend.clearRange = async () => {
+      throw new Error('clear failed')
+    }
+
+    seedReadyVisibleProjection(store, {
+      status: 'ready',
+      request: {
+        kind: 'visible-window',
+        sheetId: 'sheet-1',
+        window,
+        requestId: 1,
+      },
+      result: {
+        kind: 'visible-window',
+        sheetId: 'sheet-1',
+        window,
+        requestId: 1,
+        cells: [],
+      },
+    })
+    store.setter(openMenuAtom, {
+      surface: 'cell',
+      target: {
+        kind: 'range',
+        sheetId: 'sheet-1',
+        range,
+      },
+      position: { x: 0, y: 0 },
+      source: 'pointer',
+    })
+
+    const { getByTestId } = render(() => (
+      <SpreadsheetUiProvider backend={backend} store={store}>
+        <SpreadsheetContextMenu />
+      </SpreadsheetUiProvider>
+    ))
+
+    fireEvent.click(getByTestId('context-menu-command-cell.clear'))
+
+    await waitFor(() =>
+      expect(store.getter(spreadsheetProjectionSnapshotAtom)).toMatchObject({
+        status: 'error',
+        error: {
+          code: 'BACKEND_ERROR',
+          message: 'clear failed',
+        },
+      }),
+    )
+    expect(readVisibleRequests).toEqual([])
     await waitFor(() => expect(store.getter(menuStateAtom).status).toBe('closed'))
   })
 
@@ -602,7 +779,7 @@ describe('vNext SpreadsheetContextMenu', () => {
     const window = { rowStart: 0, rowEnd: 4, colStart: 0, colEnd: 4 }
     const range = { rowStart: 0, rowEnd: 1, colStart: 0, colEnd: 1 }
 
-    store.setter(spreadsheetProjectionSnapshotAtom, {
+    seedReadyVisibleProjection(store, {
       status: 'ready',
       request: {
         kind: 'visible-window',
@@ -662,7 +839,7 @@ describe('vNext SpreadsheetContextMenu', () => {
     const { backend, setCellInputRequests, readVisibleRequests } = createFakeBackend()
     const window = { rowStart: 0, rowEnd: 4, colStart: 0, colEnd: 4 }
 
-    store.setter(spreadsheetProjectionSnapshotAtom, {
+    seedReadyVisibleProjection(store, {
       status: 'ready',
       request: {
         kind: 'visible-window',
@@ -741,7 +918,7 @@ describe('vNext SpreadsheetContextMenu', () => {
     } = createFakeBackend()
     const window = { rowStart: 0, rowEnd: 4, colStart: 0, colEnd: 4 }
 
-    store.setter(spreadsheetProjectionSnapshotAtom, {
+    seedReadyVisibleProjection(store, {
       status: 'ready',
       request: {
         kind: 'visible-window',
@@ -840,17 +1017,13 @@ describe('vNext SpreadsheetContextMenu', () => {
     })
   })
 
-  it('executes row and column structural commands through the backend', async () => {
+  it('dispatches row and column structural intents through the Core lifecycle', async () => {
     const store = createStore()
-    const {
-      backend,
-      insertRowsRequests,
-      deleteColumnsRequests,
-      readVisibleRequests,
-    } = createFakeBackend()
+    const { backend, insertRowsRequests, deleteColumnsRequests, readVisibleRequests } =
+      createFakeBackend()
     const window = { rowStart: 0, rowEnd: 4, colStart: 0, colEnd: 4 }
 
-    store.setter(spreadsheetProjectionSnapshotAtom, {
+    seedReadyVisibleProjection(store, {
       status: 'ready',
       request: {
         kind: 'visible-window',
@@ -891,8 +1064,18 @@ describe('vNext SpreadsheetContextMenu', () => {
           sheetId: 'sheet-1',
           rowIndex: 2,
           count: 1,
+          requestId: 1,
+          revision: undefined,
         },
       ]),
+    )
+    await waitFor(() =>
+      expect(store.getter(structureOperationLifecycleAtom)).toMatchObject({
+        status: 'completed',
+        operation: 'row.insert',
+        requestId: 1,
+        acknowledgedRevision: 1,
+      }),
     )
     await waitFor(() => expect(store.getter(menuStateAtom).status).toBe('closed'))
 
@@ -915,10 +1098,100 @@ describe('vNext SpreadsheetContextMenu', () => {
           sheetId: 'sheet-1',
           colIndex: 1,
           count: 1,
+          requestId: 2,
+          revision: undefined,
         },
       ]),
     )
     await waitFor(() => expect(readVisibleRequests).toHaveLength(2))
+    expect(store.getter(historyStackAtom).entries).toHaveLength(2)
+    expect(store.getter(historyStackAtom).entries.map((entry) => entry.kind)).toEqual([
+      'row.insert',
+      'column.delete',
+    ])
+    expect(store.getter(structureOperationLifecycleAtom)).toMatchObject({
+      status: 'completed',
+      operation: 'column.delete',
+      requestId: 2,
+      acknowledgedRevision: 2,
+    })
+  })
+
+  it('reports missing structural capability in Core without rewriting projection state', async () => {
+    const store = createStore()
+    const { backend, insertRowsRequests, readVisibleRequests } = createFakeBackend()
+    backend.insertRows = undefined
+    const window = { rowStart: 0, rowEnd: 4, colStart: 0, colEnd: 4 }
+    seedReadyVisibleProjection(store, {
+      status: 'ready',
+      request: {
+        kind: 'visible-window',
+        sheetId: 'sheet-1',
+        window,
+        requestId: 1,
+      },
+      result: {
+        kind: 'visible-window',
+        sheetId: 'sheet-1',
+        window,
+        requestId: 1,
+        cells: [],
+      },
+    })
+    store.setter(openMenuAtom, {
+      surface: 'header',
+      target: { kind: 'row', sheetId: 'sheet-1', rowIndex: 2 },
+      position: { x: 0, y: 0 },
+      source: 'pointer',
+    })
+
+    const { getByTestId } = render(() => (
+      <SpreadsheetUiProvider backend={backend} store={store}>
+        <SpreadsheetContextMenu />
+      </SpreadsheetUiProvider>
+    ))
+    fireEvent.click(getByTestId('context-menu-command-row.insert'))
+
+    await waitFor(() =>
+      expect(store.getter(structureOperationLifecycleAtom).status).toBe('unsupported'),
+    )
+    expect(insertRowsRequests).toEqual([])
+    expect(readVisibleRequests).toEqual([])
+    expect(store.getter(historyStackAtom).entries).toEqual([])
+    expect(store.getter(spreadsheetProjectionSnapshotAtom).status).toBe('ready')
+  })
+
+  it('keeps a mismatched structural acknowledgement outcome-unknown and does not refresh', async () => {
+    const store = createStore()
+    const { backend, insertRowsRequests, readVisibleRequests } = createFakeBackend()
+    backend.insertRows = async (request) => {
+      insertRowsRequests.push(request)
+      return {
+        sheetId: request.sheetId,
+        requestId: (request.requestId ?? 0) + 1,
+        revision: 1,
+      }
+    }
+    store.setter(openMenuAtom, {
+      surface: 'header',
+      target: { kind: 'row', sheetId: 'sheet-1', rowIndex: 2 },
+      position: { x: 0, y: 0 },
+      source: 'pointer',
+    })
+
+    const { getByTestId } = render(() => (
+      <SpreadsheetUiProvider backend={backend} store={store}>
+        <SpreadsheetContextMenu />
+      </SpreadsheetUiProvider>
+    ))
+    fireEvent.click(getByTestId('context-menu-command-row.insert'))
+
+    await waitFor(() =>
+      expect(store.getter(structureOperationLifecycleAtom).status).toBe('outcome-unknown'),
+    )
+    expect(insertRowsRequests).toHaveLength(1)
+    expect(readVisibleRequests).toEqual([])
+    expect(store.getter(historyStackAtom).entries).toEqual([])
   })
 
   it('freezes rows above the clicked row from the row header context menu', async () => {
@@ -1001,7 +1274,7 @@ describe('vNext SpreadsheetContextMenu', () => {
 
   it('shows all four freeze actions on a cell right-click and labels them short-form', async () => {
     const store = createStore()
-    const { backend } = createFakeBackend()
+    const { backend, seedFreeze } = createFakeBackend()
 
     store.setter(openMenuAtom, {
       surface: 'context',
@@ -1009,11 +1282,9 @@ describe('vNext SpreadsheetContextMenu', () => {
       position: { x: 0, y: 0 },
       source: 'pointer',
     })
-    // Pre-activate freeze so Unfreeze is also visible.
-    store.setter(viewportFreezeAtom, {
-      rowsBySheet: { 'sheet-1': 1 },
-      colsBySheet: {},
-    })
+    // Pre-activate canonical freeze so Unfreeze is also visible.
+    seedFreeze({ rows: 1, cols: 0 })
+    await hydrateFreeze(store, backend)
 
     const { getByTestId } = render(() => (
       <SpreadsheetUiProvider backend={backend} store={store}>
@@ -1037,13 +1308,11 @@ describe('vNext SpreadsheetContextMenu', () => {
 
   it('freezes rows only via cell-target Freeze row — preserves col freeze', async () => {
     const store = createStore()
-    const { backend } = createFakeBackend()
+    const { backend, seedFreeze } = createFakeBackend()
 
     // Start with cols already frozen; "Freeze row" must not clear that axis.
-    store.setter(viewportFreezeAtom, {
-      rowsBySheet: {},
-      colsBySheet: { 'sheet-1': 2 },
-    })
+    seedFreeze({ rows: 0, cols: 2 })
+    await hydrateFreeze(store, backend)
     store.setter(openMenuAtom, {
       surface: 'context',
       target: { kind: 'cell', sheetId: 'sheet-1', cell: { row: 3, col: 1 } },
@@ -1067,12 +1336,10 @@ describe('vNext SpreadsheetContextMenu', () => {
 
   it('freezes cols only via cell-target Freeze column — preserves row freeze', async () => {
     const store = createStore()
-    const { backend } = createFakeBackend()
+    const { backend, seedFreeze } = createFakeBackend()
 
-    store.setter(viewportFreezeAtom, {
-      rowsBySheet: { 'sheet-1': 2 },
-      colsBySheet: {},
-    })
+    seedFreeze({ rows: 2, cols: 0 })
+    await hydrateFreeze(store, backend)
     store.setter(openMenuAtom, {
       surface: 'context',
       target: { kind: 'cell', sheetId: 'sheet-1', cell: { row: 1, col: 4 } },
@@ -1096,7 +1363,7 @@ describe('vNext SpreadsheetContextMenu', () => {
 
   it('shows Unfreeze only when freeze is active on the target sheet', async () => {
     const store = createStore()
-    const { backend } = createFakeBackend()
+    const { backend, seedFreeze } = createFakeBackend()
 
     store.setter(openMenuAtom, {
       surface: 'header',
@@ -1114,11 +1381,9 @@ describe('vNext SpreadsheetContextMenu', () => {
     // No freeze yet — Unfreeze is hidden.
     expect(queryByTestId('context-menu-command-view.unfreeze')).toBeNull()
 
-    // Activate freeze on this sheet, re-open the menu, and the item appears.
-    store.setter(viewportFreezeAtom, {
-      rowsBySheet: { 'sheet-1': 2 },
-      colsBySheet: {},
-    })
+    // Activate canonical freeze on this sheet, re-open the menu, and the item appears.
+    seedFreeze({ rows: 2, cols: 0 })
+    await hydrateFreeze(store, backend)
     store.setter(openMenuAtom, {
       surface: 'header',
       target: { kind: 'row', sheetId: 'sheet-1', rowIndex: 4 },
@@ -1134,5 +1399,79 @@ describe('vNext SpreadsheetContextMenu', () => {
       expect(freeze.rowsBySheet['sheet-1'] ?? 0).toBe(0)
       expect(freeze.colsBySheet['sheet-1'] ?? 0).toBe(0)
     })
+  })
+
+  it('does not expose the previous backend freeze while the next authority is hydrating', async () => {
+    const store = createStore()
+    const first = createFakeBackend()
+    first.seedFreeze({ rows: 2, cols: 1 })
+    await hydrateFreeze(store, first.backend)
+
+    const second = createFakeBackend()
+    let pendingRequestId: number | undefined
+    let resolveRead!: (
+      value: Awaited<ReturnType<NonNullable<SpreadsheetBackend['readFreezeConfig']>>>,
+    ) => void
+    second.backend.readFreezeConfig = (request) => {
+      pendingRequestId = request.requestId
+      return new Promise((resolve) => {
+        resolveRead = resolve
+      })
+    }
+    const hydration = store.setter(readViewportFreezeCanonicalAtom, {
+      source: second.backend,
+      sheetId: 'sheet-1',
+    })
+
+    store.setter(openMenuAtom, {
+      surface: 'header',
+      target: { kind: 'row', sheetId: 'sheet-1', rowIndex: 4 },
+      position: { x: 0, y: 0 },
+      source: 'pointer',
+    })
+
+    const { queryByTestId } = render(() => (
+      <SpreadsheetUiProvider backend={second.backend} store={store}>
+        <SpreadsheetContextMenu />
+      </SpreadsheetUiProvider>
+    ))
+
+    expect(queryByTestId('context-menu-command-view.unfreeze')).toBeNull()
+    await waitFor(() => expect(pendingRequestId).toBeDefined())
+    resolveRead({
+      kind: 'freeze-config',
+      sheetId: 'sheet-1',
+      requestId: pendingRequestId,
+      revision: 0,
+      freeze: { rows: 0, cols: 0 },
+    })
+    await expect(hydration).resolves.toBe('committed')
+  })
+
+  it('hides freeze commands and dispatches nothing when either authority port is missing', () => {
+    const store = createStore()
+    const fake = createFakeBackend()
+    const readOnlyBackend: SpreadsheetBackend = {
+      ...fake.backend,
+      setFreezeConfig: undefined,
+    }
+    store.setter(openMenuAtom, {
+      surface: 'context',
+      target: { kind: 'cell', sheetId: 'sheet-1', cell: { row: 2, col: 2 } },
+      position: { x: 0, y: 0 },
+      source: 'pointer',
+    })
+
+    const { queryByTestId } = render(() => (
+      <SpreadsheetUiProvider backend={readOnlyBackend} store={store}>
+        <SpreadsheetContextMenu />
+      </SpreadsheetUiProvider>
+    ))
+
+    expect(queryByTestId('context-menu-command-view.freezePanes')).toBeNull()
+    expect(queryByTestId('context-menu-command-view.freezeRowsHere')).toBeNull()
+    expect(queryByTestId('context-menu-command-view.freezeColsHere')).toBeNull()
+    expect(queryByTestId('context-menu-command-view.unfreeze')).toBeNull()
+    expect(fake.setFreezeConfigRequests).toEqual([])
   })
 })

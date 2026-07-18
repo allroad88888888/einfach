@@ -8,19 +8,24 @@ import { resolveProjectionSourceRanges } from '../provider/projection-coordinate
 import { refreshVisibleProjection } from '../provider/projection-refresh'
 import { useSpreadsheetBackend, useSpreadsheetUiStore } from '../provider/hooks'
 import {
+  captureFormatCellsBackendCapabilitiesAtom,
   CURRENCY_FORMAT_OPTIONS,
   DATE_TIME_FORMAT_OPTIONS,
   NUMBER_FORMAT_OPTIONS,
   closeNumberFormatDialogAtom,
   numberFormatDialogAtom,
-  numberFormatDialogSavePayloadAtom,
   patchNumberFormatDialogAtom,
-  saveNumberFormatDialogAtom,
+  runNumberFormatDialogSaveAtom,
   type CurrencyFormatOption,
   type NumberFormatDialogKind,
   type NumberFormatDialogOpenState,
   type PatternFormatOption,
 } from './number-format-dialog-atoms'
+import type {
+  CellRange,
+  RunFormatCellsSaveInput,
+  SpreadsheetBackend,
+} from '@einfach/spreadsheet-ui-core'
 import './number-format-dialog.css'
 
 export interface SpreadsheetNumberFormatDialogsProps {
@@ -48,6 +53,22 @@ export function SpreadsheetNumberFormatDialogs(
   const t = useT()
   const store = useSpreadsheetUiStore()
   const backend = useSpreadsheetBackend()
+  const capabilities = store.setter(captureFormatCellsBackendCapabilitiesAtom, backend)
+  const projectionBackend = Object.freeze({
+    readVisibleProjection: capabilities.readVisibleProjection,
+  }) as SpreadsheetBackend
+  const savePorts: RunFormatCellsSaveInput = Object.freeze({
+    resolveSourceRanges: Object.freeze((sheetId: string, range: CellRange) =>
+      resolveProjectionSourceRanges(store, sheetId, range),
+    ),
+    setFormatRange: capabilities.setFormatRange,
+    refreshProjection:
+      capabilities.readVisibleProjection === undefined
+        ? undefined
+        : Object.freeze((sheetId: string) =>
+            refreshVisibleProjection(store, projectionBackend, sheetId),
+          ),
+  })
   const state = useAtomValue(numberFormatDialogAtom)
 
   const dialog = () => {
@@ -82,32 +103,8 @@ export function SpreadsheetNumberFormatDialogs(
     store.setter(closeNumberFormatDialogAtom)
   }
 
-  async function saveDialog() {
-    const payload = store.getter(numberFormatDialogSavePayloadAtom)
-    if (!payload) return
-
-    if (backend.setFormatRange) {
-      try {
-        const sourceRanges = resolveProjectionSourceRanges(
-          store,
-          payload.sheetId,
-          payload.range,
-        )
-        for (const sourceRange of sourceRanges) {
-          await backend.setFormatRange({
-            kind: 'set-format-range',
-            sheetId: payload.sheetId,
-            range: sourceRange,
-            format: payload.format,
-          })
-        }
-        await refreshVisibleProjection(store, backend, payload.sheetId)
-      } catch {
-        return
-      }
-    }
-
-    store.setter(saveNumberFormatDialogAtom)
+  function saveDialog() {
+    void store.setter(runNumberFormatDialogSaveAtom, savePorts)
   }
 
   function renderCurrencyList(open: NumberFormatDialogOpenState) {
@@ -226,14 +223,22 @@ export function SpreadsheetNumberFormatDialogs(
           <div class="number-format-dialog-body">{renderBody(open())}</div>
 
           <div class="number-format-dialog-actions">
-            <button
-              type="button"
-              data-testid="number-format-dialog-cancel"
-              onClick={closeDialog}
-            >
+            <Show when={open().error}>
+              {(message) => (
+                <span role="alert" data-testid="number-format-dialog-save-error">
+                  {message()}
+                </span>
+              )}
+            </Show>
+            <button type="button" data-testid="number-format-dialog-cancel" onClick={closeDialog}>
               {t('formatCells.cancel')}
             </button>
-            <button type="button" data-testid="number-format-dialog-save" onClick={saveDialog}>
+            <button
+              type="button"
+              data-testid="number-format-dialog-save"
+              disabled={open().pending || open().phase === 'outcome-unknown-blocked'}
+              onClick={saveDialog}
+            >
               {t('formatCells.save')}
             </button>
           </div>

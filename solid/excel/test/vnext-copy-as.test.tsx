@@ -13,6 +13,7 @@ import type {
 } from '@einfach/spreadsheet-ui-core'
 import {
   lastCopyAsAtom,
+  publishCopyAsResultAtom,
   selectionAtom,
   setSelectionBoundsAtom,
   setWorkspaceActiveSheetAtom,
@@ -480,7 +481,7 @@ describe('Copy as HTML / Markdown (Ctrl+Shift+C)', () => {
       markdown: '| sentinel |',
     }
     const store = createStore()
-    store.setter(lastCopyAsAtom, sentinel)
+    store.setter(publishCopyAsResultAtom, sentinel)
     seedTwoByTwoSelection(store)
 
     // Remove writeText so even the tier-3 fallback fails.
@@ -541,6 +542,21 @@ describe('Copy as PNG (Ctrl+Shift+P) — dispatchCopyAsImage', () => {
     const store = createStore()
     const backend = backendWithImagePort()
     seedTwoByTwoSelection(store)
+
+    fake.fakeWrite.mockImplementationOnce(async (items) => {
+      const snapshotAtWrite = store.getter(lastCopyAsAtom)
+      expect(snapshotAtWrite?.kind).toBe('image')
+      if (!snapshotAtWrite || snapshotAtWrite.kind !== 'image') {
+        throw new Error('image snapshot was not published before clipboard.write')
+      }
+      const mirrorAtWrite = (window as unknown as { __einfach_lastCopyAs__?: unknown })
+        .__einfach_lastCopyAs__
+      expect(mirrorAtWrite).toBe(snapshotAtWrite)
+      expect(items[0]?.blobs['image/png']).toBe(snapshotAtWrite.blob)
+      for (const item of items) {
+        fake.writeCalls.push({ types: [...item.types], blobs: { ...item.blobs } })
+      }
+    })
 
     await dispatchCopyAsImage(store, backend, {
       sheetId: 'sheet-1',

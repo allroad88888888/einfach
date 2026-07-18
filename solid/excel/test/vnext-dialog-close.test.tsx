@@ -28,6 +28,7 @@ import {
   openCommentSessionAtom,
   openConditionalFormatEditorAtom,
   openFilterDropdownAtom,
+  openFindReplaceAtom,
   openFormatCellsAtom,
   openNameManagerAtom,
   openProtectionUnlockAtom,
@@ -92,7 +93,7 @@ const cases: readonly DialogCase[] = [
   {
     name: 'find-replace',
     testid: 'find-replace-dialog',
-    open: (store) => store.setter(findReplaceOpenAtom, true),
+    open: (store) => store.setter(openFindReplaceAtom),
     isOpen: (store) => store.getter(findReplaceOpenAtom) === true,
     render: () => <SpreadsheetFindReplaceDialog />,
   },

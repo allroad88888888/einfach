@@ -1,4 +1,4 @@
-import { createSignal, For, onCleanup, onMount, Show } from 'solid-js'
+import { createEffect, createSignal, For, onCleanup, onMount, Show } from 'solid-js'
 import { useAtomValue } from '@einfach/solid'
 import { useT } from '../../src/i18n'
 import {
@@ -6,27 +6,37 @@ import {
   armFormatPainterStickyAtom,
   canRedoAtom,
   canUndoAtom,
-  dispatchSortAtom,
+  captureFilterSortCapabilityAtom,
+  captureFindReplaceCapabilityAtom,
+  closeToolbarSurfaceAtom,
   dispatchToolbarFormatCommandAtom,
   exitFormatPainterAtom,
-  findReplaceOpenAtom,
+  filterSortEntrypointProjectionAtom,
+  findReplaceCapabilityProjectionAtom,
   formatPainterStateAtom,
-  nextHistoryTransactionId,
   openCommentSessionAtom,
   openConditionalFormatEditorAtom,
-  openFilterDropdownAtom,
+  openFilterDropdownFromEntrypointAtom,
+  openFindReplaceFromEntrypointAtom,
   openFormatCellsAtom,
   openNameManagerAtom,
+  openToolbarDropdownAtom,
+  openToolbarPaletteAtom,
   openValidationRuleEditorAtom,
-  pushHistoryAtom,
+  retryFilterSortRefreshAtom,
+  retryToolbarMutationRefreshAtom,
+  runFilterSortEntrypointAtom,
+  runToolbarMutationAtom,
   selectionSnapshotAtom,
+  toolbarActiveSurfaceAtom,
   toolbarCommandAvailabilityAtom,
+  toolbarMutationLifecycleAtom,
   activeCellLockedAtom,
   selectionLockedAtom,
   type CapturedFormat,
   type CellRange,
   type DisplayCell,
-  type HistoryEntryKind,
+  type RunToolbarMutationInput,
   type SortDirection,
   type SpreadsheetBorders,
   type SpreadsheetBorderStyle,
@@ -34,6 +44,8 @@ import {
   type SpreadsheetNumberFormat,
   type ToolbarFormatCommandInput,
   type ToolbarFormatCommandIntent,
+  type ToolbarDropdownKind,
+  type ToolbarMutationStep,
 } from '@einfach/spreadsheet-ui-core'
 
 import {
@@ -57,7 +69,7 @@ import {
   type NumberFormatCustomMenuId,
   type NumberFormatId,
 } from './NumberFormatDropdown'
-import { FillColorPopover, colorPopoverAtom, type ColorPopoverMode } from './FillColorPopover'
+import { FillColorPopover, type ColorPopoverMode } from './FillColorPopover'
 import { DEFAULT_FONT_FAMILY, FontFamilyDropdown } from './FontFamilyDropdown'
 import {
   DEFAULT_FONT_SIZE,
@@ -276,6 +288,8 @@ function rangeCellCount(range: CellRange): number {
 interface SortDropdownProps {
   isOpen: boolean
   anchorRef?: HTMLElement | null
+  disabled: boolean
+  disabledReason: string | null
   onSelect: (direction: SortDirection) => void
   onRequestClose: () => void
   /** Translator from the parent toolbar; avoids a second `useT()` call. */
@@ -344,12 +358,14 @@ function SortDropdown(props: SortDropdownProps) {
               class="spreadsheet-toolbar-sort-option"
               role="menuitem"
               data-testid={option.testId}
+              disabled={props.disabled}
+              title={props.disabledReason ?? ''}
               style={{
                 padding: '4px 12px',
                 'text-align': 'left',
                 background: 'transparent',
                 border: 'none',
-                cursor: 'pointer',
+                cursor: props.disabled ? 'not-allowed' : 'pointer',
                 font: 'inherit',
               }}
               onClick={() => props.onSelect(option.direction)}
@@ -368,41 +384,58 @@ export function SpreadsheetToolbar(props: SpreadsheetToolbarProps) {
   const backend = useSpreadsheetBackend()
   const t = useT()
   const availability = useAtomValue(toolbarCommandAvailabilityAtom)
+  const filterSortEntrypoint = useAtomValue(filterSortEntrypointProjectionAtom)
+  const findReplaceCapability = useAtomValue(findReplaceCapabilityProjectionAtom)
+  const activeToolbarSurface = useAtomValue(toolbarActiveSurfaceAtom)
+  const toolbarMutationLifecycle = useAtomValue(toolbarMutationLifecycleAtom)
+
+  createEffect(() => {
+    store.setter(captureFilterSortCapabilityAtom, backend)
+    store.setter(captureFindReplaceCapabilityAtom, backend)
+  })
   const projectionSnapshot = useAtomValue(spreadsheetProjectionSnapshotAtom)
   const selectionSnapshot = useAtomValue(selectionSnapshotAtom)
   const activeCellLocked = useAtomValue(activeCellLockedAtom)
   const selectionLocked = useAtomValue(selectionLockedAtom)
   const formatPainterState = useAtomValue(formatPainterStateAtom)
-  const [numberFormatOpen, setNumberFormatOpen] = createSignal(false)
   const [numberFormatAnchor, setNumberFormatAnchor] = createSignal<DOMRect | null>(null)
   let numberFormatAnchorEl: HTMLButtonElement | null = null
 
-  // Borders dropdown lives entirely inside the toolbar component since the
-  // backend exposes no toolbar-surface atom for it. We hold the open flag in
-  // a local signal — under solid-js 1.9.12 the toolbar body re-executes on
-  // atom mutations but `createSignal` survives the re-run.
-  const [bordersDropdownOpen, setBordersDropdownOpen] = createSignal(false)
+  const numberFormatOpen = () => isDropdownOpen('number-format')
+  const bordersDropdownOpen = () => isDropdownOpen('border')
   let bordersAnchorRef: HTMLButtonElement | undefined
 
-  // Merge dropdown mirrors the borders dropdown pattern — local signal, click-
-  // outside / Esc handled by the dropdown itself.
-  const [mergeDropdownOpen, setMergeDropdownOpen] = createSignal(false)
+  const mergeDropdownOpen = () => isDropdownOpen('merge')
   let mergeAnchorRef: HTMLButtonElement | undefined
 
-  // Horizontal / vertical alignment dropdowns mirror the borders surface —
-  // a single toolbar anchor button reveals 3 options.
-  const [hAlignDropdownOpen, setHAlignDropdownOpen] = createSignal(false)
+  const hAlignDropdownOpen = () => isDropdownOpen('alignment')
   let hAlignAnchorRef: HTMLButtonElement | undefined
-  const [vAlignDropdownOpen, setVAlignDropdownOpen] = createSignal(false)
+  const vAlignDropdownOpen = () => isDropdownOpen('vertical-alignment')
   let vAlignAnchorRef: HTMLButtonElement | undefined
 
-  // Font-family / font-size dropdown open-state + anchors.
-  const [fontFamilyOpen, setFontFamilyOpen] = createSignal(false)
+  const fontFamilyOpen = () => isDropdownOpen('font-family')
   const [fontFamilyAnchor, setFontFamilyAnchor] = createSignal<DOMRect | null>(null)
   let fontFamilyAnchorEl: HTMLButtonElement | null = null
-  const [fontSizeOpen, setFontSizeOpen] = createSignal(false)
+  const fontSizeOpen = () => isDropdownOpen('font-size')
   const [fontSizeAnchor, setFontSizeAnchor] = createSignal<DOMRect | null>(null)
   let fontSizeAnchorEl: HTMLButtonElement | null = null
+
+  function isDropdownOpen(dropdown: ToolbarDropdownKind) {
+    const surface = activeToolbarSurface()
+    return surface?.kind === 'dropdown' && surface.id === dropdown
+  }
+
+  function closeToolbarSurface() {
+    store.setter(closeToolbarSurfaceAtom)
+  }
+
+  function toggleToolbarDropdown(dropdown: ToolbarDropdownKind) {
+    if (isDropdownOpen(dropdown)) {
+      closeToolbarSurface()
+    } else {
+      store.setter(openToolbarDropdownAtom, { dropdown })
+    }
+  }
 
   function currentHAlign(): HAlignValue {
     const align = activeCellFormat().align
@@ -417,44 +450,51 @@ export function SpreadsheetToolbar(props: SpreadsheetToolbarProps) {
   }
 
   function handleHAlignSelect(value: HAlignValue) {
-    setHAlignDropdownOpen(false)
+    closeToolbarSurface()
     dispatchCommand({ command: 'alignment', value })
   }
 
   function handleVAlignSelect(value: VAlignValue) {
-    setVAlignDropdownOpen(false)
+    closeToolbarSurface()
     dispatchCommand({ command: 'vertical-alignment', value })
   }
 
-  // Rotation dropdown mirrors the borders pattern — local signal, anchored to
-  // its own toolbar button.
-  const [rotationDropdownOpen, setRotationDropdownOpen] = createSignal(false)
+  const rotationDropdownOpen = () => isDropdownOpen('rotation')
   let rotationAnchorRef: HTMLButtonElement | undefined
 
-  // Sort dropdown — minimal asc/desc menu, inlined rather than living in its
-  // own file since it only carries two static options.
-  const [sortDropdownOpen, setSortDropdownOpen] = createSignal(false)
+  const sortDropdownOpen = () => isDropdownOpen('sort')
   let sortAnchorRef: HTMLButtonElement | undefined
 
-  const colorPopover = useAtomValue(colorPopoverAtom)
   const [anchorRect, setAnchorRect] = createSignal<DOMRect | null>(null)
   const colorAnchors: Partial<Record<ColorPopoverMode, HTMLButtonElement>> = {}
 
+  function activeColorMode(): ColorPopoverMode | null {
+    const surface = activeToolbarSurface()
+    if (surface?.kind !== 'palette') return null
+    return surface.id === 'fill-color' ? 'fill' : 'text'
+  }
+
   function toggleColorPopover(mode: ColorPopoverMode) {
-    const current = colorPopover().mode
-    if (current === mode) {
-      store.setter(colorPopoverAtom, { mode: null })
+    const palette = mode === 'fill' ? 'fill-color' : 'text-color'
+    const current = activeToolbarSurface()
+    if (current?.kind === 'palette' && current.id === palette) {
+      closeToolbarSurface()
       setAnchorRect(null)
       return
     }
     const anchor = colorAnchors[mode]
     setAnchorRect(anchor ? anchor.getBoundingClientRect() : null)
-    store.setter(colorPopoverAtom, { mode })
+    store.setter(openToolbarPaletteAtom, { palette })
   }
 
+  createEffect(() => {
+    if (activeColorMode() === null) setAnchorRect(null)
+  })
+
   function handleColorPick(hex: string) {
-    const mode = colorPopover().mode
+    const mode = activeColorMode()
     if (mode === null) return
+    closeToolbarSurface()
     dispatchCommand({
       command: mode === 'fill' ? 'fill-color' : 'text-color',
       value: hex,
@@ -468,22 +508,22 @@ export function SpreadsheetToolbar(props: SpreadsheetToolbarProps) {
   function openNumberFormatDropdown(buttonEl: HTMLButtonElement) {
     numberFormatAnchorEl = buttonEl
     setNumberFormatAnchor(buttonEl.getBoundingClientRect())
-    setNumberFormatOpen(true)
+    store.setter(openToolbarDropdownAtom, { dropdown: 'number-format' })
   }
 
   function closeNumberFormatDropdown() {
-    setNumberFormatOpen(false)
+    closeToolbarSurface()
     setNumberFormatAnchor(null)
   }
 
   function openFontFamilyDropdown(buttonEl: HTMLButtonElement) {
     fontFamilyAnchorEl = buttonEl
     setFontFamilyAnchor(buttonEl.getBoundingClientRect())
-    setFontFamilyOpen(true)
+    store.setter(openToolbarDropdownAtom, { dropdown: 'font-family' })
   }
 
   function closeFontFamilyDropdown() {
-    setFontFamilyOpen(false)
+    closeToolbarSurface()
     setFontFamilyAnchor(null)
   }
 
@@ -495,11 +535,11 @@ export function SpreadsheetToolbar(props: SpreadsheetToolbarProps) {
   function openFontSizeDropdown(buttonEl: HTMLButtonElement) {
     fontSizeAnchorEl = buttonEl
     setFontSizeAnchor(buttonEl.getBoundingClientRect())
-    setFontSizeOpen(true)
+    store.setter(openToolbarDropdownAtom, { dropdown: 'font-size' })
   }
 
   function closeFontSizeDropdown() {
-    setFontSizeOpen(false)
+    closeToolbarSurface()
     setFontSizeAnchor(null)
   }
 
@@ -553,8 +593,7 @@ export function SpreadsheetToolbar(props: SpreadsheetToolbarProps) {
 
     const cell = result.cells.find(
       (candidate) =>
-        candidate.row === selection.activeCell.row &&
-        candidate.col === selection.activeCell.col,
+        candidate.row === selection.activeCell.row && candidate.col === selection.activeCell.col,
     )
     return cloneFormat(cell?.format)
   }
@@ -590,8 +629,7 @@ export function SpreadsheetToolbar(props: SpreadsheetToolbarProps) {
 
     const cell = result.cells.find(
       (candidate) =>
-        candidate.row === selection.activeCell.row &&
-        candidate.col === selection.activeCell.col,
+        candidate.row === selection.activeCell.row && candidate.col === selection.activeCell.col,
     )
     return {
       format: cloneFormat(cell?.format),
@@ -733,60 +771,30 @@ export function SpreadsheetToolbar(props: SpreadsheetToolbarProps) {
     }
   }
 
-  function reportCommandError(error: unknown) {
-    const current = store.getter(spreadsheetProjectionSnapshotAtom)
-    store.setter(spreadsheetProjectionSnapshotAtom, {
-      ...current,
-      status: 'error',
-      error:
-        error instanceof Error
-          ? { code: 'BACKEND_ERROR', message: error.message }
-          : { code: 'BACKEND_ERROR', message: 'Spreadsheet toolbar command failed.' },
+  function dispatchToolbarMutation(
+    input: Omit<RunToolbarMutationInput, 'source' | 'refreshProjection'>,
+  ) {
+    void store.setter(runToolbarMutationAtom, {
+      ...input,
+      source: backend,
+      refreshProjection: (sheetId) => refreshVisibleProjection(store, backend, sheetId),
     })
   }
 
-  function recordHistoryEntry(input: {
-    sheetId: string | null
-    kind: HistoryEntryKind
-    revision: number | string | undefined
-    affectedRange?: CellRange
-  }) {
-    const projectionRevision =
-      typeof input.revision === 'number' ? input.revision : Number(input.revision ?? 0) || 0
-    store.setter(pushHistoryAtom, {
-      transactionId: nextHistoryTransactionId(),
-      kind: input.kind,
-      sheetId: input.sheetId,
-      projectionRevision,
-      affectedRange: input.affectedRange ? { ...input.affectedRange } : undefined,
-    })
-  }
-
-  async function executeCommand(intent: ToolbarFormatCommandIntent, range: CellRange) {
-    if (!backend.setFormatRange) {
-      throw new Error('Range formatting is not supported by this spreadsheet backend.')
-    }
-
+  function executeCommand(intent: ToolbarFormatCommandIntent, range: CellRange) {
     const current = activeCellFormat()
     const format = commandFormat(intent, current)
     const sourceRanges = resolveProjectionSourceRanges(store, intent.sheetId, range)
-    let result: Awaited<ReturnType<NonNullable<typeof backend.setFormatRange>>> | undefined
-    for (const sourceRange of sourceRanges) {
-      result = await backend.setFormatRange({
+    dispatchToolbarMutation({
+      sheetId: intent.sheetId,
+      operation: 'format',
+      affectedRange: sourceRanges.length === 1 ? sourceRanges[0] : range,
+      steps: sourceRanges.map((sourceRange) => ({
         kind: 'set-format-range',
-        sheetId: intent.sheetId,
         range: sourceRange,
         format,
-      })
-    }
-    recordHistoryEntry({
-      sheetId: intent.sheetId,
-      kind: 'format.set',
-      revision: result?.revision,
-      affectedRange:
-        sourceRanges.length === 1 ? result?.affectedRange ?? sourceRanges[0] : range,
+      })),
     })
-    await refreshVisibleProjection(store, backend, intent.sheetId)
   }
 
   function dispatchCommand(input: ToolbarFormatCommandInput) {
@@ -796,7 +804,7 @@ export function SpreadsheetToolbar(props: SpreadsheetToolbarProps) {
     }
 
     const range = selectionSnapshot().range
-    void executeCommand(intent, range).catch(reportCommandError)
+    executeCommand(intent, range)
   }
 
   function projectionCellMap(): Map<string, DisplayCell> {
@@ -821,16 +829,9 @@ export function SpreadsheetToolbar(props: SpreadsheetToolbarProps) {
    * (`setFormatRange` clobbers cell formats within the range, so a single
    * range-wide call would lose any pre-existing variation).
    */
-  async function executeBordersPreset(
-    preset: BordersPreset,
-    sheetId: string,
-    range: CellRange,
-  ) {
-    if (!backend.setFormatRange) {
-      throw new Error('Range formatting is not supported by this spreadsheet backend.')
-    }
-
+  function executeBordersPreset(preset: BordersPreset, sheetId: string, range: CellRange) {
     const cells = projectionCellMap()
+    const steps: ToolbarMutationStep[] = []
 
     for (let row = range.rowStart; row <= range.rowEnd; row += 1) {
       for (let col = range.colStart; col <= range.colEnd; col += 1) {
@@ -849,27 +850,23 @@ export function SpreadsheetToolbar(props: SpreadsheetToolbarProps) {
           colStart: col,
           colEnd: col,
         })
-        await backend.setFormatRange({
+        steps.push({
           kind: 'set-format-range',
-          sheetId,
           range: sourceRange,
           format: nextFormat,
         })
       }
     }
-
-    recordHistoryEntry({
+    dispatchToolbarMutation({
       sheetId,
-      kind: 'format.set',
-      revision: undefined,
+      operation: 'border-batch',
       affectedRange: range,
+      steps,
     })
-
-    await refreshVisibleProjection(store, backend, sheetId)
   }
 
   function handleBordersSelect(preset: BordersPreset) {
-    setBordersDropdownOpen(false)
+    closeToolbarSurface()
     const range = selectionSnapshot().range
     const isMulti = rangeCellCount(range) > 1
     if (preset === 'inner' && !isMulti) {
@@ -878,11 +875,11 @@ export function SpreadsheetToolbar(props: SpreadsheetToolbarProps) {
     }
     const sheetId = getMutationSheetId()
     if (!sheetId) return
-    void executeBordersPreset(preset, sheetId, range).catch(reportCommandError)
+    executeBordersPreset(preset, sheetId, range)
   }
 
   function handleRotationSelect(preset: RotationPreset) {
-    setRotationDropdownOpen(false)
+    closeToolbarSurface()
     // Serialize the SpreadsheetRotation through the existing string-valued
     // command channel. The receiving `commandFormat` arm parses 'vertical'
     // and numeric tokens back into the union value.
@@ -937,37 +934,25 @@ export function SpreadsheetToolbar(props: SpreadsheetToolbarProps) {
     return null
   }
 
-  /**
-   * Dispatch handler for the merge dropdown. Each preset issues one or more
-   * `mergeRange` / `unmergeRange` calls and then a single history entry.
-   */
-  async function executeMergePreset(preset: MergePreset) {
+  /** Capture a complete merge/unmerge plan; Core owns settlement, history and refresh. */
+  function executeMergePreset(preset: MergePreset) {
     const sheetId = getMutationSheetId()
     if (!sheetId) return
 
     const selectionRange = selectionSnapshot().range
 
     if (preset === 'unmerge') {
-      if (!backend.unmergeRange) return
       // Prefer the active-cell merge range so a 1x1 selection inside a merge
       // still unmerges the full region; fall back to the raw selection.
       const targetRange = activeCellMergeRange() ?? selectionRange
-      const result = await backend.unmergeRange({
-        kind: 'unmerge-range',
+      dispatchToolbarMutation({
         sheetId,
-        range: targetRange,
+        operation: 'unmerge',
+        affectedRange: targetRange,
+        steps: [{ kind: 'unmerge-range', range: targetRange }],
       })
-      recordHistoryEntry({
-        sheetId,
-        kind: 'range.unmerge',
-        revision: result?.revision,
-        affectedRange: result?.affectedRange ?? targetRange,
-      })
-      await refreshVisibleProjection(store, backend, sheetId)
       return
     }
-
-    if (!backend.mergeRange) return
 
     if (preset === 'merge-center') {
       // The dropdown promises "合并居中" (merge + center) but the backend
@@ -976,25 +961,19 @@ export function SpreadsheetToolbar(props: SpreadsheetToolbarProps) {
       // undo step, breaking the timeline contract that one user action equals
       // one undo. Until a compound-transaction port lands we ship just the
       // merge here so undo reverses the user's click in one move.
-      const result = await backend.mergeRange({
-        kind: 'merge-range',
+      dispatchToolbarMutation({
         sheetId,
-        range: selectionRange,
+        operation: 'merge',
+        affectedRange: selectionRange,
+        steps: [{ kind: 'merge-range', range: selectionRange }],
       })
-      recordHistoryEntry({
-        sheetId,
-        kind: 'range.merge',
-        revision: result?.revision,
-        affectedRange: result?.affectedRange ?? selectionRange,
-      })
-      await refreshVisibleProjection(store, backend, sheetId)
       return
     }
 
     if (preset === 'across-rows') {
       // Merge each row of the selection independently. Univer labels this
       // 跨列合并 — within each row the cells across columns collapse.
-      let lastAffected: CellRange | undefined
+      const steps: ToolbarMutationStep[] = []
       for (let row = selectionRange.rowStart; row <= selectionRange.rowEnd; row += 1) {
         if (selectionRange.colEnd <= selectionRange.colStart) break
         const rowRange: CellRange = {
@@ -1003,27 +982,22 @@ export function SpreadsheetToolbar(props: SpreadsheetToolbarProps) {
           colStart: selectionRange.colStart,
           colEnd: selectionRange.colEnd,
         }
-        const result = await backend.mergeRange({
-          kind: 'merge-range',
-          sheetId,
-          range: rowRange,
-        })
-        lastAffected = result?.affectedRange ?? rowRange
+        steps.push({ kind: 'merge-range', range: rowRange })
       }
-      recordHistoryEntry({
+      if (steps.length === 0) return
+      dispatchToolbarMutation({
         sheetId,
-        kind: 'range.merge',
-        revision: undefined,
-        affectedRange: lastAffected ?? selectionRange,
+        operation: 'merge',
+        affectedRange: selectionRange,
+        steps,
       })
-      await refreshVisibleProjection(store, backend, sheetId)
       return
     }
 
     if (preset === 'across-cols') {
       // Merge each column of the selection independently. Univer labels this
       // 跨行合并 — within each column the cells across rows collapse.
-      let lastAffected: CellRange | undefined
+      const steps: ToolbarMutationStep[] = []
       for (let col = selectionRange.colStart; col <= selectionRange.colEnd; col += 1) {
         if (selectionRange.rowEnd <= selectionRange.rowStart) break
         const colRange: CellRange = {
@@ -1032,27 +1006,21 @@ export function SpreadsheetToolbar(props: SpreadsheetToolbarProps) {
           colStart: col,
           colEnd: col,
         }
-        const result = await backend.mergeRange({
-          kind: 'merge-range',
-          sheetId,
-          range: colRange,
-        })
-        lastAffected = result?.affectedRange ?? colRange
+        steps.push({ kind: 'merge-range', range: colRange })
       }
-      recordHistoryEntry({
+      if (steps.length === 0) return
+      dispatchToolbarMutation({
         sheetId,
-        kind: 'range.merge',
-        revision: undefined,
-        affectedRange: lastAffected ?? selectionRange,
+        operation: 'merge',
+        affectedRange: selectionRange,
+        steps,
       })
-      await refreshVisibleProjection(store, backend, sheetId)
-      return
     }
   }
 
   function handleMergeSelect(preset: MergePreset) {
-    setMergeDropdownOpen(false)
-    void executeMergePreset(preset).catch(reportCommandError)
+    closeToolbarSurface()
+    executeMergePreset(preset)
   }
 
   // === New group: Find/Replace, Conditional format, Data validation,
@@ -1061,7 +1029,7 @@ export function SpreadsheetToolbar(props: SpreadsheetToolbarProps) {
   // and render themselves; the toolbar just opens them.
 
   function handleOpenFindReplace() {
-    store.setter(findReplaceOpenAtom, true)
+    store.setter(openFindReplaceFromEntrypointAtom)
   }
 
   function handleOpenConditionalFormat() {
@@ -1080,32 +1048,26 @@ export function SpreadsheetToolbar(props: SpreadsheetToolbarProps) {
   }
 
   function handleOpenFilterDropdown() {
-    const sheetId = getMutationSheetId()
-    if (!sheetId) return
-    const colIndex = selectionSnapshot().activeCell.col
-    store.setter(openFilterDropdownAtom, { sheetId, colIndex })
+    store.setter(openFilterDropdownFromEntrypointAtom, {
+      source: backend,
+      entrypoint: 'toolbar',
+    })
   }
 
   function handleSortSelect(direction: SortDirection) {
-    setSortDropdownOpen(false)
-    const sheetId = getMutationSheetId()
-    if (!sheetId) return
-    const colIndex = selectionSnapshot().activeCell.col
-    const next = store.setter(dispatchSortAtom, { sheetId, colIndex, direction })
-    if (!backend.setFilterSort) return
-    void (async () => {
-      try {
-        await backend.setFilterSort!({
-          kind: 'set-filter-sort',
-          sheetId,
-          rules: next.rules,
-          directives: next.directives,
-        })
-        await refreshVisibleProjection(store, backend, sheetId)
-      } catch (error) {
-        reportCommandError(error)
-      }
-    })()
+    closeToolbarSurface()
+    void store.setter(runFilterSortEntrypointAtom, {
+      source: backend,
+      entrypoint: 'toolbar',
+      direction,
+      refreshProjection: (sheetId) => refreshVisibleProjection(store, backend, sheetId),
+    })
+  }
+
+  function handleFilterSortRefreshRetry() {
+    void store.setter(retryFilterSortRefreshAtom, {
+      refreshProjection: (sheetId) => refreshVisibleProjection(store, backend, sheetId),
+    })
   }
 
   function handleOpenNameManager() {
@@ -1125,41 +1087,22 @@ export function SpreadsheetToolbar(props: SpreadsheetToolbarProps) {
     await dispatchRedo(store, backend)
   }
 
-  /**
-   * Clear-formatting handler. Issues a direct `setFormatRange` with an empty
-   * format object, bypassing `dispatchToolbarFormatCommandAtom` because the
-   * spreadsheet-ui-core contract has no `clear-format` kind today and the
-   * toolbar already owns the projection refresh path. History entry kind
-   * stays `'format.set'` so undo treats it like any other range format
-   * mutation.
-   */
-  async function handleClearFormat() {
-    if (!backend.setFormatRange) return
+  /** Clear formatting is planned in Solid and settled by the Core mutation lifecycle. */
+  function handleClearFormat() {
     const sheetId = getMutationSheetId()
     if (!sheetId) return
     const range = selectionSnapshot().range
     const sourceRanges = resolveProjectionSourceRanges(store, sheetId, range)
-    try {
-      let result: Awaited<ReturnType<NonNullable<typeof backend.setFormatRange>>> | undefined
-      for (const sourceRange of sourceRanges) {
-        result = await backend.setFormatRange({
-          kind: 'set-format-range',
-          sheetId,
-          range: sourceRange,
-          format: {},
-        })
-      }
-      recordHistoryEntry({
-        sheetId,
-        kind: 'format.set',
-        revision: result?.revision,
-        affectedRange:
-          sourceRanges.length === 1 ? result?.affectedRange ?? sourceRanges[0] : range,
-      })
-      await refreshVisibleProjection(store, backend, sheetId)
-    } catch (error) {
-      reportCommandError(error)
-    }
+    dispatchToolbarMutation({
+      sheetId,
+      operation: 'format',
+      affectedRange: sourceRanges.length === 1 ? sourceRanges[0] : range,
+      steps: sourceRanges.map((sourceRange) => ({
+        kind: 'set-format-range',
+        range: sourceRange,
+        format: {},
+      })),
+    })
   }
 
   /**
@@ -1224,8 +1167,6 @@ export function SpreadsheetToolbar(props: SpreadsheetToolbarProps) {
    * path is a no-op there because there is no `digits` to remove.
    */
   function adjustDigits(direction: 'increase' | 'decrease') {
-    const setFormatRange = backend.setFormatRange
-    if (!setFormatRange) return
     const sheetId = getMutationSheetId()
     if (!sheetId) return
     const range = selectionSnapshot().range
@@ -1235,38 +1176,23 @@ export function SpreadsheetToolbar(props: SpreadsheetToolbarProps) {
     const nextFormat: SpreadsheetCellFormat = { ...currentFormat }
     if (isDecimalCapableFormat(nf)) {
       const current = nf.digits ?? 0
-      const nextDigits =
-        direction === 'increase' ? current + 1 : Math.max(0, current - 1)
+      const nextDigits = direction === 'increase' ? current + 1 : Math.max(0, current - 1)
       if (nextDigits === current) return
       nextFormat.numberFormat = { ...nf, digits: nextDigits } as SpreadsheetNumberFormat
     } else {
       if (direction === 'decrease') return
       nextFormat.numberFormat = { kind: 'decimal', digits: 1, thousands: false }
     }
-    void (async () => {
-      let result: Awaited<ReturnType<typeof setFormatRange>> | undefined
-      for (const sourceRange of sourceRanges) {
-        result = await setFormatRange({
-          kind: 'set-format-range',
-          sheetId,
-          range: sourceRange,
-          format: nextFormat,
-        })
-      }
-      return result
-    })()
-      .then((result) => {
-        const affectedRange =
-          sourceRanges.length === 1 ? result?.affectedRange ?? sourceRanges[0] : range
-        recordHistoryEntry({
-          sheetId,
-          kind: 'format.set',
-          revision: result?.revision,
-          affectedRange,
-        })
-        return refreshVisibleProjection(store, backend, sheetId)
-      })
-      .catch(reportCommandError)
+    dispatchToolbarMutation({
+      sheetId,
+      operation: 'format',
+      affectedRange: sourceRanges.length === 1 ? sourceRanges[0] : range,
+      steps: sourceRanges.map((sourceRange) => ({
+        kind: 'set-format-range',
+        range: sourceRange,
+        format: nextFormat,
+      })),
+    })
   }
 
   const canUndo = useAtomValue(canUndoAtom)
@@ -1290,9 +1216,7 @@ export function SpreadsheetToolbar(props: SpreadsheetToolbarProps) {
     return (
       <button
         type="button"
-        class={`fmt-btn spreadsheet-toolbar-button ${
-          isPressed() ? 'fmt-btn-active' : ''
-        }`.trim()}
+        class={`fmt-btn spreadsheet-toolbar-button ${isPressed() ? 'fmt-btn-active' : ''}`.trim()}
         data-testid={command.testId}
         data-tooltip={t(command.title)}
         aria-label={t(command.title)}
@@ -1307,10 +1231,14 @@ export function SpreadsheetToolbar(props: SpreadsheetToolbarProps) {
 
   function renderColorButton(mode: ColorPopoverMode) {
     const isText = mode === 'text'
+    const palette = isText ? 'text-color' : 'fill-color'
     const testId = isText ? 'toolbar-btn-text-color' : 'toolbar-btn-fill-color'
     const titleKey = isText ? 'toolbar.textColor.title' : 'toolbar.fillColor.title'
     const isEnabled = () => (isText ? availability().textColor : availability().fillColor)
-    const isPressed = () => colorPopover().mode === mode
+    const isPressed = () => {
+      const surface = activeToolbarSurface()
+      return surface?.kind === 'palette' && surface.id === palette
+    }
     const Icon = isText ? TextColorIcon : FillColorIcon
 
     return (
@@ -1319,9 +1247,7 @@ export function SpreadsheetToolbar(props: SpreadsheetToolbarProps) {
         ref={(el) => {
           colorAnchors[mode] = el
         }}
-        class={`fmt-btn spreadsheet-toolbar-button ${
-          isPressed() ? 'fmt-btn-active' : ''
-        }`.trim()}
+        class={`fmt-btn spreadsheet-toolbar-button ${isPressed() ? 'fmt-btn-active' : ''}`.trim()}
         data-testid={testId}
         data-tooltip={t(titleKey)}
         aria-label={t(titleKey)}
@@ -1340,6 +1266,10 @@ export function SpreadsheetToolbar(props: SpreadsheetToolbarProps) {
       class={`format-toolbar spreadsheet-toolbar ${props.class ?? ''}`.trim()}
       role="toolbar"
       data-testid={props['data-testid'] ?? 'spreadsheet-toolbar'}
+      data-filter-sort-status={filterSortEntrypoint().status}
+      data-filter-sort-error={filterSortEntrypoint().error || undefined}
+      data-toolbar-mutation-status={toolbarMutationLifecycle().status}
+      data-toolbar-mutation-error={toolbarMutationLifecycle().error || undefined}
       // `preventDefault` on mousedown keeps the grid (or active editor) as the
       // focused element so post-click keyboard shortcuts (Ctrl+Z, Ctrl+Y,
       // arrows, etc.) reach the grid's keydown handler instead of stranding on
@@ -1411,9 +1341,7 @@ export function SpreadsheetToolbar(props: SpreadsheetToolbarProps) {
         data-testid="toolbar-btn-clear-format"
         data-tooltip={t('toolbar.clearFormat.title')}
         aria-label={t('toolbar.clearFormat.title')}
-        disabled={
-          !backend.setFormatRange || isProtectionGated() || !activeCellHasFormat()
-        }
+        disabled={!backend.setFormatRange || isProtectionGated() || !activeCellHasFormat()}
         onClick={() => void handleClearFormat()}
       >
         <ClearFormatIcon />
@@ -1443,9 +1371,7 @@ export function SpreadsheetToolbar(props: SpreadsheetToolbarProps) {
         data-testid="toolbar-btn-comment"
         data-tooltip={t('toolbar.comment.title')}
         aria-label={t('toolbar.comment.title')}
-        disabled={
-          !availability().sheetId || availability().editingMode === 'drafting'
-        }
+        disabled={!availability().sheetId || availability().editingMode === 'drafting'}
         onClick={handleOpenComment}
       >
         <CommentIcon />
@@ -1551,9 +1477,7 @@ export function SpreadsheetToolbar(props: SpreadsheetToolbarProps) {
           aria-haspopup="menu"
           aria-expanded={bordersDropdownOpen()}
           disabled={!availability().border || isProtectionGated()}
-          onClick={() => {
-            setBordersDropdownOpen((open) => !open)
-          }}
+          onClick={() => toggleToolbarDropdown('border')}
         >
           <BordersIcon />
         </button>
@@ -1562,7 +1486,7 @@ export function SpreadsheetToolbar(props: SpreadsheetToolbarProps) {
           isMultiCell={rangeCellCount(selectionSnapshot().range) > 1}
           anchorRef={bordersAnchorRef ?? null}
           onSelect={handleBordersSelect}
-          onRequestClose={() => setBordersDropdownOpen(false)}
+          onRequestClose={closeToolbarSurface}
         />
       </div>
 
@@ -1586,9 +1510,7 @@ export function SpreadsheetToolbar(props: SpreadsheetToolbarProps) {
           aria-haspopup="menu"
           aria-expanded={hAlignDropdownOpen()}
           disabled={!availability().alignment || isProtectionGated()}
-          onClick={() => {
-            setHAlignDropdownOpen((open) => !open)
-          }}
+          onClick={() => toggleToolbarDropdown('alignment')}
         >
           {currentHAlign() === 'center' ? (
             <AlignCenterIcon />
@@ -1603,7 +1525,7 @@ export function SpreadsheetToolbar(props: SpreadsheetToolbarProps) {
           current={currentHAlign()}
           anchorRef={hAlignAnchorRef ?? null}
           onSelect={handleHAlignSelect}
-          onRequestClose={() => setHAlignDropdownOpen(false)}
+          onRequestClose={closeToolbarSurface}
         />
       </div>
       <div
@@ -1623,9 +1545,7 @@ export function SpreadsheetToolbar(props: SpreadsheetToolbarProps) {
           aria-haspopup="menu"
           aria-expanded={vAlignDropdownOpen()}
           disabled={!availability().verticalAlignment || isProtectionGated()}
-          onClick={() => {
-            setVAlignDropdownOpen((open) => !open)
-          }}
+          onClick={() => toggleToolbarDropdown('vertical-alignment')}
         >
           {currentVAlign() === 'top' ? (
             <VAlignTopIcon />
@@ -1640,7 +1560,7 @@ export function SpreadsheetToolbar(props: SpreadsheetToolbarProps) {
           current={currentVAlign()}
           anchorRef={vAlignAnchorRef ?? null}
           onSelect={handleVAlignSelect}
-          onRequestClose={() => setVAlignDropdownOpen(false)}
+          onRequestClose={closeToolbarSurface}
         />
       </div>
       <button
@@ -1673,9 +1593,7 @@ export function SpreadsheetToolbar(props: SpreadsheetToolbarProps) {
           aria-haspopup="menu"
           aria-expanded={rotationDropdownOpen()}
           disabled={!availability().rotation || isProtectionGated()}
-          onClick={() => {
-            setRotationDropdownOpen((open) => !open)
-          }}
+          onClick={() => toggleToolbarDropdown('rotation')}
         >
           <RotationIcon />
         </button>
@@ -1683,7 +1601,7 @@ export function SpreadsheetToolbar(props: SpreadsheetToolbarProps) {
           isOpen={rotationDropdownOpen()}
           anchorRef={rotationAnchorRef ?? null}
           onSelect={handleRotationSelect}
-          onRequestClose={() => setRotationDropdownOpen(false)}
+          onRequestClose={closeToolbarSurface}
         />
       </div>
 
@@ -1698,9 +1616,7 @@ export function SpreadsheetToolbar(props: SpreadsheetToolbarProps) {
           ref={(el) => (mergeAnchorRef = el)}
           type="button"
           class={`fmt-btn spreadsheet-toolbar-button ${
-            mergeDropdownOpen() || activeCellMergeRange() !== null
-              ? 'fmt-btn-active'
-              : ''
+            mergeDropdownOpen() || activeCellMergeRange() !== null ? 'fmt-btn-active' : ''
           }`.trim()}
           data-testid="toolbar-btn-merge"
           data-tooltip={t('toolbar.merge.title')}
@@ -1709,9 +1625,7 @@ export function SpreadsheetToolbar(props: SpreadsheetToolbarProps) {
           aria-expanded={mergeDropdownOpen()}
           aria-pressed={activeCellMergeRange() !== null}
           disabled={
-            !backend.mergeRange ||
-            availability().editingMode === 'drafting' ||
-            isProtectionGated()
+            !backend.mergeRange || availability().editingMode === 'drafting' || isProtectionGated()
             // 1x1 selection is allowed — the dropdown opens so users see
             // why every preset is greyed out. Each preset (merge-center,
             // across-rows, across-cols) declares its own
@@ -1719,9 +1633,7 @@ export function SpreadsheetToolbar(props: SpreadsheetToolbarProps) {
             // `enabledWhen === 'merged'`, so the dropdown items disable
             // themselves when the selection is a single non-merged cell.
           }
-          onClick={() => {
-            setMergeDropdownOpen((open) => !open)
-          }}
+          onClick={() => toggleToolbarDropdown('merge')}
         >
           <MergeCellsIcon />
         </button>
@@ -1731,7 +1643,7 @@ export function SpreadsheetToolbar(props: SpreadsheetToolbarProps) {
           canUnmerge={activeCellMergeRange() !== null}
           anchorRef={mergeAnchorRef ?? null}
           onSelect={handleMergeSelect}
-          onRequestClose={() => setMergeDropdownOpen(false)}
+          onRequestClose={closeToolbarSurface}
         />
       </div>
 
@@ -1745,9 +1657,10 @@ export function SpreadsheetToolbar(props: SpreadsheetToolbarProps) {
         type="button"
         class="fmt-btn spreadsheet-toolbar-button"
         data-testid="toolbar-btn-find-replace"
+        data-capability={findReplaceCapability().capability}
         data-tooltip={t('toolbar.findReplace.title')}
         aria-label={t('toolbar.findReplace.title')}
-        disabled={!availability().sheetId}
+        disabled={!availability().sheetId || !findReplaceCapability().findEnabled}
         onClick={handleOpenFindReplace}
       >
         <FindReplaceIcon />
@@ -1769,9 +1682,7 @@ export function SpreadsheetToolbar(props: SpreadsheetToolbarProps) {
         data-testid="toolbar-btn-data-validation"
         data-tooltip={t('toolbar.dataValidation.title')}
         aria-label={t('toolbar.dataValidation.title')}
-        disabled={
-          !availability().sheetId || availability().editingMode === 'drafting'
-        }
+        disabled={!availability().sheetId || availability().editingMode === 'drafting'}
         onClick={handleOpenDataValidation}
       >
         <DataValidationIcon />
@@ -1780,9 +1691,10 @@ export function SpreadsheetToolbar(props: SpreadsheetToolbarProps) {
         type="button"
         class="fmt-btn spreadsheet-toolbar-button"
         data-testid="toolbar-btn-filter"
-        data-tooltip={t('toolbar.filter.title')}
+        data-tooltip={filterSortEntrypoint().disabledReason ?? t('toolbar.filter.title')}
         aria-label={t('toolbar.filter.title')}
-        disabled={!availability().sheetId || !backend.setFilterSort}
+        title={filterSortEntrypoint().disabledReason ?? ''}
+        disabled={filterSortEntrypoint().disabled}
         onClick={handleOpenFilterDropdown}
       >
         <FilterIcon />
@@ -1798,22 +1710,23 @@ export function SpreadsheetToolbar(props: SpreadsheetToolbarProps) {
             sortDropdownOpen() ? 'fmt-btn-active' : ''
           }`.trim()}
           data-testid="toolbar-btn-sort"
-          data-tooltip={t('toolbar.sort.title')}
+          data-tooltip={filterSortEntrypoint().disabledReason ?? t('toolbar.sort.title')}
           aria-label={t('toolbar.sort.title')}
+          title={filterSortEntrypoint().disabledReason ?? ''}
           aria-haspopup="menu"
           aria-expanded={sortDropdownOpen()}
-          disabled={!availability().sheetId}
-          onClick={() => {
-            setSortDropdownOpen((open) => !open)
-          }}
+          disabled={filterSortEntrypoint().disabled}
+          onClick={() => toggleToolbarDropdown('sort')}
         >
           <SortIcon />
         </button>
         <SortDropdown
           isOpen={sortDropdownOpen()}
           anchorRef={sortAnchorRef ?? null}
+          disabled={filterSortEntrypoint().disabled}
+          disabledReason={filterSortEntrypoint().disabledReason}
           onSelect={handleSortSelect}
-          onRequestClose={() => setSortDropdownOpen(false)}
+          onRequestClose={closeToolbarSurface}
           t={t}
         />
       </div>
@@ -1909,9 +1822,7 @@ export function SpreadsheetToolbar(props: SpreadsheetToolbarProps) {
         data-tooltip={t('toolbar.decDecimal.title')}
         aria-label={t('toolbar.decDecimal.title')}
         disabled={
-          !availability().numberFormat ||
-          isProtectionGated() ||
-          currentDecimalDigits() <= 0
+          !availability().numberFormat || isProtectionGated() || currentDecimalDigits() <= 0
         }
         onClick={() => adjustDigits('decrease')}
       >
@@ -1943,7 +1854,55 @@ export function SpreadsheetToolbar(props: SpreadsheetToolbarProps) {
         onSelect={onFontSizePick}
         onClose={closeFontSizeDropdown}
       />
-      <FillColorPopover anchorRect={anchorRect} onPick={handleColorPick} />
+      <FillColorPopover
+        open={activeColorMode() !== null}
+        mode={activeColorMode()}
+        anchorRect={anchorRect}
+        onPick={handleColorPick}
+        onRequestClose={closeToolbarSurface}
+      />
+      <Show when={toolbarMutationLifecycle().error}>
+        {(error) => (
+          <span role="status" data-testid="toolbar-mutation-status">
+            {error()}
+          </span>
+        )}
+      </Show>
+      <Show
+        when={
+          toolbarMutationLifecycle().canRetryRefresh &&
+          (toolbarMutationLifecycle().status === 'refresh-failed' ||
+            toolbarMutationLifecycle().status === 'outcome-unknown')
+        }
+      >
+        <button
+          type="button"
+          class="fmt-btn spreadsheet-toolbar-button"
+          data-testid="toolbar-mutation-refresh-retry"
+          aria-label="Reconcile toolbar mutation"
+          onClick={() => void store.setter(retryToolbarMutationRefreshAtom)}
+        >
+          ↻
+        </button>
+      </Show>
+      <Show when={filterSortEntrypoint().error}>
+        {(error) => (
+          <span role="status" data-testid="toolbar-filter-sort-status">
+            {error()}
+          </span>
+        )}
+      </Show>
+      <Show when={filterSortEntrypoint().status === 'refresh-failed'}>
+        <button
+          type="button"
+          class="fmt-btn spreadsheet-toolbar-button"
+          data-testid="toolbar-filter-sort-refresh-retry"
+          aria-label="Retry filter and sort refresh"
+          onClick={handleFilterSortRefreshRetry}
+        >
+          ↻
+        </button>
+      </Show>
     </div>
   )
 }

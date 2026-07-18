@@ -1,9 +1,14 @@
 /** @jsxImportSource solid-js */
 
 import { afterEach, describe, expect, it, jest } from '@jest/globals'
-import { createStore } from '@einfach/core'
+import { createStore, type Store } from '@einfach/core'
 import { cleanup, fireEvent, render, waitFor } from '@solidjs/testing-library'
-import type { SpreadsheetBackend } from '@einfach/spreadsheet-ui-core'
+import type {
+  BackendMutationResult,
+  SetFormatRangeRequest,
+  SpreadsheetBackend,
+  VisibleProjectionRequest,
+} from '@einfach/spreadsheet-ui-core'
 import {
   closeFormatCellsAtom,
   formatCellsEditorAtom,
@@ -14,8 +19,10 @@ import { SpreadsheetUiProvider } from '../src-vnext/provider'
 import {
   SpreadsheetFormatCellsDialog,
   SpreadsheetNumberFormatDialogs,
+  numberFormatDialogAtom,
   openNumberFormatDialogAtom,
 } from '../src-vnext/format-cells'
+import { seedReadyVisibleProjection } from './projection-test-fixture'
 
 const RAW_I18N_KEY_RE =
   /\b(?:toolbar|numberFormatDropdown|numberFormatDialog|formatCells)\.[A-Za-z0-9_.-]+/
@@ -48,13 +55,133 @@ function createFakeBackend() {
       cells: [],
     }),
     setCellInput: async (req) => ({ sheetId: req.sheetId }),
-    setFormatRange: jest.fn(async (req) => {
+    setFormatRange: jest.fn(async (req: SetFormatRangeRequest) => {
       setFormatRangeRequests.push(req)
-      return { sheetId: (req as { sheetId: string }).sheetId }
+      return {
+        sheetId: req.sheetId,
+        requestId: req.requestId,
+        affectedRange: req.range,
+      }
     }),
   }
 
   return { backend, setFormatRangeRequests }
+}
+
+type TestDialogKind = 'format-cells' | 'number-format'
+
+interface Deferred<T> {
+  readonly promise: Promise<T>
+  readonly resolve: (value: T) => void
+  readonly reject: (reason: unknown) => void
+}
+
+function deferred<T>(): Deferred<T> {
+  let resolve!: (value: T) => void
+  let reject!: (reason: unknown) => void
+  const promise = new Promise<T>((onResolve, onReject) => {
+    resolve = onResolve
+    reject = onReject
+  })
+  return { promise, resolve, reject }
+}
+
+function openTestDialog(store: Store, kind: TestDialogKind): void {
+  if (kind === 'format-cells') {
+    store.setter(openFormatCellsAtom, {
+      sheetId: 'sheet-1',
+      range: RANGE,
+      initialFormat: { bold: true },
+    })
+    return
+  }
+  store.setter(openNumberFormatDialogAtom, {
+    kind: 'currency',
+    sheetId: 'sheet-1',
+    range: RANGE,
+  })
+}
+
+function renderTestDialog(kind: TestDialogKind, store: Store, backend: SpreadsheetBackend) {
+  return render(() => (
+    <SpreadsheetUiProvider backend={backend} store={store}>
+      {kind === 'format-cells' ? (
+        <SpreadsheetFormatCellsDialog />
+      ) : (
+        <SpreadsheetNumberFormatDialogs />
+      )}
+    </SpreadsheetUiProvider>
+  ))
+}
+
+function readTestDialogState(store: Store, kind: TestDialogKind) {
+  return kind === 'format-cells'
+    ? store.getter(formatCellsEditorAtom)
+    : store.getter(numberFormatDialogAtom)
+}
+
+function seedVisibleProjection(store: Store): void {
+  seedReadyVisibleProjection(store, {
+    status: 'ready',
+    result: {
+      kind: 'visible-window',
+      sheetId: 'sheet-1',
+      requestId: 1,
+      window: RANGE,
+      cells: [],
+    },
+  })
+}
+
+interface CapabilityProbe {
+  readonly backend: SpreadsheetBackend
+  readonly counters: {
+    setCalls: number
+    readCalls: number
+  }
+  readonly settleMutation: () => void
+}
+
+function createCapabilityProbe(options: { rejectRefresh?: boolean } = {}): CapabilityProbe {
+  const mutation = deferred<BackendMutationResult>()
+  const counters = {
+    setCalls: 0,
+    readCalls: 0,
+  }
+  let request: SetFormatRangeRequest | null = null
+
+  const setFormatRange = async (next: SetFormatRangeRequest): Promise<BackendMutationResult> => {
+    counters.setCalls += 1
+    request = next
+    return mutation.promise
+  }
+  const readVisibleProjection = async (next: VisibleProjectionRequest) => {
+    counters.readCalls += 1
+    if (options.rejectRefresh === true) throw new Error('projection refresh rejected')
+    return {
+      kind: 'visible-window' as const,
+      sheetId: next.sheetId,
+      requestId: next.requestId,
+      window: next.window,
+      cells: [],
+    }
+  }
+  const { backend } = createFakeBackend()
+  backend.setFormatRange = setFormatRange
+  backend.readVisibleProjection = readVisibleProjection
+
+  return {
+    backend,
+    counters,
+    settleMutation() {
+      if (request === null) throw new Error('setFormatRange was not called')
+      mutation.resolve({
+        sheetId: request.sheetId,
+        requestId: request.requestId,
+        affectedRange: request.range,
+      })
+    },
+  }
 }
 
 function expectNoRawI18nKeys(text: string | null | undefined) {
@@ -457,9 +584,7 @@ describe('SpreadsheetFormatCellsDialog', () => {
       range: RANGE,
       format: { bold: true, italic: true },
     })
-    await waitFor(() =>
-      expect(store.getter(formatCellsEditorAtom).status).toBe('closed'),
-    )
+    await waitFor(() => expect(store.getter(formatCellsEditorAtom).status).toBe('closed'))
   })
 
   it('Cancel closes the dialog without calling setFormatRange', async () => {
@@ -481,9 +606,7 @@ describe('SpreadsheetFormatCellsDialog', () => {
     await waitFor(() => expect(getByTestId('format-cells-cancel')).toBeTruthy())
     fireEvent.click(getByTestId('format-cells-cancel'))
 
-    await waitFor(() =>
-      expect(store.getter(formatCellsEditorAtom).status).toBe('closed'),
-    )
+    await waitFor(() => expect(store.getter(formatCellsEditorAtom).status).toBe('closed'))
     expect(backend.setFormatRange).not.toHaveBeenCalled()
   })
 
@@ -557,4 +680,33 @@ describe('SpreadsheetFormatCellsDialog', () => {
     store.setter(closeFormatCellsAtom)
     await waitFor(() => expect(queryByTestId('format-cells-dialog')).toBeNull())
   })
+
+  it.each<TestDialogKind>(['format-cells', 'number-format'])(
+    '%s blocks with outcome unknown when the captured projection refresh rejects',
+    async (kind) => {
+      const store = createStore()
+      seedVisibleProjection(store)
+      openTestDialog(store, kind)
+      const probe = createCapabilityProbe({ rejectRefresh: true })
+      const { getByTestId } = renderTestDialog(kind, store, probe.backend)
+      const saveTestId = kind === 'format-cells' ? 'format-cells-save' : 'number-format-dialog-save'
+
+      fireEvent.click(getByTestId(saveTestId))
+      await waitFor(() => expect(probe.counters.setCalls).toBe(1))
+      probe.settleMutation()
+      await waitFor(() => {
+        const state = readTestDialogState(store, kind)
+        expect(state.status).toBe('open')
+        if (state.status !== 'open') return
+        expect(state.phase).toBe('outcome-unknown-blocked')
+        expect(state.pending).toBe(false)
+        expect(state.error).toBe('projection refresh rejected')
+        expect((getByTestId(saveTestId) as HTMLButtonElement).disabled).toBe(true)
+      })
+      expect(probe.counters).toEqual({
+        setCalls: 1,
+        readCalls: 1,
+      })
+    },
+  )
 })

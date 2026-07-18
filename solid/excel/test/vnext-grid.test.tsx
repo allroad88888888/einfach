@@ -1,5 +1,7 @@
 /** @jsxImportSource solid-js */
 
+import { readFileSync } from 'node:fs'
+import { join } from 'node:path'
 import { afterEach, describe, expect, it, jest } from '@jest/globals'
 import { createStore } from '@einfach/core'
 import { render, cleanup, fireEvent, waitFor } from '@solidjs/testing-library'
@@ -7,12 +9,14 @@ import type {
   ClearRangeRequest,
   DisplayCell,
   FillRangeRequest,
+  FillSeriesRequest,
   RangeProjectionRequest,
   RangeProjectionResult,
   RangeTsvChunkExportResult,
   RangeTsvExportRequest,
   RangeTsvExportResult,
   ResolveDataEdgeRequest,
+  SetCellInputRequest,
   SpreadsheetBackend,
   VisibleProjectionRequest,
   VisibleProjectionResult,
@@ -21,6 +25,7 @@ import type {
 } from '@einfach/spreadsheet-ui-core'
 import {
   clipboardStateAtom,
+  menuIntentAtom,
   menuStateAtom,
   selectionAtom,
   selectionRegionsAtom,
@@ -39,8 +44,15 @@ import {
   setFilterSortAtom,
   filterDropdownAtom,
   applyPresenceUpdateAtom,
-  setViewportFreezeAtom,
+  readViewportFreezeCanonicalAtom,
+  setViewportColumnWidthAtom,
+  setViewportHiddenAtom,
+  setViewportRowHeightAtom,
 } from '@einfach/spreadsheet-ui-core'
+import {
+  createWorkerWorkbookSpreadsheetBackend,
+  type WorkerWorkbookClient,
+} from '../src-vnext/adapter'
 import { SpreadsheetGrid } from '../src-vnext/grid'
 import { SpreadsheetUiProvider } from '../src-vnext/provider'
 
@@ -55,7 +67,12 @@ function flushMicrotasks() {
 function dispatchPointerEvent(
   target: EventTarget,
   type: 'pointerdown' | 'pointermove' | 'pointerup',
-  coordinates: { clientX?: number; clientY?: number },
+  coordinates: {
+    clientX?: number
+    clientY?: number
+    ctrlKey?: boolean
+    metaKey?: boolean
+  },
 ) {
   target.dispatchEvent(
     new MouseEvent(type, {
@@ -63,6 +80,8 @@ function dispatchPointerEvent(
       cancelable: true,
       clientX: coordinates.clientX ?? 0,
       clientY: coordinates.clientY ?? 0,
+      ctrlKey: coordinates.ctrlKey ?? false,
+      metaKey: coordinates.metaKey ?? false,
     }),
   )
 }
@@ -81,17 +100,22 @@ function buildCells(window: VisibleProjectionRequest['window']): DisplayCell[] {
   return cells
 }
 
-function createFakeBackend(options: {
-  rowHeights?: ViewportSizeProjectionResult['rowHeights']
-  colWidths?: ViewportSizeProjectionResult['colWidths']
-  hiddenRowIndices?: number[]
-  hiddenColIndices?: number[]
-  cells?: DisplayCell[] | ((window: VisibleProjectionRequest['window']) => DisplayCell[])
-} = {}) {
+function createFakeBackend(
+  options: {
+    rowHeights?: ViewportSizeProjectionResult['rowHeights']
+    colWidths?: ViewportSizeProjectionResult['colWidths']
+    hiddenRowIndices?: number[]
+    hiddenColIndices?: number[]
+    cells?: DisplayCell[] | ((window: VisibleProjectionRequest['window']) => DisplayCell[])
+    freeze?: { rows: number; cols: number }
+  } = {},
+) {
   const requests: VisibleProjectionRequest[] = []
   const sizeRequests: ViewportSizeProjectionRequest[] = []
   const rowHeightCalls: Array<{ rowIndex: number; heightPx: number }> = []
   const columnWidthCalls: Array<{ colIndex: number; widthPx: number }> = []
+  let freeze = options.freeze ?? { rows: 0, cols: 0 }
+  let freezeRevision = 0
 
   const backend: SpreadsheetBackend = {
     async readVisibleProjection(request) {
@@ -119,12 +143,33 @@ function createFakeBackend(options: {
         kind: 'viewport-size',
         sheetId: request.sheetId,
         requestId: request.requestId,
-        revision: request.revision,
+        revision: request.revision ?? 1,
         window: { ...request.window },
         rowHeights: options.rowHeights ?? [],
         colWidths: options.colWidths ?? [],
         hiddenRowIndices: options.hiddenRowIndices,
         hiddenColIndices: options.hiddenColIndices,
+      }
+    },
+    async readFreezeConfig(request) {
+      return {
+        kind: 'freeze-config',
+        sheetId: request.sheetId,
+        requestId: request.requestId,
+        revision: freezeRevision,
+        freeze: { ...freeze },
+      }
+    },
+    async setFreezeConfig(request) {
+      if (request.revision !== undefined && request.revision !== freezeRevision) {
+        throw new Error('freeze revision conflict')
+      }
+      freeze = { ...request.freeze }
+      freezeRevision += 1
+      return {
+        sheetId: request.sheetId,
+        requestId: request.requestId,
+        revision: freezeRevision,
       }
     },
     async setCellInput() {
@@ -141,6 +186,155 @@ function createFakeBackend(options: {
   }
 
   return { backend, requests, sizeRequests, rowHeightCalls, columnWidthCalls }
+}
+
+interface FillSeriesDragOptions {
+  readonly sourceCells: DisplayCell[]
+  readonly sourceStartAddr?: string
+  readonly sourceEndAddr?: string
+  readonly targetAddr?: string
+  readonly copyOnly?: boolean
+  readonly includeFillSeries?: boolean
+  readonly includeFillRange?: boolean
+  readonly expectedMutation: 'series' | 'range' | 'cells'
+  readonly expectedCellWrites?: number
+  readonly rangeResult?: (request: RangeProjectionRequest) => RangeProjectionResult
+}
+
+async function runFillSeriesDrag(options: FillSeriesDragOptions) {
+  const store = createStore()
+  const rangeRequests: RangeProjectionRequest[] = []
+  const fillSeriesRequests: FillSeriesRequest[] = []
+  const fillRangeRequests: FillRangeRequest[] = []
+  const setCellInputRequests: SetCellInputRequest[] = []
+  const { backend, requests: visibleRequests } = createFakeBackend({
+    cells: options.sourceCells,
+  })
+
+  backend.readRangeProjection = async (request) => {
+    rangeRequests.push(request)
+    return (
+      options.rangeResult?.(request) ?? {
+        kind: 'range',
+        sheetId: request.sheetId,
+        requestId: request.requestId,
+        revision: 17,
+        range: request.range,
+        cells: options.sourceCells,
+      }
+    )
+  }
+  if (options.includeFillSeries !== false) {
+    backend.fillSeries = async (request) => {
+      fillSeriesRequests.push(request)
+      return {
+        sheetId: request.sheetId,
+        requestId: request.requestId,
+        revision: 18,
+        affectedRange: request.targetRange,
+      }
+    }
+  }
+  if (options.includeFillRange !== false) {
+    backend.fillRange = async (request) => {
+      fillRangeRequests.push(request)
+      return {
+        sheetId: request.sheetId,
+        affectedRange: request.targetRange,
+      }
+    }
+  }
+  backend.setCellInput = async (request) => {
+    setCellInputRequests.push(request)
+    return { sheetId: request.sheetId, requestId: request.requestId }
+  }
+
+  const viewport = {
+    scrollTop: 0,
+    scrollLeft: 0,
+    viewportHeight: 4,
+    viewportWidth: 3,
+    rowHeight: 1,
+    colWidth: 1,
+    rowCount: 10,
+    colCount: 10,
+    overscanRows: 0,
+    overscanCols: 0,
+  }
+  const { container, getByTestId } = render(() => (
+    <SpreadsheetUiProvider backend={backend} store={store}>
+      <SpreadsheetGrid sheetId="sheet-1" viewport={viewport} data-testid="grid" />
+    </SpreadsheetUiProvider>
+  ))
+
+  await waitFor(() => {
+    expect(container.querySelectorAll('td.spreadsheet-grid-cell')).toHaveLength(12)
+  })
+
+  const sourceStartAddr = options.sourceStartAddr ?? 'A1'
+  const sourceEndAddr = options.sourceEndAddr ?? 'A2'
+  fireEvent.click(
+    container.querySelector(`[data-cell-addr="${sourceStartAddr}"] .spreadsheet-grid-cell-button`)!,
+  )
+  if (sourceEndAddr !== sourceStartAddr) {
+    fireEvent.click(
+      container.querySelector(`[data-cell-addr="${sourceEndAddr}"] .spreadsheet-grid-cell-button`)!,
+      { shiftKey: true },
+    )
+  }
+
+  const targetAddr = options.targetAddr ?? 'A4'
+  const targetCell = container.querySelector(`[data-cell-addr="${targetAddr}"]`) as HTMLElement
+  const originalElementFromPoint = document.elementFromPoint
+  Object.defineProperty(document, 'elementFromPoint', {
+    configurable: true,
+    value: () => targetCell,
+  })
+
+  try {
+    const modifier = options.copyOnly === true
+    dispatchPointerEvent(getByTestId(`fill-handle-${sourceEndAddr}`), 'pointerdown', {
+      clientX: 1,
+      clientY: 1,
+      ctrlKey: modifier,
+    })
+    dispatchPointerEvent(window, 'pointermove', {
+      clientX: 1,
+      clientY: 4,
+      ctrlKey: modifier,
+    })
+    dispatchPointerEvent(window, 'pointerup', {
+      clientX: 1,
+      clientY: 4,
+      ctrlKey: modifier,
+    })
+
+    await waitFor(() => {
+      if (options.expectedMutation === 'series') {
+        expect(fillSeriesRequests).toHaveLength(1)
+      } else if (options.expectedMutation === 'range') {
+        expect(fillRangeRequests).toHaveLength(1)
+      } else {
+        expect(setCellInputRequests).toHaveLength(options.expectedCellWrites ?? 2)
+      }
+    })
+    await waitFor(() => {
+      expect(visibleRequests.length).toBeGreaterThanOrEqual(2)
+    })
+  } finally {
+    Object.defineProperty(document, 'elementFromPoint', {
+      configurable: true,
+      value: originalElementFromPoint,
+    })
+  }
+
+  return {
+    rangeRequests,
+    fillSeriesRequests,
+    fillRangeRequests,
+    setCellInputRequests,
+    visibleRequests,
+  }
 }
 
 describe('vNext SpreadsheetGrid', () => {
@@ -215,9 +409,7 @@ describe('vNext SpreadsheetGrid', () => {
 
     await flushMicrotasks()
 
-    const scroller = container.querySelector(
-      '.spreadsheet-grid-scroll-viewport',
-    ) as HTMLDivElement
+    const scroller = container.querySelector('.spreadsheet-grid-scroll-viewport') as HTMLDivElement
     scroller.scrollTop = 4
     scroller.scrollLeft = 5
     fireEvent.scroll(scroller)
@@ -657,9 +849,12 @@ describe('vNext SpreadsheetGrid', () => {
     })
 
     fireEvent.click(container.querySelector('[data-cell-addr="A1"] .spreadsheet-grid-cell-button')!)
-    fireEvent.click(container.querySelector('[data-cell-addr="C3"] .spreadsheet-grid-cell-button')!, {
-      ctrlKey: true,
-    })
+    fireEvent.click(
+      container.querySelector('[data-cell-addr="C3"] .spreadsheet-grid-cell-button')!,
+      {
+        ctrlKey: true,
+      },
+    )
 
     expect(store.getter(selectionRegionsAtom)).toEqual([
       {
@@ -716,9 +911,12 @@ describe('vNext SpreadsheetGrid', () => {
     })
 
     fireEvent.click(container.querySelector('[data-cell-addr="A1"] .spreadsheet-grid-cell-button')!)
-    fireEvent.click(container.querySelector('[data-cell-addr="C3"] .spreadsheet-grid-cell-button')!, {
-      metaKey: true,
-    })
+    fireEvent.click(
+      container.querySelector('[data-cell-addr="C3"] .spreadsheet-grid-cell-button')!,
+      {
+        metaKey: true,
+      },
+    )
     expect(store.getter(selectionRegionsAtom)).toHaveLength(2)
 
     fireEvent.keyDown(container.querySelector('[data-testid="grid"]')!, { key: 'Escape' })
@@ -979,6 +1177,7 @@ describe('vNext SpreadsheetGrid', () => {
     })
 
     expect(store.getter(workspaceSessionAtom).activeSheetId).toBe('sheet-3')
+    expect(store.getter(selectionAtom).sheetId).toBe('sheet-3')
 
     fireEvent.keyDown(container.querySelector('[data-testid="grid"]')!, {
       key: 'PageUp',
@@ -986,6 +1185,7 @@ describe('vNext SpreadsheetGrid', () => {
     })
 
     expect(store.getter(workspaceSessionAtom).activeSheetId).toBe('sheet-2')
+    expect(store.getter(selectionAtom).sheetId).toBe('sheet-2')
   })
 
   it('commits fill handle drag as a compact backend fillRange request', async () => {
@@ -1055,6 +1255,337 @@ describe('vNext SpreadsheetGrid', () => {
       targetRange: { rowStart: 0, rowEnd: 2, colStart: 0, colEnd: 0 },
       direction: 'down',
     })
+  })
+
+  it('dispatches one numeric fillSeries mutation bound to the accepted projection witness', async () => {
+    const sourceCells: DisplayCell[] = [
+      { row: 0, col: 0, displayValue: '1', valueKind: 'number', numericValue: 1 },
+      { row: 1, col: 0, displayValue: '3', valueKind: 'number', numericValue: 3 },
+    ]
+    const result = await runFillSeriesDrag({
+      sourceCells,
+      expectedMutation: 'series',
+    })
+
+    expect(result.rangeRequests).toHaveLength(1)
+    expect(result.rangeRequests[0]).toMatchObject({
+      kind: 'range',
+      sheetId: 'sheet-1',
+      reason: 'fill-handle',
+      range: { rowStart: 0, rowEnd: 1, colStart: 0, colEnd: 0 },
+    })
+    expect(result.fillSeriesRequests).toEqual([
+      {
+        kind: 'fill-series',
+        sheetId: 'sheet-1',
+        sourceRange: { rowStart: 0, rowEnd: 1, colStart: 0, colEnd: 0 },
+        targetRange: { rowStart: 0, rowEnd: 3, colStart: 0, colEnd: 0 },
+        direction: 'down',
+        series: 'integer-step',
+        step: 2,
+        requestId: result.rangeRequests[0].requestId,
+        revision: 17,
+      },
+    ])
+    expect(result.fillRangeRequests).toHaveLength(0)
+    expect(result.setCellInputRequests).toHaveLength(0)
+    expect(result.visibleRequests.length).toBeGreaterThanOrEqual(2)
+  })
+
+  it.each([
+    {
+      name: 'constant numeric source',
+      sourceCells: [
+        { row: 0, col: 0, displayValue: '5', valueKind: 'number' as const, numericValue: 5 },
+        { row: 1, col: 0, displayValue: '5', valueKind: 'number' as const, numericValue: 5 },
+      ],
+      expectedRangeReads: 1,
+    },
+    {
+      name: 'formula source',
+      sourceCells: [
+        {
+          row: 0,
+          col: 0,
+          displayValue: '1',
+          valueKind: 'number' as const,
+          numericValue: 1,
+          formula: '=1',
+        },
+        { row: 1, col: 0, displayValue: '2', valueKind: 'number' as const, numericValue: 2 },
+      ],
+      expectedRangeReads: 1,
+    },
+    {
+      name: 'mixed numeric and string source',
+      sourceCells: [
+        { row: 0, col: 0, displayValue: '1', valueKind: 'number' as const, numericValue: 1 },
+        { row: 1, col: 0, displayValue: 'x', valueKind: 'string' as const },
+      ],
+      expectedRangeReads: 1,
+    },
+    {
+      name: 'multi-dimensional source',
+      sourceCells: [
+        { row: 0, col: 0, displayValue: '1', valueKind: 'number' as const, numericValue: 1 },
+        { row: 0, col: 1, displayValue: '2', valueKind: 'number' as const, numericValue: 2 },
+        { row: 1, col: 0, displayValue: '3', valueKind: 'number' as const, numericValue: 3 },
+        { row: 1, col: 1, displayValue: '4', valueKind: 'number' as const, numericValue: 4 },
+      ],
+      sourceEndAddr: 'B2',
+      targetAddr: 'B4',
+      expectedRangeReads: 0,
+    },
+  ])('keeps $name on the existing fillRange path', async (testCase) => {
+    const result = await runFillSeriesDrag({
+      sourceCells: testCase.sourceCells,
+      sourceEndAddr: testCase.sourceEndAddr,
+      targetAddr: testCase.targetAddr,
+      expectedMutation: 'range',
+    })
+
+    expect(result.fillSeriesRequests).toHaveLength(0)
+    expect(result.fillRangeRequests).toHaveLength(1)
+    expect(result.rangeRequests).toHaveLength(testCase.expectedRangeReads)
+  })
+
+  it.each([
+    [
+      'missing revision',
+      (request: RangeProjectionRequest, cells: DisplayCell[]): RangeProjectionResult => ({
+        kind: 'range',
+        sheetId: request.sheetId,
+        requestId: request.requestId,
+        range: request.range,
+        cells,
+      }),
+    ],
+    [
+      'truncated projection',
+      (request: RangeProjectionRequest, cells: DisplayCell[]): RangeProjectionResult => ({
+        kind: 'range',
+        sheetId: request.sheetId,
+        requestId: request.requestId,
+        revision: 17,
+        range: request.range,
+        cells,
+        truncated: true,
+      }),
+    ],
+    [
+      'duplicate coordinate',
+      (request: RangeProjectionRequest, cells: DisplayCell[]): RangeProjectionResult => ({
+        kind: 'range',
+        sheetId: request.sheetId,
+        requestId: request.requestId,
+        revision: 17,
+        range: request.range,
+        cells: [cells[0], cells[0]],
+      }),
+    ],
+    [
+      'out-of-range coordinate',
+      (request: RangeProjectionRequest, cells: DisplayCell[]): RangeProjectionResult => ({
+        kind: 'range',
+        sheetId: request.sheetId,
+        requestId: request.requestId,
+        revision: 17,
+        range: request.range,
+        cells: [cells[0], { ...cells[1], row: 99 }],
+      }),
+    ],
+    [
+      'missing source cell',
+      (request: RangeProjectionRequest, cells: DisplayCell[]): RangeProjectionResult => ({
+        kind: 'range',
+        sheetId: request.sheetId,
+        requestId: request.requestId,
+        revision: 17,
+        range: request.range,
+        cells: [cells[0]],
+      }),
+    ],
+  ])('fails closed to fillRange for a %s', async (_name, makeResult) => {
+    const sourceCells: DisplayCell[] = [
+      { row: 0, col: 0, displayValue: '1', valueKind: 'number', numericValue: 1 },
+      { row: 1, col: 0, displayValue: '3', valueKind: 'number', numericValue: 3 },
+    ]
+    const result = await runFillSeriesDrag({
+      sourceCells,
+      expectedMutation: 'range',
+      rangeResult: (request) => makeResult(request, sourceCells),
+    })
+
+    expect(result.rangeRequests).toHaveLength(1)
+    expect(result.fillSeriesRequests).toHaveLength(0)
+    expect(result.fillRangeRequests).toHaveLength(1)
+  })
+
+  it('honors Ctrl copy-only and skips both projection detection and fillSeries', async () => {
+    const result = await runFillSeriesDrag({
+      sourceCells: [
+        { row: 0, col: 0, displayValue: '1', valueKind: 'number', numericValue: 1 },
+        { row: 1, col: 0, displayValue: '3', valueKind: 'number', numericValue: 3 },
+      ],
+      copyOnly: true,
+      expectedMutation: 'range',
+    })
+
+    expect(result.rangeRequests).toHaveLength(0)
+    expect(result.fillSeriesRequests).toHaveLength(0)
+    expect(result.fillRangeRequests).toHaveLength(1)
+  })
+
+  it('uses fillRange without a range read when fillSeries capability is absent', async () => {
+    const result = await runFillSeriesDrag({
+      sourceCells: [
+        { row: 0, col: 0, displayValue: '1', valueKind: 'number', numericValue: 1 },
+        { row: 1, col: 0, displayValue: '3', valueKind: 'number', numericValue: 3 },
+      ],
+      includeFillSeries: false,
+      expectedMutation: 'range',
+    })
+
+    expect(result.rangeRequests).toHaveLength(0)
+    expect(result.fillRangeRequests).toHaveLength(1)
+  })
+
+  it('uses the existing per-cell fallback when fillSeries and fillRange are absent', async () => {
+    const result = await runFillSeriesDrag({
+      sourceCells: [
+        { row: 0, col: 0, displayValue: '1', valueKind: 'number', numericValue: 1 },
+        { row: 1, col: 0, displayValue: '3', valueKind: 'number', numericValue: 3 },
+      ],
+      includeFillSeries: false,
+      includeFillRange: false,
+      expectedMutation: 'cells',
+      expectedCellWrites: 2,
+    })
+
+    expect(result.rangeRequests).toHaveLength(1)
+    expect(result.fillSeriesRequests).toHaveLength(0)
+    expect(result.fillRangeRequests).toHaveLength(0)
+    expect(result.setCellInputRequests.map((request) => request.input)).toEqual(['1', '3'])
+  })
+
+  it('shifts fallback fill formulas from each repeated source coordinate', async () => {
+    const store = createStore()
+    const setCellInputRequests: SetCellInputRequest[] = []
+    const sourceCells: DisplayCell[] = [
+      {
+        row: 0,
+        col: 0,
+        displayValue: 'formula-a',
+        valueKind: 'string',
+        formula: '=$A1+B$1+$C$1+"A1"',
+      },
+      {
+        row: 0,
+        col: 1,
+        displayValue: 'formula-b',
+        valueKind: 'string',
+        formula: '=Sheet1!B1',
+      },
+    ]
+    const { backend } = createFakeBackend({ cells: sourceCells })
+    backend.readRangeProjection = async (request) => ({
+      kind: 'range',
+      sheetId: request.sheetId,
+      requestId: request.requestId,
+      revision: request.revision,
+      range: request.range,
+      cells: sourceCells,
+    })
+    backend.setCellInput = async (request) => {
+      setCellInputRequests.push(request)
+      return { sheetId: request.sheetId, requestId: request.requestId }
+    }
+    const viewport = {
+      scrollTop: 0,
+      scrollLeft: 0,
+      viewportHeight: 1,
+      viewportWidth: 6,
+      rowHeight: 1,
+      colWidth: 1,
+      rowCount: 4,
+      colCount: 10,
+      overscanRows: 0,
+      overscanCols: 0,
+    }
+
+    const { container, getByTestId } = render(() => (
+      <SpreadsheetUiProvider backend={backend} store={store}>
+        <SpreadsheetGrid sheetId="sheet-1" viewport={viewport} data-testid="grid" />
+      </SpreadsheetUiProvider>
+    ))
+
+    await waitFor(() => {
+      expect(container.querySelectorAll('td.spreadsheet-grid-cell')).toHaveLength(6)
+    })
+
+    fireEvent.click(container.querySelector('[data-cell-addr="A1"] .spreadsheet-grid-cell-button')!)
+    fireEvent.click(
+      container.querySelector('[data-cell-addr="B1"] .spreadsheet-grid-cell-button')!,
+      {
+        shiftKey: true,
+      },
+    )
+
+    const targetCell = container.querySelector('[data-cell-addr="F1"]') as HTMLElement
+    const originalElementFromPoint = document.elementFromPoint
+    Object.defineProperty(document, 'elementFromPoint', {
+      configurable: true,
+      value: () => targetCell,
+    })
+
+    try {
+      dispatchPointerEvent(getByTestId('fill-handle-B1'), 'pointerdown', {
+        clientX: 2,
+        clientY: 1,
+      })
+      dispatchPointerEvent(window, 'pointermove', { clientX: 6, clientY: 1 })
+      dispatchPointerEvent(window, 'pointerup', { clientX: 6, clientY: 1 })
+
+      await waitFor(() => {
+        expect(setCellInputRequests).toHaveLength(4)
+      })
+    } finally {
+      Object.defineProperty(document, 'elementFromPoint', {
+        configurable: true,
+        value: originalElementFromPoint,
+      })
+    }
+
+    expect(setCellInputRequests).toEqual([
+      {
+        kind: 'set-cell-input',
+        sheetId: 'sheet-1',
+        row: 0,
+        col: 2,
+        input: '=$A1+D$1+$C$1+"A1"',
+      },
+      {
+        kind: 'set-cell-input',
+        sheetId: 'sheet-1',
+        row: 0,
+        col: 3,
+        input: '=Sheet1!D1',
+      },
+      {
+        kind: 'set-cell-input',
+        sheetId: 'sheet-1',
+        row: 0,
+        col: 4,
+        input: '=$A1+F$1+$C$1+"A1"',
+      },
+      {
+        kind: 'set-cell-input',
+        sheetId: 'sheet-1',
+        row: 0,
+        col: 5,
+        input: '=Sheet1!F1',
+      },
+    ])
   })
 
   it('uses backend data-edge resolution for ctrl arrow movement when available', async () => {
@@ -1273,14 +1804,12 @@ describe('vNext SpreadsheetGrid', () => {
     dispatchPointerEvent(window, 'pointerup', { clientX: 250 })
 
     await waitFor(() => {
-      expect(
-        (container.querySelector('.spreadsheet-grid-table') as HTMLElement).style.width,
-      ).toBe('394px')
+      expect((container.querySelector('.spreadsheet-grid-table') as HTMLElement).style.width).toBe(
+        '394px',
+      )
     })
 
-    const scroller = container.querySelector(
-      '.spreadsheet-grid-scroll-viewport',
-    ) as HTMLDivElement
+    const scroller = container.querySelector('.spreadsheet-grid-scroll-viewport') as HTMLDivElement
     scroller.scrollLeft = 220
     fireEvent.scroll(scroller)
 
@@ -1295,8 +1824,11 @@ describe('vNext SpreadsheetGrid', () => {
 
     expect(store.getter(viewportMetricsAtom).scrollLeft).toBe(220)
     expect(
-      (container.querySelector('.spreadsheet-grid-row .spreadsheet-grid-virtual-spacer') as HTMLElement)
-        .style.width,
+      (
+        container.querySelector(
+          '.spreadsheet-grid-row .spreadsheet-grid-virtual-spacer',
+        ) as HTMLElement
+      ).style.width,
     ).toBe('200px')
     expect(container.querySelector('[data-cell-addr="B1"]')).not.toBeNull()
     expect(container.querySelector('[data-cell-addr="D1"]')).not.toBeNull()
@@ -1396,8 +1928,8 @@ describe('vNext SpreadsheetGrid', () => {
 
     await waitFor(() => {
       expect(
-        (container.querySelector('.spreadsheet-grid-col-header[data-col="1"]') as HTMLElement)
-          .style.width,
+        (container.querySelector('.spreadsheet-grid-col-header[data-col="1"]') as HTMLElement).style
+          .width,
       ).toBe('132px')
     })
 
@@ -1424,6 +1956,276 @@ describe('vNext SpreadsheetGrid', () => {
       (container.querySelector('.spreadsheet-grid-row-header[data-row="1"]') as HTMLElement).style
         .height,
     ).toBe('40px')
+  })
+
+  it('reconciles only the hydrated window and preserves off-window metadata', async () => {
+    const store = createStore()
+    store.setter(setViewportRowHeightAtom, {
+      sheetId: 'sheet-1',
+      rowIndex: 4,
+      heightPx: 54,
+    })
+    store.setter(setViewportColumnWidthAtom, {
+      sheetId: 'sheet-1',
+      colIndex: 4,
+      widthPx: 154,
+    })
+    store.setter(setViewportHiddenAtom, {
+      sheetId: 'sheet-1',
+      rows: [4],
+      cols: [4],
+    })
+    const { backend } = createFakeBackend({
+      rowHeights: [{ rowIndex: 1, heightPx: 41 }],
+      colWidths: [{ colIndex: 1, widthPx: 131 }],
+      hiddenRowIndices: [1],
+      hiddenColIndices: [1],
+    })
+    const viewport = {
+      scrollTop: 0,
+      scrollLeft: 0,
+      viewportHeight: 2,
+      viewportWidth: 2,
+      rowHeight: 1,
+      colWidth: 1,
+      rowCount: 6,
+      colCount: 6,
+      overscanRows: 0,
+      overscanCols: 0,
+    }
+
+    render(() => (
+      <SpreadsheetUiProvider backend={backend} store={store}>
+        <SpreadsheetGrid sheetId="sheet-1" viewport={viewport} />
+      </SpreadsheetUiProvider>
+    ))
+
+    await waitFor(() => {
+      expect(store.getter(viewportSizeOverridesAtom)).toEqual({
+        rowHeightsBySheet: { 'sheet-1': { '1': 41, '4': 54 } },
+        colWidthsBySheet: { 'sheet-1': { '1': 131, '4': 154 } },
+      })
+    })
+    expect(store.getter(viewportHiddenAtom)).toEqual({
+      rowsBySheet: { 'sheet-1': [1, 4] },
+      colsBySheet: { 'sheet-1': [1, 4] },
+    })
+  })
+
+  it('keeps the latest Grid hydration when viewport requests resolve out of order', async () => {
+    const store = createStore()
+    const { backend, sizeRequests } = createFakeBackend()
+    const pending: Array<{
+      request: ViewportSizeProjectionRequest
+      resolve(result: ViewportSizeProjectionResult): void
+    }> = []
+    backend.readViewportSizeProjection = (request) => {
+      sizeRequests.push(request)
+      return new Promise<ViewportSizeProjectionResult>((resolve) => {
+        pending.push({ request, resolve: (result) => resolve(result) })
+      })
+    }
+    const viewport = {
+      scrollTop: 0,
+      scrollLeft: 0,
+      viewportHeight: 2,
+      viewportWidth: 2,
+      rowHeight: 1,
+      colWidth: 1,
+      rowCount: 6,
+      colCount: 6,
+      overscanRows: 0,
+      overscanCols: 0,
+    }
+
+    const { container } = render(() => (
+      <SpreadsheetUiProvider backend={backend} store={store}>
+        <SpreadsheetGrid sheetId="sheet-1" viewport={viewport} />
+      </SpreadsheetUiProvider>
+    ))
+
+    await waitFor(() => expect(pending).toHaveLength(1))
+    const scroller = container.querySelector('.spreadsheet-grid-scroll-viewport') as HTMLElement
+    scroller.scrollTop = 2
+    scroller.scrollLeft = 2
+    fireEvent.scroll(scroller)
+    await waitFor(() => expect(pending).toHaveLength(2))
+
+    const latest = pending[1].request
+    pending[1].resolve({
+      kind: 'viewport-size',
+      sheetId: latest.sheetId,
+      requestId: latest.requestId,
+      revision: 2,
+      window: { ...latest.window },
+      rowHeights: [{ rowIndex: 2, heightPx: 42 }],
+      colWidths: [{ colIndex: 2, widthPx: 142 }],
+      hiddenRowIndices: [],
+      hiddenColIndices: [],
+    })
+
+    await waitFor(() => {
+      expect(store.getter(viewportSizeOverridesAtom)).toEqual({
+        rowHeightsBySheet: { 'sheet-1': { '2': 42 } },
+        colWidthsBySheet: { 'sheet-1': { '2': 142 } },
+      })
+    })
+    const acceptedSizes = store.getter(viewportSizeOverridesAtom)
+    const acceptedHidden = store.getter(viewportHiddenAtom)
+
+    const stale = pending[0].request
+    pending[0].resolve({
+      kind: 'viewport-size',
+      sheetId: stale.sheetId,
+      requestId: stale.requestId,
+      revision: 1,
+      window: { ...stale.window },
+      rowHeights: [{ rowIndex: 0, heightPx: 40 }],
+      colWidths: [{ colIndex: 0, widthPx: 140 }],
+      hiddenRowIndices: [0],
+      hiddenColIndices: [0],
+    })
+    await flushMicrotasks()
+
+    expect(store.getter(viewportSizeOverridesAtom)).toBe(acceptedSizes)
+    expect(store.getter(viewportHiddenAtom)).toBe(acceptedHidden)
+  })
+
+  it('commits sizes-only metadata from the worker backend without replacing hidden state', async () => {
+    const store = createStore()
+    store.setter(setViewportHiddenAtom, {
+      sheetId: 'sheet-1',
+      rows: [4],
+      cols: [4],
+    })
+    const hiddenBefore = store.getter(viewportHiddenAtom)
+    const client = {
+      async initWorkbook(names?: string[]) {
+        return [{ idx: 0, name: names?.[0] ?? 'Sheet1' }]
+      },
+      onCellsDirty() {
+        return () => undefined
+      },
+      async readSparseRange() {
+        return []
+      },
+      async snapshotFormatRange(range: {
+        sheet: number
+        startRow: number
+        startCol: number
+        endRow: number
+        endCol: number
+      }) {
+        return { ...range, cellFormats: [], rangeFormats: [] }
+      },
+      async snapshotViewportSizes(range: {
+        sheet: number
+        startRow: number
+        startCol: number
+        endRow: number
+        endCol: number
+      }) {
+        return {
+          ...range,
+          rowHeights: [{ rowIndex: 1, heightPx: 43 }],
+          colWidths: [{ colIndex: 1, widthPx: 143 }],
+        }
+      },
+      dispose() {},
+    } as unknown as WorkerWorkbookClient
+    const backend = createWorkerWorkbookSpreadsheetBackend({
+      client,
+      sheets: [{ id: 'sheet-1', name: 'Sheet1' }],
+      revision: 7,
+    })
+    await backend.ready()
+    const viewport = {
+      scrollTop: 0,
+      scrollLeft: 0,
+      viewportHeight: 2,
+      viewportWidth: 2,
+      rowHeight: 1,
+      colWidth: 1,
+      rowCount: 6,
+      colCount: 6,
+      overscanRows: 0,
+      overscanCols: 0,
+    }
+
+    render(() => (
+      <SpreadsheetUiProvider backend={backend} store={store}>
+        <SpreadsheetGrid sheetId="sheet-1" viewport={viewport} />
+      </SpreadsheetUiProvider>
+    ))
+
+    await waitFor(() => {
+      expect(store.getter(viewportSizeOverridesAtom)).toEqual({
+        rowHeightsBySheet: { 'sheet-1': { '1': 43 } },
+        colWidthsBySheet: { 'sheet-1': { '1': 143 } },
+      })
+    })
+    expect(store.getter(viewportHiddenAtom)).toBe(hiddenBefore)
+    backend.dispose()
+  })
+
+  it('does not partially commit valid sizes when hidden metadata is malformed', async () => {
+    const store = createStore()
+    store.setter(setViewportRowHeightAtom, {
+      sheetId: 'sheet-1',
+      rowIndex: 4,
+      heightPx: 54,
+    })
+    store.setter(setViewportColumnWidthAtom, {
+      sheetId: 'sheet-1',
+      colIndex: 4,
+      widthPx: 154,
+    })
+    store.setter(setViewportHiddenAtom, {
+      sheetId: 'sheet-1',
+      rows: [4],
+      cols: [4],
+    })
+    const sizesBefore = store.getter(viewportSizeOverridesAtom)
+    const hiddenBefore = store.getter(viewportHiddenAtom)
+    const { backend, sizeRequests } = createFakeBackend({
+      rowHeights: [{ rowIndex: 1, heightPx: 41 }],
+      colWidths: [{ colIndex: 1, widthPx: 141 }],
+      hiddenRowIndices: [1],
+    })
+    const viewport = {
+      scrollTop: 0,
+      scrollLeft: 0,
+      viewportHeight: 2,
+      viewportWidth: 2,
+      rowHeight: 1,
+      colWidth: 1,
+      rowCount: 6,
+      colCount: 6,
+      overscanRows: 0,
+      overscanCols: 0,
+    }
+
+    render(() => (
+      <SpreadsheetUiProvider backend={backend} store={store}>
+        <SpreadsheetGrid sheetId="sheet-1" viewport={viewport} />
+      </SpreadsheetUiProvider>
+    ))
+
+    await waitFor(() => expect(sizeRequests).toHaveLength(1))
+    await flushMicrotasks()
+    expect(store.getter(viewportSizeOverridesAtom)).toBe(sizesBefore)
+    expect(store.getter(viewportHiddenAtom)).toBe(hiddenBefore)
+  })
+
+  it('keeps Grid metadata hydration behind the UI-core command boundary', () => {
+    const source = readFileSync(
+      join(process.cwd(), 'solid/excel/src-vnext/grid/SpreadsheetGrid.tsx'),
+      'utf8',
+    )
+
+    expect(source).toContain('store.setter(hydrateViewportSizeProjectionAtom')
+    expect(source).not.toMatch(/\bbackend\s*\.\s*readViewportSizeProjection\b/)
+    expect(source).not.toContain('setViewportHiddenAtom')
   })
 
   it('preserves selected range when opening a cell context menu inside it', async () => {
@@ -1453,9 +2255,12 @@ describe('vNext SpreadsheetGrid', () => {
     })
 
     fireEvent.click(container.querySelector('[data-cell-addr="A1"] .spreadsheet-grid-cell-button')!)
-    fireEvent.click(container.querySelector('[data-cell-addr="C2"] .spreadsheet-grid-cell-button')!, {
-      shiftKey: true,
-    })
+    fireEvent.click(
+      container.querySelector('[data-cell-addr="C2"] .spreadsheet-grid-cell-button')!,
+      {
+        shiftKey: true,
+      },
+    )
 
     expect(store.getter(selectionAtom)).toEqual({
       kind: 'range',
@@ -1483,6 +2288,83 @@ describe('vNext SpreadsheetGrid', () => {
         },
       },
     })
+  })
+
+  it('opens the canonical selected range context menu from keyboard without changing selection', async () => {
+    const store = createStore()
+    const { backend } = createFakeBackend()
+    const viewport = {
+      scrollTop: 0,
+      scrollLeft: 0,
+      viewportHeight: 4,
+      viewportWidth: 4,
+      rowHeight: 1,
+      colWidth: 1,
+      rowCount: 10,
+      colCount: 10,
+      overscanRows: 0,
+      overscanCols: 0,
+    }
+
+    const { container, getByTestId } = render(() => (
+      <SpreadsheetUiProvider backend={backend} store={store}>
+        <SpreadsheetGrid sheetId="sheet-1" viewport={viewport} data-testid="grid" />
+      </SpreadsheetUiProvider>
+    ))
+
+    await waitFor(() => {
+      expect(container.querySelectorAll('td.spreadsheet-grid-cell')).toHaveLength(16)
+    })
+
+    fireEvent.click(container.querySelector('[data-cell-addr="A1"] .spreadsheet-grid-cell-button')!)
+    fireEvent.click(
+      container.querySelector('[data-cell-addr="C2"] .spreadsheet-grid-cell-button')!,
+      { shiftKey: true },
+    )
+
+    const selectionBefore = store.getter(selectionAtom)
+    const activeCell = container.querySelector('[data-cell-addr="C2"]') as HTMLElement
+    jest.spyOn(activeCell, 'getBoundingClientRect').mockReturnValue({
+      x: 20,
+      y: 30,
+      left: 20,
+      top: 30,
+      right: 30,
+      bottom: 40,
+      width: 10,
+      height: 10,
+      toJSON: () => ({}),
+    } as DOMRect)
+
+    const grid = getByTestId('grid')
+    grid.focus()
+    fireEvent.keyDown(grid, { key: 'F10', shiftKey: true })
+
+    expect(store.getter(menuStateAtom)).toMatchObject({
+      status: 'open',
+      surface: 'cell',
+      target: {
+        kind: 'range',
+        sheetId: 'sheet-1',
+        range: { rowStart: 0, rowEnd: 1, colStart: 0, colEnd: 2 },
+      },
+      position: { x: 20, y: 40 },
+    })
+    expect(store.getter(menuIntentAtom)).toMatchObject({
+      type: 'menu.open',
+      source: 'keyboard',
+      target: { kind: 'range', sheetId: 'sheet-1' },
+    })
+    expect(store.getter(selectionAtom)).toEqual(selectionBefore)
+
+    fireEvent.keyDown(grid, { key: 'ContextMenu' })
+
+    expect(store.getter(menuIntentAtom)).toMatchObject({
+      type: 'menu.open',
+      source: 'keyboard',
+      target: { kind: 'range', sheetId: 'sheet-1' },
+    })
+    expect(store.getter(selectionAtom)).toEqual(selectionBefore)
   })
 
   it('PageDown at viewport edge advances scroll position to follow the selection', async () => {
@@ -1673,9 +2555,12 @@ describe('vNext SpreadsheetGrid', () => {
 
     // select A1:B2 (2x2 range)
     fireEvent.click(container.querySelector('[data-cell-addr="A1"] .spreadsheet-grid-cell-button')!)
-    fireEvent.click(container.querySelector('[data-cell-addr="B2"] .spreadsheet-grid-cell-button')!, {
-      shiftKey: true,
-    })
+    fireEvent.click(
+      container.querySelector('[data-cell-addr="B2"] .spreadsheet-grid-cell-button')!,
+      {
+        shiftKey: true,
+      },
+    )
 
     expect(store.getter(selectionAtom)).toMatchObject({
       kind: 'range',
@@ -1733,9 +2618,12 @@ describe('vNext SpreadsheetGrid', () => {
 
     // Set primary region A1:B2 via click + shift-click
     fireEvent.click(container.querySelector('[data-cell-addr="A1"] .spreadsheet-grid-cell-button')!)
-    fireEvent.click(container.querySelector('[data-cell-addr="B2"] .spreadsheet-grid-cell-button')!, {
-      shiftKey: true,
-    })
+    fireEvent.click(
+      container.querySelector('[data-cell-addr="B2"] .spreadsheet-grid-cell-button')!,
+      {
+        shiftKey: true,
+      },
+    )
     // Add second region C3:D4 directly via the store atom
     store.setter(addSelectionRegionAtom, {
       region: {
@@ -1762,10 +2650,16 @@ describe('vNext SpreadsheetGrid', () => {
   it('blocks edit start on a locked cell in a protected sheet', async () => {
     const store = createStore()
     const { backend } = createFakeBackend()
-    backend.setCellInput = async (request) => ({ sheetId: request.sheetId, requestId: request.requestId })
+    backend.setCellInput = async (request) => ({
+      sheetId: request.sheetId,
+      requestId: request.requestId,
+    })
 
     // protect the sheet with no unlocked ranges → all cells locked
-    store.setter(setSheetProtectionAtom, { sheetId: 'sheet-1', state: { mode: 'protected', unlockedRanges: [] } })
+    store.setter(setSheetProtectionAtom, {
+      sheetId: 'sheet-1',
+      state: { mode: 'protected', unlockedRanges: [] },
+    })
 
     const viewport = {
       scrollTop: 0,
@@ -1871,7 +2765,11 @@ describe('vNext SpreadsheetGrid', () => {
 
     fireEvent.click(chevron)
 
-    expect(store.getter(filterDropdownAtom)).toMatchObject({ status: 'open', sheetId: 'sheet-1', colIndex: 1 })
+    expect(store.getter(filterDropdownAtom)).toMatchObject({
+      status: 'open',
+      sheetId: 'sheet-1',
+      colIndex: 1,
+    })
   })
 
   it('switching active sheet closes an open filter dropdown', async () => {
@@ -1955,13 +2853,23 @@ describe('vNext SpreadsheetGrid', () => {
 
     store.setter(applyPresenceUpdateAtom, {
       kind: 'join',
-      participant: { id: 'user-42', displayName: 'Alice', colorHint: '#ff0000', lastSeenAt: Date.now() },
+      participant: {
+        id: 'user-42',
+        displayName: 'Alice',
+        colorHint: '#ff0000',
+        lastSeenAt: Date.now(),
+      },
     })
     store.setter(applyPresenceUpdateAtom, {
       kind: 'cursor',
       participantId: 'user-42',
       sheetId: 'sheet-1',
-      selection: { kind: 'cell', sheetId: 'sheet-1', anchor: { row: 1, col: 1 }, focus: { row: 1, col: 1 } },
+      selection: {
+        kind: 'cell',
+        sheetId: 'sheet-1',
+        anchor: { row: 1, col: 1 },
+        focus: { row: 1, col: 1 },
+      },
     })
 
     await waitFor(() => {
@@ -2112,6 +3020,7 @@ describe('vNext SpreadsheetGrid', () => {
 
     await waitFor(() => {
       expect(writeText).toHaveBeenCalledTimes(1)
+      expect(store.getter(clipboardStateAtom).status).toBe('ready')
     })
 
     // Streaming path was used.
@@ -2124,7 +3033,6 @@ describe('vNext SpreadsheetGrid', () => {
     })
     // Non-streaming path was NOT used.
     expect(rangeRequests).toHaveLength(0)
-    expect(store.getter(clipboardStateAtom).status).toBe('ready')
   })
 
   it('Ctrl+C on full-row selection without streaming backend surfaces a clipboard error', async () => {
@@ -2256,7 +3164,7 @@ describe('vNext SpreadsheetGrid', () => {
     expect(exportCalls).toHaveLength(1)
   })
 
-  it("applies transform: rotate(...) when format.rotation is numeric (Wave 6.2)", async () => {
+  it('applies transform: rotate(...) when format.rotation is numeric (Wave 6.2)', async () => {
     const store = createStore()
     const viewport = {
       scrollTop: 0,
@@ -2420,9 +3328,9 @@ describe('vNext SpreadsheetGrid', () => {
     ))
 
     await waitFor(() => {
-      expect(
-        container.querySelector('[data-cell-addr="A1"] .cell-display')?.textContent,
-      ).toContain('long sentence')
+      expect(container.querySelector('[data-cell-addr="A1"] .cell-display')?.textContent).toContain(
+        'long sentence',
+      )
     })
 
     const display = container.querySelector('[data-cell-addr="A1"] .cell-display') as HTMLElement
@@ -2627,9 +3535,7 @@ describe('vNext SpreadsheetGrid', () => {
     it('single click + printable key starts edit with that key as initial draft', async () => {
       const store = createStore()
       const { backend } = createFakeBackend({
-        cells: [
-          { row: 0, col: 0, displayValue: 'existing', valueKind: 'string' },
-        ],
+        cells: [{ row: 0, col: 0, displayValue: 'existing', valueKind: 'string' }],
       })
       backend.setCellInput = async (request) => ({
         sheetId: request.sheetId,
@@ -2721,9 +3627,7 @@ describe('vNext SpreadsheetGrid', () => {
     it('F2 preserves existing cell content as initial draft', async () => {
       const store = createStore()
       const { backend } = createFakeBackend({
-        cells: [
-          { row: 0, col: 0, displayValue: 'existing', valueKind: 'string' },
-        ],
+        cells: [{ row: 0, col: 0, displayValue: 'existing', valueKind: 'string' }],
       })
       backend.setCellInput = async (request) => ({
         sheetId: request.sheetId,
@@ -2768,9 +3672,7 @@ describe('vNext SpreadsheetGrid', () => {
     it('Backspace clears existing content and enters edit with empty draft', async () => {
       const store = createStore()
       const { backend } = createFakeBackend({
-        cells: [
-          { row: 0, col: 0, displayValue: 'existing', valueKind: 'string' },
-        ],
+        cells: [{ row: 0, col: 0, displayValue: 'existing', valueKind: 'string' }],
       })
       backend.setCellInput = async (request) => ({
         sheetId: request.sheetId,
@@ -2850,9 +3752,9 @@ describe('vNext SpreadsheetGrid', () => {
   })
 
   describe('freeze boundary attributes', () => {
-    it('flags the last frozen row and column with data-freeze-boundary-* on cells and headers', async () => {
+    it('masks backend A freeze until backend B canonical hydration completes in the same store', async () => {
       const store = createStore()
-      const { backend } = createFakeBackend()
+      const first = createFakeBackend({ freeze: { rows: 2, cols: 2 } })
       const viewport = {
         scrollTop: 0,
         scrollLeft: 0,
@@ -2866,11 +3768,108 @@ describe('vNext SpreadsheetGrid', () => {
         overscanCols: 0,
       }
 
-      store.setter(setViewportFreezeAtom, {
-        sheetId: 'sheet-1',
-        rows: 2,
-        cols: 3,
+      const firstMount = render(() => (
+        <SpreadsheetUiProvider backend={first.backend} store={store}>
+          <SpreadsheetGrid sheetId="sheet-1" viewport={viewport} />
+        </SpreadsheetUiProvider>
+      ))
+      await waitFor(() => {
+        expect(
+          firstMount.container.querySelector('[data-testid="freeze-boundary-horizontal"]'),
+        ).not.toBeNull()
       })
+      firstMount.unmount()
+
+      const second = createFakeBackend({ freeze: { rows: 1, cols: 0 } })
+      let pendingRequestId: number | undefined
+      let resolveRead!: (
+        value: Awaited<ReturnType<NonNullable<SpreadsheetBackend['readFreezeConfig']>>>,
+      ) => void
+      second.backend.readFreezeConfig = (request) => {
+        pendingRequestId = request.requestId
+        return new Promise((resolve) => {
+          resolveRead = resolve
+        })
+      }
+
+      const secondMount = render(() => (
+        <SpreadsheetUiProvider backend={second.backend} store={store}>
+          <SpreadsheetGrid sheetId="sheet-1" viewport={viewport} />
+        </SpreadsheetUiProvider>
+      ))
+      await waitFor(() => expect(pendingRequestId).toBeDefined())
+      await waitFor(() => expect(second.requests).toHaveLength(1))
+      expect(secondMount.container.querySelector('svg.spreadsheet-grid-freeze-boundary')).toBeNull()
+
+      resolveRead({
+        kind: 'freeze-config',
+        sheetId: 'sheet-1',
+        requestId: pendingRequestId,
+        revision: 7,
+        freeze: { rows: 1, cols: 0 },
+      })
+      await waitFor(() => {
+        expect(
+          secondMount.container.querySelector('[data-testid="freeze-boundary-horizontal"]'),
+        ).not.toBeNull()
+      })
+      expect(second.requests).toHaveLength(2)
+      expect(
+        secondMount.container.querySelector('[data-testid="freeze-boundary-vertical"]'),
+      ).toBeNull()
+    })
+
+    it('does not render a divider for a read-only freeze backend', async () => {
+      const store = createStore()
+      const first = createFakeBackend({ freeze: { rows: 2, cols: 2 } })
+      const viewport = {
+        scrollTop: 0,
+        scrollLeft: 0,
+        viewportHeight: 4,
+        viewportWidth: 4,
+        rowHeight: 1,
+        colWidth: 1,
+        rowCount: 8,
+        colCount: 8,
+        overscanRows: 0,
+        overscanCols: 0,
+      }
+      await store.setter(readViewportFreezeCanonicalAtom, {
+        source: first.backend,
+        sheetId: 'sheet-1',
+      })
+      const readOnlyBackend: SpreadsheetBackend = {
+        ...createFakeBackend({ freeze: { rows: 3, cols: 3 } }).backend,
+        setFreezeConfig: undefined,
+      }
+
+      const { container } = render(() => (
+        <SpreadsheetUiProvider backend={readOnlyBackend} store={store}>
+          <SpreadsheetGrid sheetId="sheet-1" viewport={viewport} />
+        </SpreadsheetUiProvider>
+      ))
+      await flushMicrotasks()
+
+      expect(container.querySelector('svg.spreadsheet-grid-freeze-boundary')).toBeNull()
+      expect(container.querySelectorAll('[data-freeze-boundary-bottom="true"]')).toHaveLength(0)
+      expect(container.querySelectorAll('[data-freeze-boundary-right="true"]')).toHaveLength(0)
+    })
+
+    it('flags the last frozen row and column with data-freeze-boundary-* on cells and headers', async () => {
+      const store = createStore()
+      const { backend } = createFakeBackend({ freeze: { rows: 2, cols: 3 } })
+      const viewport = {
+        scrollTop: 0,
+        scrollLeft: 0,
+        viewportHeight: 4,
+        viewportWidth: 4,
+        rowHeight: 1,
+        colWidth: 1,
+        rowCount: 8,
+        colCount: 8,
+        overscanRows: 0,
+        overscanCols: 0,
+      }
 
       const { container } = render(() => (
         <SpreadsheetUiProvider backend={backend} store={store}>
@@ -2885,18 +3884,14 @@ describe('vNext SpreadsheetGrid', () => {
       const bottomCells = container.querySelectorAll(
         'td.spreadsheet-grid-cell[data-freeze-boundary-bottom="true"]',
       )
-      const bottomRows = new Set(
-        Array.from(bottomCells).map((n) => n.getAttribute('data-row')),
-      )
+      const bottomRows = new Set(Array.from(bottomCells).map((n) => n.getAttribute('data-row')))
       expect(bottomRows).toEqual(new Set(['1']))
 
       // Last frozen col index is 2; same check on right boundary.
       const rightCells = container.querySelectorAll(
         'td.spreadsheet-grid-cell[data-freeze-boundary-right="true"]',
       )
-      const rightCols = new Set(
-        Array.from(rightCells).map((n) => n.getAttribute('data-col')),
-      )
+      const rightCols = new Set(Array.from(rightCells).map((n) => n.getAttribute('data-col')))
       expect(rightCols).toEqual(new Set(['2']))
 
       // The single cell at row=1, col=2 sits on both boundaries.
@@ -2955,17 +3950,13 @@ describe('vNext SpreadsheetGrid', () => {
 
       await flushMicrotasks()
 
-      expect(
-        container.querySelectorAll('[data-freeze-boundary-bottom="true"]'),
-      ).toHaveLength(0)
-      expect(
-        container.querySelectorAll('[data-freeze-boundary-right="true"]'),
-      ).toHaveLength(0)
+      expect(container.querySelectorAll('[data-freeze-boundary-bottom="true"]')).toHaveLength(0)
+      expect(container.querySelectorAll('[data-freeze-boundary-right="true"]')).toHaveLength(0)
     })
 
     it('renders an SVG overlay with the freeze boundary lines at the cumulative pixel offsets', async () => {
       const store = createStore()
-      const { backend } = createFakeBackend()
+      const { backend } = createFakeBackend({ freeze: { rows: 2, cols: 3 } })
       const viewport = {
         scrollTop: 0,
         scrollLeft: 0,
@@ -2982,12 +3973,6 @@ describe('vNext SpreadsheetGrid', () => {
       // Freeze first 2 rows and first 3 cols. With rowHeight=2 / colWidth=4,
       // the horizontal line should sit at y = headerHeight(2) + 2*2 = 6, and
       // the vertical line at x = rowHeaderWidth(44) + 3*4 = 56.
-      store.setter(setViewportFreezeAtom, {
-        sheetId: 'sheet-1',
-        rows: 2,
-        cols: 3,
-      })
-
       const { container } = render(() => (
         <SpreadsheetUiProvider backend={backend} store={store}>
           <SpreadsheetGrid sheetId="sheet-1" viewport={viewport} />
@@ -3039,7 +4024,7 @@ describe('vNext SpreadsheetGrid', () => {
 
     it('renders only the horizontal line when only rows are frozen', async () => {
       const store = createStore()
-      const { backend } = createFakeBackend()
+      const { backend } = createFakeBackend({ freeze: { rows: 1, cols: 0 } })
       const viewport = {
         scrollTop: 0,
         scrollLeft: 0,
@@ -3053,8 +4038,6 @@ describe('vNext SpreadsheetGrid', () => {
         overscanCols: 0,
       }
 
-      store.setter(setViewportFreezeAtom, { sheetId: 'sheet-1', rows: 1, cols: 0 })
-
       const { container } = render(() => (
         <SpreadsheetUiProvider backend={backend} store={store}>
           <SpreadsheetGrid sheetId="sheet-1" viewport={viewport} />
@@ -3063,12 +4046,8 @@ describe('vNext SpreadsheetGrid', () => {
 
       await flushMicrotasks()
 
-      expect(
-        container.querySelector('[data-testid="freeze-boundary-horizontal"]'),
-      ).not.toBeNull()
-      expect(
-        container.querySelector('[data-testid="freeze-boundary-vertical"]'),
-      ).toBeNull()
+      expect(container.querySelector('[data-testid="freeze-boundary-horizontal"]')).not.toBeNull()
+      expect(container.querySelector('[data-testid="freeze-boundary-vertical"]')).toBeNull()
     })
   })
 })

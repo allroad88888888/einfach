@@ -15,9 +15,9 @@ import {
   formulaBarStateAtom,
   selectCellAtom,
 } from '@einfach/spreadsheet-ui-core'
-import { spreadsheetProjectionSnapshotAtom } from '../src-vnext/provider/atoms'
 import { SpreadsheetFormulaBar } from '../src-vnext/formula-bar'
 import { SpreadsheetUiProvider } from '../src-vnext/provider'
+import { seedReadyVisibleProjection } from './projection-test-fixture'
 
 afterEach(cleanup)
 
@@ -66,7 +66,7 @@ describe('vNext SpreadsheetFormulaBar', () => {
     const result = createVisibleProjectionResult(window, 'sheet-1')
     const setCellInput = jest.fn(async () => ({ sheetId: 'sheet-1' }))
     const { backend } = createBackend(result, setCellInput)
-    store.setter(spreadsheetProjectionSnapshotAtom, {
+    seedReadyVisibleProjection(store, {
       status: 'ready',
       request: {
         kind: 'visible-window',
@@ -104,7 +104,7 @@ describe('vNext SpreadsheetFormulaBar', () => {
     const initialResult = createVisibleProjectionResult(initialWindow, 'sheet-1')
     const setCellInput = jest.fn(async () => ({ sheetId: 'sheet-1' }))
     const { backend } = createBackend(initialResult, setCellInput)
-    store.setter(spreadsheetProjectionSnapshotAtom, {
+    seedReadyVisibleProjection(store, {
       status: 'ready',
       request: {
         kind: 'visible-window',
@@ -129,7 +129,7 @@ describe('vNext SpreadsheetFormulaBar', () => {
     await waitFor(() => expect(input.value).toBe('=1'))
 
     const scrolledWindow = { rowStart: 10, rowEnd: 12, colStart: 0, colEnd: 1 }
-    store.setter(spreadsheetProjectionSnapshotAtom, {
+    seedReadyVisibleProjection(store, {
       status: 'ready',
       request: {
         kind: 'visible-window',
@@ -164,7 +164,7 @@ describe('vNext SpreadsheetFormulaBar', () => {
     }
     const setCellInput = jest.fn(async () => ({ sheetId: 'sheet-1' }))
     const { backend } = createBackend(result, setCellInput)
-    store.setter(spreadsheetProjectionSnapshotAtom, {
+    seedReadyVisibleProjection(store, {
       status: 'ready',
       request: {
         kind: 'visible-window',
@@ -193,10 +193,14 @@ describe('vNext SpreadsheetFormulaBar', () => {
     const store = createStore()
     const window = { rowStart: 0, rowEnd: 0, colStart: 0, colEnd: 0 }
     const result = createVisibleProjectionResult(window, 'sheet-1')
-    const setCellInput = jest.fn(async () => ({ sheetId: 'sheet-1' }))
+    const setCellInput = jest.fn(async (request: SetCellInputRequest) => ({
+      sheetId: request.sheetId,
+      requestId: request.requestId,
+      revision: 'rev-2',
+    }))
     const { backend, readVisibleProjection } = createBackend(result, setCellInput)
 
-    store.setter(spreadsheetProjectionSnapshotAtom, {
+    seedReadyVisibleProjection(store, {
       status: 'ready',
       request: {
         kind: 'visible-window',
@@ -257,7 +261,7 @@ describe('vNext SpreadsheetFormulaBar', () => {
     const setCellInput = jest.fn(async () => ({ sheetId: 'sheet-1' }))
     const { backend } = createBackend(result, setCellInput)
 
-    store.setter(spreadsheetProjectionSnapshotAtom, {
+    seedReadyVisibleProjection(store, {
       status: 'ready',
       request: {
         kind: 'visible-window',

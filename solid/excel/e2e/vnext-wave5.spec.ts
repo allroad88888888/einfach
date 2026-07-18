@@ -18,16 +18,36 @@ test.describe('vNext Wave 5 — shell + canvas overlay', () => {
 
   test('demo loads with all Wave 5 surfaces mounted', async ({ page }) => {
     await gotoWave5(page)
-    // Menubar (文件/编辑/插入/格式/数据/视图/帮助) was removed for Univer
-    // parity — every menu action is now reachable from the toolbar / right
-    // click / keyboard, so the redundant menubar would only steal vertical
-    // space.
-    await expect(page.getByTestId('wave5-menu-bar')).toHaveCount(0)
+    const menuBar = page.getByTestId('wave5-menu-bar')
+    await expect(menuBar).toBeVisible()
+    const topLevelMenuIds = ['file', 'edit', 'insert', 'format', 'data', 'view', 'help']
+    await expect(menuBar.locator('[data-testid^="menu-bar-button-"]')).toHaveCount(7)
+    for (const menuId of topLevelMenuIds) {
+      await expect(menuBar.getByTestId(`menu-bar-button-${menuId}`)).toBeVisible()
+    }
     await expect(page.getByTestId('wave5-toolbar')).toBeVisible()
     await expect(page.getByTestId('wave5-formula-bar')).toBeVisible()
     await expect(page.getByTestId('wave5-status-bar')).toBeVisible()
     await expect(page.getByTestId('grid-overlay-canvas')).toBeVisible()
     await expect(cell(page, 'A1')).toBeVisible()
+  })
+
+  test('host defers print while Format exposes row and column unhide commands', async ({ page }) => {
+    await gotoWave5(page)
+
+    await page.getByTestId('menu-bar-button-file').click()
+    await expect(page.getByTestId('menu-bar-dropdown-file')).toBeVisible()
+    await expect(page.getByTestId('menu-bar-item-file.printPreview')).toHaveCount(0)
+    await expect(page.getByTestId('wave5-print-preview')).toHaveCount(0)
+
+    await page.keyboard.press('Escape')
+    await expect(page.getByTestId('menu-bar-dropdown-file')).toHaveCount(0)
+    await page.getByTestId('menu-bar-button-format').click()
+    await expect(page.getByTestId('menu-bar-dropdown-format')).toBeVisible()
+    await expect(page.getByTestId('menu-bar-item-format.unhideRow')).toBeVisible()
+    await expect(page.getByTestId('menu-bar-item-format.unhideRow')).toBeEnabled()
+    await expect(page.getByTestId('menu-bar-item-format.unhideCol')).toBeVisible()
+    await expect(page.getByTestId('menu-bar-item-format.unhideCol')).toBeEnabled()
   })
 
   test('name box reflects active cell and jumps on commit', async ({ page }) => {

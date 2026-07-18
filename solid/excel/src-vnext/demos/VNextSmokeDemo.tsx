@@ -6,7 +6,10 @@ import {
   setWorkspaceActiveSheetAtom,
   workspaceSessionAtom,
 } from '@einfach/spreadsheet-ui-core'
-import { createStaticSpreadsheetBackend } from '../adapter'
+import {
+  createStaticNamedRangeCapabilityPort,
+  createStaticSpreadsheetBackend,
+} from '../adapter'
 import { SpreadsheetCommentThread } from '../comments'
 import { SpreadsheetConditionalFormatDialog } from '../conditional-formatting'
 import { SpreadsheetContextMenu } from '../context-menu'
@@ -19,6 +22,7 @@ import { SpreadsheetFormulaBar } from '../formula-bar'
 import { SpreadsheetGrid } from '../grid'
 import { SpreadsheetHistoryTimeline } from '../history'
 import { SpreadsheetNameManagerDialog } from '../named-ranges'
+import { SpreadsheetPasteSpecialDialog } from '../paste-special'
 import { SpreadsheetPresenceOverlay } from '../presence'
 import { SpreadsheetPrintPreviewOverlay } from '../print'
 import { SpreadsheetProtectionUnlockDialog } from '../protection'
@@ -32,6 +36,8 @@ const sheets = [
   { id: 'sheet-2', name: 'Sheet2' },
   { id: 'sheet-3', name: 'Sheet3' },
 ]
+
+const namedRangeCapabilityPort = createStaticNamedRangeCapabilityPort()
 
 const backend = createStaticSpreadsheetBackend({
   revision: 1,
@@ -142,6 +148,7 @@ function VNextSmokeWorkbook() {
       <SpreadsheetConditionalFormatDialog data-testid="vnext-conditional-format" />
       <SpreadsheetDataValidationDialog data-testid="vnext-data-validation" />
       <SpreadsheetNameManagerDialog data-testid="vnext-name-manager" />
+      <SpreadsheetPasteSpecialDialog data-testid="vnext-paste-special" />
       <SpreadsheetCommentThread data-testid="vnext-comment-thread" />
       <SpreadsheetPrintPreviewOverlay data-testid="vnext-print-preview" />
       <SpreadsheetProtectionUnlockDialog data-testid="vnext-protection-unlock" />
@@ -178,7 +185,10 @@ export function VNextSmokeDemo() {
         </p>
       </div>
 
-      <SpreadsheetUiProvider backend={backend}>
+      <SpreadsheetUiProvider
+        backend={backend}
+        namedRangeCapabilityPort={namedRangeCapabilityPort}
+      >
         <VNextSmokeWorkbook />
       </SpreadsheetUiProvider>
     </div>

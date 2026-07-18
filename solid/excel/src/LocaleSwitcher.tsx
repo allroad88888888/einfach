@@ -1,6 +1,6 @@
 
 import { For } from 'solid-js'
-import { locale, setLocale, useT, type Locale } from './i18n'
+import { setLocale, useLocale, useT, type Locale } from './i18n'
 
 /**
  * EN | 中 toggle. Drops two pill buttons at the top of the app header; the
@@ -9,6 +9,7 @@ import { locale, setLocale, useT, type Locale } from './i18n'
  */
 export function LocaleSwitcher() {
   const t = useT()
+  const locale = useLocale()
   const options: ReadonlyArray<{ value: Locale; key: string }> = [
     { value: 'en', key: 'locale.en' },
     { value: 'zh', key: 'locale.zh' },

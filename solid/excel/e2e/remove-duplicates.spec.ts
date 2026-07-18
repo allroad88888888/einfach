@@ -3,11 +3,11 @@ import { test, expect, type Page } from '@playwright/test'
 /**
  * Wave 7.5 — Remove Duplicates e2e.
  *
- * The Wave 5 demo omits the menubar (Univer parity), so we open the dialog
- * by dispatching the `spreadsheet:open-remove-duplicates` window event the
- * demo's helper listens for. The helper mirrors the menubar dispatcher's
- * two-write transaction (sheetId capture + open + cells), so all the
- * confirm-time safety checks behave identically to the production flow.
+ * The visible Wave 5 menu is the production entrypoint. These focused flows
+ * retain the `spreadsheet:open-remove-duplicates` CustomEvent only as a
+ * direct-flow / compatibility test hook. The helper mirrors the menubar's
+ * source-only Core command: Core captures the authoritative sheet + selection,
+ * reads the exact projection, and owns the complete dialog lifecycle.
  *
  * Coverage:
  *   1. Full-row duplicate detection + removal (existing).
@@ -15,15 +15,15 @@ import { test, expect, type Page } from '@playwright/test'
  *   3. caseInsensitive comparison finds dups across case.
  *   4. noDuplicates preview message + Remove button disabled.
  *   5. Deselect-all → noKeyColumns preview + Remove disabled.
- *   6. Sheet-id race fix (HIGH #1): switching sheets mid-dialog still
- *      deletes from the original sheet, not the active one.
+ *   6. Authority drift: switching sheets mid-dialog makes the session
+ *      read-stale, keeps the dialog recoverable, and removes no rows.
  *   7. Undo restores deleted rows.
  *   8. Trim comparison treats leading/trailing whitespace as equal.
  *
- * Capability gating (backend without `removeRows` → menu entry hidden) is
- * covered by `solid/excel/test/vnext-menu-bar.test.tsx`. The Wave 5 demo
- * does not render the menubar so the corresponding e2e assertion would
- * have no DOM to query.
+ * Capability gating (backend without `readRangeProjection` or
+ * `removeRowsExact` → menu entry hidden) is covered by
+ * `solid/excel/test/vnext-menu-bar.test.tsx`; Wave 5 exposes the production
+ * menu with its Static capabilities rather than a capability-negative fixture.
  */
 
 const WAVE5_GRID = '[data-testid="wave5-grid"]'
@@ -35,9 +35,9 @@ async function gotoWave5(page: Page) {
   await page.goto('/?locale=en')
   await page.getByTestId('nav-tab-vnext-wave5').click()
   await expect(page.getByTestId('wave5-grid')).toBeVisible({ timeout: 30_000 })
-  await expect(
-    page.locator(`${WAVE5_GRID} td.cell[data-cell-addr="B2"] .cell-display`),
-  ).toHaveText('120')
+  await expect(page.locator(`${WAVE5_GRID} td.cell[data-cell-addr="B2"] .cell-display`)).toHaveText(
+    '120',
+  )
 }
 
 function cell(page: Page, addr: string) {
@@ -61,10 +61,20 @@ async function selectRange(page: Page, anchor: string, focus: string) {
   await cell(page, focus).click({ modifiers: ['Shift'] })
 }
 
-async function openDialog(page: Page) {
+async function openDialogFromCompatibilityEvent(page: Page) {
   await page.evaluate(() => {
     window.dispatchEvent(new CustomEvent('spreadsheet:open-remove-duplicates'))
   })
+  await expect(page.getByTestId('wave5-remove-duplicates')).toBeVisible()
+}
+
+async function openDialogFromDataMenu(page: Page) {
+  await page.getByTestId('menu-bar-button-data').click()
+  await expect(page.getByTestId('menu-bar-dropdown-data')).toBeVisible()
+  const menuItem = page.getByTestId('menu-bar-item-data.removeDuplicates')
+  await expect(menuItem).toBeVisible()
+  await expect(menuItem).toBeEnabled()
+  await menuItem.click()
   await expect(page.getByTestId('wave5-remove-duplicates')).toBeVisible()
 }
 
@@ -94,7 +104,7 @@ test.describe('remove-duplicates — Data > Remove Duplicates smoke', () => {
 
     await selectRange(page, 'G1', 'I6')
 
-    await openDialog(page)
+    await openDialogFromDataMenu(page)
 
     // All three columns should be checked by default.
     const colCheckboxes = [
@@ -151,7 +161,7 @@ test.describe('remove-duplicates — Data > Remove Duplicates smoke', () => {
 
     await selectRange(page, 'G1', 'I5')
 
-    await openDialog(page)
+    await openDialogFromCompatibilityEvent(page)
 
     // With all three columns selected, no two rows match fully -> the
     // confirm button should be disabled (preview reports 0 duplicates).
@@ -177,7 +187,7 @@ test.describe('remove-duplicates — Data > Remove Duplicates smoke', () => {
 
     await selectRange(page, 'G1', 'G4')
 
-    await openDialog(page)
+    await openDialogFromCompatibilityEvent(page)
 
     // Default = exact → no duplicates → Remove disabled.
     await expect(page.getByTestId('remove-duplicates-confirm-button')).toBeDisabled()
@@ -203,7 +213,7 @@ test.describe('remove-duplicates — Data > Remove Duplicates smoke', () => {
 
     await selectRange(page, 'G1', 'G4')
 
-    await openDialog(page)
+    await openDialogFromCompatibilityEvent(page)
 
     // Preview reads the noDuplicates string (en locale: "No duplicates
     // found — nothing to remove"). Match a stable substring so a future
@@ -225,7 +235,7 @@ test.describe('remove-duplicates — Data > Remove Duplicates smoke', () => {
 
     await selectRange(page, 'G1', 'H3')
 
-    await openDialog(page)
+    await openDialogFromCompatibilityEvent(page)
 
     // Sanity: with all columns selected the duplicate is found.
     const preview = page.getByTestId('remove-duplicates-preview')
@@ -238,13 +248,29 @@ test.describe('remove-duplicates — Data > Remove Duplicates smoke', () => {
     await expect(page.getByTestId('remove-duplicates-confirm-button')).toBeDisabled()
   })
 
-  test('sheet-id race fix: confirming after sheet switch deletes from the original sheet', async ({
-    page,
-  }) => {
+  test('sheet drift makes confirm read-stale without removing rows', async ({ page }) => {
     await gotoWave5(page)
 
-    // Seed on the active sheet (Sales / sheet-1): a 4-row table with one
-    // duplicate so we can verify the row count drops by 1.
+    // Seed Forecast first so the active sheet also has observable data. If
+    // confirmation were ever sent to either the current or captured sheet,
+    // the unchanged assertions below expose the mutation.
+    await page
+      .locator(
+        '[data-testid="wave5-sheet-tabs"] button.spreadsheet-sheet-tab[data-sheet-id="sheet-2"]',
+      )
+      .click()
+    await typeRow(page, 'G1', ['forecast'])
+    await typeRow(page, 'G2', ['North'])
+    await typeRow(page, 'G3', ['South'])
+    await typeRow(page, 'G4', ['West'])
+
+    await page
+      .locator(
+        '[data-testid="wave5-sheet-tabs"] button.spreadsheet-sheet-tab[data-sheet-id="sheet-1"]',
+      )
+      .click()
+
+    // Seed Sales with one duplicate and open from its exact selection.
     await typeRow(page, 'G1', ['name'])
     await typeRow(page, 'G2', ['Alice'])
     await typeRow(page, 'G3', ['Bob'])
@@ -252,37 +278,52 @@ test.describe('remove-duplicates — Data > Remove Duplicates smoke', () => {
 
     await selectRange(page, 'G1', 'G4')
 
-    await openDialog(page)
+    await openDialogFromCompatibilityEvent(page)
 
     // Sanity: 1 duplicate of 3.
     const preview = page.getByTestId('remove-duplicates-preview')
     await expect(preview).toContainText('1')
 
-    // Switch to the Forecast tab (sheet-2) while the dialog stays open.
-    // The dialog's reset-on-open is store-side so it doesn't re-fire on
-    // unrelated mutations (Solid 1.9.12 hazard, see CLAUDE.md). The
-    // dialog must STILL be open after the click.
+    // Switching to Forecast invalidates the Core authority witnesses. The
+    // dialog remains open until the user confirms or cancels.
     await page
-      .locator('[data-testid="wave5-sheet-tabs"] button.spreadsheet-sheet-tab[data-sheet-id="sheet-2"]')
+      .locator(
+        '[data-testid="wave5-sheet-tabs"] button.spreadsheet-sheet-tab[data-sheet-id="sheet-2"]',
+      )
       .click()
-    await expect(page.getByTestId('wave5-remove-duplicates')).toBeVisible()
+    const dialog = page.getByTestId('wave5-remove-duplicates')
+    const confirm = page.getByTestId('remove-duplicates-confirm-button')
+    await expect(dialog).toBeVisible()
+    await expect(confirm).toBeEnabled()
 
-    // Confirm. Sheet-id race fix means the deletion targets sheet-1
-    // (where the dialog opened), not sheet-2 (active now).
-    await page.getByTestId('remove-duplicates-confirm-button').click()
-    await expect(page.getByTestId('wave5-remove-duplicates')).toHaveCount(0)
+    // Core rejects the stale authority before resolving/calling
+    // removeRowsExact. The session stays visible as read-stale, explains
+    // how to recover, disables repeat confirmation, and still allows cancel.
+    await confirm.click()
+    await expect(dialog).toHaveAttribute('data-status', 'read-stale')
+    await expect(page.getByTestId('remove-duplicates-error')).toContainText(
+      'selected range changed',
+    )
+    await expect(confirm).toBeDisabled()
+    await expect(page.getByTestId('remove-duplicates-cancel-button')).toBeEnabled()
 
-    // Switch back to Sales and confirm the duplicate is gone. The
-    // surviving rows are: Alice, Bob (the second Alice was the dup).
+    // The active Forecast sheet is untouched.
+    await expect(cell(page, 'G1').locator('.cell-display')).toHaveText('forecast')
+    await expect(cell(page, 'G2').locator('.cell-display')).toHaveText('North')
+    await expect(cell(page, 'G3').locator('.cell-display')).toHaveText('South')
+    await expect(cell(page, 'G4').locator('.cell-display')).toHaveText('West')
+
+    // The captured Sales sheet is also untouched: the duplicate remains,
+    // proving the stale confirmation produced zero row-removal mutation.
     await page
-      .locator('[data-testid="wave5-sheet-tabs"] button.spreadsheet-sheet-tab[data-sheet-id="sheet-1"]')
+      .locator(
+        '[data-testid="wave5-sheet-tabs"] button.spreadsheet-sheet-tab[data-sheet-id="sheet-1"]',
+      )
       .click()
 
     await expect(cell(page, 'G2').locator('.cell-display')).toHaveText('Alice')
     await expect(cell(page, 'G3').locator('.cell-display')).toHaveText('Bob')
-    // Row 4 used to be the duplicate "Alice" — it now shifts up and the
-    // bottom row clears.
-    await expect(cell(page, 'G4').locator('.cell-display')).toHaveText('')
+    await expect(cell(page, 'G4').locator('.cell-display')).toHaveText('Alice')
   })
 
   test('undo restores rows deleted by Remove Duplicates', async ({ page }) => {
@@ -299,7 +340,7 @@ test.describe('remove-duplicates — Data > Remove Duplicates smoke', () => {
 
     await selectRange(page, 'G1', 'G6')
 
-    await openDialog(page)
+    await openDialogFromDataMenu(page)
 
     await page.getByTestId('remove-duplicates-confirm-button').click()
     await expect(page.getByTestId('wave5-remove-duplicates')).toHaveCount(0)
@@ -339,7 +380,7 @@ test.describe('remove-duplicates — Data > Remove Duplicates smoke', () => {
 
     await selectRange(page, 'G1', 'G4')
 
-    await openDialog(page)
+    await openDialogFromCompatibilityEvent(page)
 
     // Default exact → no duplicates.
     await expect(page.getByTestId('remove-duplicates-confirm-button')).toBeDisabled()

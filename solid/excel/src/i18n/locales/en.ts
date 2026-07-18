@@ -40,41 +40,51 @@ export const messages: Record<string, string> = {
 
   // Demo headings + descriptions.
   'demo.blank.title': 'Blank Spreadsheet',
-  'demo.blank.desc.beforeCode': 'Double-click any cell to edit. Type a number, text, or formula (start with',
+  'demo.blank.desc.beforeCode':
+    'Double-click any cell to edit. Type a number, text, or formula (start with',
   'demo.blank.desc.beforeEnter': '). Press',
   'demo.blank.desc.beforeEsc': 'to confirm,',
   'demo.blank.desc.afterEsc': 'to cancel.',
 
   'demo.formulas.title': 'Formula Showcase',
-  'demo.formulas.desc.beforeDiv': 'Try changing the blue numbers — all formulas update automatically. Cell E4 shows',
-  'demo.formulas.desc.afterDiv': '(division by zero). The chain F8→G8→H8→I8 propagates through 4 levels.',
+  'demo.formulas.desc.beforeDiv':
+    'Try changing the blue numbers — all formulas update automatically. Cell E4 shows',
+  'demo.formulas.desc.afterDiv':
+    '(division by zero). The chain F8→G8→H8→I8 propagates through 4 levels.',
 
   'demo.budget.title': 'Monthly Budget',
-  'demo.budget.desc': 'Edit the Budget (B) and Actual (C) columns. The Diff column and summary rows update automatically. Positive diff = under budget, negative = over budget.',
+  'demo.budget.desc':
+    'Edit the Budget (B) and Actual (C) columns. The Diff column and summary rows update automatically. Positive diff = under budget, negative = over budget.',
 
   'demo.grades.title': 'Grade Calculator',
-  'demo.grades.desc': "Edit any score — Average, Max, Min, and class statistics all recalculate instantly. Each student's row uses AVERAGE, MAX, MIN.",
+  'demo.grades.desc':
+    "Edit any score — Average, Max, Min, and class statistics all recalculate instantly. Each student's row uses AVERAGE, MAX, MIN.",
 
   'demo.sales.title': 'Sales Dashboard',
-  'demo.sales.desc.before': 'Quarterly sales report with automatic totals, averages, and KPI calculations. Edit any sales figure — the dashboard updates in real time. Growth rates are computed as',
+  'demo.sales.desc.before':
+    'Quarterly sales report with automatic totals, averages, and KPI calculations. Edit any sales figure — the dashboard updates in real time. Growth rates are computed as',
   'demo.sales.desc.after': '.',
 
   'demo.multi.title': 'Multi-Sheet Workbook',
   'demo.multi.desc.beforePlus': 'Click a tab to switch sheets. Click',
-  'demo.multi.desc.afterPlus': 'to add a new sheet. Right-click a tab for rename / delete. Each sheet has independent state, undo, and selection.',
+  'demo.multi.desc.afterPlus':
+    'to add a new sheet. Right-click a tab for rename / delete. Each sheet has independent state, undo, and selection.',
 
   'demo.cross.title': '3-Sheet Dependency Chain',
   'demo.cross.desc.lazyProbe': 'Lazy probe:',
   'demo.cross.desc.cache': ', cache',
 
   'demo.large.title': 'Large Grid — Row Virtualization',
-  'demo.large.desc': '1000 rows × 26 columns. Only the visible window plus a small overscan is in the DOM — scroll to see new rows hydrate on demand. Arrow-keys past the bottom of the viewport auto-scroll the focus cell back into view.',
+  'demo.large.desc':
+    '1000 rows × 26 columns. Only the visible window plus a small overscan is in the DOM — scroll to see new rows hydrate on demand. Arrow-keys past the bottom of the viewport auto-scroll the focus cell back into view.',
 
   'demo.worker.title': 'Worker-backed Sheet',
-  'demo.worker.desc': 'WASM runs in a Web Worker; the main thread only ferries diffs. Type into cells, create formulas — same Excel demo, just with the compute on a separate thread. Useful for very heavy recompute workloads (the UI stays responsive).',
+  'demo.worker.desc':
+    'WASM runs in a Web Worker; the main thread only ferries diffs. Type into cells, create formulas — same Excel demo, just with the compute on a separate thread. Useful for very heavy recompute workloads (the UI stays responsive).',
 
   'demo.million.title': '1M-Cell Worker Demo',
-  'demo.million.desc': '1000 × 1000 = 1,000,000 addressable cells over a Web Worker backend. Only a handful are seeded; the rest stay sparse. Two-dimensional virtualization renders just the viewport.',
+  'demo.million.desc':
+    '1000 × 1000 = 1,000,000 addressable cells over a Web Worker backend. Only a handful are seeded; the rest stay sparse. Two-dimensional virtualization renders just the viewport.',
   'demo.million.import.choose': 'Import CSV/TSV',
   'demo.million.import.cancel': 'Cancel',
   'demo.million.import.status.running': 'Importing',
@@ -130,7 +140,9 @@ export const messages: Record<string, string> = {
   'menuBar.format.conditional': 'Conditional Formatting…',
   'menuBar.format.validation': 'Data Validation…',
   'menuBar.format.hideRow': 'Hide Row',
+  'menuBar.format.unhideRow': 'Unhide Rows',
   'menuBar.format.hideCol': 'Hide Column',
+  'menuBar.format.unhideCol': 'Unhide Columns',
   'menuBar.format.freezePanes': 'Freeze Panes',
   // Menu bar — Data
   'menuBar.data.sortAsc': 'Sort Ascending',
@@ -176,8 +188,7 @@ export const messages: Record<string, string> = {
   'copyAs.status.success': 'Copied as HTML + Markdown + Plain text',
   // Fallback status: ClipboardItem write rejected (e.g. permission), the
   // host fell back to navigator.clipboard.writeText with the TSV flavour.
-  'copyAs.status.fallback':
-    'Copied as plain text only (HTML/Markdown unavailable in this context)',
+  'copyAs.status.fallback': 'Copied as plain text only (HTML/Markdown unavailable in this context)',
   // Error status: both write paths failed (rare — http:// without permission).
   'copyAs.status.failed': 'Copy failed — clipboard access blocked',
   // Selection-size cap: emitted when the user tries to Copy as on a region
@@ -426,10 +437,8 @@ export const messages: Record<string, string> = {
   'toolbar.printPreview': 'Print preview',
   'toolbar.printPreview.title': 'Print preview',
   'toolbar.painter': 'Painter',
-  'toolbar.painter.title':
-    'Format painter (single click to copy format; double click for sticky)',
-  'toolbar.painter.title.sticky':
-    'Format painter (sticky — click button or Esc to exit)',
+  'toolbar.painter.title': 'Format painter (single click to copy format; double click for sticky)',
+  'toolbar.painter.title.sticky': 'Format painter (sticky — click button or Esc to exit)',
   'toolbar.undo': 'Undo',
   'toolbar.undo.title': 'Undo (Ctrl+Z)',
   'toolbar.redo': 'Redo',
@@ -470,13 +479,15 @@ export const messages: Record<string, string> = {
   'findReplace.scope.workbook': 'Workbook',
   'findReplace.scope.selection': 'Current selection',
   'findReplace.status.searching': 'Searching...',
+  'findReplace.status.refreshing': 'Refreshing Find results',
   'findReplace.status.failed': 'Search failed',
   'findReplace.status.noMatches': 'No matches',
   'findReplace.status.count': '{current} of {total}',
   'findReplace.replaceAll': 'Replace all',
   'findReplace.replaceAll.capped':
-    'Replaced first {replaced} of {total} matches — run Replace all again for the rest',
+    'Local projection acknowledged {acknowledged} of {total} matches; canonical workbook state is not confirmed.',
   'findReplace.replace': 'Replace',
+  'findReplace.action.retryRefresh': 'Retry refresh',
   'findReplace.close': 'Close',
 
   // Go To dialog
@@ -576,6 +587,8 @@ export const messages: Record<string, string> = {
   'dataValidation.clear': 'Clear',
   'dataValidation.cancel': 'Cancel',
   'dataValidation.save': 'OK',
+  'nameBox.label': 'Name box',
+  'nameBox.error': 'Enter a valid cell, range, or defined name.',
   'nameManager.title': 'Name Manager',
   'nameManager.name': 'Name',
   'nameManager.scope': 'Scope',
@@ -601,6 +614,31 @@ export const messages: Record<string, string> = {
   'status.aggregate.numericCount': 'Numeric Count',
   'status.aggregate.min': 'Min',
   'status.aggregate.max': 'Max',
+  'status.aggregate.groupLabel': 'Selection aggregates',
+  'status.aggregate.toggleLabel': 'Toggle {aggregate}',
+  'status.aggregate.empty': 'No aggregates',
+  'status.aggregate.truncated': 'Partial results',
+  'status.aggregate.summary': 'Selection aggregates: {values}',
+  'status.aggregate.summaryEmpty': 'Selection aggregates: none',
+  'status.aggregate.summaryTruncated': '{summary}. Results are truncated.',
+  'status.selection.all': 'All',
+  'status.projection.label': 'Projection status',
+  'status.projection.idle': 'Idle',
+  'status.projection.loading': 'Loading',
+  'status.projection.ready': 'Ready',
+  'status.projection.error': 'Projection error',
+  'status.projection.unknown': 'Unknown',
+  'status.visibleCells': '{count} cells',
+  'status.loadedValues': '{count} loaded',
+  'status.lastCommand.ready': 'Ready',
+  'status.lastCommand.toolbar': 'Toolbar {command}',
+  'status.lastCommand.menu': 'Menu {command}',
+  'status.lastCommand.clipboardCopy': 'Clipboard copy',
+  'status.lastCommand.clipboardCut': 'Clipboard cut',
+  'status.lastCommand.clipboardPaste': 'Clipboard paste',
+  'status.zoom.presetLabel': 'Set zoom to {percent}%',
+  'status.zoom.sliderLabel': 'Zoom level',
+  'status.zoom.resetLabel': 'Reset zoom to 100%',
   'status.viewMode.normal': 'Normal',
   'status.viewMode.pageBreak': 'Page Break Preview',
   'status.viewMode.pageLayout': 'Page Layout',
@@ -611,6 +649,16 @@ export const messages: Record<string, string> = {
 
   // Shared dialog chrome
   'dialog.close.label': 'Close',
+
+  // Worksheet protection unlock dialog
+  'protection.unlock.ariaLabel': 'Unlock protected range',
+  'protection.unlock.target.sheet': 'Worksheet {sheetId}',
+  'protection.unlock.target.range':
+    'Worksheet {sheetId}, rows {rowStart}–{rowEnd}, columns {colStart}–{colEnd}',
+  'protection.unlock.password': 'Password',
+  'protection.unlock.confirm': 'Unlock',
+  'protection.unlock.refresh': 'Refresh status',
+  'protection.unlock.cancel': 'Cancel',
 
   // Format Cells dialog — tabs
   'formatCells.tab.number': 'Number',

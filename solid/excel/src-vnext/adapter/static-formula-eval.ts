@@ -792,6 +792,7 @@ function resolveCellValue(
     return result
   }
   if (cell.valueKind === 'number') {
+    if (Number.isFinite(cell.numericValue)) return cell.numericValue!
     const n = Number(cell.displayValue)
     return Number.isFinite(n) ? n : 0
   }

@@ -18,6 +18,7 @@ import {
   selectionAtom,
   selectionRegionsAtom,
   setSelectionBoundsAtom,
+  setSelectionAtom,
   setSheetTabsSheetsAtom,
   setNameRegistryAtom,
   setViewportMetricsAtom,
@@ -28,9 +29,17 @@ import { SpreadsheetGoToDialog } from '../src-vnext/go-to'
 
 afterEach(cleanup)
 
-function createBaseBackend(
-  cells: RangeProjectionResult['cells'] = [],
-): SpreadsheetBackend {
+function deferred<T>() {
+  let resolve!: (value: T | PromiseLike<T>) => void
+  let reject!: (reason?: unknown) => void
+  const promise = new Promise<T>((resolvePromise, rejectPromise) => {
+    resolve = resolvePromise
+    reject = rejectPromise
+  })
+  return { promise, reject, resolve }
+}
+
+function createBaseBackend(cells: RangeProjectionResult['cells'] = []): SpreadsheetBackend {
   return {
     async readVisibleProjection() {
       throw new Error('not used')
@@ -265,7 +274,9 @@ describe('SpreadsheetGoToDialog', () => {
     ))
     store.setter(openGoToAtom)
     // Switch to special tab
-    const specialTab = container.querySelector('[data-testid="go-to-tab-special"]') as HTMLButtonElement
+    const specialTab = container.querySelector(
+      '[data-testid="go-to-tab-special"]',
+    ) as HTMLButtonElement
     fireEvent.click(specialTab)
     const blanksRadio = container.querySelector(
       '[data-testid="go-to-locator-blanks"]',
@@ -286,8 +297,7 @@ describe('SpreadsheetGoToDialog', () => {
         if (r.kind === 'cell') {
           covered += 1
         } else if (r.kind === 'range') {
-          covered +=
-            (r.focus.row - r.anchor.row + 1) * (r.focus.col - r.anchor.col + 1)
+          covered += (r.focus.row - r.anchor.row + 1) * (r.focus.col - r.anchor.col + 1)
         }
       }
       expect(covered).toBe(6)
@@ -323,9 +333,7 @@ describe('SpreadsheetGoToDialog', () => {
   it('Special mode: shows "no matches" inline when scan returns 0 cells', async () => {
     const store = createStore()
     bootstrap(store)
-    const cells = [
-      { row: 0, col: 0, displayValue: '1', valueKind: 'number' as const },
-    ]
+    const cells = [{ row: 0, col: 0, displayValue: '1', valueKind: 'number' as const }]
     const backend = createBaseBackend(cells)
     const { container } = render(() => (
       <SpreadsheetUiProvider backend={backend} store={store}>
@@ -343,6 +351,258 @@ describe('SpreadsheetGoToDialog', () => {
       return el!
     })
     expect(err.textContent ?? '').toBeTruthy()
+    expect(store.getter(goToOpenAtom)).toBe(true)
+  })
+
+  it('Special mode: bounded no-match stays open with a visible incomplete warning', async () => {
+    const store = createStore()
+    bootstrap(store)
+    store.setter(setSelectionBoundsAtom, { rowCount: 100_001, colCount: 1 })
+    store.setter(setSelectionAtom, {
+      kind: 'cell',
+      sheetId: 'sheet1',
+      anchor: { row: 1, col: 0 },
+      focus: { row: 1, col: 0 },
+    })
+    store.setter(setViewportMetricsAtom, {
+      scrollTop: 0,
+      scrollLeft: 0,
+      viewportHeight: 240,
+      viewportWidth: 80,
+      rowHeight: 24,
+      colWidth: 80,
+      rowCount: 100_001,
+      colCount: 1,
+      overscanRows: 0,
+      overscanCols: 0,
+    })
+    const initialSelection = store.getter(selectionAtom)
+    const capturedRequests: RangeProjectionRequest[] = []
+    const backend: SpreadsheetBackend = {
+      ...createBaseBackend(),
+      async readRangeProjection(request) {
+        capturedRequests.push(request)
+        return {
+          kind: 'range',
+          sheetId: request.sheetId,
+          range: request.range,
+          requestId: request.requestId,
+          cells: [],
+        }
+      },
+    }
+    const { container } = render(() => (
+      <SpreadsheetUiProvider backend={backend} store={store}>
+        <SpreadsheetGoToDialog />
+      </SpreadsheetUiProvider>
+    ))
+    store.setter(openGoToAtom)
+    fireEvent.click(container.querySelector('[data-testid="go-to-tab-special"]')!)
+    fireEvent.click(container.querySelector('[data-testid="go-to-locator-comments"]')!)
+    fireEvent.click(container.querySelector('[data-testid="go-to-confirm-button"]')!)
+
+    const warning = await waitFor(() => {
+      const el = container.querySelector('[data-testid="go-to-truncated"]')
+      expect(el).not.toBeNull()
+      return el!
+    })
+    const dialog = container.querySelector('[data-testid="go-to-dialog"]')!
+    expect(capturedRequests[0]?.range).toEqual({
+      rowStart: 0,
+      rowEnd: 99_999,
+      colStart: 0,
+      colEnd: 0,
+    })
+    expect(warning.textContent).toContain('100000')
+    expect(dialog.getAttribute('data-special-warning')).toBe('cells')
+    expect(dialog.getAttribute('data-special-pending')).toBe('false')
+    expect(container.querySelector('[data-testid="go-to-error-text"]')).toBeNull()
+    expect(store.getter(selectionAtom)).toEqual(initialSelection)
+    expect(store.getter(goToOpenAtom)).toBe(true)
+  })
+
+  it('Special mode: bounded match commits selection and keeps warning visible', async () => {
+    const store = createStore()
+    bootstrap(store)
+    store.setter(setSelectionBoundsAtom, { rowCount: 100_001, colCount: 1 })
+    store.setter(setViewportMetricsAtom, {
+      scrollTop: 0,
+      scrollLeft: 0,
+      viewportHeight: 240,
+      viewportWidth: 80,
+      rowHeight: 24,
+      colWidth: 80,
+      rowCount: 100_001,
+      colCount: 1,
+      overscanRows: 0,
+      overscanCols: 0,
+    })
+    const backend = createBaseBackend([
+      {
+        row: 99_999,
+        col: 0,
+        displayValue: 'commented',
+        valueKind: 'string',
+        commentThreadId: 'thread-last',
+      },
+    ])
+    const { container } = render(() => (
+      <SpreadsheetUiProvider backend={backend} store={store}>
+        <SpreadsheetGoToDialog />
+      </SpreadsheetUiProvider>
+    ))
+    store.setter(openGoToAtom)
+    fireEvent.click(container.querySelector('[data-testid="go-to-tab-special"]')!)
+    fireEvent.click(container.querySelector('[data-testid="go-to-locator-comments"]')!)
+    fireEvent.click(container.querySelector('[data-testid="go-to-confirm-button"]')!)
+
+    await waitFor(() => {
+      expect(store.getter(selectionAtom)).toMatchObject({ anchor: { row: 99_999, col: 0 } })
+      expect(container.querySelector('[data-testid="go-to-truncated"]')).not.toBeNull()
+    })
+    expect(store.getter(goToOpenAtom)).toBe(true)
+    expect(
+      container.querySelector('[data-testid="go-to-dialog"]')?.getAttribute('data-special-warning'),
+    ).toBe('cells')
+  })
+
+  it('Special mode: pending witness disables duplicate dispatch but keeps cancel available', async () => {
+    const store = createStore()
+    bootstrap(store)
+    const gate = deferred<RangeProjectionResult>()
+    const requests: RangeProjectionRequest[] = []
+    const backend: SpreadsheetBackend = {
+      ...createBaseBackend(),
+      readRangeProjection(request) {
+        requests.push(request)
+        return gate.promise
+      },
+    }
+    const { container } = render(() => (
+      <SpreadsheetUiProvider backend={backend} store={store}>
+        <SpreadsheetGoToDialog />
+      </SpreadsheetUiProvider>
+    ))
+    store.setter(openGoToAtom)
+    fireEvent.click(container.querySelector('[data-testid="go-to-tab-special"]')!)
+    fireEvent.click(container.querySelector('[data-testid="go-to-locator-comments"]')!)
+    const confirm = container.querySelector(
+      '[data-testid="go-to-confirm-button"]',
+    ) as HTMLButtonElement
+    fireEvent.click(confirm)
+    fireEvent.click(confirm)
+
+    await waitFor(() => {
+      const dialog = container.querySelector('[data-testid="go-to-dialog"]')!
+      expect(dialog.getAttribute('data-special-pending')).toBe('true')
+      expect(confirm.disabled).toBe(true)
+    })
+    expect(requests).toHaveLength(1)
+    expect(
+      (container.querySelector('[data-testid="go-to-cancel-button"]') as HTMLButtonElement)
+        .disabled,
+    ).toBe(false)
+
+    const request = requests[0]
+    gate.resolve({
+      kind: 'range',
+      sheetId: request.sheetId,
+      range: request.range,
+      requestId: request.requestId,
+      cells: [],
+    })
+    await waitFor(() => {
+      expect(
+        container
+          .querySelector('[data-testid="go-to-dialog"]')
+          ?.getAttribute('data-special-pending'),
+      ).toBe('false')
+    })
+  })
+
+  it('Special mode: close/reopen ignores the old async result', async () => {
+    const store = createStore()
+    bootstrap(store)
+    store.setter(setSelectionAtom, {
+      kind: 'cell',
+      sheetId: 'sheet1',
+      anchor: { row: 1, col: 1 },
+      focus: { row: 1, col: 1 },
+    })
+    const initialSelection = store.getter(selectionAtom)
+    const gate = deferred<RangeProjectionResult>()
+    let request!: RangeProjectionRequest
+    const backend: SpreadsheetBackend = {
+      ...createBaseBackend(),
+      readRangeProjection(next) {
+        request = next
+        return gate.promise
+      },
+    }
+    const { container } = render(() => (
+      <SpreadsheetUiProvider backend={backend} store={store}>
+        <SpreadsheetGoToDialog />
+      </SpreadsheetUiProvider>
+    ))
+    store.setter(openGoToAtom)
+    fireEvent.click(container.querySelector('[data-testid="go-to-tab-special"]')!)
+    fireEvent.click(container.querySelector('[data-testid="go-to-locator-comments"]')!)
+    fireEvent.click(container.querySelector('[data-testid="go-to-confirm-button"]')!)
+    fireEvent.click(container.querySelector('[data-testid="go-to-cancel-button"]')!)
+    store.setter(openGoToAtom)
+    fireEvent.click(container.querySelector('[data-testid="go-to-tab-special"]')!)
+
+    gate.resolve({
+      kind: 'range',
+      sheetId: request.sheetId,
+      range: request.range,
+      requestId: request.requestId,
+      cells: [
+        {
+          row: 4,
+          col: 4,
+          displayValue: 'stale',
+          valueKind: 'string',
+          commentThreadId: 'stale-thread',
+        },
+      ],
+    })
+    await gate.promise
+    await waitFor(() => {
+      expect(store.getter(selectionAtom)).toEqual(initialSelection)
+      expect(store.getter(goToOpenAtom)).toBe(true)
+      expect(container.querySelector('[data-testid="go-to-special-pane"]')).not.toBeNull()
+      expect(container.querySelector('[data-testid="go-to-error-text"]')).toBeNull()
+    })
+  })
+
+  it('Special mode: missing range projection is explicit and confirm stays disabled', async () => {
+    const store = createStore()
+    bootstrap(store)
+    const backend = {
+      ...createBaseBackend(),
+      readRangeProjection: undefined,
+    } as unknown as SpreadsheetBackend
+    const { container } = render(() => (
+      <SpreadsheetUiProvider backend={backend} store={store}>
+        <SpreadsheetGoToDialog />
+      </SpreadsheetUiProvider>
+    ))
+    store.setter(openGoToAtom)
+    fireEvent.click(container.querySelector('[data-testid="go-to-tab-special"]')!)
+
+    const error = await waitFor(() => {
+      const el = container.querySelector('[data-testid="go-to-error-text"]')
+      expect(el).not.toBeNull()
+      return el!
+    })
+    const dialog = container.querySelector('[data-testid="go-to-dialog"]')!
+    expect(error.textContent).toContain('range projection')
+    expect(dialog.getAttribute('data-special-capability')).toBe('unavailable')
+    expect(
+      (container.querySelector('[data-testid="go-to-confirm-button"]') as HTMLButtonElement)
+        .disabled,
+    ).toBe(true)
     expect(store.getter(goToOpenAtom)).toBe(true)
   })
 
@@ -379,7 +639,9 @@ describe('SpreadsheetGoToDialog', () => {
     expect(store.getter(goToModeAtom)).toBe('special')
 
     // Close dialog
-    const closeBtn = container.querySelector('[data-testid="go-to-cancel-button"]') as HTMLButtonElement
+    const closeBtn = container.querySelector(
+      '[data-testid="go-to-cancel-button"]',
+    ) as HTMLButtonElement
     fireEvent.click(closeBtn)
     expect(store.getter(goToOpenAtom)).toBe(false)
 

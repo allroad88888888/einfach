@@ -5,10 +5,12 @@ import { useAtomValue } from '@einfach/solid'
 import {
   canRedoAtom,
   canUndoAtom,
+  historyCanRetryRefreshAtom,
+  historyLifecycleAtom,
   historyStackAtom,
   type HistoryEntry,
 } from '@einfach/spreadsheet-ui-core'
-import { dispatchRedo, dispatchUndo } from '../provider/history-dispatch'
+import { dispatchRedo, dispatchUndo, retryHistoryRefresh } from '../provider/history-dispatch'
 import { useSpreadsheetBackend, useSpreadsheetUiStore } from '../provider/hooks'
 
 export interface SpreadsheetHistoryTimelineProps {
@@ -28,8 +30,10 @@ export function SpreadsheetHistoryTimeline(props: SpreadsheetHistoryTimelineProp
   const store = useSpreadsheetUiStore()
   const backend = useSpreadsheetBackend()
   const stack = useAtomValue(historyStackAtom)
+  const lifecycle = useAtomValue(historyLifecycleAtom)
   const canUndo = useAtomValue(canUndoAtom)
   const canRedo = useAtomValue(canRedoAtom)
+  const canRetryRefresh = useAtomValue(historyCanRetryRefreshAtom)
 
   function format(entry: HistoryEntry): string {
     return (props.formatTimestamp ?? defaultFormatTimestamp)(entry)
@@ -37,6 +41,12 @@ export function SpreadsheetHistoryTimeline(props: SpreadsheetHistoryTimelineProp
 
   const dispatchUndoOnce = () => dispatchUndo(store, backend)
   const dispatchRedoOnce = () => dispatchRedo(store, backend)
+  const retryRefreshOnce = () => retryHistoryRefresh(store, backend)
+
+  const timelineLocked = () =>
+    stack().inFlight ||
+    lifecycle().status === 'refresh-failed' ||
+    lifecycle().status === 'outcome-unknown'
 
   async function jumpTo(targetIndex: number) {
     // targetIndex 0 means "before any entry"; cursor==N means "after entry N-1".
@@ -47,11 +57,12 @@ export function SpreadsheetHistoryTimeline(props: SpreadsheetHistoryTimelineProp
     while (safety++ < 200) {
       const current = store.getter(historyStackAtom)
       if (current.cursor === desiredCursor) return
-      if (current.inFlight) return
       if (current.cursor < desiredCursor) {
+        if (!store.getter(canRedoAtom)) return
         const ok = await dispatchRedoOnce()
         if (!ok) return
       } else {
+        if (!store.getter(canUndoAtom)) return
         const ok = await dispatchUndoOnce()
         if (!ok) return
       }
@@ -62,6 +73,7 @@ export function SpreadsheetHistoryTimeline(props: SpreadsheetHistoryTimelineProp
     <div
       class={`spreadsheet-history-timeline ${props.class ?? ''}`.trim()}
       data-testid={props['data-testid'] ?? 'history-timeline'}
+      data-lifecycle-status={lifecycle().status}
       role="list"
       aria-label="History timeline"
     >
@@ -112,7 +124,7 @@ export function SpreadsheetHistoryTimeline(props: SpreadsheetHistoryTimelineProp
                   type="button"
                   class="history-timeline-entry-btn"
                   data-testid={`history-timeline-jump-${index()}`}
-                  disabled={stack().inFlight}
+                  disabled={timelineLocked()}
                   onClick={() => void jumpTo(index())}
                 >
                   <span class="history-timeline-entry-kind">{entry.kind}</span>
@@ -125,12 +137,31 @@ export function SpreadsheetHistoryTimeline(props: SpreadsheetHistoryTimelineProp
       </ul>
 
       <Show when={stack().entries.length === 0}>
-        <div
-          class="history-timeline-empty"
-          data-testid="history-timeline-empty"
-        >
+        <div class="history-timeline-empty" data-testid="history-timeline-empty">
           No history yet
         </div>
+      </Show>
+
+      <Show when={lifecycle().status !== 'ready' && lifecycle().error.length > 0}>
+        <div
+          class="history-timeline-status"
+          data-testid="history-timeline-status"
+          data-status={lifecycle().status}
+          role={lifecycle().status === 'outcome-unknown' ? 'alert' : 'status'}
+        >
+          {lifecycle().error}
+        </div>
+      </Show>
+
+      <Show when={canRetryRefresh()}>
+        <button
+          type="button"
+          class="history-timeline-btn history-timeline-btn-retry"
+          data-testid="history-timeline-retry-refresh"
+          onClick={() => void retryRefreshOnce()}
+        >
+          Retry refresh
+        </button>
       </Show>
     </div>
   )

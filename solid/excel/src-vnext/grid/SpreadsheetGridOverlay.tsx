@@ -4,10 +4,12 @@ import {
   editingSessionAtom,
   formulaReferenceTokensAtom,
   getSelectionRange,
+  isViewportFreezeProjectionReady,
   pointerSessionAtom,
   selectionRangeAtom,
   selectionRegionsAtom,
   viewportFreezeAtom,
+  viewportFreezeProjectionAuthorityAtom,
   viewportHiddenAtom,
   viewportMetricsAtom,
   viewportSizeOverridesAtom,
@@ -21,7 +23,7 @@ import {
 import { onCleanup, onMount } from 'solid-js'
 import type { Store } from '@einfach/core'
 import { spreadsheetProjectionSnapshotAtom } from '../provider'
-import { useSpreadsheetUiStore } from '../provider'
+import { useSpreadsheetBackend, useSpreadsheetUiStore } from '../provider'
 import { computeOverlayRectForRange } from './overlayGeometry'
 
 // Stable color palette for formula-reference highlights. Indexed by colorIndex
@@ -97,6 +99,7 @@ export interface OverlayViewportProvider {
   getSheetId(): string
   getCells(): readonly DisplayCell[]
   getFreezeOrigin(): { x: number; y: number }
+  isFreezeProjectionReady?(): boolean
   getVisibleRows?(): readonly number[]
   getVisibleCols?(): readonly number[]
 }
@@ -224,6 +227,7 @@ export class OverlayRenderer {
     this.unsubscribes.push(store.sub(clipboardStateAtom, wake('clipboard')))
     this.unsubscribes.push(store.sub(viewportMetricsAtom, wake('metrics')))
     this.unsubscribes.push(store.sub(viewportFreezeAtom, wake('viewport')))
+    this.unsubscribes.push(store.sub(viewportFreezeProjectionAuthorityAtom, wake('viewport')))
     this.unsubscribes.push(store.sub(viewportSizeOverridesAtom, wake('metrics')))
     this.unsubscribes.push(store.sub(viewportHiddenAtom, wake('viewport')))
     this.unsubscribes.push(store.sub(spreadsheetProjectionSnapshotAtom, wake('projection')))
@@ -264,6 +268,7 @@ export class OverlayRenderer {
     const store = this.store
     const sheetId = this.viewport.getSheetId()
     const freeze = store.getter(viewportFreezeAtom)
+    const freezeProjectionReady = this.viewport.isFreezeProjectionReady?.() ?? true
     const selection = store.getter(selectionRangeAtom)
     const regions = store.getter(selectionRegionsAtom)
     const active = store.getter(activeCellAtom)
@@ -277,8 +282,8 @@ export class OverlayRenderer {
       selectionRange: selection,
       pointerSession: ps,
       clipboard: clip,
-      freezeRows: freeze.rowsBySheet[sheetId] ?? 0,
-      freezeCols: freeze.colsBySheet[sheetId] ?? 0,
+      freezeRows: freezeProjectionReady ? (freeze.rowsBySheet[sheetId] ?? 0) : 0,
+      freezeCols: freezeProjectionReady ? (freeze.colsBySheet[sheetId] ?? 0) : 0,
       marchingAntsOffset: this.marchingAntsOffset,
       formulaReferenceTokens: tokens,
       formulaReferenceSheetId: editing.source?.sheetId ?? null,
@@ -631,6 +636,7 @@ export interface SpreadsheetGridOverlayProps {
 
 export function SpreadsheetGridOverlay(props: SpreadsheetGridOverlayProps) {
   const store = useSpreadsheetUiStore()
+  const backend = useSpreadsheetBackend()
   let canvas: HTMLCanvasElement | undefined
   const renderer = new OverlayRenderer(props.contextFactory)
 
@@ -642,6 +648,12 @@ export function SpreadsheetGridOverlay(props: SpreadsheetGridOverlayProps) {
       getSheetId: () => props.sheetId,
       getCells: () => props.getCells(),
       getFreezeOrigin: () => props.getFreezeOrigin?.() ?? { x: 0, y: 0 },
+      isFreezeProjectionReady: () =>
+        isViewportFreezeProjectionReady(
+          store.getter(viewportFreezeProjectionAuthorityAtom),
+          backend,
+          props.sheetId,
+        ),
       getVisibleRows: props.getVisibleRows ? () => props.getVisibleRows!() : undefined,
       getVisibleCols: props.getVisibleCols ? () => props.getVisibleCols!() : undefined,
     }

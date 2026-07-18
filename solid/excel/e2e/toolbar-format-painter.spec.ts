@@ -1,5 +1,11 @@
 import { expect, test, type Page } from '@playwright/test'
-import { cell, cellDisplay, guardConsoleErrors, withEnglishLocale } from './helpers'
+import {
+  cell,
+  cellDisplay,
+  expectNoConsoleErrors,
+  guardConsoleErrors,
+  withEnglishLocale,
+} from './helpers'
 
 async function gotoWave5(page: Page) {
   await page.goto(withEnglishLocale())
@@ -65,6 +71,33 @@ test.describe('Wave 5 toolbar format painter', () => {
 
     await cell(page, skipTarget).click()
     await expect(cellDisplay(page, skipTarget)).not.toHaveCSS('font-weight', '700')
+  })
+
+  test('single-click painter restores a formatted target from an unformatted source', async ({
+    page,
+  }) => {
+    await gotoWave5(page)
+    const target = 'B2'
+    const unformattedSource = 'C2'
+
+    await cell(page, unformattedSource).click()
+    await expect(cellDisplay(page, unformattedSource)).not.toHaveCSS('font-weight', '700')
+
+    await cell(page, target).click()
+    await boldButton(page).click()
+    await expect(cellDisplay(page, target)).toHaveCSS('font-weight', '700')
+
+    await cell(page, unformattedSource).click()
+    const painter = painterButton(page)
+    await painter.click()
+    await expect(painter).toHaveAttribute('data-format-painter-state', 'armed')
+    await expect(painter).toHaveAttribute('aria-pressed', 'true')
+
+    await cell(page, target).click()
+    await expect(cellDisplay(page, target)).not.toHaveCSS('font-weight', '700')
+    await expect(painter).toHaveAttribute('data-format-painter-state', 'idle')
+    await expect(painter).toHaveAttribute('aria-pressed', 'false')
+    await expectNoConsoleErrors(page)
   })
 
   test('Escape closes an armed painter before any target is painted', async ({ page }) => {

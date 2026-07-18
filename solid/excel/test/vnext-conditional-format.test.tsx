@@ -6,10 +6,10 @@ import { cleanup, fireEvent, render, waitFor } from '@solidjs/testing-library'
 import type { SpreadsheetBackend } from '@einfach/spreadsheet-ui-core'
 import {
   conditionalFormatEditorAtom,
-  conditionalFormatRulesCacheAtom,
   closeConditionalFormatEditorAtom,
   openConditionalFormatEditorAtom,
   selectionAtom,
+  setConditionalFormatRulesAtom,
   workspaceSessionAtom,
   type ConditionalFormatRuleEntry,
 } from '@einfach/spreadsheet-ui-core'
@@ -40,11 +40,17 @@ function createFakeBackend() {
     setCellInput: async (req) => ({ sheetId: req.sheetId }),
     setConditionalFormatRule: jest.fn(async (req) => {
       setConditionalFormatRuleRequests.push(req)
-      return { sheetId: (req as { sheetId: string }).sheetId }
+      return {
+        sheetId: (req as { sheetId: string }).sheetId,
+        requestId: (req as { requestId?: number }).requestId,
+      }
     }),
     removeConditionalFormatRule: jest.fn(async (req) => {
       removeConditionalFormatRuleRequests.push(req)
-      return { sheetId: (req as { sheetId: string }).sheetId }
+      return {
+        sheetId: (req as { sheetId: string }).sheetId,
+        requestId: (req as { requestId?: number }).requestId,
+      }
     }),
   }
 
@@ -76,7 +82,7 @@ describe('SpreadsheetConditionalFormatDialog', () => {
     const store = createStore()
     const { backend } = createFakeBackend()
 
-    store.setter(conditionalFormatRulesCacheAtom, {
+    store.setter(setConditionalFormatRulesAtom, {
       sheetId: 'sheet-1',
       rules: [sampleEntry],
     })
@@ -98,7 +104,7 @@ describe('SpreadsheetConditionalFormatDialog', () => {
     const store = createStore()
     const { backend, setConditionalFormatRuleRequests } = createFakeBackend()
 
-    store.setter(conditionalFormatRulesCacheAtom, {
+    store.setter(setConditionalFormatRulesAtom, {
       sheetId: 'sheet-1',
       rules: [sampleEntry],
     })
@@ -127,7 +133,7 @@ describe('SpreadsheetConditionalFormatDialog', () => {
     const store = createStore()
     const { backend, removeConditionalFormatRuleRequests } = createFakeBackend()
 
-    store.setter(conditionalFormatRulesCacheAtom, { sheetId: 'sheet-2', rules: [sampleEntry] })
+    store.setter(setConditionalFormatRulesAtom, { sheetId: 'sheet-2', rules: [sampleEntry] })
     store.setter(openConditionalFormatEditorAtom, sampleEntry)
 
     const { getByTestId } = render(() => (
@@ -190,16 +196,19 @@ describe('SpreadsheetConditionalFormatDialog', () => {
     expect(options).toContain('top-bottom')
   })
 
-  it('surfaces backend errors on Save and clears them on the next attempt', async () => {
+  it('surfaces an unknown Save outcome and blocks an unverified retry', async () => {
     const store = createStore()
     const { backend } = createFakeBackend()
     let shouldFail = true
     backend.setConditionalFormatRule = jest.fn(async (req) => {
       if (shouldFail) throw new Error('boom')
-      return { sheetId: (req as { sheetId: string }).sheetId }
+      return {
+        sheetId: (req as { sheetId: string }).sheetId,
+        requestId: (req as { requestId?: number }).requestId,
+      }
     })
 
-    store.setter(conditionalFormatRulesCacheAtom, { sheetId: 'sheet-1', rules: [sampleEntry] })
+    store.setter(setConditionalFormatRulesAtom, { sheetId: 'sheet-1', rules: [sampleEntry] })
     store.setter(openConditionalFormatEditorAtom, sampleEntry)
 
     const { getByTestId, queryByTestId } = render(() => (
@@ -216,8 +225,12 @@ describe('SpreadsheetConditionalFormatDialog', () => {
 
     shouldFail = false
     fireEvent.click(getByTestId('cf-save-button'))
-    await waitFor(() => expect(store.getter(conditionalFormatEditorAtom).open).toBe(false))
-    expect(queryByTestId('cf-error-text')).toBeNull()
+    await waitFor(() =>
+      expect(getByTestId('cf-error-text').textContent).toContain('unknown outcome'),
+    )
+    expect(backend.setConditionalFormatRule).toHaveBeenCalledTimes(1)
+    expect(store.getter(conditionalFormatEditorAtom).open).toBe(true)
+    expect(queryByTestId('cf-error-text')).not.toBeNull()
   })
 
   it('surfaces backend errors on Remove', async () => {
@@ -227,7 +240,7 @@ describe('SpreadsheetConditionalFormatDialog', () => {
       throw new Error('remove failed')
     })
 
-    store.setter(conditionalFormatRulesCacheAtom, { sheetId: 'sheet-1', rules: [sampleEntry] })
+    store.setter(setConditionalFormatRulesAtom, { sheetId: 'sheet-1', rules: [sampleEntry] })
     store.setter(openConditionalFormatEditorAtom, sampleEntry)
 
     const { getByTestId } = render(() => (
@@ -253,7 +266,7 @@ describe('SpreadsheetConditionalFormatDialog', () => {
       projectionRequestRevision: 0,
       committedProjectionRequestRevision: 0,
     })
-    store.setter(conditionalFormatRulesCacheAtom, {
+    store.setter(setConditionalFormatRulesAtom, {
       sheetId: 'stale-sheet',
       rules: [sampleEntry],
     })
@@ -278,7 +291,7 @@ describe('SpreadsheetConditionalFormatDialog', () => {
     const store = createStore()
     const { backend, setConditionalFormatRuleRequests } = createFakeBackend()
 
-    store.setter(conditionalFormatRulesCacheAtom, { sheetId: 'cache-sheet', rules: [sampleEntry] })
+    store.setter(setConditionalFormatRulesAtom, { sheetId: 'cache-sheet', rules: [sampleEntry] })
     store.setter(openConditionalFormatEditorAtom, sampleEntry)
 
     const { getByTestId } = render(() => (
@@ -327,9 +340,16 @@ describe('SpreadsheetConditionalFormatDialog', () => {
     })
   })
 
-  it('resets signals when dialog is reopened without a draft', async () => {
+  it('resets core editor kind when dialog is reopened without a draft', async () => {
     const store = createStore()
     const { backend, setConditionalFormatRuleRequests } = createFakeBackend()
+
+    store.setter(workspaceSessionAtom, {
+      activeSheetId: 'sheet-1',
+      viewportRevision: 0,
+      projectionRequestRevision: 0,
+      committedProjectionRequestRevision: 0,
+    })
 
     store.setter(openConditionalFormatEditorAtom, sampleEntry)
 

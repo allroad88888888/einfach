@@ -1,6 +1,5 @@
 import type { Store } from '@einfach/core'
 import {
-  commitEditingAtom,
   cancelEditingAtom,
   editingDraftAtom,
   editingSessionAtom,
@@ -8,11 +7,12 @@ import {
   exitFormulaReferenceAtom,
   formulaFunctionSuggestionCursorAtom,
   formulaFunctionSuggestionsAtom,
-  formulaReferenceCaretAtom,
   formulaReferenceSessionAtom,
-  nextHistoryTransactionId,
-  pushHistoryAtom,
+  retryEditingRefreshAtom,
+  runEditingCommitAtom,
+  setFormulaReferenceCaretAtom,
   shouldEnterFormulaReferenceMode,
+  type EditingCommitOutcome,
   type EditingCommitMove,
   type FormulaFunctionSuggestion,
   type FormulaReferenceExitReason,
@@ -27,61 +27,37 @@ import { refreshVisibleProjection } from './projection-refresh'
  * refreshing the visible projection. Used by both the formula bar and the
  * grid in-cell editor so the two paths share identical post-commit wiring.
  *
- * Returns true if a commit was actually dispatched. Returns false when no
- * editing session was active (i.e. commitEditingAtom returned null).
+ * Returns the UI-core lifecycle outcome. The framework host never owns the
+ * mutation acknowledgement, history cursor, or refresh retry state.
  */
 export async function dispatchEditingCommit(
   store: Store,
   backend: SpreadsheetBackend,
   options: { move?: EditingCommitMove; source?: 'cell' | 'formula-bar' | 'keyboard' | 'paste' } = {},
-): Promise<boolean> {
+): Promise<EditingCommitOutcome> {
   // Clear any active formula-reference pick session before committing —
   // otherwise the next pointer click after commit would still route to
   // pickFormulaReferenceAtom and silently mutate an empty draft.
   if (store.getter(formulaReferenceSessionAtom) !== null) {
     store.setter(exitFormulaReferenceAtom, 'commit' as FormulaReferenceExitReason)
   }
-  const draft = store.getter(editingDraftAtom)
-  const intent = store.setter(commitEditingAtom, {
-    input: draft,
+  return store.setter(runEditingCommitAtom, {
+    source: backend,
     move: options.move ?? 'none',
-    source: options.source ?? 'cell',
+    commitSource: options.source ?? 'cell',
+    refreshProjection: (sheetId) =>
+      refreshVisibleProjection(store, backend, sheetId, 'formula-bar'),
   })
-  if (!intent) return false
+}
 
-  const result = await backend.setCellInput({
-    kind: 'set-cell-input',
-    sheetId: intent.sheetId,
-    row: intent.cell.row,
-    col: intent.cell.col,
-    input: intent.input,
+export async function retryEditingCommitRefresh(
+  store: Store,
+  backend: SpreadsheetBackend,
+): Promise<EditingCommitOutcome> {
+  return store.setter(retryEditingRefreshAtom, {
+    refreshProjection: (sheetId) =>
+      refreshVisibleProjection(store, backend, sheetId, 'formula-bar'),
   })
-  const revision =
-    typeof result?.revision === 'number'
-      ? result.revision
-      : Number(result?.revision ?? 0) || 0
-  store.setter(pushHistoryAtom, {
-    transactionId: nextHistoryTransactionId(),
-    kind: 'cell.set-input',
-    sheetId: intent.sheetId,
-    projectionRevision: revision,
-    affectedRange: result?.affectedRange ?? {
-      rowStart: intent.cell.row,
-      rowEnd: intent.cell.row,
-      colStart: intent.cell.col,
-      colEnd: intent.cell.col,
-    },
-  })
-  // The commit has been applied to the backend and the history entry pushed.
-  // A failed post-commit projection refresh (flaky backend read, stale request
-  // id) must not reject the editing-commit promise — the caller would then
-  // think the commit itself failed even though state has already moved on.
-  try {
-    await refreshVisibleProjection(store, backend, intent.sheetId, 'formula-bar')
-  } catch {
-    // swallow — next user-triggered refresh will reconcile the view.
-  }
-  return true
 }
 
 /**
@@ -110,7 +86,7 @@ export function dispatchEditingCancel(store: Store): boolean {
  * another ref-pick trigger.
  */
 export function syncFormulaReferenceCaret(store: Store, caret: number): void {
-  store.setter(formulaReferenceCaretAtom, caret)
+  store.setter(setFormulaReferenceCaretAtom, caret)
   const session = store.getter(editingSessionAtom)
   if (session.status !== 'drafting' || !session.source) return
   const draft = store.getter(editingDraftAtom)

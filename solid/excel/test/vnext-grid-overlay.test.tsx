@@ -5,6 +5,8 @@ import { createStore } from '@einfach/core'
 import { cleanup, render, waitFor, fireEvent } from '@solidjs/testing-library'
 import type {
   DisplayCell,
+  ReadFreezeConfigRequest,
+  SetFreezeConfigRequest,
   SpreadsheetBackend,
   VisibleProjectionRequest,
   VisibleProjectionResult,
@@ -14,9 +16,9 @@ import {
   clipboardStateAtom,
   copyClipboardAtom,
   cutClipboardAtom,
+  readViewportFreezeCanonicalAtom,
   selectCellAtom,
   setSelectionAtom,
-  setViewportFreezeAtom,
   visibleWindowAtom,
 } from '@einfach/spreadsheet-ui-core'
 import { SpreadsheetGrid } from '../src-vnext/grid'
@@ -205,6 +207,30 @@ function findFillRectForColor(calls: CtxCall[], color: string): CtxCall[] {
   )
 }
 
+async function hydrateFreezeProjection(
+  store: ReturnType<typeof createStore>,
+  freeze: { rows: number; cols: number },
+) {
+  const source = {
+    async readFreezeConfig(request: ReadFreezeConfigRequest) {
+      return {
+        kind: 'freeze-config' as const,
+        sheetId: request.sheetId,
+        requestId: request.requestId,
+        revision: 1,
+        freeze: { ...freeze },
+      }
+    },
+    async setFreezeConfig(request: SetFreezeConfigRequest) {
+      return { sheetId: request.sheetId, requestId: request.requestId, revision: 1 }
+    },
+  }
+  await store.setter(readViewportFreezeCanonicalAtom, {
+    source,
+    sheetId: 'sheet-1',
+  })
+}
+
 describe('OverlayRenderer', () => {
   it('draws a primary selection rectangle at the correct pixel coords', () => {
     const store = createStore()
@@ -372,13 +398,9 @@ describe('OverlayRenderer', () => {
     renderer.detach()
   })
 
-  it('draws a frozen pane divider when viewportFreezeAtom is non-zero', () => {
+  it('draws a frozen pane divider when the canonical projection is ready', async () => {
     const store = createStore()
-    store.setter(setViewportFreezeAtom, {
-      sheetId: 'sheet-1',
-      rows: 2,
-      cols: 1,
-    })
+    await hydrateFreezeProjection(store, { rows: 2, cols: 1 })
 
     const { ctx, calls } = createRecordingContext()
     const renderer = new OverlayRenderer(() => ctx)
@@ -400,6 +422,28 @@ describe('OverlayRenderer', () => {
       (c) => c.args[0] === HEADER_W + CELL_W && c.args[1] === HEADER_H,
     )
     expect(verticalMoves).toHaveLength(1)
+
+    renderer.detach()
+  })
+
+  it('does not draw a stale divider while the projection authority is not ready', async () => {
+    const store = createStore()
+    await hydrateFreezeProjection(store, { rows: 2, cols: 1 })
+    const viewport = makeViewportProvider(store)
+    viewport.isFreezeProjectionReady = () => false
+
+    const { ctx, calls } = createRecordingContext()
+    const renderer = new OverlayRenderer(() => ctx)
+    renderer.attach(makeCanvas(), store, viewport)
+    renderer.renderNow()
+
+    expect(calls.filter((call) => call.op === 'stroke')).toEqual([])
+    expect(
+      calls.filter(
+        (call) =>
+          call.op === 'set:strokeStyle' && call.args[0] === OVERLAY_COLORS.freezeDivider,
+      ),
+    ).toEqual([])
 
     renderer.detach()
   })

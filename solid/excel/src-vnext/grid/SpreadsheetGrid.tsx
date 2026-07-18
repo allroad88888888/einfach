@@ -1,18 +1,20 @@
 import {
+  activateSheetTabAtom,
   CLIPBOARD_ORIGIN_MARKER_PREFIX,
+  beginProjectionAtom,
   cancelPointerAtom,
   clipboardStateAtom,
   commitPointerAtom,
-  commitEditingAtom,
   copyClipboardAtom,
   createClipboardTsvPastePlan,
   cutClipboardAtom,
   createFillHandlePreview,
-  createVisibleProjectionRequest,
+  detectFillSeries,
   dispatchKeyboardInputAtom,
   dismissFormulaSuggestionsAtom,
   editingDraftAtom,
   editingSessionAtom,
+  exitFormulaReferenceAtom,
   formulaFunctionSuggestionCursorAtom,
   formulaFunctionSuggestionsAtom,
   formulaReferenceSessionAtom,
@@ -26,18 +28,22 @@ import {
   getViewportColumnWidth,
   getViewportRowHeight,
   getSelectionRange,
+  hydrateViewportSizeProjectionAtom,
   addSelectionRegionAtom,
+  isViewportFreezeProjectionReady,
   isMergeCovered,
   markClipboardReadyAtom,
   nextHistoryTransactionId,
   openMenuAtom,
   openPasteSpecialAtom,
+  pasteSpecialCapabilityAtom,
   pasteClipboardAtom,
   pointerSessionAtom,
   pushHistoryAtom,
   scrollToCellAtom,
   serializeClipboardTsv,
   setClipboardErrorAtom,
+  shiftFormulaRefs,
   MAX_VIEWPORT_COL_WIDTH,
   MAX_VIEWPORT_ROW_HEIGHT,
   MIN_VIEWPORT_COL_WIDTH,
@@ -50,24 +56,29 @@ import {
   selectColumnsAtom,
   selectRowsAtom,
   setSelectionAtom,
-  setViewportHiddenAtom,
   setViewportColumnWidthAtom,
   setSelectionBoundsAtom,
-  setWorkspaceActiveSheetAtom,
   setViewportRowHeightAtom,
   setViewportMetricsAtom,
+  supportsViewportFreezeAuthority,
   sheetTabsSheetsAtom,
   startPointerAtom,
   startEditingAtom,
   updatePointerAtom,
   activeCellLockedAtom,
-  findReplaceOpenAtom,
+  issueProjectionRequestIdAtom,
+  openFindReplaceAtom,
   openGoToAtom,
   filterSortStateAtom,
+  fillSeriesLocaleAtom,
   openFilterDropdownAtom,
   openFormatCellsAtom,
   notifyActiveSheetChangedAtom,
   remoteCursorsAtom,
+  rejectProjectionAtom,
+  readViewportFreezeCanonicalAtom,
+  resetProjectionAtom,
+  resolveProjectionAtom,
   presenceStateAtom,
   type CellCoord,
   type CellRange,
@@ -75,13 +86,16 @@ import {
   type DisplayCell,
   type DisplayCellRichValue,
   type FormatToggleField,
+  type MenuOpenInput,
   type PointerFillHandleCommitIntent,
+  type RangeProjectionResult,
   type RichTextRunFormat,
   type SelectionRegion,
   type SelectionState,
   type SpreadsheetCellFormat,
   type ViewportMetrics,
   viewportFreezeAtom,
+  viewportFreezeProjectionAuthorityAtom,
   viewportHiddenAtom,
   viewportMetricsAtom,
   viewportShowGridlinesAtom,
@@ -89,23 +103,24 @@ import {
   viewportSizeOverridesAtom,
   workspaceSessionAtom,
 } from '@einfach/spreadsheet-ui-core'
-import { createSignal, For, onCleanup, onMount, Show } from 'solid-js'
+import { createEffect, createSignal, For, onCleanup, onMount, Show } from 'solid-js'
 import {
   acceptFormulaSuggestion,
-  advanceSpreadsheetProjectionRequestIdAtom,
   dispatchCopyAs,
   dispatchCopyAsImage,
   dispatchEditingCancel,
+  dispatchEditingCommit,
   dispatchRedo,
   dispatchUndo,
   notifyDraftTypedChar,
-  pasteSpecialSupportedAtom,
   readActiveFormulaSuggestion,
   resolveProjectionSourceRange,
+  runVisibleProjectionTransport,
   spreadsheetProjectionSnapshotAtom,
   syncFormulaReferenceCaret,
 } from '../provider'
 import { useSpreadsheetBackend, useSpreadsheetUiStore } from '../provider'
+import { SpreadsheetCellBorders } from './SpreadsheetCellBorders'
 import { SpreadsheetGridOverlay } from './SpreadsheetGridOverlay'
 import { SpreadsheetGridOverlaySvg } from './SpreadsheetGridOverlaySvg'
 
@@ -394,10 +409,10 @@ function getCellBordersAttr(cell: DisplayCell | undefined): string | undefined {
   const borders = cell?.format?.borders
   if (!borders) return undefined
   const sides: string[] = []
-  if (borders.top) sides.push('top')
-  if (borders.right) sides.push('right')
-  if (borders.bottom) sides.push('bottom')
-  if (borders.left) sides.push('left')
+  if (borders.top && borders.top.style !== 'none') sides.push('top')
+  if (borders.right && borders.right.style !== 'none') sides.push('right')
+  if (borders.bottom && borders.bottom.style !== 'none') sides.push('bottom')
+  if (borders.left && borders.left.style !== 'none') sides.push('left')
   if (sides.length === 0) return undefined
   return sides.join(' ')
 }
@@ -461,8 +476,15 @@ function isCoordInRange(row: number, col: number, range: CellRange): boolean {
   )
 }
 
-function getCellInputForFill(cell: DisplayCell | undefined): string {
-  return cell?.formula ?? cell?.displayValue ?? ''
+function getCellInputForFill(
+  cell: DisplayCell | undefined,
+  source: CellCoord,
+  target: CellCoord,
+): string {
+  if (cell?.formula) {
+    return shiftFormulaRefs(cell.formula, target.row - source.row, target.col - source.col)
+  }
+  return cell?.displayValue ?? ''
 }
 
 const MAX_UI_FILL_FALLBACK_CELLS = 200
@@ -544,6 +566,7 @@ function measureAutoFitHeight(source: HTMLElement): number {
 export function SpreadsheetGrid(props: SpreadsheetGridProps) {
   const store = useSpreadsheetUiStore()
   const backend = useSpreadsheetBackend()
+  const freezeAuthoritySupported = supportsViewportFreezeAuthority(backend)
   const [renderTick, setRenderTick] = createSignal(0)
   let gridRoot: HTMLDivElement | undefined
   let scrollRoot: HTMLDivElement | undefined
@@ -555,6 +578,7 @@ export function SpreadsheetGrid(props: SpreadsheetGridProps) {
   let unsubscribeSizes: (() => void) | null = null
   let unsubscribeHidden: (() => void) | null = null
   let unsubscribeFreeze: (() => void) | null = null
+  let unsubscribeFreezeAuthority: (() => void) | null = null
   let unsubscribePointer: (() => void) | null = null
   let unsubscribePresence: (() => void) | null = null
   let unsubscribeFilterSort: (() => void) | null = null
@@ -564,6 +588,8 @@ export function SpreadsheetGrid(props: SpreadsheetGridProps) {
   let unsubscribeSelection: (() => void) | null = null
   let unsubscribeEditing: (() => void) | null = null
   let lastActiveSheetId: string | null = null
+  let lastEffectiveFreezeRows = 0
+  let lastEffectiveFreezeCols = 0
   let resizeObserver: ResizeObserver | null = null
 
   function bumpRender() {
@@ -608,6 +634,22 @@ export function SpreadsheetGrid(props: SpreadsheetGridProps) {
   function sizeOverrides() {
     renderTick()
     return store.getter(viewportSizeOverridesAtom)
+  }
+
+  function getEffectiveFreezeProjection() {
+    const authority = store.getter(viewportFreezeProjectionAuthorityAtom)
+    if (
+      !freezeAuthoritySupported ||
+      !isViewportFreezeProjectionReady(authority, backend, props.sheetId)
+    ) {
+      return { rows: 0, cols: 0 }
+    }
+
+    const freezeState = store.getter(viewportFreezeAtom)
+    return {
+      rows: freezeState.rowsBySheet[props.sheetId] ?? 0,
+      cols: freezeState.colsBySheet[props.sheetId] ?? 0,
+    }
   }
 
   function getRenderedVisibleWindow(): CellRange {
@@ -661,9 +703,9 @@ export function SpreadsheetGrid(props: SpreadsheetGridProps) {
     // past them — they need to stay in DOM for `position: sticky` to keep
     // pinning them. readSparseRange returns only cells that exist, so the
     // wider window costs nothing for sparse sheets.
-    const freezeState = store.getter(viewportFreezeAtom)
-    const frozenRows = freezeState.rowsBySheet[props.sheetId] ?? 0
-    const frozenCols = freezeState.colsBySheet[props.sheetId] ?? 0
+    const freeze = getEffectiveFreezeProjection()
+    const frozenRows = freeze.rows
+    const frozenCols = freeze.cols
 
     const expandedRowStart = frozenRows > 0 ? 0 : Math.max(0, rawRowStart - metrics.overscanRows)
     const expandedColStart = frozenCols > 0 ? 0 : Math.max(0, rawColStart - metrics.overscanCols)
@@ -681,14 +723,30 @@ export function SpreadsheetGrid(props: SpreadsheetGridProps) {
     return store.getter(viewportHiddenAtom)
   }
 
+  function freezeProjectionReady(): boolean {
+    renderTick()
+    return (
+      freezeAuthoritySupported &&
+      isViewportFreezeProjectionReady(
+        store.getter(viewportFreezeProjectionAuthorityAtom),
+        backend,
+        props.sheetId,
+      )
+    )
+  }
+
   function freezeRowCount(): number {
     renderTick()
-    return store.getter(viewportFreezeAtom).rowsBySheet[props.sheetId] ?? 0
+    return freezeProjectionReady()
+      ? (store.getter(viewportFreezeAtom).rowsBySheet[props.sheetId] ?? 0)
+      : 0
   }
 
   function freezeColCount(): number {
     renderTick()
-    return store.getter(viewportFreezeAtom).colsBySheet[props.sheetId] ?? 0
+    return freezeProjectionReady()
+      ? (store.getter(viewportFreezeAtom).colsBySheet[props.sheetId] ?? 0)
+      : 0
   }
 
   function getFreezeBoundaryY(): number {
@@ -747,33 +805,26 @@ export function SpreadsheetGrid(props: SpreadsheetGridProps) {
   function requestProjection() {
     const window = getRenderedVisibleWindow()
     if (window.rowEnd < window.rowStart || window.colEnd < window.colStart) {
-      store.setter(spreadsheetProjectionSnapshotAtom, {
-        status: 'idle',
-        request: undefined,
-        result: undefined,
-        error: undefined,
-      })
+      store.setter(resetProjectionAtom)
       bumpRender()
       return undefined
     }
 
-    const requestId = store.setter(advanceSpreadsheetProjectionRequestIdAtom)
-    const request = createVisibleProjectionRequest({
+    const begin = store.setter(beginProjectionAtom, {
+      kind: 'visible-window',
       sheetId: props.sheetId,
       window,
-      requestId,
       reason: 'viewport',
     })
-
-    store.setter(spreadsheetProjectionSnapshotAtom, {
-      status: 'loading',
-      request,
-      result: undefined,
-      error: undefined,
-    })
+    if (
+      (begin.status !== 'started' && begin.status !== 'queued') ||
+      begin.request.kind !== 'visible-window'
+    ) {
+      return undefined
+    }
     bumpRender()
 
-    return { request, requestId }
+    return begin.status === 'started' ? { request: begin.request } : undefined
   }
 
   async function loadProjection(requestInfo: ReturnType<typeof requestProjection>) {
@@ -781,75 +832,53 @@ export function SpreadsheetGrid(props: SpreadsheetGridProps) {
       return
     }
 
-    const { request, requestId } = requestInfo
+    const { request } = requestInfo
     try {
-      const result = await backend.readVisibleProjection(request)
-      const current = store.getter(spreadsheetProjectionSnapshotAtom)
-      if (current.request?.requestId !== requestId) {
-        return
-      }
-      store.setter(spreadsheetProjectionSnapshotAtom, {
-        status: 'ready',
-        request,
-        result,
-        error: undefined,
-      })
-    } catch (error: unknown) {
-      const current = store.getter(spreadsheetProjectionSnapshotAtom)
-      if (current.request?.requestId !== requestId) {
-        return
-      }
-      store.setter(spreadsheetProjectionSnapshotAtom, {
-        status: 'error',
-        request,
-        result: undefined,
-        error:
-          error instanceof Error
-            ? { code: 'BACKEND_ERROR', message: error.message }
-            : { code: 'BACKEND_ERROR', message: 'Spreadsheet projection failed.' },
-      })
+      await runVisibleProjectionTransport(store, backend, request)
+    } catch {
+      // The shared transport loop already published the terminal error.
     }
     bumpRender()
   }
 
-  async function hydrateViewportSizeProjection() {
-    if (!backend.readViewportSizeProjection) {
-      return
-    }
+  async function readRangeProjection(
+    sheetId: string,
+    range: CellRange,
+    reason: 'clipboard' | 'fill-handle',
+  ): Promise<RangeProjectionResult | null> {
+    const begin = store.setter(beginProjectionAtom, {
+      kind: 'range',
+      sheetId,
+      range,
+      reason,
+    })
+    if (begin.status !== 'started' || begin.request.kind !== 'range') return null
 
+    const request = begin.request
+    try {
+      const result = await backend.readRangeProjection(request)
+      const outcome = store.setter(resolveProjectionAtom, { request, result })
+      return outcome.status === 'accepted' && outcome.result.kind === 'range'
+        ? outcome.result
+        : null
+    } catch (error) {
+      store.setter(rejectProjectionAtom, { request, error })
+      throw error
+    }
+  }
+
+  async function hydrateViewportSizeProjection() {
     const window = getRenderedVisibleWindow()
     if (window.rowEnd < window.rowStart || window.colEnd < window.colStart) {
       return
     }
 
-    const result = await backend.readViewportSizeProjection({
-      kind: 'viewport-size',
+    const outcome = await store.setter(hydrateViewportSizeProjectionAtom, {
+      source: backend,
       sheetId: props.sheetId,
       window,
     })
-
-    for (const row of result.rowHeights) {
-      store.setter(setViewportRowHeightAtom, {
-        sheetId: props.sheetId,
-        rowIndex: row.rowIndex,
-        heightPx: row.heightPx,
-      })
-    }
-    for (const col of result.colWidths) {
-      store.setter(setViewportColumnWidthAtom, {
-        sheetId: props.sheetId,
-        colIndex: col.colIndex,
-        widthPx: col.widthPx,
-      })
-    }
-    if (result.hiddenRowIndices !== undefined || result.hiddenColIndices !== undefined) {
-      store.setter(setViewportHiddenAtom, {
-        sheetId: props.sheetId,
-        rows: result.hiddenRowIndices,
-        cols: result.hiddenColIndices,
-      })
-    }
-    bumpRender()
+    if (outcome === 'ready' || outcome === 'sizes-only') bumpRender()
   }
 
   function syncScrollElementToViewport() {
@@ -895,6 +924,17 @@ export function SpreadsheetGrid(props: SpreadsheetGridProps) {
     bumpRender()
     void loadProjection(requestProjection())
     void hydrateViewportSizeProjection()
+  }
+
+  function refreshEffectiveFreezeProjection() {
+    const next = getEffectiveFreezeProjection()
+    const changed = next.rows !== lastEffectiveFreezeRows || next.cols !== lastEffectiveFreezeCols
+    lastEffectiveFreezeRows = next.rows
+    lastEffectiveFreezeCols = next.cols
+    bumpRender()
+    if (changed) {
+      void loadProjection(requestProjection())
+    }
   }
 
   function handleViewportScroll(event: Event & { currentTarget: HTMLDivElement }) {
@@ -995,18 +1035,28 @@ export function SpreadsheetGrid(props: SpreadsheetGridProps) {
     await persistRowHeight(row, heightPx)
   }
 
+  createEffect(() => {
+    void store.setter(readViewportFreezeCanonicalAtom, {
+      source: backend,
+      sheetId: props.sheetId,
+    })
+  })
+
   onMount(() => {
+    const initialFreeze = getEffectiveFreezeProjection()
+    lastEffectiveFreezeRows = initialFreeze.rows
+    lastEffectiveFreezeCols = initialFreeze.cols
     unsubscribeProjection = store.sub(spreadsheetProjectionSnapshotAtom, bumpRender)
     unsubscribeViewport = store.sub(viewportMetricsAtom, refreshViewportProjection)
     unsubscribeSizes = store.sub(viewportSizeOverridesAtom, bumpRender)
     unsubscribeHidden = store.sub(viewportHiddenAtom, bumpRender)
-    unsubscribeFreeze = store.sub(viewportFreezeAtom, () => {
-      // Freeze affects both layout (sticky offsets) and projection (we must
-      // pull rows 0..freezeRowCount-1 into the data set so they survive
-      // scroll). Refresh both.
-      bumpRender()
-      void loadProjection(requestProjection())
-    })
+    // Backing and authority commit independently. Deduplicate their callbacks
+    // against the ready, backend-and-sheet-scoped freeze that consumers may use.
+    unsubscribeFreeze = store.sub(viewportFreezeAtom, refreshEffectiveFreezeProjection)
+    unsubscribeFreezeAuthority = store.sub(
+      viewportFreezeProjectionAuthorityAtom,
+      refreshEffectiveFreezeProjection,
+    )
     unsubscribePointer = store.sub(pointerSessionAtom, bumpRender)
     unsubscribePresence = store.sub(presenceStateAtom, bumpRender)
     unsubscribeFilterSort = store.sub(filterSortStateAtom, bumpRender)
@@ -1054,6 +1104,7 @@ export function SpreadsheetGrid(props: SpreadsheetGridProps) {
     unsubscribeSizes?.()
     unsubscribeHidden?.()
     unsubscribeFreeze?.()
+    unsubscribeFreezeAuthority?.()
     unsubscribePointer?.()
     unsubscribePresence?.()
     unsubscribeFilterSort?.()
@@ -1071,55 +1122,21 @@ export function SpreadsheetGrid(props: SpreadsheetGridProps) {
   async function commitCellEdit(
     move: 'none' | 'down' | 'up' | 'left' | 'right' = 'none',
   ) {
-    // Tear down any active formula-reference pick session so the post-commit
-    // pointer events route normally (selectCell, not pick).
-    if (store.getter(formulaReferenceSessionAtom)) {
-      store.setter(formulaReferenceSessionAtom, null)
-    }
-    const intent = store.setter(commitEditingAtom, {
-      input: store.getter(editingDraftAtom),
-      source: 'cell',
-      move,
-    })
-
-    if (!intent) {
-      return
-    }
-
-    const result = await backend.setCellInput({
-      kind: 'set-cell-input',
-      sheetId: intent.sheetId,
-      row: intent.cell.row,
-      col: intent.cell.col,
-      input: intent.input,
-    })
-    const cellRevision =
-      typeof result?.revision === 'number'
-        ? result.revision
-        : Number(result?.revision ?? 0) || 0
-    store.setter(pushHistoryAtom, {
-      transactionId: nextHistoryTransactionId(),
-      kind: 'cell.set-input',
-      sheetId: intent.sheetId,
-      projectionRevision: cellRevision,
-      affectedRange: result?.affectedRange ?? {
-        rowStart: intent.cell.row,
-        rowEnd: intent.cell.row,
-        colStart: intent.cell.col,
-        colEnd: intent.cell.col,
-      },
-    })
-    await loadProjection(requestProjection())
+    const session = store.getter(editingSessionAtom)
+    if (session.status !== 'drafting' || session.source === null) return
+    const source = session.source
+    const outcome = await dispatchEditingCommit(store, backend, { move, source: 'cell' })
+    if (outcome !== 'completed') return
 
     if (move !== 'none') {
       const bounds = getSelectionBounds()
-      const next = { row: intent.cell.row, col: intent.cell.col }
+      const next = { row: source.cell.row, col: source.cell.col }
       if (move === 'down') next.row = Math.min(bounds.rowCount - 1, next.row + 1)
       else if (move === 'up') next.row = Math.max(0, next.row - 1)
       else if (move === 'right') next.col = Math.min(bounds.colCount - 1, next.col + 1)
       else if (move === 'left') next.col = Math.max(0, next.col - 1)
       store.setter(selectCellAtom, {
-        sheetId: intent.sheetId,
+        sheetId: source.sheetId,
         coord: next,
         extend: false,
       })
@@ -1499,6 +1516,129 @@ export function SpreadsheetGrid(props: SpreadsheetGridProps) {
     gridRoot?.focus()
   }
 
+  function getKeyboardContextMenuInput(): MenuOpenInput | null {
+    const snapshot = store.getter(selectionSnapshotAtom)
+    if (!gridRoot || snapshot.selection.sheetId !== props.sheetId) {
+      return null
+    }
+
+    const activeCellElement =
+      gridRoot.querySelector<HTMLElement>(
+        `td.spreadsheet-grid-cell[data-row="${snapshot.activeCell.row}"][data-col="${snapshot.activeCell.col}"]`,
+      ) ??
+      findMergeAnchorCovering(snapshot.activeCell.row, snapshot.activeCell.col)?.el ??
+      null
+    let anchorElement: HTMLElement | null = activeCellElement
+    let input: Pick<MenuOpenInput, 'surface' | 'target'>
+
+    switch (snapshot.selection.kind) {
+      case 'cell':
+        input = {
+          surface: 'cell',
+          target: {
+            kind: 'cell',
+            sheetId: props.sheetId,
+            cell: { row: snapshot.activeCell.row, col: snapshot.activeCell.col },
+          },
+        }
+        break
+      case 'range': {
+        const isSingleCell =
+          snapshot.range.rowStart === snapshot.range.rowEnd &&
+          snapshot.range.colStart === snapshot.range.colEnd
+        input = {
+          surface: 'cell',
+          target: isSingleCell
+            ? {
+                kind: 'cell',
+                sheetId: props.sheetId,
+                cell: { row: snapshot.activeCell.row, col: snapshot.activeCell.col },
+              }
+            : {
+                kind: 'range',
+                sheetId: props.sheetId,
+                range: snapshot.range,
+              },
+        }
+        break
+      }
+      case 'row':
+        anchorElement =
+          gridRoot.querySelector<HTMLElement>(
+            `.spreadsheet-grid-row-header[data-row="${snapshot.selection.rowFocus}"]`,
+          ) ?? activeCellElement
+        input = {
+          surface: 'header',
+          target: {
+            kind: 'row',
+            sheetId: props.sheetId,
+            rowIndex: snapshot.selection.rowFocus,
+          },
+        }
+        break
+      case 'column':
+        anchorElement =
+          gridRoot.querySelector<HTMLElement>(
+            `.spreadsheet-grid-col-header[data-col="${snapshot.selection.colFocus}"]`,
+          ) ?? activeCellElement
+        input = {
+          surface: 'header',
+          target: {
+            kind: 'column',
+            sheetId: props.sheetId,
+            colIndex: snapshot.selection.colFocus,
+          },
+        }
+        break
+      case 'all':
+        anchorElement =
+          gridRoot.querySelector<HTMLElement>('.spreadsheet-grid-corner') ?? activeCellElement
+        input = {
+          surface: 'header',
+          target: {
+            kind: 'all',
+            sheetId: props.sheetId,
+          },
+        }
+        break
+    }
+
+    if (!anchorElement) {
+      return null
+    }
+
+    const rect = anchorElement.getBoundingClientRect()
+    return {
+      ...input,
+      position: { x: rect.left, y: rect.bottom },
+      source: 'keyboard',
+    }
+  }
+
+  function targetFallsWithinSingleAxisSelection(
+    target: { kind: 'row'; row: number } | { kind: 'column'; col: number },
+  ): boolean {
+    const regions = store.getter(selectionRegionsAtom)
+    if (regions.length !== 1) return false
+
+    const region = regions[0]
+    if (region?.sheetId !== props.sheetId || region.kind !== target.kind) return false
+
+    if (target.kind === 'row' && region.kind === 'row') {
+      const start = Math.min(region.rowAnchor, region.rowFocus)
+      const end = Math.max(region.rowAnchor, region.rowFocus)
+      return target.row >= start && target.row <= end
+    }
+
+    if (target.kind === 'column' && region.kind === 'column') {
+      const start = Math.min(region.colAnchor, region.colFocus)
+      const end = Math.max(region.colAnchor, region.colFocus)
+      return target.col >= start && target.col <= end
+    }
+
+    return false
+  }
+
   function openContextMenu(
     event: MouseEvent,
     target:
@@ -1515,13 +1655,13 @@ export function SpreadsheetGrid(props: SpreadsheetGridProps) {
         sheetId: props.sheetId,
         coord: { row: target.row, col: target.col },
       })
-    } else if (target.kind === 'row') {
+    } else if (target.kind === 'row' && !targetFallsWithinSingleAxisSelection(target)) {
       store.setter(selectRowsAtom, {
         sheetId: props.sheetId,
         rowAnchor: target.row,
         rowFocus: target.row,
       })
-    } else if (target.kind === 'column') {
+    } else if (target.kind === 'column' && !targetFallsWithinSingleAxisSelection(target)) {
       store.setter(selectColumnsAtom, {
         sheetId: props.sheetId,
         colAnchor: target.col,
@@ -1636,14 +1776,12 @@ export function SpreadsheetGrid(props: SpreadsheetGridProps) {
       return
     }
 
-    const requestId = store.setter(advanceSpreadsheetProjectionRequestIdAtom)
-    const sourceProjection = await backend.readRangeProjection({
-      kind: 'range',
-      sheetId: intent.sheetId,
-      requestId,
-      reason: 'fill-handle',
-      range: intent.sourceRange,
-    })
+    const sourceProjection = await readRangeProjection(
+      intent.sheetId,
+      intent.sourceRange,
+      'fill-handle',
+    )
+    if (sourceProjection === null) return
     const sourceCells = new Map<string, DisplayCell>()
     for (const cell of sourceProjection.cells) {
       sourceCells.set(makeCellKey(cell.row, cell.col), cell)
@@ -1658,10 +1796,132 @@ export function SpreadsheetGrid(props: SpreadsheetGridProps) {
           sheetId: intent.sheetId,
           row,
           col,
-          input: getCellInputForFill(sourceCell),
+          input: getCellInputForFill(sourceCell, sourceCoord, { row, col }),
         })
       }
     }
+  }
+
+  function isBoundedNumericSeriesSource(
+    sourceRange: CellRange,
+    direction: Exclude<PointerFillHandleCommitIntent['direction'], null>,
+  ): boolean {
+    if (sourceRange.rowStart > sourceRange.rowEnd || sourceRange.colStart > sourceRange.colEnd) {
+      return false
+    }
+
+    if (direction === 'down' || direction === 'up') {
+      return (
+        sourceRange.colStart === sourceRange.colEnd &&
+        sourceRange.rowEnd - sourceRange.rowStart + 1 >= 2
+      )
+    }
+
+    return (
+      sourceRange.rowStart === sourceRange.rowEnd &&
+      sourceRange.colEnd - sourceRange.colStart + 1 >= 2
+    )
+  }
+
+  function getOrderedSeriesSourceCells(
+    projection: RangeProjectionResult,
+    sourceRange: CellRange,
+    direction: Exclude<PointerFillHandleCommitIntent['direction'], null>,
+  ): DisplayCell[] | null {
+    const expectedCellCount =
+      direction === 'down' || direction === 'up'
+        ? sourceRange.rowEnd - sourceRange.rowStart + 1
+        : sourceRange.colEnd - sourceRange.colStart + 1
+    if (projection.truncated === true || projection.cells.length !== expectedCellCount) {
+      return null
+    }
+
+    const cellsByCoord = new Map<string, DisplayCell>()
+    for (const cell of projection.cells) {
+      if (
+        !Number.isSafeInteger(cell.row) ||
+        !Number.isSafeInteger(cell.col) ||
+        !isCoordInRange(cell.row, cell.col, sourceRange)
+      ) {
+        return null
+      }
+      const key = makeCellKey(cell.row, cell.col)
+      if (cellsByCoord.has(key)) return null
+      cellsByCoord.set(key, cell)
+    }
+
+    const ordered: DisplayCell[] = []
+    if (direction === 'down' || direction === 'up') {
+      for (let row = sourceRange.rowStart; row <= sourceRange.rowEnd; row += 1) {
+        const cell = cellsByCoord.get(makeCellKey(row, sourceRange.colStart))
+        if (!cell) return null
+        ordered.push(cell)
+      }
+    } else {
+      for (let col = sourceRange.colStart; col <= sourceRange.colEnd; col += 1) {
+        const cell = cellsByCoord.get(makeCellKey(sourceRange.rowStart, col))
+        if (!cell) return null
+        ordered.push(cell)
+      }
+    }
+
+    return ordered
+  }
+
+  async function tryNumericFillSeries(
+    intent: PointerFillHandleCommitIntent & {
+      direction: Exclude<PointerFillHandleCommitIntent['direction'], null>
+    },
+  ): Promise<boolean> {
+    if (
+      intent.copyOnly === true ||
+      !backend.fillSeries ||
+      !isBoundedNumericSeriesSource(intent.sourceRange, intent.direction)
+    ) {
+      return false
+    }
+
+    let sourceProjection: RangeProjectionResult | null
+    try {
+      sourceProjection = await readRangeProjection(
+        intent.sheetId,
+        intent.sourceRange,
+        'fill-handle',
+      )
+    } catch {
+      return false
+    }
+    if (sourceProjection === null || sourceProjection.revision === undefined) return false
+
+    const sourceCells = getOrderedSeriesSourceCells(
+      sourceProjection,
+      intent.sourceRange,
+      intent.direction,
+    )
+    if (sourceCells === null) return false
+
+    const detected = detectFillSeries(sourceCells, store.getter(fillSeriesLocaleAtom))
+    if (
+      (detected.kind !== 'integer-step' && detected.kind !== 'decimal-step') ||
+      typeof detected.step !== 'number' ||
+      !Number.isFinite(detected.step) ||
+      detected.step === 0
+    ) {
+      return false
+    }
+
+    await backend.fillSeries({
+      kind: 'fill-series',
+      sheetId: intent.sheetId,
+      sourceRange: intent.sourceRange,
+      targetRange: intent.targetRange,
+      direction: intent.direction,
+      series: detected.kind,
+      step: detected.step,
+      requestId: sourceProjection.requestId,
+      revision: sourceProjection.revision,
+    })
+    return true
   }
 
   async function executeFillHandle(intent: PointerFillHandleCommitIntent) {
@@ -1678,7 +1938,11 @@ export function SpreadsheetGrid(props: SpreadsheetGridProps) {
       return
     }
 
-    if (backend.fillRange) {
+    const filledSeries = await tryNumericFillSeries({ ...intent, direction: intent.direction })
+
+    if (filledSeries) {
+      // Numeric series is a single compact backend mutation.
+    } else if (backend.fillRange) {
       await backend.fillRange({
         kind: 'fill-range',
         sheetId: intent.sheetId,
@@ -1862,11 +2126,19 @@ export function SpreadsheetGrid(props: SpreadsheetGridProps) {
     let transferInput: ClipboardTransferInput
 
     if (cellCount > CLIPBOARD_CELL_LIMIT) {
+      const requestId = store.setter(issueProjectionRequestIdAtom)
+      if (requestId === null) {
+        store.setter(setClipboardErrorAtom, {
+          code: 'BACKEND_ERROR',
+          message: 'Clipboard request identity space is exhausted.',
+        })
+        return
+      }
       const streamRequest = {
         kind: 'export-range-tsv' as const,
         sheetId: props.sheetId,
         range,
-        requestId: store.setter(advanceSpreadsheetProjectionRequestIdAtom),
+        requestId,
       }
       const chunks: string[] = []
       let streamResult:
@@ -1903,14 +2175,8 @@ export function SpreadsheetGrid(props: SpreadsheetGridProps) {
         revision: streamResult?.revision ?? undefined,
       }
     } else {
-      const requestId = store.setter(advanceSpreadsheetProjectionRequestIdAtom)
-      const result = await backend.readRangeProjection({
-        kind: 'range',
-        sheetId: props.sheetId,
-        requestId,
-        reason: 'clipboard',
-        range,
-      })
+      const result = await readRangeProjection(props.sheetId, range, 'clipboard')
+      if (result === null) return
 
       const cells: string[][] = []
       const cellsByKey = new Map<string, (typeof result.cells)[number]>()
@@ -2084,7 +2350,7 @@ export function SpreadsheetGrid(props: SpreadsheetGridProps) {
 
     if ((event.ctrlKey || event.metaKey) && event.key === 'f' && !event.altKey && !event.shiftKey) {
       event.preventDefault()
-      store.setter(findReplaceOpenAtom, true)
+      store.setter(openFindReplaceAtom)
       return
     }
 
@@ -2093,7 +2359,7 @@ export function SpreadsheetGrid(props: SpreadsheetGridProps) {
     // it once and subsequent Ctrl+H invocations land there.
     if ((event.ctrlKey || event.metaKey) && event.key === 'h' && !event.altKey && !event.shiftKey) {
       event.preventDefault()
-      store.setter(findReplaceOpenAtom, true)
+      store.setter(openFindReplaceAtom)
       return
     }
 
@@ -2157,6 +2423,19 @@ export function SpreadsheetGrid(props: SpreadsheetGridProps) {
     })
 
     switch (intent.type) {
+      case 'context-menu.open': {
+        const input = getKeyboardContextMenuInput()
+        if (!input) {
+          return
+        }
+        const menu = store.setter(openMenuAtom, input)
+        if (menu.status !== 'open') {
+          return
+        }
+        event.preventDefault()
+        bumpRender()
+        return
+      }
       case 'selection.move':
         event.preventDefault()
         if (intent.scroll) {
@@ -2244,7 +2523,7 @@ export function SpreadsheetGrid(props: SpreadsheetGridProps) {
         //       paste-special, so don't surface the dialog. Mirrors
         //       how Ctrl+V's `pasteFromClipboard` early-returns when
         //       the system clipboard is empty.
-        if (!store.getter(pasteSpecialSupportedAtom)) {
+        if (!store.getter(pasteSpecialCapabilityAtom)) {
           return
         }
         const clipboard = store.getter(clipboardStateAtom)
@@ -2263,7 +2542,7 @@ export function SpreadsheetGrid(props: SpreadsheetGridProps) {
           intent.direction,
         )
         if (nextSheetId) {
-          store.setter(setWorkspaceActiveSheetAtom, { sheetId: nextSheetId })
+          store.setter(activateSheetTabAtom, { sheetId: nextSheetId })
         }
         return
       }
@@ -2309,7 +2588,7 @@ export function SpreadsheetGrid(props: SpreadsheetGridProps) {
         // The keyboard dispatcher emits this for operator/separator typed, or
         // for commit/cancel keys. The host clears the session here; if the
         // reason is commit/cancel the cell editor's keydown will follow.
-        store.setter(formulaReferenceSessionAtom, null)
+        store.setter(exitFormulaReferenceAtom, intent.reason)
         bumpRender()
         return
       }
@@ -2567,6 +2846,7 @@ export function SpreadsheetGrid(props: SpreadsheetGridProps) {
       focus: selection.activeCell,
       previewRange: preview.previewRange,
       direction: preview.direction,
+      copyOnly: event.ctrlKey || event.metaKey,
       source: 'pointer',
     })
 
@@ -2582,11 +2862,16 @@ export function SpreadsheetGrid(props: SpreadsheetGridProps) {
         focus,
         previewRange: nextPreview.previewRange,
         direction: nextPreview.direction,
+        copyOnly: moveEvent.ctrlKey || moveEvent.metaKey,
       })
       bumpRender()
     }
 
-    const onPointerUp = () => {
+    const onPointerUp = (upEvent: PointerEvent) => {
+      store.setter(updatePointerAtom, {
+        kind: 'fill-handle',
+        copyOnly: upEvent.ctrlKey || upEvent.metaKey,
+      })
       const intent = store.setter(commitPointerAtom)
       cleanupFill()
       if (intent?.type === 'pointer.fill-handle.commit') {
@@ -3179,6 +3464,7 @@ export function SpreadsheetGrid(props: SpreadsheetGridProps) {
                               openContextMenu(event, getCellContextTarget(row, col))
                             }}
                           >
+                            <SpreadsheetCellBorders borders={cell()?.format?.borders} />
                             <Show
                               when={editing()}
                               fallback={

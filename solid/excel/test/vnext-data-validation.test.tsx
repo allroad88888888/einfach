@@ -4,6 +4,7 @@ import { afterEach, beforeEach, describe, expect, it } from '@jest/globals'
 import { createStore } from '@einfach/core'
 import { cleanup, fireEvent, render, waitFor } from '@solidjs/testing-library'
 import type {
+  BackendMutationResult,
   ClearValidationRuleRequest,
   SetValidationRuleRequest,
   SpreadsheetBackend,
@@ -11,8 +12,10 @@ import type {
   RangeProjectionRequest,
 } from '@einfach/spreadsheet-ui-core'
 import {
+  dataValidationOperationAttemptLedgerAtom,
   openValidationRuleEditorAtom,
   validationRuleEditorAtom,
+  validationRuleFormAtom,
 } from '@einfach/spreadsheet-ui-core'
 import { SpreadsheetDataValidationDialog } from '../src-vnext/data-validation'
 import { SpreadsheetUiProvider } from '../src-vnext/provider'
@@ -63,6 +66,16 @@ function createFakeBackend() {
   }
 
   return { backend, setValidationRuleRequests, clearValidationRuleRequests }
+}
+
+function createDeferred<T>() {
+  let resolve!: (value: T) => void
+  let reject!: (reason?: unknown) => void
+  const promise = new Promise<T>((resolvePromise, rejectPromise) => {
+    resolve = resolvePromise
+    reject = rejectPromise
+  })
+  return { promise, resolve, reject }
 }
 
 const testRange = { rowStart: 0, rowEnd: 2, colStart: 0, colEnd: 1 }
@@ -200,6 +213,67 @@ describe('SpreadsheetDataValidationDialog', () => {
     await waitFor(() => expect(store.getter(validationRuleEditorAtom).status).toBe('closed'))
     expect(setValidationRuleRequests).toHaveLength(0)
     expect(clearValidationRuleRequests).toHaveLength(0)
+  })
+
+  it('keeps a reopened draft intact when the prior dispatched Save acknowledges late', async () => {
+    const store = createStore()
+    const { backend: baseBackend } = createFakeBackend()
+    const deferred = createDeferred<BackendMutationResult>()
+    let dispatchedRequest: SetValidationRuleRequest | undefined
+    const backend: SpreadsheetBackend = {
+      ...baseBackend,
+      setValidationRule(request) {
+        dispatchedRequest = request
+        return deferred.promise
+      },
+    }
+    const reopenedRange = { rowStart: 4, rowEnd: 5, colStart: 3, colEnd: 4 }
+
+    store.setter(openValidationRuleEditorAtom, { range: testRange })
+    const view = render(() => (
+      <SpreadsheetUiProvider backend={backend} store={store}>
+        <SpreadsheetDataValidationDialog sheetId="sheet-1" />
+      </SpreadsheetUiProvider>
+    ))
+
+    fireEvent.input(await waitFor(() => view.getByTestId('validation-list-values')), {
+      target: { value: 'old-session' },
+    })
+    fireEvent.click(view.getByTestId('validation-save-button'))
+    await waitFor(() => expect(dispatchedRequest).toBeDefined())
+    expect(store.getter(dataValidationOperationAttemptLedgerAtom)).toMatchObject([
+      { status: 'pending', sheetId: 'sheet-1', range: testRange },
+    ])
+
+    fireEvent.click(view.getByTestId('validation-cancel-button'))
+    await waitFor(() => expect(view.queryByTestId('validation-dialog')).toBeNull())
+    store.setter(openValidationRuleEditorAtom, { range: reopenedRange })
+    fireEvent.input(await waitFor(() => view.getByTestId('validation-list-values')), {
+      target: { value: 'new-session' },
+    })
+
+    deferred.resolve({
+      sheetId: dispatchedRequest!.sheetId,
+      requestId: dispatchedRequest!.requestId,
+      affectedRange: dispatchedRequest!.range,
+    })
+
+    await waitFor(() =>
+      expect(store.getter(dataValidationOperationAttemptLedgerAtom)).toMatchObject([
+        { status: 'acknowledged', sheetId: 'sheet-1', range: testRange },
+      ]),
+    )
+    expect(store.getter(validationRuleEditorAtom)).toMatchObject({
+      status: 'editing',
+      range: reopenedRange,
+      pending: false,
+      error: null,
+    })
+    expect(store.getter(validationRuleFormAtom).listValues).toBe('new-session')
+    expect(view.getByTestId('validation-range').textContent).toBe('D5:E6')
+    expect((view.getByTestId('validation-list-values') as HTMLInputElement).value).toBe(
+      'new-session',
+    )
   })
 
   it('shows "no range selected" when editor has no range', async () => {

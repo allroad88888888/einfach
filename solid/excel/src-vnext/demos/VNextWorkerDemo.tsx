@@ -14,6 +14,7 @@ import {
   defaultVNextWorkbookWorkerFactory,
 } from '../adapter/worker-factory'
 import {
+  createWorkerNamedRangeCapabilityPort,
   createWorkerWorkbookSpreadsheetBackend,
   type WorkerWorkbookBackendSheet,
   type WorkerWorkbookSpreadsheetBackendOptions,
@@ -27,14 +28,19 @@ import { SpreadsheetFindReplaceDialog } from '../find-replace'
 import { SpreadsheetFormatPainter } from '../format-painter'
 import { SpreadsheetFormulaAutocomplete } from '../formula-autocomplete'
 import { SpreadsheetFormulaBar } from '../formula-bar'
+import { SpreadsheetGoToDialog } from '../go-to'
 import { SpreadsheetGrid } from '../grid'
 import { SpreadsheetHistoryTimeline } from '../history'
+import { SpreadsheetMenuBar } from '../menu-bar'
 import { SpreadsheetNameManagerDialog } from '../named-ranges'
+import { SpreadsheetPasteSpecialDialog } from '../paste-special'
 import { SpreadsheetPresenceOverlay } from '../presence'
 import { SpreadsheetPrintPreviewOverlay } from '../print'
 import { SpreadsheetProtectionUnlockDialog } from '../protection'
+import { SpreadsheetRemoveDuplicatesDialog } from '../remove-duplicates'
 import { SpreadsheetSheetTabs } from '../sheet-tabs'
 import { SpreadsheetStatusBar } from '../status-bar'
+import { SpreadsheetTextToColumnsDialog } from '../text-to-columns'
 import { SpreadsheetToolbar } from '../toolbar'
 import { acceptFormulaSuggestion, SpreadsheetUiProvider, useSpreadsheetUiStore } from '../provider'
 
@@ -212,6 +218,7 @@ function VNextWorkerWorkbook() {
 
   return (
     <>
+      <SpreadsheetMenuBar data-testid="vnext-worker-menu-bar" />
       <SpreadsheetToolbar data-testid="vnext-worker-toolbar" />
       <SpreadsheetFormulaBar data-testid="vnext-worker-formula-bar" />
       <Show keyed when={activeSheetId()}>
@@ -225,10 +232,14 @@ function VNextWorkerWorkbook() {
       <SpreadsheetContextMenu data-testid="vnext-worker-context-menu" />
       <SpreadsheetFormatPainter data-testid="vnext-worker-format-painter" />
       <SpreadsheetFindReplaceDialog data-testid="vnext-worker-find-replace" />
+      <SpreadsheetGoToDialog data-testid="vnext-worker-go-to" />
+      <SpreadsheetTextToColumnsDialog data-testid="vnext-worker-text-to-columns" />
+      <SpreadsheetRemoveDuplicatesDialog data-testid="vnext-worker-remove-duplicates" />
       <SpreadsheetFilterDropdown data-testid="vnext-worker-filter-dropdown" />
       <SpreadsheetConditionalFormatDialog data-testid="vnext-worker-conditional-format" />
       <SpreadsheetDataValidationDialog data-testid="vnext-worker-data-validation" />
       <SpreadsheetNameManagerDialog data-testid="vnext-worker-name-manager" />
+      <SpreadsheetPasteSpecialDialog data-testid="vnext-worker-paste-special" />
       <SpreadsheetCommentThread data-testid="vnext-worker-comment-thread" />
       <SpreadsheetPrintPreviewOverlay data-testid="vnext-worker-print-preview" />
       <SpreadsheetProtectionUnlockDialog data-testid="vnext-worker-protection-unlock" />
@@ -268,12 +279,16 @@ function pickWorkerFactory(choice: BackendChoice) {
 
 export function VNextWorkerDemo() {
   const backendChoice = readBackendChoice()
+  const namedRangeCapabilityPort = createWorkerNamedRangeCapabilityPort(
+    backendChoice === 'ts' ? 'worker-ts' : 'worker-wasm',
+  )
   const backendDescription =
     backendChoice === 'ts' ? 'the in-process TS core' : 'the Rust workbook worker'
 
   const backend = createWorkerWorkbookSpreadsheetBackend({
     workerFactory: pickWorkerFactory(backendChoice),
     sheets,
+    removeRowsExactCapability: backendChoice === 'wasm' ? 'worker-engine-delete-rows' : false,
     afterInit: seedWorkerWorkbook,
   })
 
@@ -297,7 +312,7 @@ export function VNextWorkerDemo() {
         </p>
       </div>
 
-      <SpreadsheetUiProvider backend={backend}>
+      <SpreadsheetUiProvider backend={backend} namedRangeCapabilityPort={namedRangeCapabilityPort}>
         <VNextWorkerWorkbook />
       </SpreadsheetUiProvider>
     </div>

@@ -1,30 +1,25 @@
 /** @jsxImportSource solid-js */
 
-import { Show, createEffect, createSignal, onCleanup } from 'solid-js'
+import { Show, createEffect, onCleanup } from 'solid-js'
 import { useAtomValue } from '@einfach/solid'
 import { useT } from '../../src/i18n'
 import {
   closeProtectionUnlockAtom,
-  issueProtectionUnlockSyncTicketAtom,
+  protectionUnlockPasswordAtom,
   protectionUnlockStateAtom,
-  protectionUnlockSyncTicketAtom,
-  setProtectionUnlockErrorAtom,
-  setProtectionUnlockPendingAtom,
-  type CellRange,
+  refreshProtectionUnlockAtom,
+  setProtectionUnlockPasswordAtom,
+  submitProtectionUnlockAtom,
+  type SubmitProtectionUnlockInput,
+  type VerifySheetProtectionPort,
 } from '@einfach/spreadsheet-ui-core'
 import { useSpreadsheetBackend, useSpreadsheetUiStore } from '../provider/hooks'
 
 export interface SpreadsheetProtectionUnlockDialogProps {
   class?: string
   'data-testid'?: string
-  /** Optional credential verifier. When supplied, the dialog calls this before
-   *  invoking the backend.setRangeLock call; rejection blocks the unlock and
-   *  surfaces the rejection message via the error slot. */
-  verifySheetProtection?: (input: {
-    sheetId: string
-    range?: CellRange
-    password: string
-  }) => Promise<{ ok: boolean; message?: string }>
+  /** Optional host password verifier. A rejection prevents the range-lock mutation. */
+  verifySheetProtection?: VerifySheetProtectionPort
 }
 
 export function SpreadsheetProtectionUnlockDialog(props: SpreadsheetProtectionUnlockDialogProps) {
@@ -32,16 +27,7 @@ export function SpreadsheetProtectionUnlockDialog(props: SpreadsheetProtectionUn
   const store = useSpreadsheetUiStore()
   const backend = useSpreadsheetBackend()
   const state = useAtomValue(protectionUnlockStateAtom)
-
-  const [password, setPassword] = createSignal('')
-
-  createEffect<boolean>((wasOpen) => {
-    const open = state().isOpen
-    if (open && !wasOpen) {
-      setPassword('')
-    }
-    return open
-  }, false)
+  const password = useAtomValue(protectionUnlockPasswordAtom)
 
   createEffect(() => {
     if (!state().isOpen) return
@@ -56,75 +42,39 @@ export function SpreadsheetProtectionUnlockDialog(props: SpreadsheetProtectionUn
   })
 
   function handleClose() {
-    // Advance the ticket so any in-flight unlock resolves into a no-op
-    // instead of writing into a future reopened dialog's state.
-    store.setter(issueProtectionUnlockSyncTicketAtom)
     store.setter(closeProtectionUnlockAtom)
   }
 
-  async function handleUnlock() {
-    const current = state()
-    if (!current.isOpen || !current.target) return
-    const pwd = password()
-
-    const ticket = store.setter(issueProtectionUnlockSyncTicketAtom) as number
-    store.setter(setProtectionUnlockPendingAtom, true)
-
-    function isStale(): boolean {
-      return ticket !== store.getter(protectionUnlockSyncTicketAtom)
+  function handleUnlock() {
+    const verifySheetProtection = props.verifySheetProtection
+    const input: SubmitProtectionUnlockInput = {
+      ...(verifySheetProtection ? { verifySheetProtection } : {}),
+      setRangeLock: backend.setRangeLock?.bind(backend),
+      readSheetProtection: backend.readSheetProtection?.bind(backend),
     }
+    return store.setter(submitProtectionUnlockAtom, input)
+  }
 
-    if (props.verifySheetProtection) {
-      try {
-        const result = await props.verifySheetProtection({
-          sheetId: current.target.sheetId,
-          range: current.target.range,
-          password: pwd,
-        })
-        if (isStale()) return
-        if (!result.ok) {
-          store.setter(setProtectionUnlockErrorAtom, result.message ?? 'Incorrect password')
-          return
-        }
-      } catch (err) {
-        if (isStale()) return
-        store.setter(
-          setProtectionUnlockErrorAtom,
-          err instanceof Error ? err.message : String(err),
-        )
-        return
-      }
-    }
-
-    if (backend.setRangeLock && current.target.range) {
-      try {
-        await backend.setRangeLock({
-          kind: 'set-range-lock',
-          sheetId: current.target.sheetId,
-          range: current.target.range,
-          locked: false,
-        })
-        if (isStale()) return
-      } catch (err) {
-        if (isStale()) return
-        store.setter(
-          setProtectionUnlockErrorAtom,
-          err instanceof Error ? err.message : String(err),
-        )
-        return
-      }
-    }
-
-    if (isStale()) return
-    store.setter(closeProtectionUnlockAtom)
+  function handleRefresh() {
+    const readSheetProtection = backend.readSheetProtection?.bind(backend)
+    if (!readSheetProtection) return
+    return store.setter(refreshProtectionUnlockAtom, { readSheetProtection })
   }
 
   function targetLabel(): string {
     const target = state().target
     if (!target) return ''
-    if (!target.range) return target.sheetId
+    if (!target.range) {
+      return t('protection.unlock.target.sheet', { sheetId: target.sheetId })
+    }
     const r = target.range
-    return `${target.sheetId} r${r.rowStart}-${r.rowEnd} c${r.colStart}-${r.colEnd}`
+    return t('protection.unlock.target.range', {
+      sheetId: target.sheetId,
+      rowStart: r.rowStart + 1,
+      rowEnd: r.rowEnd + 1,
+      colStart: r.colStart + 1,
+      colEnd: r.colEnd + 1,
+    })
   }
 
   return (
@@ -134,7 +84,7 @@ export function SpreadsheetProtectionUnlockDialog(props: SpreadsheetProtectionUn
         data-testid={props['data-testid'] ?? 'protection-unlock-dialog'}
         role="dialog"
         aria-modal="true"
-        aria-label="Unlock protected range"
+        aria-label={t('protection.unlock.ariaLabel')}
       >
         <button
           type="button"
@@ -152,7 +102,7 @@ export function SpreadsheetProtectionUnlockDialog(props: SpreadsheetProtectionUn
         </div>
         <div class="protection-unlock-row">
           <label class="protection-unlock-label" for="protection-unlock-password">
-            Password
+            {t('protection.unlock.password')}
           </label>
           <input
             id="protection-unlock-password"
@@ -160,10 +110,10 @@ export function SpreadsheetProtectionUnlockDialog(props: SpreadsheetProtectionUn
             data-testid="protection-unlock-password"
             type="password"
             value={password()}
-            disabled={state().pending}
-            onInput={(e) => setPassword(e.currentTarget.value)}
+            disabled={state().pending || state().recoveryRequired}
+            onInput={(e) => store.setter(setProtectionUnlockPasswordAtom, e.currentTarget.value)}
             onKeyDown={(e) => {
-              if (e.key === 'Enter') {
+              if (e.key === 'Enter' && !state().recoveryRequired) {
                 e.preventDefault()
                 void handleUnlock()
               }
@@ -172,32 +122,43 @@ export function SpreadsheetProtectionUnlockDialog(props: SpreadsheetProtectionUn
         </div>
 
         <Show when={state().error}>
-          <div
-            class="protection-unlock-error"
-            data-testid="protection-unlock-error"
-            role="alert"
-          >
+          <div class="protection-unlock-error" data-testid="protection-unlock-error" role="alert">
             {state().error}
           </div>
         </Show>
 
         <div class="protection-unlock-actions">
-          <button
-            type="button"
-            class="protection-unlock-btn"
-            data-testid="protection-unlock-confirm"
-            disabled={state().pending}
-            onClick={() => void handleUnlock()}
+          <Show
+            when={state().recoveryRequired}
+            fallback={
+              <button
+                type="button"
+                class="protection-unlock-btn"
+                data-testid="protection-unlock-confirm"
+                disabled={state().pending}
+                onClick={() => void handleUnlock()}
+              >
+                {t('protection.unlock.confirm')}
+              </button>
+            }
           >
-            Unlock
-          </button>
+            <button
+              type="button"
+              class="protection-unlock-btn"
+              data-testid="protection-unlock-refresh"
+              disabled={state().pending}
+              onClick={() => void handleRefresh()}
+            >
+              {t('protection.unlock.refresh')}
+            </button>
+          </Show>
           <button
             type="button"
             class="protection-unlock-btn protection-unlock-btn-cancel"
             data-testid="protection-unlock-cancel"
             onClick={handleClose}
           >
-            Cancel
+            {t('protection.unlock.cancel')}
           </button>
         </div>
       </div>
