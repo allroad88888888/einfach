@@ -537,11 +537,18 @@ describe('audit D-10 · P-B · FIXED — removeRows batches contiguous rows into
   test('scattered + clustered rows collapse to one RPC per contiguous band, descending', async () => {
     const client = createWorkerWorkbook({ workerFactory: () => createInProcessWorker() })
     const deleteCalls: Array<{ rowIndex: number; count: number }> = []
+    // Fail-closed follow-up (#31): the real TS runtime now declares
+    // `structuralEdits: false` and answers deleteRows with a structured
+    // UNSUPPORTED error, so this ADAPTER band-batching pin stands in a
+    // structural-capable engine: a no-claims witness plus a genuine ACK.
     const spyClient: typeof client = {
       ...client,
+      async describeCapabilities() {
+        return null
+      },
       deleteRows(sheet, rowIndex, count) {
         deleteCalls.push({ rowIndex, count })
-        return client.deleteRows(sheet, rowIndex, count)
+        return Promise.resolve(true)
       },
     }
     const backend = createWorkerWorkbookSpreadsheetBackend({

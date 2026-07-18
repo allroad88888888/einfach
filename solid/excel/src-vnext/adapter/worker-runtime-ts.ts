@@ -16,13 +16,16 @@
  *    `clearRange`.
  *  - Projection reads: `readSparseRange`, `snapshotRangeSparse`,
  *    `snapshotSparse`, `listNonEmpty`, `readCells`.
- *  - Format shims: `setFormatRange` / `snapshotFormatRange` return empty
- *    snapshots — TS core does not yet model formats.
+ *  - Formats (`setFormatRange` / `snapshotFormatRange` /
+ *    `restoreFormatSnapshot`), structural ops (`insertRows` /
+ *    `deleteRows` / `insertColumns` / `deleteColumns`), chunked TSV
+ *    export sessions, and the persistence `formats` block are NOT
+ *    implemented: `describeCapabilities` declares them `false` and the
+ *    commands answer a structured `UNSUPPORTED` RPC error (fail-closed)
+ *    instead of a success-shaped fake ACK — the host adapter withholds
+ *    the matching optional backend ports, which hides the UI entries.
  *  - Size metadata: row heights / column widths live in this worker runtime
  *    so `snapshotViewportSizes` and persistence v1 match the WASM RPC shape.
- *  - Structural ops `insertRows` / `deleteRows` / `insertColumns` /
- *    `deleteColumns` are stubbed to no-ops returning `true` — the TS
- *    core has no native band shift yet.
  *  - Import sessions: minimal pass-through. `beginImport` opens a session,
  *    `importChunk` applies cells via `workbook.bulkApply`, `commitImport`
  *    closes it; `cancelImport` discards.
@@ -81,7 +84,6 @@ import type {
   CellRefWire,
   CellSnapshotWire,
   CellWire,
-  FormatRangeSnapshot,
   FormulaMutationResultWire,
   ImportCellWire,
   RpcErrorWire,
@@ -94,7 +96,24 @@ import type {
   WorkbookImportStatsWire,
   WorkbookPersistenceSnapshotWire,
   WorkbookSheetMeta,
+  WorkerRuntimeCapabilitiesWire,
 } from './worker-protocol'
+
+/**
+ * Honest capability declaration for this runtime (see
+ * `WorkerRuntimeCapabilitiesWire`). Every family listed `false` answers
+ * a structured `UNSUPPORTED` RPC error instead of a success-shaped fake
+ * ACK, and the host adapter withholds the matching backend port so the
+ * UI hides the entry (fail-closed, same witness discipline as the
+ * removeRowsExact capability).
+ */
+export const TS_WORKER_RUNTIME_CAPABILITIES: WorkerRuntimeCapabilitiesWire = Object.freeze({
+  structuralEdits: false,
+  formats: false,
+  formatSnapshots: false,
+  tsvChunkExport: false,
+  persistenceFormats: false,
+})
 
 const CUSTOM_FORMULA_ERROR_CODES: readonly ErrorCode[] = [
   '#NULL!',
@@ -199,6 +218,17 @@ function rangeTotalRows(range: SparseRangeWire): number {
 
 function rpcError(code: string, message: string): Error & { code: string } {
   return Object.assign(new Error(message), { code })
+}
+
+/**
+ * Structured fail-closed refusal: surfaces on the wire as
+ * `{ ok: false, error: { code: 'UNSUPPORTED', … } }` — recognizable at
+ * the protocol level (same discipline as the WASM runtime's
+ * `NAME_BINDING_UNSUPPORTED` refusal for defineName), never a
+ * success-shaped fake ACK.
+ */
+function unsupported(feature: string): never {
+  throw rpcError('UNSUPPORTED', `${feature} is not implemented by the TS worker runtime`)
 }
 
 function normalizeAddr(addr: unknown): string {
@@ -1079,18 +1109,6 @@ function debugCountersFor(state: RuntimeState) {
   }
 }
 
-function emptyFormatSnapshot(range: SparseRangeWire): FormatRangeSnapshot {
-  return {
-    sheet: range.sheet,
-    startRow: range.startRow,
-    startCol: range.startCol,
-    endRow: range.endRow,
-    endCol: range.endCol,
-    cellFormats: [],
-    rangeFormats: [],
-  }
-}
-
 const FULL_SHEET_SIZE_BOUND = 0xffffffff
 
 function normalizeDimensionRange(range: SparseRangeWire): SparseRangeWire {
@@ -1445,19 +1463,30 @@ export function createWorkerRuntimeTs(events?: WorkerRuntimeTsEvents): ExcelCore
       case 'clearRange': {
         return clearRange(state, normalizeSparseRange(msg.range))
       }
+      case 'describeCapabilities':
+        return { ...TS_WORKER_RUNTIME_CAPABILITIES }
       case 'insertRows':
       case 'deleteRows':
       case 'insertColumns':
       case 'deleteColumns':
-        // Wave E will implement band shifts. For Phase 4, no-op true.
-        return true
+        // Fail-closed: the TS core has no band shift yet. The old no-op
+        // `true` was a success-shaped fake ACK that made hosts believe
+        // rows/columns really moved (and removeRows count real
+        // deletions). The capability handshake declares
+        // `structuralEdits: false`, so a compliant adapter never sends
+        // these; if one does, the refusal is structured and honest.
+        return unsupported(`${String(msg.cmd)} (structural edits)`)
       case 'setFormatRange':
-        // Formats not modelled yet — succeed with 0 cells affected.
-        return 0
+        // Fail-closed: was "succeed with 0 cells affected".
+        return unsupported('setFormatRange (formats)')
       case 'snapshotFormatRange':
-        return emptyFormatSnapshot(normalizeSparseRange(msg.range))
+        // Fail-closed: was an empty-snapshot success shape. The adapter
+        // skips this call when `formatSnapshots: false` and overlays an
+        // empty format map locally (truthful — no formats exist).
+        return unsupported('snapshotFormatRange (format snapshots)')
       case 'restoreFormatSnapshot':
-        return 0
+        // Fail-closed: was "restored 0" success shape.
+        return unsupported('restoreFormatSnapshot (format snapshots)')
       case 'snapshotViewportSizes':
         return snapshotViewportSizes(state, normalizeSparseRange(msg.range))
       case 'setRowHeight':
@@ -1564,20 +1593,17 @@ export function createWorkerRuntimeTs(events?: WorkerRuntimeTsEvents): ExcelCore
       }
       case 'exportRangeTsv':
         return exportRangeTsv(state, normalizeSparseRange(msg.range))
-      case 'beginExportRangeTsv': {
-        // Single-chunk fallback — emit the whole rectangle in one go.
-        return {
-          sessionId: 1,
-          totalRows: Math.max(0, Number(normalizeSparseRange(msg.range).endRow) - Number(normalizeSparseRange(msg.range).startRow) + 1),
-          rowsPerChunk: 1024,
-        }
-      }
-      case 'nextExportRangeTsvChunk': {
-        // Stubbed: emit empty chunk with done=true so callers wind down.
-        return { sessionId: Number(msg.sessionId), startRow: 0, endRow: 0, chunk: '', done: true }
-      }
+      case 'beginExportRangeTsv':
+      case 'nextExportRangeTsvChunk':
+        // Fail-closed: the old stub opened a fake session and emitted a
+        // single EMPTY chunk with done=true, so chunked exports silently
+        // produced '' end to end. Chunked sessions are unsupported
+        // (`tsvChunkExport: false`); the single-shot 'exportRangeTsv'
+        // command IS implemented and the adapter falls back to it.
+        return unsupported(`${String(msg.cmd)} (chunked TSV export)`)
       case 'cancelExport':
-        return true
+        // No chunked-export session can exist — nothing was cancelled.
+        return false
       case 'cancelSnapshot': {
         const sessionId = Number(msg.sessionId)
         const existed = state.snapshotSessions.delete(sessionId)
@@ -1639,8 +1665,19 @@ export function createWorkerRuntimeTs(events?: WorkerRuntimeTsEvents): ExcelCore
         // Reset + restore.
         {
           const snapshot = msg.snapshot as WorkbookPersistenceSnapshotWire | undefined
+          if ((snapshot?.formats?.length ?? 0) > 0) {
+            // Fail-closed BEFORE touching any state: silently dropping
+            // the snapshot's format block would be data loss reported as
+            // a successful `restored_formats: 0`.
+            return unsupported('restorePersistenceV1 with a formats block (persistence formats)')
+          }
           const names = snapshot?.sheets?.map((s) => s.name) ?? DEFAULT_INITIAL_SHEETS
           const { wb, sheets } = makeWorkbookFor(names)
+          // Registrations survive the engine swap (parity with the WASM
+          // runtime, whose Workbook instance survives
+          // restore_persistence_v1) — re-bind them on the new workbook
+          // instead of silently dropping the registry.
+          const preservedCustomFormulas = state.customFormulas
           state.workbook = wb
           state.sheets = sheets
           state.customFormulas = new Map()
@@ -1649,6 +1686,13 @@ export function createWorkerRuntimeTs(events?: WorkerRuntimeTsEvents): ExcelCore
           state.importSessions = new Map()
           state.snapshotSessions = new Map()
           state.nextSnapshotSessionId = 1
+          for (const [name, entry] of preservedCustomFormulas) {
+            try {
+              registerCustomFormulaInWorker(state, name, entry.source, entry.isAsync)
+            } catch {
+              // Best-effort — same contract as rebuildPreservingCells.
+            }
+          }
           const cells = snapshot?.cells ?? []
           const importable: ImportCellWire[] = cells.map((c) => {
             switch (c.kind) {

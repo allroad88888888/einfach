@@ -93,6 +93,7 @@ import {
   type SparseCellWire,
   type SparseRangeWire,
   type WorkerLike,
+  type WorkerRuntimeCapabilitiesWire,
   type WorkerWorkbookClient,
   type WorkbookImportStatsWire,
   type WorkbookSheetMeta,
@@ -453,6 +454,19 @@ export function applyConditionalFormatOverlay(
   })
 }
 
+/** Truthful overlay for runtimes that model no formats (`formatSnapshots: false`). */
+function emptyFormatRangeSnapshot(range: SparseRangeWire): FormatRangeSnapshot {
+  return {
+    sheet: range.sheet,
+    startRow: range.startRow,
+    startCol: range.startCol,
+    endRow: range.endRow,
+    endCol: range.endCol,
+    cellFormats: [],
+    rangeFormats: [],
+  }
+}
+
 function preprocessFormatSnapshot(snapshot: FormatRangeSnapshot): {
   cellFormats: Map<string, SpreadsheetCellFormat>
   rangeFormats: RangeFormatLayer[]
@@ -764,13 +778,35 @@ export function createWorkerWorkbookSpreadsheetBackend(
   const conditionalFormatRulesBySheetId = new Map<string, ConditionalFormatRuleEntry[]>()
   let namedRanges: NamedRange[] = []
   let namedRangeMutationTail: Promise<void> = Promise.resolve()
+  /**
+   * Fail-closed capability witness declared by the worker runtime itself
+   * (see `WorkerRuntimeCapabilitiesWire`). `null` means the runtime made
+   * no claims — either it predates the `describeCapabilities` handshake
+   * (the WASM runtime answers UNKNOWN_COMMAND) or the client double does
+   * not implement the method — and the adapter keeps the legacy
+   * full-trust contract so the WASM path is behaviorally unchanged.
+   * Until the handshake resolves the value stays `null` (full trust);
+   * capability-gated ports are getters, so post-`ready()` reads see the
+   * declared witness.
+   */
+  let runtimeCapabilities: WorkerRuntimeCapabilitiesWire | null = null
   const readyPromise = client
     .initWorkbook(sheetInputs.map((sheet) => sheet.name))
     .then(async (metas) => {
       lookup = buildSheetLookup(sheetInputs, metas)
+      runtimeCapabilities = (await client.describeCapabilities?.()) ?? null
       await options.afterInit?.(client, lookup.sheets)
       return lookup.sheets
     })
+
+  /**
+   * `null` witness → legacy full trust. A declared witness gates each
+   * family, and undeclared keys on a declared witness read as
+   * unsupported (fail-closed).
+   */
+  function runtimeSupports(key: keyof WorkerRuntimeCapabilitiesWire): boolean {
+    return runtimeCapabilities === null || runtimeCapabilities[key] === true
+  }
 
   // Wave 8.2 — content-change push for worker-initiated recomputes
   // (async custom-formula settles). The worker posts a cellsDirty event
@@ -943,7 +979,12 @@ export function createWorkerWorkbookSpreadsheetBackend(
     const sparseRange = toSparseRange(sheet.idx, range)
     const [snapshots, formatSnapshot] = await Promise.all([
       client.readSparseRange(sparseRange),
-      client.snapshotFormatRange(sparseRange),
+      // Runtimes that declare `formatSnapshots: false` model no formats
+      // at all, so the truthful overlay is empty — never ask them to
+      // fake a snapshot success shape.
+      runtimeSupports('formatSnapshots')
+        ? client.snapshotFormatRange(sparseRange)
+        : Promise.resolve(emptyFormatRangeSnapshot(sparseRange)),
     ])
     const cells = snapshots
       .map(snapshotToDisplayCell)
@@ -979,7 +1020,14 @@ export function createWorkerWorkbookSpreadsheetBackend(
     let chunkCount = 0
     let estimatedBytes = 0
 
-    if (typeof client.consumeExportRangeTsvChunks === 'function') {
+    // Chunked sessions are only used when the runtime really streams
+    // them (`tsvChunkExport`); otherwise fall back to the single-shot
+    // 'exportRangeTsv' command, which honest runtimes DO implement —
+    // the old TS-runtime chunk stub silently exported empty strings.
+    if (
+      typeof client.consumeExportRangeTsvChunks === 'function' &&
+      runtimeSupports('tsvChunkExport')
+    ) {
       await client.consumeExportRangeTsvChunks(
         sparseRange,
         async (chunk) => {
@@ -1308,6 +1356,67 @@ export function createWorkerWorkbookSpreadsheetBackend(
     }
   }
 
+  // Capability-gated port implementations. Exposed through getters below
+  // so a runtime that declares `structuralEdits: false` / `formats: false`
+  // in the `describeCapabilities` handshake makes the optional port read
+  // as `undefined` — UI core then hides the matching entries (the same
+  // fail-closed degradation the removeRowsExact witness uses).
+  async function insertRowsThroughWorker(
+    request: InsertRowsRequest,
+  ): Promise<BackendMutationResult> {
+    const sheet = await resolveSheet(request.sheetId)
+    await client.insertRows(sheet.idx, request.rowIndex, request.count)
+    return structuralMutationResult(request, bumpRevision())
+  }
+
+  async function deleteRowsThroughWorker(
+    request: DeleteRowsRequest,
+  ): Promise<BackendMutationResult> {
+    const sheet = await resolveSheet(request.sheetId)
+    await client.deleteRows(sheet.idx, request.rowIndex, request.count)
+    return structuralMutationResult(request, bumpRevision())
+  }
+
+  async function insertColumnsThroughWorker(
+    request: InsertColumnsRequest,
+  ): Promise<BackendMutationResult> {
+    const sheet = await resolveSheet(request.sheetId)
+    await client.insertColumns(sheet.idx, request.colIndex, request.count)
+    return structuralMutationResult(request, bumpRevision())
+  }
+
+  async function deleteColumnsThroughWorker(
+    request: DeleteColumnsRequest,
+  ): Promise<BackendMutationResult> {
+    const sheet = await resolveSheet(request.sheetId)
+    await client.deleteColumns(sheet.idx, request.colIndex, request.count)
+    return structuralMutationResult(request, bumpRevision())
+  }
+
+  async function setFormatRangeThroughWorker(
+    request: SetFormatRangeRequest,
+  ): Promise<ToolbarBackendMutationResult> {
+    const sheet = await resolveSheet(request.sheetId)
+    await client.setFormatRange(
+      toSparseRange(sheet.idx, request.range),
+      request.format as CellFormatJSON | null | undefined,
+    )
+    const nextRevision = bumpRevision()
+
+    return {
+      kind: request.kind,
+      sheetId: request.sheetId,
+      requestId: request.requestId,
+      revision: request.revision ?? nextRevision,
+      affectedRange: {
+        rowStart: request.range.rowStart,
+        rowEnd: request.range.rowEnd,
+        colStart: request.range.colStart,
+        colEnd: request.range.colEnd,
+      },
+    }
+  }
+
   return {
     async listSheets() {
       await refreshSheetLookup()
@@ -1410,10 +1519,12 @@ export function createWorkerWorkbookSpreadsheetBackend(
       if (target === 'values' || target === 'all') {
         await client.clearRange(sparseRange)
       }
-      if (target === 'formats' || target === 'all') {
+      if ((target === 'formats' || target === 'all') && runtimeSupports('formats')) {
         // Rust set_format_range drops per-cell overrides inside the range and a
         // null/default layer makes the rectangle read back as unformatted,
-        // which is the contract for 'formats'/'all' clearing.
+        // which is the contract for 'formats'/'all' clearing. Runtimes
+        // that declare `formats: false` model no formats, so the clear
+        // is vacuously complete and the RPC is skipped.
         await client.setFormatRange(sparseRange, null)
       }
       const nextRevision = bumpRevision()
@@ -1431,16 +1542,12 @@ export function createWorkerWorkbookSpreadsheetBackend(
       }
     },
 
-    async insertRows(request: InsertRowsRequest): Promise<BackendMutationResult> {
-      const sheet = await resolveSheet(request.sheetId)
-      await client.insertRows(sheet.idx, request.rowIndex, request.count)
-      return structuralMutationResult(request, bumpRevision())
+    get insertRows() {
+      return runtimeSupports('structuralEdits') ? insertRowsThroughWorker : undefined
     },
 
-    async deleteRows(request: DeleteRowsRequest): Promise<BackendMutationResult> {
-      const sheet = await resolveSheet(request.sheetId)
-      await client.deleteRows(sheet.idx, request.rowIndex, request.count)
-      return structuralMutationResult(request, bumpRevision())
+    get deleteRows() {
+      return runtimeSupports('structuralEdits') ? deleteRowsThroughWorker : undefined
     },
 
     /**
@@ -1472,48 +1579,29 @@ export function createWorkerWorkbookSpreadsheetBackend(
      * effect, so accidentally confirming with zero duplicates leaves the
      * workbook entirely untouched.
      */
-    async removeRows(request: RemoveRowsRequest): Promise<RemoveRowsResult> {
-      return removeRowsThroughWorker(request)
+    get removeRows() {
+      return runtimeSupports('structuralEdits') ? removeRowsThroughWorker : undefined
     },
 
     get removeRowsExact() {
-      return options.removeRowsExactCapability === 'worker-engine-delete-rows'
+      // Two witnesses must agree: the host's explicit opt-in AND the
+      // runtime's own structural-edit declaration.
+      return options.removeRowsExactCapability === 'worker-engine-delete-rows' &&
+        runtimeSupports('structuralEdits')
         ? removeRowsExact
         : undefined
     },
 
-    async insertColumns(request: InsertColumnsRequest): Promise<BackendMutationResult> {
-      const sheet = await resolveSheet(request.sheetId)
-      await client.insertColumns(sheet.idx, request.colIndex, request.count)
-      return structuralMutationResult(request, bumpRevision())
+    get insertColumns() {
+      return runtimeSupports('structuralEdits') ? insertColumnsThroughWorker : undefined
     },
 
-    async deleteColumns(request: DeleteColumnsRequest): Promise<BackendMutationResult> {
-      const sheet = await resolveSheet(request.sheetId)
-      await client.deleteColumns(sheet.idx, request.colIndex, request.count)
-      return structuralMutationResult(request, bumpRevision())
+    get deleteColumns() {
+      return runtimeSupports('structuralEdits') ? deleteColumnsThroughWorker : undefined
     },
 
-    async setFormatRange(request: SetFormatRangeRequest): Promise<ToolbarBackendMutationResult> {
-      const sheet = await resolveSheet(request.sheetId)
-      await client.setFormatRange(
-        toSparseRange(sheet.idx, request.range),
-        request.format as CellFormatJSON | null | undefined,
-      )
-      const nextRevision = bumpRevision()
-
-      return {
-        kind: request.kind,
-        sheetId: request.sheetId,
-        requestId: request.requestId,
-        revision: request.revision ?? nextRevision,
-        affectedRange: {
-          rowStart: request.range.rowStart,
-          rowEnd: request.range.rowEnd,
-          colStart: request.range.colStart,
-          colEnd: request.range.colEnd,
-        },
-      }
+    get setFormatRange() {
+      return runtimeSupports('formats') ? setFormatRangeThroughWorker : undefined
     },
 
     async setRowHeight(request: SetRowHeightRequest): Promise<BackendMutationResult> {

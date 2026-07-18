@@ -195,6 +195,37 @@ export interface WorkbookPersistenceRestoreStatsWire {
   sheets: number
 }
 
+/**
+ * Fail-closed capability witness — a worker runtime's own declaration of
+ * which optional command families it REALLY implements. The host adapter
+ * requests it right after `initWorkbook` via the `describeCapabilities`
+ * command.
+ *
+ * Semantics:
+ *  - A runtime that does not understand the command (the WASM runtime,
+ *    which predates this handshake) answers `UNKNOWN_COMMAND`; the client
+ *    maps that to `null` ("no claims") and the adapter keeps the legacy
+ *    full-trust contract, so the WASM path is behaviorally unchanged.
+ *  - A runtime that answers MUST tell the truth: any family declared
+ *    `false` (or omitted — fail-closed) makes the adapter withhold the
+ *    corresponding optional `SpreadsheetBackend` port, which hides the
+ *    UI entry through the existing degradation contract.
+ *  - Commands in a family declared `false` answer a structured
+ *    `UNSUPPORTED` RPC error instead of a success-shaped fake ACK.
+ */
+export interface WorkerRuntimeCapabilitiesWire {
+  /** insertRows / deleteRows / insertColumns / deleteColumns really shift bands. */
+  structuralEdits: boolean
+  /** setFormatRange really persists formats. */
+  formats: boolean
+  /** snapshotFormatRange / restoreFormatSnapshot are backed by real format state. */
+  formatSnapshots: boolean
+  /** beginExportRangeTsv / nextExportRangeTsvChunk stream real TSV chunks. */
+  tsvChunkExport: boolean
+  /** persistence v1 snapshots round-trip the `formats` block. */
+  persistenceFormats: boolean
+}
+
 export interface WorkerWorkbookSheetDebugCountersWire {
   idx: number
   name: string
@@ -226,6 +257,15 @@ export type RpcEventWire =
 
 export interface WorkerWorkbookClient {
   initWorkbook(sheets?: string[]): Promise<WorkbookSheetMeta[]>
+  /**
+   * Honest capability handshake. Resolves `null` when the runtime
+   * predates the `describeCapabilities` command (`UNKNOWN_COMMAND`),
+   * which the adapter treats as "no claims" — legacy full-trust
+   * behavior, keeping the WASM path unchanged. Optional so hand-rolled
+   * client doubles (tests) keep compiling; the adapter reads it with
+   * `client.describeCapabilities?.()`.
+   */
+  describeCapabilities?(): Promise<WorkerRuntimeCapabilitiesWire | null>
   sheetList(): Promise<WorkbookSheetMeta[]>
   addSheet(name: string): Promise<number>
   renameSheet(sheet: number, name: string): Promise<boolean>
@@ -473,6 +513,17 @@ export function createWorkerWorkbook(opts: WorkerWorkbookOptions): WorkerWorkboo
   return {
     initWorkbook(sheets) {
       return request<WorkbookSheetMeta[]>('initWorkbook', { sheets })
+    },
+    async describeCapabilities() {
+      try {
+        return await request<WorkerRuntimeCapabilitiesWire>('describeCapabilities')
+      } catch (err) {
+        // Legacy runtimes (WASM) predate the handshake and answer
+        // UNKNOWN_COMMAND — map to `null` ("no claims") so the adapter
+        // keeps its legacy full-trust contract for them.
+        if ((err as Error & { code?: string }).code === 'UNKNOWN_COMMAND') return null
+        throw err
+      }
     },
     sheetList() {
       return request<WorkbookSheetMeta[]>('sheetList')
