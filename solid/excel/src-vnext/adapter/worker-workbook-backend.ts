@@ -22,6 +22,8 @@ import type {
   RangeTsvChunkExportResult,
   ListConditionalFormatRulesRequest,
   ListNamedRangesRequest,
+  MergeRangeRequest,
+  UnmergeRangeRequest,
   NamedRange,
   NamedRangeListResult,
   NamedRangeMutationResult,
@@ -209,6 +211,18 @@ interface WorkerUndoImage {
   format: FormatRangeSnapshot | null
 }
 
+/**
+ * Parity #04 merge-overlay transaction payload: before/after images of
+ * ONE sheet's merge-range set. Replay is a pure adapter-memory swap —
+ * no engine RPC, and clear-then-restore does not apply (the record set
+ * is replaced wholesale).
+ */
+interface WorkerMergeOverlayImage {
+  sheetId: string
+  before: CellRange[]
+  after: CellRange[]
+}
+
 interface WorkerTransactionRecord {
   kind: HistoryEntryKind
   sheetIdx: number
@@ -227,6 +241,13 @@ interface WorkerTransactionRecord {
   /** null before/after → the record is not undoable; see `diagnostic`. */
   before: WorkerUndoImage | null
   after: WorkerUndoImage | null
+  /**
+   * Present when the mutation touched the #04 merge overlay. Merge /
+   * unmerge records carry ONLY this payload (before/after stay null);
+   * structural records carry it as a side payload next to their sparse
+   * engine images so undo restores the pre-shift merge set too.
+   */
+  mergeOverlay?: WorkerMergeOverlayImage
   diagnostic?: string
 }
 function normalizeSheetInputs(
@@ -393,6 +414,120 @@ function rangesIntersect(left: CellRange, right: CellRange): boolean {
     left.colStart <= right.colEnd &&
     left.colEnd >= right.colStart
   )
+}
+
+/**
+ * Parity #04 — merge metadata joins the projection last, in SOURCE
+ * coordinates. Mirrors the static backend's `applyMergeMetadata`: the
+ * anchor cell (when inside the window) carries `mergedSpan`, and every
+ * other covered coordinate inside the window materializes (as a blank
+ * cell if needed) carrying `mergeAnchor`. Cells are per-read objects on
+ * this adapter, so in-place mutation cannot leak into caches.
+ */
+function applyMergeOverlay(
+  cells: DisplayCell[],
+  projectionRange: CellRange,
+  mergeRanges: readonly CellRange[],
+): DisplayCell[] {
+  if (mergeRanges.length === 0) return cells
+  const byCoord = new Map<string, DisplayCell>()
+  for (const cell of cells) byCoord.set(keyFor(cell.row, cell.col), cell)
+
+  const upsert = (row: number, col: number): DisplayCell => {
+    const key = keyFor(row, col)
+    let cell = byCoord.get(key)
+    if (!cell) {
+      cell = { row, col, displayValue: '', valueKind: 'blank' }
+      byCoord.set(key, cell)
+    }
+    return cell
+  }
+
+  let touched = false
+  for (const mergeRange of mergeRanges) {
+    if (!rangesIntersect(mergeRange, projectionRange)) continue
+    touched = true
+
+    if (isCoordInsideRange(mergeRange.rowStart, mergeRange.colStart, projectionRange)) {
+      const anchor = upsert(mergeRange.rowStart, mergeRange.colStart)
+      delete anchor.mergeAnchor
+      anchor.mergedSpan = {
+        rows: mergeRange.rowEnd - mergeRange.rowStart + 1,
+        cols: mergeRange.colEnd - mergeRange.colStart + 1,
+      }
+    }
+
+    const rowStart = Math.max(mergeRange.rowStart, projectionRange.rowStart)
+    const rowEnd = Math.min(mergeRange.rowEnd, projectionRange.rowEnd)
+    const colStart = Math.max(mergeRange.colStart, projectionRange.colStart)
+    const colEnd = Math.min(mergeRange.colEnd, projectionRange.colEnd)
+    for (let row = rowStart; row <= rowEnd; row += 1) {
+      for (let col = colStart; col <= colEnd; col += 1) {
+        if (row === mergeRange.rowStart && col === mergeRange.colStart) continue
+        const covered = upsert(row, col)
+        delete covered.mergedSpan
+        covered.mergeAnchor = { row: mergeRange.rowStart, col: mergeRange.colStart }
+      }
+    }
+  }
+  return touched ? [...byCoord.values()] : cells
+}
+
+/**
+ * W3 structural displacement for the #04 merge overlay — Excel
+ * semantics, ported from the static backend's `shiftMergeRanges`: an
+ * insert before a merge shifts it whole, an insert strictly inside
+ * extends it; a delete before it shifts it back, a partial overlap
+ * shrinks it, and a delete covering the whole merge removes it. A merge
+ * that shrinks to a single cell stops being a merge (a 1x1 "merge" is
+ * meaningless in Excel). Mutates `ranges` in place.
+ */
+function shiftMergeRangeList(
+  ranges: CellRange[],
+  axis: 'row' | 'column',
+  index: number,
+  count: number,
+  direction: 1 | -1,
+): void {
+  const startKey = axis === 'row' ? 'rowStart' : 'colStart'
+  const endKey = axis === 'row' ? 'rowEnd' : 'colEnd'
+  const deleteEnd = index + count - 1
+
+  for (let rangeIndex = ranges.length - 1; rangeIndex >= 0; rangeIndex -= 1) {
+    const range = ranges[rangeIndex]
+    const start = range[startKey]
+    const end = range[endKey]
+
+    if (direction === 1) {
+      if (start >= index) {
+        range[startKey] = start + count
+        range[endKey] = end + count
+      } else if (end >= index) {
+        range[endKey] = end + count
+      }
+      continue
+    }
+
+    if (end < index) continue
+    if (start > deleteEnd) {
+      range[startKey] = start - count
+      range[endKey] = end - count
+      continue
+    }
+
+    const hasBefore = start < index
+    const hasAfter = end > deleteEnd
+    if (!hasBefore && !hasAfter) {
+      ranges.splice(rangeIndex, 1)
+      continue
+    }
+
+    range[startKey] = hasBefore ? start : index
+    range[endKey] = hasAfter ? end - count : index - 1
+    if (range.rowStart === range.rowEnd && range.colStart === range.colEnd) {
+      ranges.splice(rangeIndex, 1)
+    }
+  }
 }
 
 function namedRangeMatches(
@@ -920,13 +1055,32 @@ export function createWorkerWorkbookSpreadsheetBackend(
   let revision = options.revision ?? 0
   let disposed = false
   const client: WorkerWorkbookClient = resolvedClient
-  // Toolbar-overlay metadata (data validation, conditional format, named ranges) is
-  // intentionally kept on the main thread for now: the WASM Workbook does not yet model these and
-  // would not round-trip them through undo/redo or formula evaluation. The host applies them on
-  // top of the worker's projection. Move into the Rust workbook once it grows native support; at
-  // that point these Maps should disappear (not be extended).
+  // Adapter host-overlay metadata (data validation, conditional format, merge,
+  // named ranges) lives on the main thread: neither engine models these facts.
+  // CANONICAL_OWNERSHIP (2026-07-19) transposed this pattern from "temporary
+  // until the Rust workbook grows native support" to the sanctioned final form
+  // for the overlay-class items (#04 merge, #21 conditional format, #22
+  // validation rule storage) — the contract shape stays backend-canonical
+  // while the facts live here.
   const validationRulesBySheetId = new Map<string, WorkerValidationRuleLayer[]>()
   const conditionalFormatRulesBySheetId = new Map<string, ConditionalFormatRuleEntry[]>()
+  /**
+   * Parity #04 — merge/unmerge on the worker path (adapter host-overlay).
+   * The contract shape stays backend canonical (`DisplayCell.mergedSpan`
+   * / `mergeAnchor` in projections, `mergeRange` / `unmergeRange` ports
+   * with exact ACKs) while the merge facts live in this main-thread Map;
+   * neither engine models merges and, per CANONICAL_OWNERSHIP, this
+   * overlay is the sanctioned landing shape — not a stopgap.
+   *
+   * SESSION-ONLY boundary: persistence v1 snapshots do not carry merge
+   * ranges, so workbook save/restore drops them by design (consistent
+   * with the overlay definition — same boundary as the validation and
+   * conditional-format overlays above). Bounded by sheet count × merges
+   * per sheet; structural insert/delete remaps entries in place via
+   * `shiftMergeRangeList` (W3 semantics) and undo/redo replays the
+   * per-mutation before/after images recorded on the transaction log.
+   */
+  const mergeRangesBySheetId = new Map<string, CellRange[]>()
   /**
    * Parity item #29 (filter visibility = UI-core view fact). UI-core's
    * `filterSortStateAtom` is the canonical rule store; this Map is the
@@ -1175,6 +1329,8 @@ export function createWorkerWorkbookSpreadsheetBackend(
   async function recordStructuralMutation<T>(spec: {
     kind: HistoryEntryKind
     sheet: WorkerWorkbookBackendSheet
+    /** Host-overlay key: the #04 merge before/after images ride along the record. */
+    sheetId: string
     execute: () => Promise<T>
   }): Promise<T> {
     const fullRange: SparseRangeWire = {
@@ -1211,7 +1367,17 @@ export function createWorkerWorkbookSpreadsheetBackend(
       }`
       before = null
     }
+    // #04 side payload: `execute` remaps the merge overlay right after
+    // the engine shift ACKs, so the before-image is captured here and
+    // the after-image post-execute. Pure adapter memory — no RPC, never
+    // a reason to degrade the record.
+    const mergeBefore = (mergeRangesBySheetId.get(spec.sheetId) ?? []).map(cloneRange)
     const result = await spec.execute()
+    const mergeAfter = (mergeRangesBySheetId.get(spec.sheetId) ?? []).map(cloneRange)
+    const mergeOverlay =
+      mergeBefore.length > 0 || mergeAfter.length > 0
+        ? { sheetId: spec.sheetId, before: mergeBefore, after: mergeAfter }
+        : undefined
     if (before === null) {
       pushTransactionRecord(notUndoableRecord(spec.kind, spec.sheet.idx, null, diagnostic))
       return result
@@ -1240,6 +1406,7 @@ export function createWorkerWorkbookSpreadsheetBackend(
             clearRange: fullRange,
             before: { cells: before, format: null },
             after: { cells: after, format: null },
+            ...(mergeOverlay ? { mergeOverlay } : {}),
           }
         : notUndoableRecord(spec.kind, spec.sheet.idx, null, diagnostic),
     )
@@ -1306,16 +1473,26 @@ export function createWorkerWorkbookSpreadsheetBackend(
     ) {
       return historyNotApplied(request, `unknown transactionId: ${request.transactionId}`)
     }
-    if (record.before === null || record.after === null) {
+    if ((record.before === null || record.after === null) && !record.mergeOverlay) {
       return historyNotApplied(
         request,
         record.diagnostic ?? 'transaction was recorded as not undoable',
       )
     }
-    const image = action === 'undo' ? record.before : record.after
-    // Replay failures propagate as thrown errors: the workbook may be
-    // half-restored, which is exactly the outcome-unknown lane.
-    await replayUndoImage(record, image)
+    if (record.before !== null && record.after !== null) {
+      const image = action === 'undo' ? record.before : record.after
+      // Replay failures propagate as thrown errors: the workbook may be
+      // half-restored, which is exactly the outcome-unknown lane.
+      await replayUndoImage(record, image)
+    }
+    if (record.mergeOverlay) {
+      // #04 merge overlay: pure adapter-memory swap of the sheet's merge
+      // set (whole-set restore — clear-then-restore does not apply). For
+      // structural records this runs AFTER the engine image replay so a
+      // failed engine replay never half-applies the overlay side.
+      const ranges = action === 'undo' ? record.mergeOverlay.before : record.mergeOverlay.after
+      mergeRangesBySheetId.set(record.mergeOverlay.sheetId, ranges.map(cloneRange))
+    }
     record.boundTransactionId = request.transactionId
     source.pop()
     target.push(record)
@@ -1368,17 +1545,86 @@ export function createWorkerWorkbookSpreadsheetBackend(
    * sheet's id IS reused by the next added sheet — stale entries are not
    * just leaks, they get inherited. Per-sheet-keyed state in this
    * backend: `validationRulesBySheetId`, `conditionalFormatRulesBySheetId`,
-   * `filterSortStateBySheetId`, `filterSortDisplayRowsBySheetId`, and the
-   * sheet-scoped entries of `namedRanges`.
+   * `mergeRangesBySheetId`, `filterSortStateBySheetId`,
+   * `filterSortDisplayRowsBySheetId`, and the sheet-scoped entries of
+   * `namedRanges`.
    */
   function dropSheetOverlayState(sheetId: string): void {
     validationRulesBySheetId.delete(sheetId)
     conditionalFormatRulesBySheetId.delete(sheetId)
+    mergeRangesBySheetId.delete(sheetId)
     filterSortStateBySheetId.delete(sheetId)
     filterSortDisplayRowsBySheetId.delete(sheetId)
     namedRanges = namedRanges.filter(
       (item) => item.scope === 'workbook' || item.scope.sheetId !== sheetId,
     )
+  }
+
+  /**
+   * W3 remap of the #04 merge overlay after an ACKed structural shift.
+   * The engine has already displaced index space; the overlay's source
+   * coordinates must follow or every merge south/east of the band would
+   * render one band off.
+   */
+  function shiftMergeOverlay(
+    sheetId: string,
+    axis: 'row' | 'column',
+    index: number,
+    count: number,
+    direction: 1 | -1,
+  ): void {
+    const ranges = mergeRangesBySheetId.get(sheetId)
+    if (!ranges || ranges.length === 0) return
+    shiftMergeRangeList(ranges, axis, index, count, direction)
+  }
+
+  /**
+   * Parity #04 — shared core of the `mergeRange` / `unmergeRange` ports.
+   * Excel semantics mirror the static backend exactly: both ops first
+   * drop every merge intersecting the requested range; merge then adds
+   * the normalized range back when it spans more than one cell (a 1x1
+   * "merge" is meaningless). The transaction record carries before/after
+   * images of the sheet's merge set — pure adapter memory, no engine RPC
+   * — and the exact ACK echoes kind/requestId/affectedRange so the
+   * UI-core strict validator can walk local-ack → refresh → ready.
+   */
+  function applyMergeOverlayMutation(
+    request: MergeRangeRequest | UnmergeRangeRequest,
+    sheet: WorkerWorkbookBackendSheet,
+  ): ToolbarBackendMutationResult {
+    const range = normalizeRange(request.range)
+    const current = mergeRangesBySheetId.get(request.sheetId) ?? []
+    const before = current.map(cloneRange)
+    const next = current.filter((candidate) => !rangesIntersect(candidate, range))
+    if (
+      request.kind === 'merge-range' &&
+      (range.rowEnd > range.rowStart || range.colEnd > range.colStart)
+    ) {
+      next.push(cloneRange(range))
+    }
+    mergeRangesBySheetId.set(request.sheetId, next)
+    pushTransactionRecord({
+      kind: request.kind === 'merge-range' ? 'range.merge' : 'range.unmerge',
+      sheetIdx: sheet.idx,
+      boundTransactionId: null,
+      affectedRange: cloneRange(range),
+      clearRange: null,
+      before: null,
+      after: null,
+      mergeOverlay: {
+        sheetId: request.sheetId,
+        before,
+        after: next.map(cloneRange),
+      },
+    })
+    const nextRevision = bumpRevision()
+    return {
+      kind: request.kind,
+      sheetId: request.sheetId,
+      requestId: request.requestId,
+      revision: request.revision ?? nextRevision,
+      affectedRange: cloneRange(range),
+    }
   }
 
   async function refreshSheetLookup(
@@ -1626,6 +1872,12 @@ export function createWorkerWorkbookSpreadsheetBackend(
       mapped,
     )
 
+    // Parity #04 × #29: merge metadata is intentionally ABSENT while
+    // filter/sort is active. Merge coordinates are SOURCE facts but the
+    // filtered projection emits a permuted row space — a span drawn
+    // across non-adjacent surviving rows would be a lie. The static
+    // backend disables merge projection under an active filter
+    // (`filterSortActive ? [] : mergeRanges`); this path matches it.
     return {
       cells: applyConditionalFormatOverlay(
         validatedCells,
@@ -1671,11 +1923,19 @@ export function createWorkerWorkbookSpreadsheetBackend(
       validationRulesBySheetId.get(sheetId) ?? [],
     )
 
+    const conditionalCells = applyConditionalFormatOverlay(
+      validatedCells,
+      conditionalFormatRulesBySheetId.get(sheetId) ?? [],
+      range,
+    )
+    // #04 merge overlay joins last (source coordinates == display
+    // coordinates on this plain path; the filtered path above skips
+    // merges entirely, mirroring the static backend).
     return {
-      cells: applyConditionalFormatOverlay(
-        validatedCells,
-        conditionalFormatRulesBySheetId.get(sheetId) ?? [],
+      cells: applyMergeOverlay(
+        conditionalCells,
         range,
+        mergeRangesBySheetId.get(sheetId) ?? [],
       ).sort((left, right) =>
         left.row === right.row ? left.col - right.col : left.row - right.row,
       ),
@@ -1898,6 +2158,7 @@ export function createWorkerWorkbookSpreadsheetBackend(
     return recordStructuralMutation({
       kind: 'row.delete',
       sheet,
+      sheetId: request.sheetId,
       execute: () => removeRowsBands(request, sheet, unique),
     })
   }
@@ -1933,6 +2194,12 @@ export function createWorkerWorkbookSpreadsheetBackend(
         for (let offset = band.count - 1; offset >= 0; offset -= 1) {
           successfullyRemoved.push(band.startRow + offset)
         }
+        // Bands run bottom-up, so shifting the #04 merge overlay per
+        // accepted band composes exactly like the static backend's
+        // per-row descending remap: lower bands keep their original
+        // coordinates until their own turn. On partial failure the
+        // overlay matches the bands the engine really deleted.
+        shiftMergeOverlay(request.sheetId, 'row', band.startRow, band.count, -1)
       } catch (error) {
         failureCause = error
         break
@@ -2068,8 +2335,10 @@ export function createWorkerWorkbookSpreadsheetBackend(
     return recordStructuralMutation({
       kind: 'row.insert',
       sheet,
+      sheetId: request.sheetId,
       execute: async () => {
         await client.insertRows(sheet.idx, request.rowIndex, request.count)
+        shiftMergeOverlay(request.sheetId, 'row', request.rowIndex, request.count, 1)
         return structuralMutationResult(request, bumpRevision())
       },
     })
@@ -2082,8 +2351,10 @@ export function createWorkerWorkbookSpreadsheetBackend(
     return recordStructuralMutation({
       kind: 'row.delete',
       sheet,
+      sheetId: request.sheetId,
       execute: async () => {
         await client.deleteRows(sheet.idx, request.rowIndex, request.count)
+        shiftMergeOverlay(request.sheetId, 'row', request.rowIndex, request.count, -1)
         return structuralMutationResult(request, bumpRevision())
       },
     })
@@ -2096,8 +2367,10 @@ export function createWorkerWorkbookSpreadsheetBackend(
     return recordStructuralMutation({
       kind: 'column.insert',
       sheet,
+      sheetId: request.sheetId,
       execute: async () => {
         await client.insertColumns(sheet.idx, request.colIndex, request.count)
+        shiftMergeOverlay(request.sheetId, 'column', request.colIndex, request.count, 1)
         return structuralMutationResult(request, bumpRevision())
       },
     })
@@ -2110,8 +2383,10 @@ export function createWorkerWorkbookSpreadsheetBackend(
     return recordStructuralMutation({
       kind: 'column.delete',
       sheet,
+      sheetId: request.sheetId,
       execute: async () => {
         await client.deleteColumns(sheet.idx, request.colIndex, request.count)
+        shiftMergeOverlay(request.sheetId, 'column', request.colIndex, request.count, -1)
         return structuralMutationResult(request, bumpRevision())
       },
     })
@@ -2782,6 +3057,24 @@ export function createWorkerWorkbookSpreadsheetBackend(
         requestId: request.requestId,
         revision: request.revision ?? nextRevision,
       }
+    },
+
+    /**
+     * Parity #04 — merge/unmerge (adapter host-overlay, see
+     * `mergeRangesBySheetId`). Session-only, never an engine RPC; the
+     * exact ACK (kind/requestId/revision/affectedRange) satisfies the
+     * UI-core toolbar's strict validator, and each call records a
+     * before/after overlay image on the host-orchestrated transaction
+     * log so Ctrl+Z round-trips.
+     */
+    async mergeRange(request: MergeRangeRequest): Promise<ToolbarBackendMutationResult> {
+      const sheet = await resolveSheet(request.sheetId)
+      return applyMergeOverlayMutation(request, sheet)
+    },
+
+    async unmergeRange(request: UnmergeRangeRequest): Promise<ToolbarBackendMutationResult> {
+      const sheet = await resolveSheet(request.sheetId)
+      return applyMergeOverlayMutation(request, sheet)
     },
 
     /**
