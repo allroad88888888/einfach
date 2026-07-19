@@ -12,7 +12,11 @@ import type {
 } from '@einfach/spreadsheet-ui-core'
 import {
   captureTextToColumnsCapabilityAtom,
+  diagnosticsAtom,
   openTextToColumnsAtom,
+  setSheetProtectionAtom,
+  textToColumnsErrorAtom,
+  textToColumnsLifecycleAtom,
   textToColumnsOpenAtom,
   textToColumnsWizardAtom,
 } from '@einfach/spreadsheet-ui-core'
@@ -341,6 +345,53 @@ describe('SpreadsheetTextToColumnsDialog', () => {
     await waitFor(() => {
       expect(store.getter(textToColumnsOpenAtom)).toBe(false)
     })
+  })
+
+  it('blocks Finish on a protected sheet with zero importCellChunks transport', async () => {
+    const store = createStore()
+    const spy = jest.fn(
+      async (request: ImportCellChunksRequest): Promise<BackendMutationResult> =>
+        matchingAcknowledgement(request),
+    )
+    const backend = createImportSpyBackend(spy)
+    store.setter(setSheetProtectionAtom, {
+      sheetId: 'sheet-1',
+      state: { mode: 'protected', unlockedRanges: [] },
+    })
+    store.setter(openTextToColumnsAtom, {
+      sheetId: 'sheet-1',
+      anchor: { row: 0, col: 0 },
+      rows: [
+        { sourceRow: 0, text: 'a,b' },
+        { sourceRow: 1, text: 'c,d' },
+      ],
+    })
+
+    const { container } = render(() => (
+      <SpreadsheetUiProvider backend={backend} store={store}>
+        <SpreadsheetTextToColumnsDialog />
+      </SpreadsheetUiProvider>
+    ))
+
+    advanceToFinalStep(container)
+    fireEvent.click(getEls(container).finish!)
+
+    // The mutation gateway fails closed before the request id is allocated:
+    // lifecycle goes blocked, the structured diagnostic is recorded, and the
+    // transport is never launched.
+    await waitFor(() => {
+      expect(store.getter(textToColumnsLifecycleAtom).status).toBe('blocked')
+    })
+    expect(spy).not.toHaveBeenCalled()
+    expect(store.getter(textToColumnsOpenAtom)).toBe(true)
+    expect(store.getter(textToColumnsErrorAtom)).toBe(
+      'The target cells are locked on a protected sheet.',
+    )
+    expect(
+      store
+        .getter(diagnosticsAtom)
+        .items.some((item) => item.code === 'MUTATION_BLOCKED_LOCKED'),
+    ).toBe(true)
   })
 
   it('keeps X, Cancel, and Escape blocked through pending, acknowledgement, and refresh', async () => {

@@ -13,8 +13,9 @@ import type { CellCoord, CellRange } from '../shared'
  * Unified content-mutation gateway.
  *
  * Every content mutation (set-cell-input, clear-range, fill-range,
- * fill-series, paste-range, import-cell-chunks) resolves through this
- * module before any transport is launched:
+ * fill-series, paste-range, import-cell-chunks) and every format write
+ * (set-format-range) resolves through this module before any transport is
+ * launched:
  *
  * 1. Display→source row remap. When filter/sort is active the visible
  *    projection carries `DisplayCell.originalRow`; mutation targets arrive
@@ -24,11 +25,18 @@ import type { CellCoord, CellRange } from '../shared'
  *    fact) fails closed — the mutation is blocked, never guessed.
  * 2. Protection gate. After remap, if the sheet is protected and the
  *    source-coordinate target is not fully covered by unlocked ranges,
- *    the mutation is blocked before transport (fail-closed).
+ *    the mutation is blocked before transport (fail-closed). This applies
+ *    to `set-format-range` too — Excel semantics: locked cells on a
+ *    protected sheet cannot be reformatted. `protectionGate: false` skips
+ *    step 2 while still applying the row remap (e.g. reading a fill
+ *    source, format-only clears).
  *
- * Format-only mutations are out of scope; callers of format paths keep
- * their existing behavior (`protectionGate: false` skips step 2 while
- * still applying the row remap).
+ * `requireIdentityMapping: true` is for transports whose frozen request
+ * shape can only express the original contiguous display-coordinate
+ * target (paste-special sessions, text-to-columns commit plans): an
+ * otherwise-allowed resolution that would move or split any row fails
+ * closed as `unmapped-row` instead of returning remapped ranges the
+ * caller cannot forward.
  */
 
 export type ContentMutationKind =
@@ -38,6 +46,7 @@ export type ContentMutationKind =
   | 'fill-series'
   | 'paste-range'
   | 'import-cell-chunks'
+  | 'set-format-range'
 
 export interface ResolveContentMutationCellInput {
   readonly kind: ContentMutationKind
@@ -45,8 +54,10 @@ export interface ResolveContentMutationCellInput {
   /** Display-coordinate target cell. */
   readonly cell: Readonly<CellCoord>
   readonly range?: undefined
-  /** Defaults to true. Pass false for read-side or format-only resolution. */
+  /** Defaults to true. Pass false for read-side or gate-exempt resolution. */
   readonly protectionGate?: boolean
+  /** Defaults to false. When true, any row remap fails closed as unmapped-row. */
+  readonly requireIdentityMapping?: boolean
 }
 
 export interface ResolveContentMutationRangeInput {
@@ -55,8 +66,10 @@ export interface ResolveContentMutationRangeInput {
   /** Display-coordinate target range. */
   readonly range: Readonly<CellRange>
   readonly cell?: undefined
-  /** Defaults to true. Pass false for read-side or format-only resolution. */
+  /** Defaults to true. Pass false for read-side or gate-exempt resolution. */
   readonly protectionGate?: boolean
+  /** Defaults to false. When true, any row remap fails closed as unmapped-row. */
+  readonly requireIdentityMapping?: boolean
 }
 
 export type ResolveContentMutationInput =
@@ -307,6 +320,10 @@ export const resolveContentMutationAtom = atom(
       remapped = mapping.remapped
     } else {
       return publishBlock(set, createBlockedResolution(input, 'invalid-target'))
+    }
+
+    if (input.requireIdentityMapping === true && remapped) {
+      return publishBlock(set, createBlockedResolution(input, 'unmapped-row'))
     }
 
     if (enforceProtection) {

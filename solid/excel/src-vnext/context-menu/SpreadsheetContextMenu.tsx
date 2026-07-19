@@ -22,6 +22,7 @@ import {
   isViewportHiddenContextMenuCommand,
   rejectProjectionAtom,
   reportProjectionErrorAtom,
+  resolveContentMutationAtom,
   resolveProjectionAtom,
   runViewportHiddenContextMenuCommandAtom,
   runStructureOperationAtom,
@@ -167,6 +168,39 @@ function targetToRange(target: MenuTarget): CellRange | null {
     default:
       return null
   }
+}
+
+/**
+ * Display→source row lookup rebuilt from a gateway range resolution. The
+ * gateway walks display rows in order (`mapDisplayRangeToSourceRanges`) and
+ * emits one source range per contiguous run, so flattening the runs yields
+ * exactly the source row for each display row of `range`, in display order.
+ */
+function displayToSourceRowMap(
+  range: CellRange,
+  sourceRanges: readonly Readonly<CellRange>[],
+): Map<number, number> {
+  const map = new Map<number, number>()
+  let displayRow = range.rowStart
+  for (const sourceRange of sourceRanges) {
+    for (let row = sourceRange.rowStart; row <= sourceRange.rowEnd; row += 1) {
+      map.set(displayRow, row)
+      displayRow += 1
+    }
+  }
+  return map
+}
+
+function boundingRange(ranges: readonly Readonly<CellRange>[]): CellRange {
+  return ranges.reduce(
+    (acc, range) => ({
+      rowStart: Math.min(acc.rowStart, range.rowStart),
+      rowEnd: Math.max(acc.rowEnd, range.rowEnd),
+      colStart: Math.min(acc.colStart, range.colStart),
+      colEnd: Math.max(acc.colEnd, range.colEnd),
+    }),
+    { ...ranges[0] },
+  )
 }
 
 function dataRangeFromOrigin(origin: CellCoord, rowCount: number, colCount: number): CellRange {
@@ -359,13 +393,28 @@ export function SpreadsheetContextMenu(props: SpreadsheetContextMenuProps) {
     return true
   }
 
-  async function clearClipboardSource(sheetId: string, range: CellRange) {
-    if (rangeCellCount(range) === 1) {
+  /**
+   * Mutation gateway resolution for a clear over a display range. Returns the
+   * source ranges to clear, or null when the mutation is blocked (locked
+   * cells, unmappable rows) — the caller must launch zero transport then.
+   */
+  function resolveClearRanges(sheetId: string, range: CellRange): CellRange[] | null {
+    const resolution = store.setter(resolveContentMutationAtom, {
+      kind: 'clear-range',
+      sheetId,
+      range,
+    })
+    if (resolution.status === 'blocked') return null
+    return (resolution.ranges ?? [range]).map((sourceRange) => ({ ...sourceRange }))
+  }
+
+  async function clearResolvedRanges(sheetId: string, ranges: readonly CellRange[]) {
+    if (ranges.length === 1 && rangeCellCount(ranges[0]) === 1) {
       await backend.setCellInput({
         kind: 'set-cell-input',
         sheetId,
-        row: range.rowStart,
-        col: range.colStart,
+        row: ranges[0].rowStart,
+        col: ranges[0].colStart,
         input: '',
       })
       return
@@ -374,11 +423,13 @@ export function SpreadsheetContextMenu(props: SpreadsheetContextMenuProps) {
     if (!backend.clearRange) {
       throw new Error('Range clear is not supported by this spreadsheet backend.')
     }
-    await backend.clearRange({
-      kind: 'clear-range',
-      sheetId,
-      range,
-    })
+    for (const range of ranges) {
+      await backend.clearRange({
+        kind: 'clear-range',
+        sheetId,
+        range,
+      })
+    }
   }
 
   async function pasteClipboardText(sheetId: string, targetRange: CellRange) {
@@ -399,7 +450,8 @@ export function SpreadsheetContextMenu(props: SpreadsheetContextMenuProps) {
     const sourceRange = dataRangeFromOrigin(plan.sourceOrigin, plan.rowCount, plan.colCount)
     const pasteRange = plan.estimatedRange
 
-    if (cellCount > CLIPBOARD_CELL_LIMIT && !backend.importCellChunks) {
+    const useChunkedImport = cellCount > CLIPBOARD_CELL_LIMIT && backend.importCellChunks != null
+    if (cellCount > CLIPBOARD_CELL_LIMIT && !useChunkedImport) {
       store.setter(
         setClipboardErrorAtom,
         clipboardError(
@@ -409,6 +461,23 @@ export function SpreadsheetContextMenu(props: SpreadsheetContextMenuProps) {
       return
     }
 
+    // Mutation gateway: fail-closed remap + protection gate over the whole
+    // paste target before any transport or clipboard-state change.
+    const resolution = store.setter(resolveContentMutationAtom, {
+      kind: useChunkedImport ? 'import-cell-chunks' : 'paste-range',
+      sheetId,
+      range: pasteRange,
+    })
+    if (resolution.status === 'blocked') {
+      store.setter(setClipboardErrorAtom, {
+        code: resolution.diagnostic.code,
+        message: resolution.diagnostic.message,
+      })
+      return
+    }
+    const resolvedRanges = resolution.ranges ?? [pasteRange]
+    const rowMap = resolution.remapped ? displayToSourceRowMap(pasteRange, resolvedRanges) : null
+
     store.setter(pasteClipboardAtom, {
       source: { sheetId, range: sourceRange },
       target: { sheetId, range: pasteRange },
@@ -417,14 +486,18 @@ export function SpreadsheetContextMenu(props: SpreadsheetContextMenuProps) {
       estimatedBytes: plan.estimatedBytes,
     })
 
-    if (cellCount > CLIPBOARD_CELL_LIMIT && backend.importCellChunks) {
-      await backend.importCellChunks({
+    if (useChunkedImport) {
+      await backend.importCellChunks!({
         kind: 'import-cell-chunks',
         sheetId,
         chunks: (function* () {
-          for (const chunk of plan.chunks()) yield chunk.cells
+          for (const chunk of plan.chunks()) {
+            yield rowMap === null
+              ? chunk.cells
+              : chunk.cells.map((cell) => ({ ...cell, row: rowMap.get(cell.row) ?? cell.row }))
+          }
         })(),
-        range: pasteRange,
+        range: rowMap === null ? pasteRange : boundingRange(resolvedRanges),
       })
     } else {
       for (const chunk of plan.chunks()) {
@@ -432,7 +505,7 @@ export function SpreadsheetContextMenu(props: SpreadsheetContextMenuProps) {
           await backend.setCellInput({
             kind: 'set-cell-input',
             sheetId,
-            row: cell.row,
+            row: rowMap === null ? cell.row : (rowMap.get(cell.row) ?? cell.row),
             col: cell.col,
             input: cell.input,
           })
@@ -452,13 +525,19 @@ export function SpreadsheetContextMenu(props: SpreadsheetContextMenuProps) {
       case 'clipboard.copy':
         await copyRangeToClipboard(intent.target.sheetId, range)
         return
-      case 'clipboard.cut':
+      case 'clipboard.cut': {
+        // Mutation gateway: resolve the clear before the copy so a blocked
+        // cut (locked cells, unmappable rows) does nothing at all — no
+        // clipboard write, no transport (fail-closed).
+        const clearRanges = resolveClearRanges(intent.target.sheetId, range)
+        if (clearRanges === null) return
         if (await copyRangeToClipboard(intent.target.sheetId, range, 'cut')) {
-          await clearClipboardSource(intent.target.sheetId, range)
+          await clearResolvedRanges(intent.target.sheetId, clearRanges)
           store.setter(markClipboardReadyAtom)
           await refreshVisibleProjection(store, backend, intent.target.sheetId, 'selection')
         }
         return
+      }
       case 'clipboard.paste':
         await pasteClipboardText(intent.target.sheetId, range)
         return
@@ -484,28 +563,18 @@ export function SpreadsheetContextMenu(props: SpreadsheetContextMenuProps) {
       case 'clipboard.paste':
         await executeClipboardCommand(intent)
         return
-      case 'cell.clear':
-        if (target.kind === 'cell') {
-          await backend.setCellInput({
-            kind: 'set-cell-input',
-            sheetId: target.sheetId,
-            row: target.cell.row,
-            col: target.cell.col,
-            input: '',
-          })
-        } else if (target.kind === 'range') {
-          if (!backend.clearRange) {
-            throw new Error('Range clear is not supported by this spreadsheet backend.')
-          }
-          await backend.clearRange({
-            kind: 'clear-range',
-            sheetId: target.sheetId,
-            range: target.range,
-          })
-        } else {
-          return
-        }
+      case 'cell.clear': {
+        if (target.kind !== 'cell' && target.kind !== 'range') return
+        // Mutation gateway: remap display rows to source rows (filter/sort)
+        // and enforce the protection gate. A blocked resolution aborts the
+        // whole command before the first transport (fail-closed).
+        const range = targetToRange(target)
+        if (range === null) return
+        const clearRanges = resolveClearRanges(target.sheetId, range)
+        if (clearRanges === null) return
+        await clearResolvedRanges(target.sheetId, clearRanges)
         break
+      }
       case 'row.insert':
         if (target.kind !== 'row') return
         await dispatchStructureOperation(

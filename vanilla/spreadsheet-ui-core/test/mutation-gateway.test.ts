@@ -263,6 +263,7 @@ describe('mutation gateway — protection gate', () => {
       'fill-series',
       'paste-range',
       'import-cell-chunks',
+      'set-format-range',
     ] as const) {
       const resolution = store.setter(resolveContentMutationAtom, {
         kind,
@@ -271,6 +272,42 @@ describe('mutation gateway — protection gate', () => {
       })
       expect(resolution).toMatchObject({ status: 'blocked', reason: 'locked', kind })
     }
+  })
+
+  test('requireIdentityMapping fails closed when any row would remap', () => {
+    const store = createStore()
+    publishVisibleProjection(store, filteredCells())
+
+    const blocked = store.setter(resolveContentMutationAtom, {
+      kind: 'paste-range',
+      sheetId: SHEET,
+      range: { rowStart: 1, rowEnd: 2, colStart: 0, colEnd: 1 },
+      requireIdentityMapping: true,
+    })
+
+    expect(blocked).toMatchObject({ status: 'blocked', reason: 'unmapped-row' })
+    expect(store.getter(contentMutationLastBlockAtom)).toMatchObject({
+      reason: 'unmapped-row',
+      kind: 'paste-range',
+    })
+  })
+
+  test('requireIdentityMapping passes through untouched targets', () => {
+    const store = createStore()
+    publishVisibleProjection(store, plainCells())
+
+    const resolution = store.setter(resolveContentMutationAtom, {
+      kind: 'import-cell-chunks',
+      sheetId: SHEET,
+      range: { rowStart: 0, rowEnd: 1, colStart: 0, colEnd: 0 },
+      requireIdentityMapping: true,
+    })
+
+    expect(resolution).toMatchObject({
+      status: 'allowed',
+      ranges: [{ rowStart: 0, rowEnd: 1, colStart: 0, colEnd: 0 }],
+      remapped: false,
+    })
   })
 
   test('protectionGate: false still remaps but skips the lock gate', () => {
@@ -290,6 +327,78 @@ describe('mutation gateway — protection gate', () => {
       remapped: true,
       ranges: [{ rowStart: 5, rowEnd: 5, colStart: 0, colEnd: 0 }],
     })
+  })
+})
+
+describe('mutation gateway — set-format-range', () => {
+  test('identity passthrough with the protection gate open', () => {
+    const store = createStore()
+    publishVisibleProjection(store, plainCells())
+
+    const resolution = store.setter(resolveContentMutationAtom, {
+      kind: 'set-format-range',
+      sheetId: SHEET,
+      range: { rowStart: 0, rowEnd: 1, colStart: 0, colEnd: 1 },
+    })
+
+    expect(resolution).toMatchObject({
+      status: 'allowed',
+      ranges: [{ rowStart: 0, rowEnd: 1, colStart: 0, colEnd: 1 }],
+      remapped: false,
+    })
+  })
+
+  test('maps a format range onto source rows while filter/sort is active', () => {
+    const store = createStore()
+    publishVisibleProjection(store, filteredCells())
+
+    const resolution = store.setter(resolveContentMutationAtom, {
+      kind: 'set-format-range',
+      sheetId: SHEET,
+      range: { rowStart: 1, rowEnd: 2, colStart: 0, colEnd: 1 },
+    })
+
+    expect(resolution).toMatchObject({
+      status: 'allowed',
+      remapped: true,
+      ranges: [
+        { rowStart: 5, rowEnd: 5, colStart: 0, colEnd: 1 },
+        { rowStart: 3, rowEnd: 3, colStart: 0, colEnd: 1 },
+      ],
+    })
+  })
+
+  test('blocks format writes onto locked cells with a structured diagnostic', () => {
+    const store = createStore()
+    publishVisibleProjection(store, filteredCells())
+    // Unlock the SOURCE row 5 only; display row 2 maps to locked source row 3.
+    protectSheet(store, [{ rowStart: 5, rowEnd: 5, colStart: 0, colEnd: 3 }])
+
+    const allowed = store.setter(resolveContentMutationAtom, {
+      kind: 'set-format-range',
+      sheetId: SHEET,
+      range: { rowStart: 1, rowEnd: 1, colStart: 0, colEnd: 1 },
+    })
+    const blocked = store.setter(resolveContentMutationAtom, {
+      kind: 'set-format-range',
+      sheetId: SHEET,
+      range: { rowStart: 2, rowEnd: 2, colStart: 0, colEnd: 1 },
+    })
+
+    expect(allowed).toMatchObject({
+      status: 'allowed',
+      ranges: [{ rowStart: 5, rowEnd: 5, colStart: 0, colEnd: 1 }],
+    })
+    expect(blocked).toMatchObject({ status: 'blocked', reason: 'locked', kind: 'set-format-range' })
+    expect(store.getter(contentMutationLastBlockAtom)).toMatchObject({
+      kind: 'set-format-range',
+      reason: 'locked',
+    })
+    expect(
+      store
+        .getter(diagnosticsAtom)
+        .items.some((item) => item.code === 'MUTATION_BLOCKED_LOCKED' && item.sheetId === SHEET),
+    ).toBe(true)
   })
 })
 

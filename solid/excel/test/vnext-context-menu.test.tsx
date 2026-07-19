@@ -22,11 +22,13 @@ import type {
 } from '@einfach/spreadsheet-ui-core'
 import {
   clipboardStateAtom,
+  diagnosticsAtom,
   historyStackAtom,
   hydrateViewportFreezeAtom,
   menuCommandIntentAtom,
   menuStateAtom,
   openMenuAtom,
+  setSheetProtectionAtom,
   structureOperationLifecycleAtom,
   viewportFreezeAtom,
 } from '@einfach/spreadsheet-ui-core'
@@ -831,6 +833,169 @@ describe('vNext SpreadsheetContextMenu', () => {
         type: 'clipboard.cut',
       },
     })
+  })
+
+  it('clears mapped source rows via the gateway while a filter remap is active', async () => {
+    const store = createStore()
+    const { backend, clearRangeRequests, setCellInputRequests } = createFakeBackend()
+    const window = { rowStart: 0, rowEnd: 4, colStart: 0, colEnd: 4 }
+
+    // Display rows 1..2 backed by source rows 5 and 3 (filter/sort permutation).
+    seedReadyVisibleProjection(store, {
+      status: 'ready',
+      request: {
+        kind: 'visible-window',
+        sheetId: 'sheet-1',
+        window,
+        requestId: 1,
+      },
+      result: {
+        kind: 'visible-window',
+        sheetId: 'sheet-1',
+        window,
+        requestId: 1,
+        cells: [
+          { row: 1, col: 0, displayValue: 'beta', originalRow: 5 },
+          { row: 2, col: 0, displayValue: 'gamma', originalRow: 3 },
+        ],
+      },
+    })
+    store.setter(openMenuAtom, {
+      surface: 'cell',
+      target: {
+        kind: 'range',
+        sheetId: 'sheet-1',
+        range: { rowStart: 1, rowEnd: 2, colStart: 0, colEnd: 1 },
+      },
+      position: { x: 0, y: 0 },
+      source: 'pointer',
+    })
+
+    const { getByTestId } = render(() => (
+      <SpreadsheetUiProvider backend={backend} store={store}>
+        <SpreadsheetContextMenu />
+      </SpreadsheetUiProvider>
+    ))
+
+    fireEvent.click(getByTestId('context-menu-command-cell.clear'))
+
+    await waitFor(() =>
+      expect(clearRangeRequests.map((request) => request.range)).toEqual([
+        { rowStart: 5, rowEnd: 5, colStart: 0, colEnd: 1 },
+        { rowStart: 3, rowEnd: 3, colStart: 0, colEnd: 1 },
+      ]),
+    )
+    expect(setCellInputRequests).toEqual([])
+  })
+
+  it('blocks Delete on a protected sheet with zero transport', async () => {
+    const store = createStore()
+    const { backend, clearRangeRequests, setCellInputRequests, readVisibleRequests } =
+      createFakeBackend()
+    store.setter(setSheetProtectionAtom, {
+      sheetId: 'sheet-1',
+      state: { mode: 'protected', unlockedRanges: [] },
+    })
+    store.setter(openMenuAtom, {
+      surface: 'context',
+      target: {
+        kind: 'cell',
+        sheetId: 'sheet-1',
+        cell: { row: 3, col: 4 },
+      },
+      position: { x: 0, y: 0 },
+      source: 'keyboard',
+    })
+
+    const { getByTestId } = render(() => (
+      <SpreadsheetUiProvider backend={backend} store={store}>
+        <SpreadsheetContextMenu />
+      </SpreadsheetUiProvider>
+    ))
+
+    fireEvent.click(getByTestId('context-menu-command-cell.clear'))
+
+    await waitFor(() => expect(store.getter(menuStateAtom).status).toBe('closed'))
+    expect(setCellInputRequests).toEqual([])
+    expect(clearRangeRequests).toEqual([])
+    expect(readVisibleRequests).toEqual([])
+    expect(
+      store
+        .getter(diagnosticsAtom)
+        .items.some((item) => item.code === 'MUTATION_BLOCKED_LOCKED'),
+    ).toBe(true)
+  })
+
+  it('blocks cut on a protected sheet before the copy, with zero transport', async () => {
+    const clipboard = installClipboard()
+    const store = createStore()
+    const { backend, clearRangeRequests, setCellInputRequests, readRangeRequests } =
+      createFakeBackend()
+    store.setter(setSheetProtectionAtom, {
+      sheetId: 'sheet-1',
+      state: { mode: 'protected', unlockedRanges: [] },
+    })
+    store.setter(openMenuAtom, {
+      surface: 'cell',
+      target: {
+        kind: 'range',
+        sheetId: 'sheet-1',
+        range: { rowStart: 0, rowEnd: 1, colStart: 0, colEnd: 1 },
+      },
+      position: { x: 0, y: 0 },
+      source: 'pointer',
+    })
+
+    const { getByTestId } = render(() => (
+      <SpreadsheetUiProvider backend={backend} store={store}>
+        <SpreadsheetContextMenu />
+      </SpreadsheetUiProvider>
+    ))
+
+    fireEvent.click(getByTestId('context-menu-command-clipboard.cut'))
+
+    await waitFor(() => expect(store.getter(menuStateAtom).status).toBe('closed'))
+    expect(clipboard.writeText).not.toHaveBeenCalled()
+    expect(readRangeRequests).toEqual([])
+    expect(clearRangeRequests).toEqual([])
+    expect(setCellInputRequests).toEqual([])
+  })
+
+  it('blocks paste on a protected sheet with zero transport and a clipboard error', async () => {
+    installClipboard('# einfach-clipboard-origin: B2\nlocked')
+    const store = createStore()
+    const { backend, setCellInputRequests, importCellChunksRequests } = createFakeBackend()
+    store.setter(setSheetProtectionAtom, {
+      sheetId: 'sheet-1',
+      state: { mode: 'protected', unlockedRanges: [] },
+    })
+    store.setter(openMenuAtom, {
+      surface: 'cell',
+      target: {
+        kind: 'cell',
+        sheetId: 'sheet-1',
+        cell: { row: 2, col: 2 },
+      },
+      position: { x: 0, y: 0 },
+      source: 'pointer',
+    })
+
+    const { getByTestId } = render(() => (
+      <SpreadsheetUiProvider backend={backend} store={store}>
+        <SpreadsheetContextMenu />
+      </SpreadsheetUiProvider>
+    ))
+
+    fireEvent.click(getByTestId('context-menu-command-clipboard.paste'))
+
+    await waitFor(() =>
+      expect(store.getter(clipboardStateAtom)).toMatchObject({
+        status: 'error',
+        error: { code: 'MUTATION_BLOCKED_LOCKED' },
+      }),
+    )
+    expect(setCellInputRequests).toEqual([])
+    expect(importCellChunksRequests).toEqual([])
   })
 
   it('pastes clipboard TSV at the target top-left and shifts formula references', async () => {

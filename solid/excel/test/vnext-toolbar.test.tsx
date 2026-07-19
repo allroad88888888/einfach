@@ -13,6 +13,7 @@ import type {
 } from '@einfach/spreadsheet-ui-core'
 import {
   beginProjectionAtom,
+  diagnosticsAtom,
   findReplaceOpenAtom,
   formatCellsEditorAtom,
   formatPainterStateAtom,
@@ -537,6 +538,49 @@ describe('vNext SpreadsheetToolbar', () => {
       range: { rowStart: 1, rowEnd: 1, colStart: 4, colEnd: 4 },
       format: { numberFormat: { kind: 'percent', digits: 0 } },
     })
+  })
+
+  it('fails closed on a format command when a filtered row cannot be mapped', async () => {
+    const store = createStore()
+    const { backend, setFormatRangeCalls } = createRecordingBackend()
+
+    store.setter(setWorkspaceActiveSheetAtom, { sheetId: 'sheet-1' })
+    store.setter(selectCellAtom, { sheetId: 'sheet-1', coord: { row: 6, col: 4 } })
+    // The remap is active (originalRow facts exist) but display row 6 carries
+    // no fact — the mutation gateway must block instead of guessing a source
+    // row (the old lenient helper silently fell back to the display row).
+    seedVisibleProjection(store, {
+      kind: 'visible-window',
+      sheetId: 'sheet-1',
+      requestId: 1,
+      window: { rowStart: 0, rowEnd: 8, colStart: 0, colEnd: 5 },
+      cells: [
+        {
+          row: 5,
+          col: 4,
+          originalRow: 1,
+          displayValue: '300',
+          valueKind: 'number',
+          format: {},
+        },
+      ],
+    })
+
+    const { container } = render(() => (
+      <SpreadsheetUiProvider backend={backend} store={store}>
+        <SpreadsheetToolbar />
+      </SpreadsheetUiProvider>
+    ))
+
+    fireEvent.click(getButtons(container).percent)
+
+    await waitFor(() =>
+      expect(
+        store.getter(diagnosticsAtom).items.some((item) => item.code === 'MUTATION_UNMAPPED_ROW'),
+      ).toBe(true),
+    )
+    expect(setFormatRangeCalls).toHaveLength(0)
+    expect(store.getter(toolbarMutationLifecycleAtom).status).toBe('ready')
   })
 
   it('renders the Custom row in the number-format dropdown without raw i18n keys', async () => {

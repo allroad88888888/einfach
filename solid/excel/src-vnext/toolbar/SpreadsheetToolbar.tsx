@@ -23,6 +23,7 @@ import {
   openToolbarDropdownAtom,
   openToolbarPaletteAtom,
   openValidationRuleEditorAtom,
+  resolveContentMutationAtom,
   retryFilterSortRefreshAtom,
   retryToolbarMutationRefreshAtom,
   runFilterSortEntrypointAtom,
@@ -50,8 +51,6 @@ import {
 
 import {
   isVisibleProjectionResult,
-  resolveProjectionSourceRange,
-  resolveProjectionSourceRanges,
   refreshVisibleProjection,
   spreadsheetProjectionSnapshotAtom,
   useSpreadsheetBackend,
@@ -781,10 +780,29 @@ export function SpreadsheetToolbar(props: SpreadsheetToolbarProps) {
     })
   }
 
+  /**
+   * Mutation-gateway resolution for a format write over a display range:
+   * remaps display rows to source rows (filter/sort) and enforces the
+   * protection gate (locked cells on a protected sheet cannot be
+   * reformatted). Returns the source ranges to write, or null when the
+   * mutation is blocked — callers must then launch zero transport; the
+   * gateway has already recorded the structured diagnostic + lastBlock.
+   */
+  function resolveFormatSourceRanges(sheetId: string, range: CellRange): CellRange[] | null {
+    const resolution = store.setter(resolveContentMutationAtom, {
+      kind: 'set-format-range',
+      sheetId,
+      range,
+    })
+    if (resolution.status === 'blocked') return null
+    return (resolution.ranges ?? [range]).map((sourceRange) => ({ ...sourceRange }))
+  }
+
   function executeCommand(intent: ToolbarFormatCommandIntent, range: CellRange) {
     const current = activeCellFormat()
     const format = commandFormat(intent, current)
-    const sourceRanges = resolveProjectionSourceRanges(store, intent.sheetId, range)
+    const sourceRanges = resolveFormatSourceRanges(intent.sheetId, range)
+    if (sourceRanges === null) return
     dispatchToolbarMutation({
       sheetId: intent.sheetId,
       operation: 'format',
@@ -844,15 +862,18 @@ export function SpreadsheetToolbar(props: SpreadsheetToolbarProps) {
         } else {
           nextFormat.borders = nextBorders
         }
-        const sourceRange = resolveProjectionSourceRange(store, sheetId, {
+        // One gateway resolution per cell; any blocked cell aborts the whole
+        // preset before the single dispatch below (fail-closed, zero transport).
+        const sourceRanges = resolveFormatSourceRanges(sheetId, {
           rowStart: row,
           rowEnd: row,
           colStart: col,
           colEnd: col,
         })
+        if (sourceRanges === null) return
         steps.push({
           kind: 'set-format-range',
-          range: sourceRange,
+          range: sourceRanges[0],
           format: nextFormat,
         })
       }
@@ -1092,7 +1113,8 @@ export function SpreadsheetToolbar(props: SpreadsheetToolbarProps) {
     const sheetId = getMutationSheetId()
     if (!sheetId) return
     const range = selectionSnapshot().range
-    const sourceRanges = resolveProjectionSourceRanges(store, sheetId, range)
+    const sourceRanges = resolveFormatSourceRanges(sheetId, range)
+    if (sourceRanges === null) return
     dispatchToolbarMutation({
       sheetId,
       operation: 'format',
@@ -1170,7 +1192,8 @@ export function SpreadsheetToolbar(props: SpreadsheetToolbarProps) {
     const sheetId = getMutationSheetId()
     if (!sheetId) return
     const range = selectionSnapshot().range
-    const sourceRanges = resolveProjectionSourceRanges(store, sheetId, range)
+    const sourceRanges = resolveFormatSourceRanges(sheetId, range)
+    if (sourceRanges === null) return
     const currentFormat = activeCellFormat()
     const nf = currentFormat.numberFormat
     const nextFormat: SpreadsheetCellFormat = { ...currentFormat }

@@ -8,6 +8,7 @@ import {
   exitFormatPainterAtom,
   formatPainterPendingAtom,
   formatPainterStateAtom,
+  resolveContentMutationAtom,
   selectionAuthorityWitnessAtom,
   syncFormatPainterContextAtom,
   workspaceActiveSheetAuthorityWitnessAtom,
@@ -16,7 +17,6 @@ import {
   type SpreadsheetBackend,
 } from '@einfach/spreadsheet-ui-core'
 import {
-  resolveProjectionSourceRanges,
   refreshVisibleProjection,
   useSpreadsheetBackend,
   useSpreadsheetUiStore,
@@ -45,9 +45,20 @@ export function SpreadsheetFormatPainter(props: SpreadsheetFormatPainterProps) {
     readVisibleProjection: capabilities.readVisibleProjection,
   }) as SpreadsheetBackend
   const applyPorts: ApplyFormatPainterInput = Object.freeze({
-    resolveTargetRanges: Object.freeze((sheetId: string, range: CellRange) =>
-      resolveProjectionSourceRanges(store, sheetId, range),
-    ),
+    // Mutation gateway: remap display rows to source rows and enforce the
+    // protection gate (locked cells on a protected sheet cannot be painted).
+    // A blocked resolution returns [] — Core's W0 single-contiguous-target
+    // preflight then fails before any transport; the gateway has already
+    // recorded the structured diagnostic + lastBlock.
+    resolveTargetRanges: Object.freeze((sheetId: string, range: CellRange): CellRange[] => {
+      const resolution = store.setter(resolveContentMutationAtom, {
+        kind: 'set-format-range',
+        sheetId,
+        range,
+      })
+      if (resolution.status === 'blocked') return []
+      return (resolution.ranges ?? [range]).map((sourceRange) => ({ ...sourceRange }))
+    }),
     setFormatRange: capabilities.setFormatRange,
     refreshProjection:
       capabilities.readVisibleProjection === undefined

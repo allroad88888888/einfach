@@ -14,6 +14,7 @@ import {
   applyFormatPainterAtom,
   armFormatPainterAtom,
   armFormatPainterStickyAtom,
+  diagnosticsAtom,
   exitFormatPainterAtom,
   formatPainterClipboardAtom,
   formatPainterControllerAtom,
@@ -21,6 +22,7 @@ import {
   formatPainterStateAtom,
   selectCellAtom,
   setSelectionAtom,
+  setSheetProtectionAtom,
   setWorkspaceActiveSheetAtom,
   type CapturedFormat,
 } from '@einfach/spreadsheet-ui-core'
@@ -165,6 +167,42 @@ describe('SpreadsheetFormatPainter atoms (integration)', () => {
     expect(call.sheetId).toBe('sheet-1')
     expect(call.range).toEqual({ rowStart: 1, rowEnd: 4, colStart: 1, colEnd: 3 })
     expect(call.format).toEqual(richFormat())
+  })
+
+  it('blocks painting onto a locked target on a protected sheet with zero transport', async () => {
+    const store = createStore()
+    const { backend, setFormatRangeCalls, readVisibleProjectionCalls } = createRecordingBackend()
+    primeStoreWithProjection(store)
+    // Only the painter source cell is unlocked; the paste target stays locked.
+    store.setter(setSheetProtectionAtom, {
+      sheetId: 'sheet-1',
+      state: {
+        mode: 'protected',
+        unlockedRanges: [{ rowStart: 0, rowEnd: 0, colStart: 0, colEnd: 0 }],
+      },
+    })
+
+    render(() => (
+      <SpreadsheetUiProvider backend={backend} store={store}>
+        <SpreadsheetFormatPainter />
+      </SpreadsheetUiProvider>
+    ))
+
+    store.setter(armFormatPainterAtom, { format: richFormat() })
+    store.setter(selectCellAtom, { sheetId: 'sheet-1', coord: { row: 1, col: 0 } })
+
+    // The mutation gateway blocks the format write (Excel semantics: locked
+    // cells on a protected sheet cannot be reformatted) before any transport.
+    await waitFor(() =>
+      expect(
+        store.getter(diagnosticsAtom).items.some((item) => item.code === 'MUTATION_BLOCKED_LOCKED'),
+      ).toBe(true),
+    )
+    expect(setFormatRangeCalls).toHaveLength(0)
+    expect(readVisibleProjectionCalls).toHaveLength(0)
+    expect(store.getter(formatPainterControllerAtom).error?.code).toBe(
+      'FORMAT_PAINTER_NON_CONTIGUOUS_TARGET',
+    )
   })
 })
 

@@ -1,9 +1,5 @@
 import type { Store } from '@einfach/core'
-import type {
-  CellCoord,
-  CellRange,
-  VisibleProjectionResult,
-} from '@einfach/spreadsheet-ui-core'
+import type { CellRange, VisibleProjectionResult } from '@einfach/spreadsheet-ui-core'
 import { isVisibleProjectionResult, spreadsheetProjectionSnapshotAtom } from './atoms'
 
 function visibleResultForSheet(
@@ -31,17 +27,6 @@ function originalRowForVisibleRow(
   return rowCell?.originalRow
 }
 
-export function resolveProjectionSourceCell(
-  store: Store,
-  sheetId: string,
-  cell: CellCoord,
-): CellCoord {
-  const result = visibleResultForSheet(store, sheetId)
-  if (!result) return cell
-  const originalRow = originalRowForVisibleRow(result, cell.row, cell.col)
-  return originalRow === undefined ? cell : { row: originalRow, col: cell.col }
-}
-
 /**
  * Translate visible projection coordinates back to source rows for mutations.
  *
@@ -51,12 +36,14 @@ export function resolveProjectionSourceCell(
  * selection is inside the current projection window; huge selections such as
  * whole columns intentionally fall back to the source range shape.
  *
- * NOTE: content mutations (set-cell-input / clear-range / fill / paste) no
- * longer use these lenient helpers — they resolve through UI-core's
- * fail-closed `resolveContentMutationAtom` gateway (`editing/mutation-gateway`),
- * which also enforces the protection gate. These helpers remain for
- * format-path translation (e.g. toolbar format toggles), which is outside
- * the content-mutation gating scope.
+ * NOTE: content mutations (set-cell-input / clear-range / fill / paste /
+ * import-cell-chunks) and the toolbar / format-painter format paths no longer
+ * use these lenient helpers — they resolve through UI-core's fail-closed
+ * `resolveContentMutationAtom` gateway (`editing/mutation-gateway`), which
+ * also enforces the protection gate. The remaining consumers are the
+ * format-cells dialogs (`SpreadsheetFormatCellsDialog`,
+ * `SpreadsheetNumberFormatDialogs`) and the grid's `toggleActiveFormatField`;
+ * migrate them to the gateway before deleting this module.
  */
 export function resolveProjectionSourceRanges(
   store: Store,

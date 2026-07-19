@@ -7,6 +7,7 @@ import type {
   RangeProjectionRequest,
   RangeProjectionResult,
 } from '../backend/types'
+import { resolveContentMutationAtom } from '../editing/mutation-gateway'
 import { pushHistoryAtom } from '../history'
 import {
   selectionAuthorityWitnessAtom,
@@ -1459,6 +1460,26 @@ export const runTextToColumnsFinishAtom = atom(
       typeof input.refreshProjection !== 'function'
     ) {
       set(textToColumnsErrorStateAtom, TEXT_TO_COLUMNS_CONTEXT_ERROR)
+      set(
+        textToColumnsLifecycleStateAtom,
+        lifecycleFor('blocked', session.sessionId, session.sheetId),
+      )
+      return 'blocked'
+    }
+
+    // Mutation gateway: the commit plan freezes source rows captured under an
+    // identity display→source mapping, and the single importCellChunks request
+    // cannot express a permuted remap — so any active remap and any protection
+    // block fail closed here, before the transport (zero transport, structured
+    // diagnostic recorded by the gateway).
+    const resolution = set(resolveContentMutationAtom, {
+      kind: 'import-cell-chunks',
+      sheetId: session.sheetId,
+      range: target,
+      requireIdentityMapping: true,
+    })
+    if (resolution.status === 'blocked') {
+      set(textToColumnsErrorStateAtom, resolution.diagnostic.message)
       set(
         textToColumnsLifecycleStateAtom,
         lifecycleFor('blocked', session.sessionId, session.sheetId),
