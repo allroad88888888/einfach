@@ -773,6 +773,18 @@ export interface HistoryTransactionResult {
   requestId?: ProjectionRequestId
   revision?: ProjectionRevision
   affectedRange?: CellRange
+  /**
+   * Structured not-applied witness (host-orchestrated undo). `false`
+   * means the backend positively confirmed nothing was replayed —
+   * unknown transactionId, missing snapshot, or an entry degraded to
+   * not-undoable at record time. UI core routes it through the
+   * outcome-unknown convention (re-read canonical state); the revision
+   * accompanying a not-applied result is informational only. Absent or
+   * `true` means the transaction was applied.
+   */
+  applied?: boolean
+  /** Human-readable reason accompanying `applied: false`. */
+  notAppliedReason?: string
 }
 
 // --- filter-sort ---

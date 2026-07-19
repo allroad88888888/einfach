@@ -118,6 +118,17 @@ export interface HistoryMutationResult {
   readonly transactionId: HistoryTransactionId
   readonly requestId?: ProjectionRequestId
   readonly revision?: ProjectionRevision
+  /**
+   * Structured not-applied witness (host-orchestrated undo, design point
+   * C). `false` means the backend POSITIVELY confirmed it did not replay
+   * the transaction (unknown transactionId, missing/degraded snapshot).
+   * The stack cursor does not move and the acknowledged revision is not
+   * committed; the lifecycle surfaces the outcome-unknown convention so
+   * hosts re-read canonical state. Absent or `true` means applied.
+   */
+  readonly applied?: boolean
+  /** Human-readable reason accompanying `applied: false`. */
+  readonly notAppliedReason?: string
 }
 
 /** Framework-neutral history transport port. Core never retains this object. */

@@ -15,6 +15,36 @@ Two entry families share one bounded stack:
   backend projection-revision witness (`spreadsheet.history.projectionRevisionBacking`),
   keeping local labels out of the strict backend counter.
 
+## Revision witness semantics (host-orchestrated undo, design point C)
+
+Backend undo/redo requests carry the last revision UI-core witnessed
+(`spreadsheet.history.projectionRevisionBacking`), but backends MUST NOT enforce a strict
+"request revision == current revision" precondition: engine-initiated bumps are legal
+between a push and the matching undo (async custom-formula settles bump the backend
+revision unconditionally — see CANONICAL_OWNERSHIP §4-2). The witness separation is:
+
+- The history witness advances only on `pushHistoryAtom` (backend entries) and on a
+  strictly-correlated acknowledgement; local-replay entries never touch it.
+- The acknowledgement's `revision` is accepted as authoritative and becomes the next
+  witness — whatever engine-initiated bumps happened in between.
+- A backend that cannot replay the transaction (unknown `transactionId`, snapshot
+  missing, entry degraded to not-undoable at record time) returns a **structured
+  not-applied** acknowledgement (`applied: false` + `notAppliedReason`) instead of a
+  fake success or a bare throw. UI-core then keeps the cursor, does NOT commit the
+  acknowledged revision, and surfaces `HISTORY_NOT_APPLIED_ERROR` through the existing
+  outcome-unknown convention — hosts recover by re-reading canonical state.
+
+## Sheet lifecycle exclusion (design point D)
+
+`addSheet` / `deleteSheet` / `renameSheet` / `reorderSheet` are NOT recorded as history
+entries and MUST NOT be replayed through `undoTransaction` / `redoTransaction`.
+Persistence-v1 restore drops the custom-formula registry, named values, and
+subscriptions, so a snapshot-based sheet-level undo would resurrect a maimed workbook;
+the registration-replay protocol is separate future work (CANONICAL_OWNERSHIP §4-3).
+Worker adapters additionally drop their recorded transaction log when sheet indices
+shift (`deleteSheet` / `reorderSheet`) — replaying a stale sheet index would target the
+wrong sheet, and a not-applied answer is the truthful degradation.
+
 Backend entries may additionally carry **local side payloads**
 (`entry.localSidePayloads`): when a structural backend mutation displaces UI-core
 canonical view facts (freeze band, hidden index sets), the operation snapshots them as

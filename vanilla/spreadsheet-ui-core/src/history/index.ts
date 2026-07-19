@@ -33,6 +33,8 @@ export const HISTORY_ACKNOWLEDGEMENT_ERROR =
   'History acknowledgement did not match the active request.'
 export const HISTORY_OUTCOME_UNKNOWN_ERROR =
   'History result is unknown. Reload or reconcile workbook data before another history action.'
+export const HISTORY_NOT_APPLIED_ERROR =
+  'Backend confirmed the history transaction was not applied.'
 
 let historyTransactionCounter = 0
 
@@ -215,6 +217,29 @@ function isProjectionRevision(value: unknown): value is ProjectionRevision {
     (typeof value === 'number' && Number.isFinite(value)) ||
     (typeof value === 'string' && value.length > 0)
   )
+}
+
+/**
+ * Structured not-applied detection (design point C). Returns the reason
+ * string when the acknowledgement carries `applied: false`; `null`
+ * otherwise. A not-applied acknowledgement is a POSITIVE backend
+ * statement that nothing was replayed — the cursor must not move and the
+ * acknowledged revision must not be committed as the new witness. The
+ * lifecycle still lands on the outcome-unknown convention because the
+ * UI-visible history stack now disagrees with what the backend can
+ * replay; hosts recover by re-reading canonical state.
+ */
+function acknowledgementNotApplied(acknowledgement: unknown): string | null {
+  try {
+    if (typeof acknowledgement !== 'object' || acknowledgement === null) return null
+    const result = acknowledgement as Partial<HistoryMutationResult>
+    if (result.applied !== false) return null
+    return typeof result.notAppliedReason === 'string' && result.notAppliedReason.length > 0
+      ? result.notAppliedReason
+      : ''
+  } catch {
+    return null
+  }
 }
 
 function acknowledgementRevision(
@@ -486,6 +511,23 @@ async function runHistoryAction(
   }
 
   if (!ownsTicket()) return 'blocked'
+  const notAppliedReason = acknowledgementNotApplied(acknowledgement)
+  if (notAppliedReason !== null) {
+    set(
+      historyLifecycleBackingAtom,
+      lifecycleForTicket(
+        'outcome-unknown',
+        ticket,
+        null,
+        outcomeUnknownError(
+          notAppliedReason.length > 0
+            ? `${HISTORY_NOT_APPLIED_ERROR} ${notAppliedReason}`
+            : HISTORY_NOT_APPLIED_ERROR,
+        ),
+      ),
+    )
+    return 'outcome-unknown'
+  }
   const acknowledgedRevision = acknowledgementRevision(acknowledgement, ticket)
   if (acknowledgedRevision === null) {
     set(

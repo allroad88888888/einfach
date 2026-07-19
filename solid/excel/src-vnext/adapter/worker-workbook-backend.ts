@@ -11,6 +11,8 @@ import type {
   DeleteRowsRequest,
   DisplayCell,
   FilterSortState,
+  HistoryEntryKind,
+  HistoryTransactionResult,
   ImportCellChunksRequest,
   InsertColumnsRequest,
   InsertRowsRequest,
@@ -45,6 +47,8 @@ import type {
   SetValidationRuleRequest,
   SheetMutationResult,
   SpreadsheetBackend,
+  RedoTransactionRequest,
+  UndoTransactionRequest,
   SpreadsheetCellFormat,
   SpreadsheetSheetMetadata,
   ToolbarBackendMutationResult,
@@ -165,6 +169,66 @@ const MAX_IMPORT_CELLS_PER_CHUNK = 10_000
  */
 export const MAX_FILTER_SORT_PREDICATE_CELLS = 50_000
 export const FILTER_SORT_SOURCE_TOO_LARGE = 'FILTER_SORT_SOURCE_TOO_LARGE'
+
+/**
+ * Host-orchestrated undo/redo (parity #15/#36, CANONICAL_OWNERSHIP §4).
+ *
+ * The adapter records one bounded transaction per undoable mutation:
+ * before/after sparse images assembled from the snapshot primitives that
+ * are already on the worker protocol (`snapshotRangeSparse`,
+ * `snapshotFormatRange`); `undoTransaction` / `redoTransaction` replay
+ * them clear-then-restore because `restoreSparse` is an ADDITIVE merge
+ * (rust/wasm/src/lib.rs `restore_sparse` contract — design point A).
+ *
+ * Stack cap mirrors UI-core history (`DEFAULT_HISTORY_CAP = 100`):
+ * UI-core evicts oldest entries at 100, so deeper adapter records are
+ * unreachable anyway.
+ */
+export const WORKER_UNDO_STACK_CAP = 100
+/**
+ * Structural before-images must be FULL-SHEET non-empty snapshots —
+ * shift.rs rewrites formulas that referenced a deleted band into
+ * irreversible `#REF!` sentinels, so a band-scoped delta cannot restore
+ * them (design point B). Threshold carried over from the legacy
+ * sheet-store precedent (`STRUCTURAL_SNAPSHOT_MAX = 2000`,
+ * solid/excel/src/sheet-store.ts): each structural op serializes the
+ * before AND after image across the RPC boundary and up to 100 records
+ * stay resident, so the cap bounds worst-case memory at
+ * 100 × 2 × 2000 cells. Above the threshold the structural mutation
+ * still executes but its record degrades to not-undoable — the snapshot
+ * is never truncated.
+ */
+export const WORKER_STRUCTURAL_SNAPSHOT_MAX = 2000
+/** u32 max — full-sheet sparse bound accepted by both worker runtimes. */
+const FULL_SHEET_INDEX_BOUND = 0xffffffff
+
+interface WorkerUndoImage {
+  /** Sparse cells to restore; null when the mutation cannot touch values. */
+  cells: SparseCellWire[] | null
+  /** Format snapshot to restore; null when the mutation cannot touch formats. */
+  format: FormatRangeSnapshot | null
+}
+
+interface WorkerTransactionRecord {
+  kind: HistoryEntryKind
+  sheetIdx: number
+  /**
+   * The UI transaction id is minted AFTER the mutation acknowledges
+   * (`nextHistoryTransactionId()` at push time), so the adapter cannot
+   * key records by it up front. Records align positionally with UI-core
+   * backend entries (static-backend precedent) and the id binds lazily
+   * on the first successful undo; later undo/redo of the same record
+   * must present the bound id or the request answers not-applied.
+   */
+  boundTransactionId: string | null
+  affectedRange: CellRange | null
+  /** Region cleared before restoring `cells` (clear-then-restore, design point A). */
+  clearRange: SparseRangeWire | null
+  /** null before/after → the record is not undoable; see `diagnostic`. */
+  before: WorkerUndoImage | null
+  after: WorkerUndoImage | null
+  diagnostic?: string
+}
 function normalizeSheetInputs(
   sheets: readonly (string | WorkerWorkbookBackendSheetInput)[] | undefined,
 ): WorkerWorkbookBackendSheetInput[] {
@@ -302,10 +366,23 @@ function structuralMutationResult(
   request: InsertRowsRequest | DeleteRowsRequest | InsertColumnsRequest | DeleteColumnsRequest,
   revision: ProjectionRevision,
 ): BackendMutationResult {
+  // W3 structural-shift contract: the worker engine really displaced
+  // index space, so the ACK must say so — UI-core uses it to remap its
+  // canonical view facts (freeze band, hidden index sets) and to record
+  // history side payloads for the displaced facts.
+  const structuralShift: BackendMutationResult['structuralShift'] =
+    request.kind === 'insert-rows'
+      ? { axis: 'row', kind: 'insert', index: request.rowIndex, count: request.count }
+      : request.kind === 'delete-rows'
+        ? { axis: 'row', kind: 'delete', index: request.rowIndex, count: request.count }
+        : request.kind === 'insert-columns'
+          ? { axis: 'column', kind: 'insert', index: request.colIndex, count: request.count }
+          : { axis: 'column', kind: 'delete', index: request.colIndex, count: request.count }
   return {
     sheetId: request.sheetId,
     requestId: request.requestId,
     revision: request.revision ?? revision,
+    structuralShift,
   }
 }
 
@@ -727,6 +804,25 @@ function toImportCellWire(
   return { sheet, row, col, kind: 'text', value: trimmed }
 }
 
+function boundingRangeOfImportCells(
+  cells: readonly { row: number; col: number }[],
+): CellRange | null {
+  let range: CellRange | null = null
+  for (const cell of cells) {
+    if (!Number.isInteger(cell.row) || !Number.isInteger(cell.col)) continue
+    if (cell.row < 0 || cell.col < 0) continue
+    if (range === null) {
+      range = { rowStart: cell.row, rowEnd: cell.row, colStart: cell.col, colEnd: cell.col }
+    } else {
+      range.rowStart = Math.min(range.rowStart, cell.row)
+      range.rowEnd = Math.max(range.rowEnd, cell.row)
+      range.colStart = Math.min(range.colStart, cell.col)
+      range.colEnd = Math.max(range.colEnd, cell.col)
+    }
+  }
+  return range
+}
+
 function normalizeImportCellsPerChunk(value: number | undefined): number {
   const normalized = Math.floor(Number(value))
   if (!Number.isFinite(normalized)) return DEFAULT_IMPORT_CELLS_PER_CHUNK
@@ -849,6 +945,17 @@ export function createWorkerWorkbookSpreadsheetBackend(
    * projection read recomputes from fresh engine values.
    */
   const filterSortDisplayRowsBySheetId = new Map<string, number[]>()
+  /**
+   * Bounded host-orchestrated undo/redo transaction log (cap
+   * `WORKER_UNDO_STACK_CAP`, oldest dropped). One record per undoable
+   * mutation, aligned positionally with the UI-core history stack's
+   * backend entries. Cleared wholesale when sheet indices shift
+   * (deleteSheet / reorderSheet — design point D): records address
+   * sheets by positional index and a stale index would replay into the
+   * wrong sheet.
+   */
+  const undoRecords: WorkerTransactionRecord[] = []
+  const redoRecords: WorkerTransactionRecord[] = []
   let namedRanges: NamedRange[] = []
   let namedRangeMutationTail: Promise<void> = Promise.resolve()
   /**
@@ -924,6 +1031,301 @@ export function createWorkerWorkbookSpreadsheetBackend(
       revision += 1
     }
     return revision
+  }
+
+  // --- host-orchestrated undo/redo helpers -------------------------------
+
+  function pushTransactionRecord(record: WorkerTransactionRecord): void {
+    undoRecords.push(record)
+    if (undoRecords.length > WORKER_UNDO_STACK_CAP) {
+      undoRecords.shift()
+    }
+    // A new mutation invalidates all forward history, mirroring
+    // pushHistoryAtom truncating the UI-core redo tail.
+    redoRecords.length = 0
+  }
+
+  function dropTransactionRecords(): void {
+    undoRecords.length = 0
+    redoRecords.length = 0
+  }
+
+  function notUndoableRecord(
+    kind: HistoryEntryKind,
+    sheetIdx: number,
+    affectedRange: CellRange | null,
+    diagnostic: string,
+  ): WorkerTransactionRecord {
+    return {
+      kind,
+      sheetIdx,
+      boundTransactionId: null,
+      affectedRange: affectedRange ? { ...affectedRange } : null,
+      clearRange: null,
+      before: null,
+      after: null,
+      diagnostic,
+    }
+  }
+
+  async function captureUndoImage(
+    range: SparseRangeWire,
+    capture: { values: boolean; formats: boolean },
+  ): Promise<WorkerUndoImage> {
+    const cells = capture.values ? await client.snapshotRangeSparse(range) : null
+    const format = capture.formats ? await client.snapshotFormatRange(range) : null
+    return { cells, format }
+  }
+
+  /**
+   * Record one undoable cell-scoped mutation: capture the before-image,
+   * run the mutation, capture the after-image, push the bounded record.
+   * Snapshot failures NEVER block the mutation — the record degrades to
+   * not-undoable with a diagnostic instead. A mutation that throws
+   * records nothing (the UI dispatcher does not push an entry either, so
+   * the two stacks stay aligned).
+   */
+  async function recordCellMutation<T>(spec: {
+    kind: HistoryEntryKind
+    sheet: WorkerWorkbookBackendSheet
+    range: CellRange | null
+    captureValues: boolean
+    captureFormats: boolean
+    missingRangeDiagnostic?: string
+    execute: () => Promise<T>
+  }): Promise<T> {
+    if (spec.range === null) {
+      const result = await spec.execute()
+      pushTransactionRecord(
+        notUndoableRecord(
+          spec.kind,
+          spec.sheet.idx,
+          null,
+          spec.missingRangeDiagnostic ?? 'mutation carried no affected range for the undo snapshot',
+        ),
+      )
+      return result
+    }
+    if (spec.captureFormats && !runtimeSupports('formatSnapshots')) {
+      // The mutation WILL change formats but the runtime cannot snapshot
+      // them — recording values only would make undo lie about formats.
+      const result = await spec.execute()
+      pushTransactionRecord(
+        notUndoableRecord(
+          spec.kind,
+          spec.sheet.idx,
+          spec.range,
+          'runtime does not implement format snapshots; format-touching mutation is not undoable',
+        ),
+      )
+      return result
+    }
+
+    const sparse = toSparseRange(spec.sheet.idx, spec.range)
+    const capture = { values: spec.captureValues, formats: spec.captureFormats }
+    let before: WorkerUndoImage | null = null
+    let diagnostic = ''
+    try {
+      before = await captureUndoImage(sparse, capture)
+    } catch (error) {
+      diagnostic = `undo before-image snapshot failed: ${
+        error instanceof Error ? error.message : String(error)
+      }`
+    }
+    const result = await spec.execute()
+    if (before === null) {
+      pushTransactionRecord(notUndoableRecord(spec.kind, spec.sheet.idx, spec.range, diagnostic))
+      return result
+    }
+    let after: WorkerUndoImage | null = null
+    try {
+      after = await captureUndoImage(sparse, capture)
+    } catch (error) {
+      diagnostic = `redo after-image snapshot failed: ${
+        error instanceof Error ? error.message : String(error)
+      }`
+    }
+    pushTransactionRecord(
+      after !== null
+        ? {
+            kind: spec.kind,
+            sheetIdx: spec.sheet.idx,
+            boundTransactionId: null,
+            affectedRange: { ...spec.range },
+            clearRange: spec.captureValues ? sparse : null,
+            before,
+            after,
+          }
+        : notUndoableRecord(spec.kind, spec.sheet.idx, spec.range, diagnostic),
+    )
+    return result
+  }
+
+  /**
+   * Record one structural mutation (insert/delete rows/columns,
+   * removeRows). Design point B: the before-image must be the FULL-SHEET
+   * non-empty snapshot — `#REF!` sentinel rewrites are irreversible — and
+   * a sheet whose non-empty count exceeds `WORKER_STRUCTURAL_SNAPSHOT_MAX`
+   * degrades the record to not-undoable (never a truncated snapshot).
+   * Engine structural shifts move cells and formulas only (formats and
+   * dimension maps are not part of the sparse image; formats are not
+   * shifted by the engine, and sizes are UI-core canonical view facts),
+   * so the image is values/formulas only.
+   */
+  async function recordStructuralMutation<T>(spec: {
+    kind: HistoryEntryKind
+    sheet: WorkerWorkbookBackendSheet
+    execute: () => Promise<T>
+  }): Promise<T> {
+    const fullRange: SparseRangeWire = {
+      sheet: spec.sheet.idx,
+      startRow: 0,
+      startCol: 0,
+      endRow: FULL_SHEET_INDEX_BOUND,
+      endCol: FULL_SHEET_INDEX_BOUND,
+    }
+    let before: SparseCellWire[] | null = null
+    let diagnostic = ''
+    try {
+      const nonEmpty = await client.listNonEmpty()
+      let count = 0
+      for (const ref of nonEmpty) {
+        if (ref.sheet === spec.sheet.idx) count += 1
+      }
+      if (count > WORKER_STRUCTURAL_SNAPSHOT_MAX) {
+        diagnostic =
+          `structural before-image needs ${count} non-empty cells but the cap is ` +
+          `${WORKER_STRUCTURAL_SNAPSHOT_MAX}; the operation is not undoable`
+      } else {
+        before = await client.snapshotRangeSparse(fullRange)
+        if (before.length > WORKER_STRUCTURAL_SNAPSHOT_MAX) {
+          diagnostic =
+            `structural before-image produced ${before.length} cells over the cap ` +
+            `${WORKER_STRUCTURAL_SNAPSHOT_MAX}; the operation is not undoable`
+          before = null
+        }
+      }
+    } catch (error) {
+      diagnostic = `structural undo snapshot failed: ${
+        error instanceof Error ? error.message : String(error)
+      }`
+      before = null
+    }
+    const result = await spec.execute()
+    if (before === null) {
+      pushTransactionRecord(notUndoableRecord(spec.kind, spec.sheet.idx, null, diagnostic))
+      return result
+    }
+    let after: SparseCellWire[] | null = null
+    try {
+      after = await client.snapshotRangeSparse(fullRange)
+      if (after.length > WORKER_STRUCTURAL_SNAPSHOT_MAX) {
+        diagnostic =
+          `structural after-image produced ${after.length} cells over the cap ` +
+          `${WORKER_STRUCTURAL_SNAPSHOT_MAX}; the operation degraded to not-undoable`
+        after = null
+      }
+    } catch (error) {
+      diagnostic = `structural redo snapshot failed: ${
+        error instanceof Error ? error.message : String(error)
+      }`
+    }
+    pushTransactionRecord(
+      after !== null
+        ? {
+            kind: spec.kind,
+            sheetIdx: spec.sheet.idx,
+            boundTransactionId: null,
+            affectedRange: null,
+            clearRange: fullRange,
+            before: { cells: before, format: null },
+            after: { cells: after, format: null },
+          }
+        : notUndoableRecord(spec.kind, spec.sheet.idx, null, diagnostic),
+    )
+    return result
+  }
+
+  function historyNotApplied(
+    request: UndoTransactionRequest | RedoTransactionRequest,
+    reason: string,
+  ): HistoryTransactionResult {
+    return {
+      transactionId: request.transactionId,
+      requestId: request.requestId,
+      revision,
+      applied: false,
+      notAppliedReason: reason,
+    }
+  }
+
+  async function replayUndoImage(
+    record: WorkerTransactionRecord,
+    image: WorkerUndoImage,
+  ): Promise<void> {
+    // Design point A: restoreSparse is an ADDITIVE merge, so the
+    // affected region must be cleared first or a delete/overwrite undo
+    // leaves residue behind.
+    if (image.cells !== null && record.clearRange !== null) {
+      await client.clearRange(record.clearRange)
+      if (image.cells.length > 0) {
+        await client.restoreSparse(image.cells)
+      }
+    }
+    // restore_format_range_snapshot REPLACES per-cell formats inside the
+    // snapshot range and the whole range-layer list — self-clearing, no
+    // pre-clear needed.
+    if (image.format !== null) {
+      await client.restoreFormatSnapshot(image.format)
+    }
+  }
+
+  /**
+   * Design point C: no strict revision precondition — engine-initiated
+   * revision bumps (async custom-formula settles) between the recorded
+   * mutation and its undo are legal, so `request.revision` is never
+   * compared against the adapter's counter. The acknowledgement carries
+   * the ACTUAL post-replay revision, which UI-core commits as the new
+   * witness. Unknown transactionId / missing snapshot answer a
+   * structured not-applied instead of a fake success or a bare throw.
+   */
+  async function runHistoryTransaction(
+    action: 'undo' | 'redo',
+    request: UndoTransactionRequest | RedoTransactionRequest,
+  ): Promise<HistoryTransactionResult> {
+    await readyPromise
+    const source = action === 'undo' ? undoRecords : redoRecords
+    const target = action === 'undo' ? redoRecords : undoRecords
+    const record = source[source.length - 1]
+    if (!record) {
+      return historyNotApplied(request, `no recorded backend transaction to ${action}`)
+    }
+    if (
+      record.boundTransactionId !== null &&
+      record.boundTransactionId !== request.transactionId
+    ) {
+      return historyNotApplied(request, `unknown transactionId: ${request.transactionId}`)
+    }
+    if (record.before === null || record.after === null) {
+      return historyNotApplied(
+        request,
+        record.diagnostic ?? 'transaction was recorded as not undoable',
+      )
+    }
+    const image = action === 'undo' ? record.before : record.after
+    // Replay failures propagate as thrown errors: the workbook may be
+    // half-restored, which is exactly the outcome-unknown lane.
+    await replayUndoImage(record, image)
+    record.boundTransactionId = request.transactionId
+    source.pop()
+    target.push(record)
+    const nextRevision = bumpRevision()
+    return {
+      transactionId: request.transactionId,
+      requestId: request.requestId,
+      revision: nextRevision,
+      ...(record.affectedRange ? { affectedRange: { ...record.affectedRange } } : {}),
+    }
   }
 
   function assertNamedRangeBackendActive(): void {
@@ -1354,40 +1756,52 @@ export function createWorkerWorkbookSpreadsheetBackend(
 
   async function importChunks(request: ImportCellChunksRequest): Promise<BackendMutationResult> {
     const sheet = await resolveSheet(request.sheetId)
-    const cellsPerChunk = normalizeImportCellsPerChunk(request.cellsPerChunk)
-    const sessionId = await client.beginImport({ mode: 'direct' })
-    const wireChunk: ImportCellWire[] = []
-    let committed = false
 
-    async function flush() {
-      if (wireChunk.length === 0) return
-      await client.importChunk(sessionId, wireChunk.splice(0, wireChunk.length))
-    }
+    return recordCellMutation({
+      kind: 'cells.import',
+      sheet,
+      range: request.range ? { ...request.range } : null,
+      captureValues: true,
+      captureFormats: false,
+      missingRangeDiagnostic:
+        'import request carried no affected range; the undo snapshot cannot be bounded',
+      execute: async () => {
+        const cellsPerChunk = normalizeImportCellsPerChunk(request.cellsPerChunk)
+        const sessionId = await client.beginImport({ mode: 'direct' })
+        const wireChunk: ImportCellWire[] = []
+        let committed = false
 
-    try {
-      for await (const sourceChunk of request.chunks) {
-        for (const cell of sourceChunk) {
-          wireChunk.push(
-            toImportCellWire(sheet.idx, cell.row, cell.col, cell.input, cell.preserveAsText),
-          )
-          if (wireChunk.length >= cellsPerChunk) await flush()
+        async function flush() {
+          if (wireChunk.length === 0) return
+          await client.importChunk(sessionId, wireChunk.splice(0, wireChunk.length))
         }
-      }
-      await flush()
-      const stats = await client.commitImport(sessionId)
-      committed = true
-      assertImportStatsOk(stats)
-    } finally {
-      if (!committed) await client.cancelImport(sessionId).catch(() => {})
-    }
 
-    const nextRevision = bumpRevision()
-    return {
-      sheetId: request.sheetId,
-      requestId: request.requestId,
-      revision: request.revision ?? nextRevision,
-      affectedRange: request.range,
-    }
+        try {
+          for await (const sourceChunk of request.chunks) {
+            for (const cell of sourceChunk) {
+              wireChunk.push(
+                toImportCellWire(sheet.idx, cell.row, cell.col, cell.input, cell.preserveAsText),
+              )
+              if (wireChunk.length >= cellsPerChunk) await flush()
+            }
+          }
+          await flush()
+          const stats = await client.commitImport(sessionId)
+          committed = true
+          assertImportStatsOk(stats)
+        } finally {
+          if (!committed) await client.cancelImport(sessionId).catch(() => {})
+        }
+
+        const nextRevision = bumpRevision()
+        return {
+          sheetId: request.sheetId,
+          requestId: request.requestId,
+          revision: request.revision ?? nextRevision,
+          affectedRange: request.range,
+        }
+      },
+    })
   }
 
   async function resolveWorkerDataEdge(
@@ -1477,6 +1891,22 @@ export function createWorkerWorkbookSpreadsheetBackend(
     const sheet = await resolveSheet(request.sheetId)
     unique.sort((left, right) => right - left)
 
+    // Partial failure throws out of `execute`, so no transaction record
+    // is pushed — mirroring the remove-duplicates dispatcher, which does
+    // not push a history entry on the failure path either. The lifecycle
+    // there lands on outcome-unknown and the user reconciles.
+    return recordStructuralMutation({
+      kind: 'row.delete',
+      sheet,
+      execute: () => removeRowsBands(request, sheet, unique),
+    })
+  }
+
+  async function removeRowsBands(
+    request: RemoveRowsRequest,
+    sheet: WorkerWorkbookBackendSheet,
+    unique: number[],
+  ): Promise<RemoveRowsResult> {
     const bands: Array<{ startRow: number; count: number }> = []
     for (const rowIndex of unique) {
       const last = bands[bands.length - 1]
@@ -1635,56 +2065,89 @@ export function createWorkerWorkbookSpreadsheetBackend(
     request: InsertRowsRequest,
   ): Promise<BackendMutationResult> {
     const sheet = await resolveSheet(request.sheetId)
-    await client.insertRows(sheet.idx, request.rowIndex, request.count)
-    return structuralMutationResult(request, bumpRevision())
+    return recordStructuralMutation({
+      kind: 'row.insert',
+      sheet,
+      execute: async () => {
+        await client.insertRows(sheet.idx, request.rowIndex, request.count)
+        return structuralMutationResult(request, bumpRevision())
+      },
+    })
   }
 
   async function deleteRowsThroughWorker(
     request: DeleteRowsRequest,
   ): Promise<BackendMutationResult> {
     const sheet = await resolveSheet(request.sheetId)
-    await client.deleteRows(sheet.idx, request.rowIndex, request.count)
-    return structuralMutationResult(request, bumpRevision())
+    return recordStructuralMutation({
+      kind: 'row.delete',
+      sheet,
+      execute: async () => {
+        await client.deleteRows(sheet.idx, request.rowIndex, request.count)
+        return structuralMutationResult(request, bumpRevision())
+      },
+    })
   }
 
   async function insertColumnsThroughWorker(
     request: InsertColumnsRequest,
   ): Promise<BackendMutationResult> {
     const sheet = await resolveSheet(request.sheetId)
-    await client.insertColumns(sheet.idx, request.colIndex, request.count)
-    return structuralMutationResult(request, bumpRevision())
+    return recordStructuralMutation({
+      kind: 'column.insert',
+      sheet,
+      execute: async () => {
+        await client.insertColumns(sheet.idx, request.colIndex, request.count)
+        return structuralMutationResult(request, bumpRevision())
+      },
+    })
   }
 
   async function deleteColumnsThroughWorker(
     request: DeleteColumnsRequest,
   ): Promise<BackendMutationResult> {
     const sheet = await resolveSheet(request.sheetId)
-    await client.deleteColumns(sheet.idx, request.colIndex, request.count)
-    return structuralMutationResult(request, bumpRevision())
+    return recordStructuralMutation({
+      kind: 'column.delete',
+      sheet,
+      execute: async () => {
+        await client.deleteColumns(sheet.idx, request.colIndex, request.count)
+        return structuralMutationResult(request, bumpRevision())
+      },
+    })
   }
 
   async function setFormatRangeThroughWorker(
     request: SetFormatRangeRequest,
   ): Promise<ToolbarBackendMutationResult> {
     const sheet = await resolveSheet(request.sheetId)
-    await client.setFormatRange(
-      toSparseRange(sheet.idx, request.range),
-      request.format as CellFormatJSON | null | undefined,
-    )
-    const nextRevision = bumpRevision()
+    return recordCellMutation({
+      kind: 'format.set',
+      sheet,
+      range: { ...request.range },
+      captureValues: false,
+      captureFormats: true,
+      execute: async () => {
+        await client.setFormatRange(
+          toSparseRange(sheet.idx, request.range),
+          request.format as CellFormatJSON | null | undefined,
+        )
+        const nextRevision = bumpRevision()
 
-    return {
-      kind: request.kind,
-      sheetId: request.sheetId,
-      requestId: request.requestId,
-      revision: request.revision ?? nextRevision,
-      affectedRange: {
-        rowStart: request.range.rowStart,
-        rowEnd: request.range.rowEnd,
-        colStart: request.range.colStart,
-        colEnd: request.range.colEnd,
+        return {
+          kind: request.kind,
+          sheetId: request.sheetId,
+          requestId: request.requestId,
+          revision: request.revision ?? nextRevision,
+          affectedRange: {
+            rowStart: request.range.rowStart,
+            rowEnd: request.range.rowEnd,
+            colStart: request.range.colStart,
+            colEnd: request.range.colEnd,
+          },
+        }
       },
-    }
+    })
   }
 
   return {
@@ -1745,33 +2208,46 @@ export function createWorkerWorkbookSpreadsheetBackend(
       const sheet = await resolveSheet(request.sheetId)
       const addr = toA1(request.row, request.col)
       const trimmed = request.input.trim()
-
-      if (trimmed === '') {
-        await client.clearCell(sheet.idx, addr)
-      } else if (trimmed.startsWith('=')) {
-        const result = await client.setFormulaDetailed(sheet.idx, addr, trimmed)
-        if (!result.ok) throw createBackendError(result.code, result.message)
-      } else {
-        await client.setCell(sheet.idx, addr, toCellWire(request.input))
+      const cellRange: CellRange = {
+        rowStart: request.row,
+        rowEnd: request.row,
+        colStart: request.col,
+        colEnd: request.col,
       }
 
-      const nextRevision = bumpRevision()
-      return {
-        sheetId: request.sheetId,
-        requestId: request.requestId,
-        revision: request.revision ?? nextRevision,
-        affectedRange: {
-          rowStart: request.row,
-          rowEnd: request.row,
-          colStart: request.col,
-          colEnd: request.col,
+      return recordCellMutation({
+        kind: 'cell.set-input',
+        sheet,
+        range: cellRange,
+        captureValues: true,
+        captureFormats: false,
+        execute: async () => {
+          if (trimmed === '') {
+            await client.clearCell(sheet.idx, addr)
+          } else if (trimmed.startsWith('=')) {
+            const result = await client.setFormulaDetailed(sheet.idx, addr, trimmed)
+            if (!result.ok) throw createBackendError(result.code, result.message)
+          } else {
+            await client.setCell(sheet.idx, addr, toCellWire(request.input))
+          }
+
+          const nextRevision = bumpRevision()
+          return {
+            sheetId: request.sheetId,
+            requestId: request.requestId,
+            revision: request.revision ?? nextRevision,
+            affectedRange: { ...cellRange },
+          }
         },
-      }
+      })
     },
 
     async importCells(request: ImportCellsRequest): Promise<BackendMutationResult> {
       return importChunks({
         ...request,
+        // The concrete cell list is in hand, so a missing range can be
+        // derived instead of degrading the undo record to not-undoable.
+        range: request.range ?? boundingRangeOfImportCells(request.cells) ?? undefined,
         kind: 'import-cell-chunks',
         chunks: [request.cells],
       })
@@ -1785,31 +2261,43 @@ export function createWorkerWorkbookSpreadsheetBackend(
       const sheet = await resolveSheet(request.sheetId)
       const target = request.target ?? 'all'
       const sparseRange = toSparseRange(sheet.idx, request.range)
+      const touchesValues = target === 'values' || target === 'all'
+      // Runtimes that declare `formats: false` model no formats, so the
+      // clear is vacuously complete and the mutation never touches them.
+      const touchesFormats =
+        (target === 'formats' || target === 'all') && runtimeSupports('formats')
 
-      if (target === 'values' || target === 'all') {
-        await client.clearRange(sparseRange)
-      }
-      if ((target === 'formats' || target === 'all') && runtimeSupports('formats')) {
-        // Rust set_format_range drops per-cell overrides inside the range and a
-        // null/default layer makes the rectangle read back as unformatted,
-        // which is the contract for 'formats'/'all' clearing. Runtimes
-        // that declare `formats: false` model no formats, so the clear
-        // is vacuously complete and the RPC is skipped.
-        await client.setFormatRange(sparseRange, null)
-      }
-      const nextRevision = bumpRevision()
+      return recordCellMutation({
+        kind: 'range.clear',
+        sheet,
+        range: { ...request.range },
+        captureValues: touchesValues,
+        captureFormats: touchesFormats,
+        execute: async () => {
+          if (touchesValues) {
+            await client.clearRange(sparseRange)
+          }
+          if (touchesFormats) {
+            // Rust set_format_range drops per-cell overrides inside the range and a
+            // null/default layer makes the rectangle read back as unformatted,
+            // which is the contract for 'formats'/'all' clearing.
+            await client.setFormatRange(sparseRange, null)
+          }
+          const nextRevision = bumpRevision()
 
-      return {
-        sheetId: request.sheetId,
-        requestId: request.requestId,
-        revision: request.revision ?? nextRevision,
-        affectedRange: {
-          rowStart: request.range.rowStart,
-          rowEnd: request.range.rowEnd,
-          colStart: request.range.colStart,
-          colEnd: request.range.colEnd,
+          return {
+            sheetId: request.sheetId,
+            requestId: request.requestId,
+            revision: request.revision ?? nextRevision,
+            affectedRange: {
+              rowStart: request.range.rowStart,
+              rowEnd: request.range.rowEnd,
+              colStart: request.range.colStart,
+              colEnd: request.range.colEnd,
+            },
+          }
         },
-      }
+      })
     },
 
     get insertRows() {
@@ -1976,6 +2464,10 @@ export function createWorkerWorkbookSpreadsheetBackend(
       // next added sheet — drop every host-side overlay keyed by it so
       // the new sheet starts clean instead of inheriting dead state.
       dropSheetOverlayState(request.sheetId)
+      // Design point D: sheet lifecycle is not undoable, and the delete
+      // shifts positional sheet indices — recorded transactions would
+      // replay into the wrong sheet, so the log is dropped wholesale.
+      dropTransactionRecords()
       const nextRevision = bumpRevision()
       const remainingSheets = lookup.sheets.filter((item) => item.id !== request.sheetId)
       await refreshSheetLookup(remainingSheets)
@@ -2016,6 +2508,9 @@ export function createWorkerWorkbookSpreadsheetBackend(
               `cannot reorder sheet: ${request.sheetId}`,
             )
           }
+          // Design point D: the reorder shifted positional sheet indices;
+          // recorded transactions would replay into the wrong sheet.
+          dropTransactionRecords()
           nextRevision = bumpRevision()
           await refreshSheetLookup(lookup.sheets)
         } finally {
@@ -2031,6 +2526,14 @@ export function createWorkerWorkbookSpreadsheetBackend(
         activeSheetId: request.sheetId,
         revision: request.revision ?? nextRevision,
       })
+    },
+
+    async undoTransaction(request: UndoTransactionRequest): Promise<HistoryTransactionResult> {
+      return runHistoryTransaction('undo', request)
+    },
+
+    async redoTransaction(request: RedoTransactionRequest): Promise<HistoryTransactionResult> {
+      return runHistoryTransaction('redo', request)
     },
 
     async listNamedRanges(request: ListNamedRangesRequest): Promise<NamedRangeListResult> {

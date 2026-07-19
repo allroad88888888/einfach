@@ -324,6 +324,34 @@ describe('history Core lifecycle', () => {
     expect(undo).toHaveBeenCalledTimes(1)
   })
 
+  test('structured not-applied ACK is OutcomeUnknown; cursor and witness stay', async () => {
+    const store = createStore()
+    store.setter(pushHistoryAtom, makeEntry('tx-1', 1))
+    const undo = jest.fn(
+      async (request: HistoryUndoRequest): Promise<HistoryMutationResult> => ({
+        transactionId: request.transactionId,
+        requestId: request.requestId,
+        revision: 9,
+        applied: false,
+        notAppliedReason: 'unknown transactionId: tx-1',
+      }),
+    )
+    const source: HistoryControllerPort = { undoTransaction: undo }
+    const input = { source, refreshProjection: async () => {} }
+
+    await expect(store.setter(runUndoHistoryAtom, input)).resolves.toBe('outcome-unknown')
+    const lifecycle = store.getter(historyLifecycleAtom)
+    expect(lifecycle.status).toBe('outcome-unknown')
+    expect(lifecycle.error).toContain('not applied')
+    expect(lifecycle.error).toContain('unknown transactionId: tx-1')
+    // The backend positively confirmed nothing changed: the cursor must
+    // not move and the not-applied revision must not become the witness.
+    expect(store.getter(historyStackAtom).cursor).toBe(1)
+    expect(lifecycle.acknowledgedRevision).toBeNull()
+    await expect(store.setter(runUndoHistoryAtom, input)).resolves.toBe('blocked')
+    expect(undo).toHaveBeenCalledTimes(1)
+  })
+
   test('transport timeout is OutcomeUnknown and a late stale ACK cannot commit or reopen the lane', async () => {
     const store = createStore()
     store.setter(pushHistoryAtom, makeEntry('tx-1', 1))

@@ -3225,6 +3225,10 @@ describe('vnext adapter', () => {
       },
     ])
     expect(client.calls.snapshotFormatRange).toEqual([
+      // Host-orchestrated undo: before/after images around the mutation.
+      { sheet: 0, startRow: 1, startCol: 1, endRow: 999_999, endCol: 999_999 },
+      { sheet: 0, startRow: 1, startCol: 1, endRow: 999_999, endCol: 999_999 },
+      // Projection read.
       { sheet: 0, startRow: 1, startCol: 1, endRow: 1, endCol: 1 },
     ])
     expect(mutation).toEqual({
@@ -3462,11 +3466,17 @@ describe('vnext adapter', () => {
       sheetId: 'sheet-1',
       requestId: 20,
       revision: 11,
+      // W3 structural-shift contract: the worker engine really shifted
+      // index space, so the ACK declares the displacement for UI-core's
+      // view-fact remap (freeze band, hidden sets) and history side
+      // payloads.
+      structuralShift: { axis: 'row', kind: 'insert', index: 1, count: 1 },
     })
     expect(colMutation).toEqual({
       sheetId: 'sheet-1',
       requestId: 21,
       revision: 12,
+      structuralShift: { axis: 'column', kind: 'delete', index: 1, count: 1 },
     })
     expect(result.cells).toEqual([
       { row: 0, col: 0, displayValue: 'A1', valueKind: 'string' },
