@@ -637,10 +637,7 @@ export function SpreadsheetContextMenu(props: SpreadsheetContextMenuProps) {
       closeMenu('committed')
       return
     }
-    if (
-      isViewportHiddenContextMenuCommand(command) &&
-      !viewportHiddenCommandAvailable()(backend, command)
-    ) {
+    if (isViewportHiddenContextMenuCommand(command) && !viewportHiddenCommandAvailable()(command)) {
       return
     }
     const intent = store.setter(dispatchMenuCommandAtom, command)
@@ -764,8 +761,10 @@ export function SpreadsheetContextMenu(props: SpreadsheetContextMenuProps) {
 
   function isCommandVisibleForTarget(command: ContextMenuCommandKind, target: MenuTarget): boolean {
     if (command === 'clipboard.pasteSpecial') return pasteSpecialCapability()
+    // Hidden rows/columns are UI-core canonical: entry visibility reads
+    // the local view fact and selection only — never backend hidden ports.
     if (isViewportHiddenContextMenuCommand(command)) {
-      return viewportHiddenCommandAvailable()(backend, command)
+      return viewportHiddenCommandAvailable()(command)
     }
     // Freeze is UI-core canonical: entry visibility reads the local view
     // fact directly and never depends on backend freeze ports.

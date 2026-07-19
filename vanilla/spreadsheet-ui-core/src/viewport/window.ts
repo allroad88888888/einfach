@@ -1,26 +1,18 @@
-import { atom, type Atom, type Getter, type Setter } from '@einfach/core'
+import { atom, type Getter, type Setter } from '@einfach/core'
 import type {
-  BackendMutationResult,
-  HideColumnsRequest,
-  HideRowsRequest,
   ProjectionRequestId,
   ProjectionRevision,
-  UnhideColumnsRequest,
-  UnhideRowsRequest,
   ViewportColumnWidth,
   ViewportRowHeight,
   ViewportSizeProjectionRequest,
   ViewportSizeProjectionResult,
 } from '../backend/types'
-import { selectionRegionsAtom, selectionSnapshotAtom } from '../selection'
 import type { CellCoord, CellRange } from '../shared'
 import type {
   CellViewportRect,
   FrozenWindows,
   ScrollToCellInput,
-  SetViewportHiddenInput,
   ViewportCellAlign,
-  ViewportHiddenState,
   ViewportMetrics,
   ViewportScrollPosition,
   ViewportSizeOverrideState,
@@ -442,261 +434,40 @@ export const setViewportColumnWidthAtom = atom(
 )
 setViewportColumnWidthAtom.debugLabel = 'spreadsheet.viewport.setColumnWidth'
 
-export const DEFAULT_VIEWPORT_HIDDEN_STATE: ViewportHiddenState = {
-  rowsBySheet: {},
-  colsBySheet: {},
-}
-
-function sanitizeIndices(indices: readonly number[]): number[] {
-  const seen = new Set<number>()
-  const result: number[] = []
-  for (const v of indices) {
-    if (Number.isSafeInteger(v) && v >= 0 && !seen.has(v)) {
-      seen.add(v)
-      result.push(v)
-    }
-  }
-  result.sort((a, b) => a - b)
-  return result
-}
-
-export function isRowHidden(
-  state: ViewportHiddenState,
-  sheetId: string,
-  rowIndex: number,
-): boolean {
-  return (state.rowsBySheet[sheetId] ?? []).includes(rowIndex)
-}
-
-export function isColumnHidden(
-  state: ViewportHiddenState,
-  sheetId: string,
-  colIndex: number,
-): boolean {
-  return (state.colsBySheet[sheetId] ?? []).includes(colIndex)
-}
-
-export function getHiddenRowsForSheet(state: ViewportHiddenState, sheetId: string): number[] {
-  return state.rowsBySheet[sheetId] ?? []
-}
-
-export function getHiddenColumnsForSheet(state: ViewportHiddenState, sheetId: string): number[] {
-  return state.colsBySheet[sheetId] ?? []
-}
-
-const viewportHiddenBackingAtom = atom<ViewportHiddenState>(DEFAULT_VIEWPORT_HIDDEN_STATE)
-viewportHiddenBackingAtom.debugLabel = 'spreadsheet.viewport.hiddenBacking'
-
-const viewportHiddenProjectionIdentityAtom = atom<Readonly<object>>(Object.freeze({}))
-viewportHiddenProjectionIdentityAtom.debugLabel = 'spreadsheet.viewport.hiddenProjectionIdentity'
-
-export const viewportHiddenAtom: Atom<ViewportHiddenState> = atom((get) =>
-  get(viewportHiddenBackingAtom),
-)
-viewportHiddenAtom.debugLabel = 'spreadsheet.viewport.hidden'
-
-export const setViewportHiddenAtom = atom(
-  (get) => get(viewportHiddenBackingAtom),
-  (get, set, input: SetViewportHiddenInput) => {
-    if (!input.sheetId || input.sheetId.length === 0) return
-    const state = get(viewportHiddenBackingAtom)
-    const rows =
-      input.rows !== undefined
-        ? sanitizeIndices(input.rows)
-        : (state.rowsBySheet[input.sheetId] ?? [])
-    const cols =
-      input.cols !== undefined
-        ? sanitizeIndices(input.cols)
-        : (state.colsBySheet[input.sheetId] ?? [])
-    set(viewportHiddenBackingAtom, {
-      rowsBySheet: { ...state.rowsBySheet, [input.sheetId]: rows },
-      colsBySheet: { ...state.colsBySheet, [input.sheetId]: cols },
-    })
-    set(viewportHiddenProjectionIdentityAtom, Object.freeze({}))
-    rotateViewportMetadataProjectionIdentity(set)
-    invalidateViewportHiddenProjectionAuthority(set)
-  },
-)
-setViewportHiddenAtom.debugLabel = 'spreadsheet.viewport.setHidden'
-
-export type ViewportHiddenMutationAction =
-  | 'hide-rows'
-  | 'unhide-rows'
-  | 'hide-columns'
-  | 'unhide-columns'
-
-/** Framework-neutral transport required to mutate and confirm canonical hidden state. */
-export interface ViewportHiddenControllerPort {
+/** Framework-neutral transport for the windowed row-height / column-width hydration. */
+export interface ViewportSizeProjectionPort {
   readViewportSizeProjection?: (
     request: ViewportSizeProjectionRequest,
   ) => Promise<ViewportSizeProjectionResult>
-  hideRows?: (request: HideRowsRequest) => Promise<BackendMutationResult>
-  unhideRows?: (request: UnhideRowsRequest) => Promise<BackendMutationResult>
-  hideColumns?: (request: HideColumnsRequest) => Promise<BackendMutationResult>
-  unhideColumns?: (request: UnhideColumnsRequest) => Promise<BackendMutationResult>
-}
-
-export interface RunViewportHiddenMutationInput {
-  readonly source: ViewportHiddenControllerPort
-  readonly sheetId: string
-  readonly action: ViewportHiddenMutationAction
-  readonly indices: readonly number[]
-  readonly window: Readonly<CellRange>
-}
-
-export type ViewportHiddenSelectionMutationAction = 'unhide-rows' | 'unhide-columns'
-
-export interface RunViewportHiddenSelectionMutationInput {
-  readonly source: ViewportHiddenControllerPort
-  readonly action: ViewportHiddenSelectionMutationAction
 }
 
 export interface HydrateViewportSizeProjectionInput {
-  readonly source: ViewportHiddenControllerPort
+  readonly source: ViewportSizeProjectionPort
   readonly sheetId: string
   readonly window: Readonly<CellRange>
 }
 
-export type ViewportSizeHydrationOutcome =
-  | 'ready'
-  | 'sizes-only'
-  | 'blocked'
-  | 'unsupported'
-  | 'stale'
-
-export type ViewportHiddenLifecycleStatus =
-  | 'idle'
-  | 'pending'
-  | 'local-acknowledged'
-  | 'canonical-reading'
-  | 'ready'
-  | 'blocked'
-  | 'recovery-required'
-  | 'unsupported'
-
-export interface ViewportHiddenLifecycleState {
-  readonly status: ViewportHiddenLifecycleStatus
-  readonly action: ViewportHiddenMutationAction | null
-  readonly sheetId: string | null
-  readonly requestId: ProjectionRequestId | null
-  readonly revision: ProjectionRevision | null
-  readonly window: Readonly<CellRange> | null
-  readonly error: string
-}
-
-export type ViewportHiddenCommandOutcome =
-  | 'ready'
-  | 'blocked'
-  | 'recovery-required'
-  | 'unsupported'
-  | 'stale'
-
-export interface ViewportHiddenProjectionAuthorityState {
-  readonly source: ViewportHiddenControllerPort | null
-  readonly sheetId: string | null
-  readonly requestId: ProjectionRequestId | null
-  readonly revision: ProjectionRevision | null
-  readonly window: Readonly<CellRange> | null
-  readonly ready: boolean
-}
-
-type ViewportHiddenMutationTicket = Readonly<{
-  mode: 'mutation'
-  source: ViewportHiddenControllerPort
-  sheetId: string
-  action: ViewportHiddenMutationAction
-  indices: readonly number[]
-  window: Readonly<CellRange>
-  requestId: ProjectionRequestId
-  revision: ProjectionRevision | null
-  projectionIdentity: Readonly<object>
-}>
+export type ViewportSizeHydrationOutcome = 'ready' | 'blocked' | 'unsupported' | 'stale'
 
 type ViewportSizeHydrationTicket = Readonly<{
-  mode: 'hydrate'
-  source: ViewportHiddenControllerPort
+  source: ViewportSizeProjectionPort
   sheetId: string
   window: Readonly<CellRange>
   requestId: ProjectionRequestId
   metadataIdentity: Readonly<object>
 }>
 
-type ViewportHiddenTicket = ViewportHiddenMutationTicket | ViewportSizeHydrationTicket
+const activeViewportSizeTicketAtom = atom<ViewportSizeHydrationTicket | null>(null)
+activeViewportSizeTicketAtom.debugLabel = 'spreadsheet.viewport.sizeActiveTicket'
 
-const VIEWPORT_HIDDEN_INVALID_ERROR =
-  'Hidden rows and columns require a valid sheet, window, and at least one in-window index.'
-const VIEWPORT_HIDDEN_UNSUPPORTED_ERROR =
-  'Hidden rows and columns are unavailable because this workbook backend does not provide canonical mutation and readback transport.'
-const VIEWPORT_HIDDEN_RECOVERY_ERROR =
-  'The hidden rows or columns mutation may have been applied, but canonical state could not be confirmed. Read the workbook authority before retrying.'
-const VIEWPORT_HIDDEN_SELECTION_BLOCKED_ERROR =
-  'Unhiding rows or columns requires one selection covered by confirmed canonical hidden state.'
+const viewportSizeRequestSequenceAtom = atom<ProjectionRequestId>(0)
+viewportSizeRequestSequenceAtom.debugLabel = 'spreadsheet.viewport.sizeRequestSequence'
 
-const INITIAL_VIEWPORT_HIDDEN_LIFECYCLE: ViewportHiddenLifecycleState = Object.freeze({
-  status: 'idle',
-  action: null,
-  sheetId: null,
-  requestId: null,
-  revision: null,
-  window: null,
-  error: '',
-})
-
-const INITIAL_VIEWPORT_HIDDEN_PROJECTION_AUTHORITY: ViewportHiddenProjectionAuthorityState =
-  Object.freeze({
-    source: null,
-    sheetId: null,
-    requestId: null,
-    revision: null,
-    window: null,
-    ready: false,
-  })
-
-const viewportHiddenLifecycleBackingAtom = atom<ViewportHiddenLifecycleState>(
-  INITIAL_VIEWPORT_HIDDEN_LIFECYCLE,
-)
-viewportHiddenLifecycleBackingAtom.debugLabel = 'spreadsheet.viewport.hiddenLifecycleBacking'
-
-/** Read-only mutation lifecycle projection. */
-export const viewportHiddenLifecycleAtom = atom((get) => get(viewportHiddenLifecycleBackingAtom))
-viewportHiddenLifecycleAtom.debugLabel = 'spreadsheet.viewport.hiddenLifecycle'
-
-const viewportHiddenProjectionAuthorityBackingAtom = atom<ViewportHiddenProjectionAuthorityState>(
-  INITIAL_VIEWPORT_HIDDEN_PROJECTION_AUTHORITY,
-)
-viewportHiddenProjectionAuthorityBackingAtom.debugLabel =
-  'spreadsheet.viewport.hiddenProjectionAuthorityBacking'
-
-/** Read-only identity/readiness gate for the canonical hidden projection. */
-export const viewportHiddenProjectionAuthorityAtom = atom((get) =>
-  get(viewportHiddenProjectionAuthorityBackingAtom),
-)
-viewportHiddenProjectionAuthorityAtom.debugLabel = 'spreadsheet.viewport.hiddenProjectionAuthority'
-
-function invalidateViewportHiddenProjectionAuthority(set: Setter) {
-  set(viewportHiddenProjectionAuthorityBackingAtom, INITIAL_VIEWPORT_HIDDEN_PROJECTION_AUTHORITY)
-}
-
-const activeViewportHiddenTicketAtom = atom<ViewportHiddenTicket | null>(null)
-activeViewportHiddenTicketAtom.debugLabel = 'spreadsheet.viewport.hiddenActiveTicket'
-
-const viewportHiddenRequestSequenceAtom = atom<ProjectionRequestId>(0)
-viewportHiddenRequestSequenceAtom.debugLabel = 'spreadsheet.viewport.hiddenRequestSequence'
-
-function nextViewportHiddenRequestId(sequence: ProjectionRequestId): ProjectionRequestId | null {
+function nextViewportSizeRequestId(sequence: ProjectionRequestId): ProjectionRequestId | null {
   return Number.isSafeInteger(sequence) && sequence < Number.MAX_SAFE_INTEGER ? sequence + 1 : null
 }
 
-function isViewportHiddenMutationAction(value: unknown): value is ViewportHiddenMutationAction {
-  return (
-    value === 'hide-rows' ||
-    value === 'unhide-rows' ||
-    value === 'hide-columns' ||
-    value === 'unhide-columns'
-  )
-}
-
-function snapshotHiddenWindow(value: unknown): Readonly<CellRange> | null {
+function snapshotSizeWindow(value: unknown): Readonly<CellRange> | null {
   if (typeof value !== 'object' || value === null) return null
   const candidate = value as Partial<CellRange>
   const { rowStart, rowEnd, colStart, colEnd } = candidate
@@ -719,7 +490,7 @@ function snapshotHiddenWindow(value: unknown): Readonly<CellRange> | null {
   return Object.freeze({ rowStart, rowEnd, colStart, colEnd })
 }
 
-function hiddenWindowsMatch(left: Readonly<CellRange>, right: Readonly<CellRange>): boolean {
+function sizeWindowsMatch(left: Readonly<CellRange>, right: Readonly<CellRange>): boolean {
   return (
     left.rowStart === right.rowStart &&
     left.rowEnd === right.rowEnd &&
@@ -728,127 +499,16 @@ function hiddenWindowsMatch(left: Readonly<CellRange>, right: Readonly<CellRange
   )
 }
 
-function isHiddenRevision(value: unknown): value is ProjectionRevision {
+function isSizeRevision(value: unknown): value is ProjectionRevision {
   return (
     (typeof value === 'number' && Number.isFinite(value)) ||
     (typeof value === 'string' && value.length > 0)
   )
 }
 
-function setViewportHiddenLifecycle(
-  set: Setter,
-  status: ViewportHiddenLifecycleStatus,
-  input: {
-    readonly action?: ViewportHiddenMutationAction | null
-    readonly sheetId?: string | null
-    readonly requestId?: ProjectionRequestId | null
-    readonly revision?: ProjectionRevision | null
-    readonly window?: Readonly<CellRange> | null
-    readonly error?: string
-  } = {},
-) {
-  set(viewportHiddenLifecycleBackingAtom, {
-    status,
-    action: input.action ?? null,
-    sheetId: input.sheetId ?? null,
-    requestId: input.requestId ?? null,
-    revision: input.revision ?? null,
-    window: input.window ?? null,
-    error: input.error ?? '',
-  })
-}
-
-function supportsViewportHiddenMutation(
-  source: ViewportHiddenControllerPort,
-  action: ViewportHiddenMutationAction,
-): boolean {
-  switch (action) {
-    case 'hide-rows':
-      return typeof source.hideRows === 'function'
-    case 'unhide-rows':
-      return typeof source.unhideRows === 'function'
-    case 'hide-columns':
-      return typeof source.hideColumns === 'function'
-    case 'unhide-columns':
-      return typeof source.unhideColumns === 'function'
-  }
-}
-
-function matchingHiddenAcknowledgement(value: unknown, ticket: ViewportHiddenMutationTicket) {
-  if (typeof value !== 'object' || value === null) return null
-  const result = value as Partial<BackendMutationResult>
-  return result.sheetId === ticket.sheetId &&
-    result.requestId === ticket.requestId &&
-    isHiddenRevision(result.revision)
-    ? result.revision
-    : null
-}
-
-function snapshotCanonicalHiddenSlice(
-  value: unknown,
-  lower: number,
-  upper: number,
-): readonly number[] | null {
-  if (!Array.isArray(value)) return null
-  const canonical = sanitizeIndices(value)
-  if (
-    canonical.length !== value.length ||
-    canonical.some((index, offset) => index !== value[offset]) ||
-    canonical.some((index) => index < lower || index > upper)
-  ) {
-    return null
-  }
-  return Object.freeze(canonical)
-}
-
-function matchingCanonicalHiddenProjection(
-  value: unknown,
-  ticket: ViewportHiddenMutationTicket,
-  revision: ProjectionRevision,
-): { rows: readonly number[]; cols: readonly number[] } | null {
-  if (typeof value !== 'object' || value === null) return null
-  const result = value as Partial<ViewportSizeProjectionResult>
-  const range = ticket.window
-  if (
-    result.kind !== 'viewport-size' ||
-    result.sheetId !== ticket.sheetId ||
-    result.requestId !== ticket.requestId ||
-    result.revision !== revision ||
-    !result.window ||
-    !hiddenWindowsMatch(result.window, range) ||
-    !Array.isArray(result.rowHeights) ||
-    !Array.isArray(result.colWidths)
-  ) {
-    return null
-  }
-  const rows = snapshotCanonicalHiddenSlice(result.hiddenRowIndices, range.rowStart, range.rowEnd)
-  const cols = snapshotCanonicalHiddenSlice(result.hiddenColIndices, range.colStart, range.colEnd)
-  return rows && cols ? { rows, cols } : null
-}
-
-function reconcileHiddenWindow(
-  current: readonly number[],
-  canonical: readonly number[],
-  lower: number,
-  upper: number,
-): number[] {
-  return sanitizeIndices([
-    ...current.filter((index) => index < lower || index > upper),
-    ...canonical,
-  ])
-}
-
-type CanonicalViewportMetadata = Readonly<{
+type CanonicalViewportSizes = Readonly<{
   rowHeights: readonly Readonly<ViewportRowHeight>[]
   colWidths: readonly Readonly<ViewportColumnWidth>[]
-  revision: ProjectionRevision
-  hidden:
-    | Readonly<{
-        kind: 'full'
-        rows: readonly number[]
-        cols: readonly number[]
-      }>
-    | Readonly<{ kind: 'absent' }>
 }>
 
 function snapshotCanonicalRowHeights(
@@ -909,10 +569,10 @@ function snapshotCanonicalColumnWidths(
   return Object.freeze(canonical)
 }
 
-function matchingCanonicalViewportMetadata(
+function matchingCanonicalViewportSizes(
   value: unknown,
   ticket: ViewportSizeHydrationTicket,
-): CanonicalViewportMetadata | null {
+): CanonicalViewportSizes | null {
   if (typeof value !== 'object' || value === null) return null
   const result = value as Partial<ViewportSizeProjectionResult>
   const range = ticket.window
@@ -920,9 +580,9 @@ function matchingCanonicalViewportMetadata(
     result.kind !== 'viewport-size' ||
     result.sheetId !== ticket.sheetId ||
     result.requestId !== ticket.requestId ||
-    !isHiddenRevision(result.revision) ||
+    !isSizeRevision(result.revision) ||
     !result.window ||
-    !hiddenWindowsMatch(result.window, range)
+    !sizeWindowsMatch(result.window, range)
   ) {
     return null
   }
@@ -930,28 +590,10 @@ function matchingCanonicalViewportMetadata(
   const rowHeights = snapshotCanonicalRowHeights(result.rowHeights, range)
   const colWidths = snapshotCanonicalColumnWidths(result.colWidths, range)
   if (!rowHeights || !colWidths) return null
-
-  const rowsAbsent = result.hiddenRowIndices === undefined
-  const colsAbsent = result.hiddenColIndices === undefined
-  if (rowsAbsent !== colsAbsent) return null
-  if (rowsAbsent) {
-    return Object.freeze({
-      rowHeights,
-      colWidths,
-      revision: result.revision,
-      hidden: Object.freeze({ kind: 'absent' }),
-    })
-  }
-
-  const rows = snapshotCanonicalHiddenSlice(result.hiddenRowIndices, range.rowStart, range.rowEnd)
-  const cols = snapshotCanonicalHiddenSlice(result.hiddenColIndices, range.colStart, range.colEnd)
-  if (!rows || !cols) return null
-  return Object.freeze({
-    rowHeights,
-    colWidths,
-    revision: result.revision,
-    hidden: Object.freeze({ kind: 'full', rows, cols }),
-  })
+  // Hidden rows/columns are UI-core canonical (viewport/hidden.ts); any
+  // hidden slices on the sizes projection are ignored here — they only
+  // feed the one-shot `hydrateViewportHiddenAtom` seed.
+  return Object.freeze({ rowHeights, colWidths })
 }
 
 function reconcileRowHeightWindow(
@@ -984,101 +626,15 @@ function reconcileColumnWidthWindow(
   return next
 }
 
-function markViewportHiddenProjectionUnconfirmed(
-  set: Setter,
-  ticket: ViewportHiddenTicket,
-  revision: ProjectionRevision | null = null,
-) {
-  set(viewportHiddenProjectionAuthorityBackingAtom, {
-    source: ticket.source,
-    sheetId: ticket.sheetId,
-    requestId: ticket.requestId,
-    revision,
-    window: ticket.window,
-    ready: false,
-  })
-}
-
-function failViewportHiddenTicket(
-  set: Setter,
-  ticket: ViewportHiddenMutationTicket,
-  error = VIEWPORT_HIDDEN_RECOVERY_ERROR,
-  revision: ProjectionRevision | null = null,
-): ViewportHiddenCommandOutcome {
-  set(activeViewportHiddenTicketAtom, null)
-  markViewportHiddenProjectionUnconfirmed(set, ticket, revision)
-  setViewportHiddenLifecycle(set, 'recovery-required', {
-    action: ticket.action,
-    sheetId: ticket.sheetId,
-    requestId: ticket.requestId,
-    revision,
-    window: ticket.window,
-    error,
-  })
-  return 'recovery-required'
-}
-
-function hiddenErrorMessage(error: unknown): string {
-  return error instanceof Error && error.message ? error.message : 'Unknown transport failure.'
-}
-
-function viewportHiddenTicketIsCurrent(get: Getter, ticket: ViewportHiddenTicket): boolean {
-  return get(activeViewportHiddenTicketAtom) === ticket
-}
-
-function hiddenMutationRequest(ticket: ViewportHiddenMutationTicket) {
-  const common = {
-    sheetId: ticket.sheetId,
-    requestId: ticket.requestId,
-    ...(ticket.revision === null ? {} : { revision: ticket.revision }),
-  }
-  switch (ticket.action) {
-    case 'hide-rows':
-      return {
-        ...common,
-        kind: 'hide-rows',
-        rowIndices: [...ticket.indices],
-      } satisfies HideRowsRequest
-    case 'unhide-rows':
-      return {
-        ...common,
-        kind: 'unhide-rows',
-        rowIndices: [...ticket.indices],
-      } satisfies UnhideRowsRequest
-    case 'hide-columns':
-      return {
-        ...common,
-        kind: 'hide-columns',
-        colIndices: [...ticket.indices],
-      } satisfies HideColumnsRequest
-    case 'unhide-columns':
-      return {
-        ...common,
-        kind: 'unhide-columns',
-        colIndices: [...ticket.indices],
-      } satisfies UnhideColumnsRequest
-  }
-}
-
-function dispatchViewportHiddenMutation(
-  ticket: ViewportHiddenMutationTicket,
-): Promise<BackendMutationResult> {
-  const request = hiddenMutationRequest(ticket)
-  switch (ticket.action) {
-    case 'hide-rows':
-      return ticket.source.hideRows!(request as HideRowsRequest)
-    case 'unhide-rows':
-      return ticket.source.unhideRows!(request as UnhideRowsRequest)
-    case 'hide-columns':
-      return ticket.source.hideColumns!(request as HideColumnsRequest)
-    case 'unhide-columns':
-      return ticket.source.unhideColumns!(request as UnhideColumnsRequest)
-  }
+function viewportSizeTicketIsCurrent(get: Getter, ticket: ViewportSizeHydrationTicket): boolean {
+  return get(activeViewportSizeTicketAtom) === ticket
 }
 
 /**
- * Hydrates the exact viewport metadata window from workbook authority.
- * All four metadata slices are validated before one synchronous projection commit.
+ * Hydrates the exact row-height / column-width window from the backend
+ * sizes projection. Both slices are validated before one synchronous
+ * projection commit. Hidden rows/columns are UI-core canonical and are
+ * not read here (see viewport/hidden.ts for the one-shot hidden seed).
  */
 export const hydrateViewportSizeProjectionAtom = atom(
   null,
@@ -1087,36 +643,23 @@ export const hydrateViewportSizeProjectionAtom = atom(
     set,
     input: HydrateViewportSizeProjectionInput,
   ): Promise<ViewportSizeHydrationOutcome> => {
-    const activeTicket = get(activeViewportHiddenTicketAtom)
-    if (activeTicket?.mode === 'mutation') return 'blocked'
-
-    const window = snapshotHiddenWindow(input.window)
-    if (!input.sheetId || !window) {
-      if (activeTicket?.mode === 'hydrate') set(activeViewportHiddenTicketAtom, null)
-      return 'blocked'
-    }
+    const window = snapshotSizeWindow(input.window)
+    if (!input.sheetId || !window) return 'blocked'
 
     const read = input.source.readViewportSizeProjection
-    if (!read) {
-      if (activeTicket?.mode === 'hydrate') set(activeViewportHiddenTicketAtom, null)
-      return 'unsupported'
-    }
+    if (!read) return 'unsupported'
 
-    const requestId = nextViewportHiddenRequestId(get(viewportHiddenRequestSequenceAtom))
-    if (requestId === null) {
-      if (activeTicket?.mode === 'hydrate') set(activeViewportHiddenTicketAtom, null)
-      return 'blocked'
-    }
+    const requestId = nextViewportSizeRequestId(get(viewportSizeRequestSequenceAtom))
+    if (requestId === null) return 'blocked'
     const ticket: ViewportSizeHydrationTicket = Object.freeze({
-      mode: 'hydrate',
       source: input.source,
       sheetId: input.sheetId,
       window,
       requestId,
       metadataIdentity: get(viewportMetadataProjectionIdentityAtom),
     })
-    set(viewportHiddenRequestSequenceAtom, requestId)
-    set(activeViewportHiddenTicketAtom, ticket)
+    set(viewportSizeRequestSequenceAtom, requestId)
+    set(activeViewportSizeTicketAtom, ticket)
 
     let result: unknown
     try {
@@ -1127,19 +670,19 @@ export const hydrateViewportSizeProjectionAtom = atom(
         requestId: ticket.requestId,
       } satisfies ViewportSizeProjectionRequest)
     } catch {
-      if (!viewportHiddenTicketIsCurrent(get, ticket)) return 'stale'
-      set(activeViewportHiddenTicketAtom, null)
+      if (!viewportSizeTicketIsCurrent(get, ticket)) return 'stale'
+      set(activeViewportSizeTicketAtom, null)
       return 'blocked'
     }
-    if (!viewportHiddenTicketIsCurrent(get, ticket)) return 'stale'
+    if (!viewportSizeTicketIsCurrent(get, ticket)) return 'stale'
 
-    const canonical = matchingCanonicalViewportMetadata(result, ticket)
+    const canonical = matchingCanonicalViewportSizes(result, ticket)
     if (!canonical) {
-      set(activeViewportHiddenTicketAtom, null)
+      set(activeViewportSizeTicketAtom, null)
       return 'blocked'
     }
     if (get(viewportMetadataProjectionIdentityAtom) !== ticket.metadataIdentity) {
-      set(activeViewportHiddenTicketAtom, null)
+      set(activeViewportSizeTicketAtom, null)
       return 'stale'
     }
 
@@ -1166,372 +709,13 @@ export const hydrateViewportSizeProjectionAtom = atom(
       },
     }
 
-    let nextHiddenState: ViewportHiddenState | null = null
-    if (canonical.hidden.kind === 'full') {
-      const hiddenState = get(viewportHiddenBackingAtom)
-      nextHiddenState = {
-        rowsBySheet: {
-          ...hiddenState.rowsBySheet,
-          [ticket.sheetId]: reconcileHiddenWindow(
-            hiddenState.rowsBySheet[ticket.sheetId] ?? [],
-            canonical.hidden.rows,
-            range.rowStart,
-            range.rowEnd,
-          ),
-        },
-        colsBySheet: {
-          ...hiddenState.colsBySheet,
-          [ticket.sheetId]: reconcileHiddenWindow(
-            hiddenState.colsBySheet[ticket.sheetId] ?? [],
-            canonical.hidden.cols,
-            range.colStart,
-            range.colEnd,
-          ),
-        },
-      }
-    }
-
     set(viewportSizeOverridesAtom, nextSizeState)
-    if (nextHiddenState) {
-      set(viewportHiddenBackingAtom, nextHiddenState)
-      set(viewportHiddenProjectionIdentityAtom, Object.freeze({}))
-    }
     rotateViewportMetadataProjectionIdentity(set)
-    set(viewportHiddenProjectionAuthorityBackingAtom, {
-      source: ticket.source,
-      sheetId: ticket.sheetId,
-      requestId: ticket.requestId,
-      revision: canonical.revision,
-      window: ticket.window,
-      ready: canonical.hidden.kind === 'full',
-    })
-    set(activeViewportHiddenTicketAtom, null)
-    return canonical.hidden.kind === 'full' ? 'ready' : 'sizes-only'
-  },
-)
-hydrateViewportSizeProjectionAtom.debugLabel = 'spreadsheet.viewport.hydrateSizeProjection'
-
-export function isViewportHiddenProjectionReady(
-  authority: ViewportHiddenProjectionAuthorityState,
-  source: ViewportHiddenControllerPort,
-  sheetId: string,
-  window: Readonly<CellRange>,
-): boolean {
-  return (
-    authority.ready &&
-    authority.source === source &&
-    authority.sheetId === sheetId &&
-    authority.revision !== null &&
-    authority.window !== null &&
-    hiddenWindowsMatch(authority.window, window)
-  )
-}
-
-/**
- * Mutates workbook authority first, then reconciles only the exact canonical readback range.
- * The local projection is never updated optimistically.
- */
-export const runViewportHiddenMutationAtom = atom(
-  null,
-  async (
-    get,
-    set,
-    input: RunViewportHiddenMutationInput,
-  ): Promise<ViewportHiddenCommandOutcome> => {
-    if (get(activeViewportHiddenTicketAtom)?.mode === 'mutation') return 'blocked'
-
-    const action = isViewportHiddenMutationAction(input.action) ? input.action : null
-    const window = snapshotHiddenWindow(input.window)
-    const hasValidRawIndices =
-      Array.isArray(input.indices) &&
-      input.indices.every((index) => Number.isSafeInteger(index) && index >= 0)
-    const indices = hasValidRawIndices ? sanitizeIndices(input.indices) : []
-    const lower =
-      action === 'hide-rows' || action === 'unhide-rows' ? window?.rowStart : window?.colStart
-    const upper =
-      action === 'hide-rows' || action === 'unhide-rows' ? window?.rowEnd : window?.colEnd
-    if (
-      !action ||
-      !input.sheetId ||
-      !window ||
-      !hasValidRawIndices ||
-      indices.length === 0 ||
-      lower === undefined ||
-      upper === undefined ||
-      indices.some((index) => index < lower || index > upper)
-    ) {
-      setViewportHiddenLifecycle(set, 'blocked', {
-        action,
-        sheetId: input.sheetId || null,
-        window,
-        error: VIEWPORT_HIDDEN_INVALID_ERROR,
-      })
-      return 'blocked'
-    }
-
-    const read = input.source.readViewportSizeProjection
-    if (!supportsViewportHiddenMutation(input.source, action) || !read) {
-      set(viewportHiddenProjectionAuthorityBackingAtom, {
-        source: input.source,
-        sheetId: input.sheetId,
-        requestId: null,
-        revision: null,
-        window,
-        ready: false,
-      })
-      setViewportHiddenLifecycle(set, 'unsupported', {
-        action,
-        sheetId: input.sheetId,
-        window,
-        error: VIEWPORT_HIDDEN_UNSUPPORTED_ERROR,
-      })
-      return 'unsupported'
-    }
-
-    const requestId = nextViewportHiddenRequestId(get(viewportHiddenRequestSequenceAtom))
-    if (requestId === null) {
-      setViewportHiddenLifecycle(set, 'blocked', {
-        action,
-        sheetId: input.sheetId,
-        window,
-        error: 'Hidden-state request identity space is exhausted.',
-      })
-      return 'blocked'
-    }
-    const authority = get(viewportHiddenProjectionAuthorityBackingAtom)
-    const revision =
-      authority.ready && authority.source === input.source && authority.sheetId === input.sheetId
-        ? authority.revision
-        : null
-    const ticket: ViewportHiddenMutationTicket = Object.freeze({
-      mode: 'mutation',
-      source: input.source,
-      sheetId: input.sheetId,
-      action,
-      indices: Object.freeze(indices),
-      window,
-      requestId,
-      revision,
-      projectionIdentity: get(viewportHiddenProjectionIdentityAtom),
-    })
-    set(viewportHiddenRequestSequenceAtom, requestId)
-    set(activeViewportHiddenTicketAtom, ticket)
-    markViewportHiddenProjectionUnconfirmed(set, ticket, revision)
-    setViewportHiddenLifecycle(set, 'pending', {
-      action: ticket.action,
-      sheetId: ticket.sheetId,
-      requestId: ticket.requestId,
-      revision: ticket.revision,
-      window: ticket.window,
-    })
-
-    let acknowledgement: unknown
-    try {
-      acknowledgement = await dispatchViewportHiddenMutation(ticket)
-    } catch (error) {
-      if (!viewportHiddenTicketIsCurrent(get, ticket)) return 'stale'
-      return failViewportHiddenTicket(
-        set,
-        ticket,
-        `${VIEWPORT_HIDDEN_RECOVERY_ERROR} Backend detail: ${hiddenErrorMessage(error)}`,
-      )
-    }
-    if (!viewportHiddenTicketIsCurrent(get, ticket)) return 'stale'
-    const revisionAfterMutation = matchingHiddenAcknowledgement(acknowledgement, ticket)
-    if (revisionAfterMutation === null) return failViewportHiddenTicket(set, ticket)
-    setViewportHiddenLifecycle(set, 'local-acknowledged', {
-      action: ticket.action,
-      sheetId: ticket.sheetId,
-      requestId: ticket.requestId,
-      revision: revisionAfterMutation,
-      window: ticket.window,
-    })
-    setViewportHiddenLifecycle(set, 'canonical-reading', {
-      action: ticket.action,
-      sheetId: ticket.sheetId,
-      requestId: ticket.requestId,
-      revision: revisionAfterMutation,
-      window: ticket.window,
-    })
-
-    let projection: unknown
-    try {
-      projection = await read({
-        kind: 'viewport-size',
-        sheetId: ticket.sheetId,
-        window: ticket.window,
-        requestId: ticket.requestId,
-        revision: revisionAfterMutation,
-      } satisfies ViewportSizeProjectionRequest)
-    } catch (error) {
-      if (!viewportHiddenTicketIsCurrent(get, ticket)) return 'stale'
-      return failViewportHiddenTicket(
-        set,
-        ticket,
-        `${VIEWPORT_HIDDEN_RECOVERY_ERROR} Backend detail: ${hiddenErrorMessage(error)}`,
-        revisionAfterMutation,
-      )
-    }
-    if (!viewportHiddenTicketIsCurrent(get, ticket)) return 'stale'
-    const canonical = matchingCanonicalHiddenProjection(projection, ticket, revisionAfterMutation)
-    if (!canonical) {
-      return failViewportHiddenTicket(
-        set,
-        ticket,
-        VIEWPORT_HIDDEN_RECOVERY_ERROR,
-        revisionAfterMutation,
-      )
-    }
-    if (get(viewportHiddenProjectionIdentityAtom) !== ticket.projectionIdentity) {
-      return failViewportHiddenTicket(
-        set,
-        ticket,
-        `${VIEWPORT_HIDDEN_RECOVERY_ERROR} The local canonical projection changed while the request was in flight.`,
-        revisionAfterMutation,
-      )
-    }
-
-    const state = get(viewportHiddenBackingAtom)
-    const range = ticket.window
-    const rows = reconcileHiddenWindow(
-      state.rowsBySheet[ticket.sheetId] ?? [],
-      canonical.rows,
-      range.rowStart,
-      range.rowEnd,
-    )
-    const cols = reconcileHiddenWindow(
-      state.colsBySheet[ticket.sheetId] ?? [],
-      canonical.cols,
-      range.colStart,
-      range.colEnd,
-    )
-    set(setViewportHiddenAtom, { sheetId: ticket.sheetId, rows, cols })
-    set(viewportHiddenProjectionAuthorityBackingAtom, {
-      source: ticket.source,
-      sheetId: ticket.sheetId,
-      requestId: ticket.requestId,
-      revision: revisionAfterMutation,
-      window: ticket.window,
-      ready: true,
-    })
-    set(activeViewportHiddenTicketAtom, null)
-    setViewportHiddenLifecycle(set, 'ready', {
-      action: ticket.action,
-      sheetId: ticket.sheetId,
-      requestId: ticket.requestId,
-      revision: revisionAfterMutation,
-      window: ticket.window,
-    })
+    set(activeViewportSizeTicketAtom, null)
     return 'ready'
   },
 )
-runViewportHiddenMutationAtom.debugLabel = 'spreadsheet.viewport.runHiddenMutation'
-
-type ViewportHiddenSelectionMutationResolution =
-  | Readonly<{ kind: 'ready'; input: RunViewportHiddenMutationInput }>
-  | Readonly<{
-      kind: 'blocked'
-      action: ViewportHiddenSelectionMutationAction | null
-      sheetId: string | null
-      window: Readonly<CellRange> | null
-    }>
-
-function isViewportHiddenSelectionMutationAction(
-  value: unknown,
-): value is ViewportHiddenSelectionMutationAction {
-  return value === 'unhide-rows' || value === 'unhide-columns'
-}
-
-function resolveViewportHiddenSelectionMutation(
-  get: Getter,
-  input: RunViewportHiddenSelectionMutationInput,
-): ViewportHiddenSelectionMutationResolution {
-  const action = isViewportHiddenSelectionMutationAction(input?.action) ? input.action : null
-  const source = input?.source
-  const regions = get(selectionRegionsAtom)
-  const snapshot = get(selectionSnapshotAtom)
-  const sheetId = snapshot.selection.sheetId || null
-  const selectionWindow = snapshotHiddenWindow(snapshot.range)
-  const authority = get(viewportHiddenProjectionAuthorityBackingAtom)
-  const authorityWindow = snapshotHiddenWindow(authority.window)
-  const blocked = (): ViewportHiddenSelectionMutationResolution =>
-    Object.freeze({
-      kind: 'blocked',
-      action,
-      sheetId,
-      window: authorityWindow,
-    })
-
-  if (
-    !action ||
-    !source ||
-    regions.length !== 1 ||
-    !sheetId ||
-    regions[0]?.sheetId !== sheetId ||
-    !selectionWindow ||
-    !authority.ready ||
-    authority.source !== source ||
-    authority.sheetId !== sheetId ||
-    !isHiddenRevision(authority.revision) ||
-    !authorityWindow
-  ) {
-    return blocked()
-  }
-
-  const selectsRows = action === 'unhide-rows'
-  const selectionStart = selectsRows ? selectionWindow.rowStart : selectionWindow.colStart
-  const selectionEnd = selectsRows ? selectionWindow.rowEnd : selectionWindow.colEnd
-  const authorityStart = selectsRows ? authorityWindow.rowStart : authorityWindow.colStart
-  const authorityEnd = selectsRows ? authorityWindow.rowEnd : authorityWindow.colEnd
-  if (authorityStart > selectionStart || authorityEnd < selectionEnd) return blocked()
-
-  const hidden = get(viewportHiddenBackingAtom)
-  const canonicalIndices = selectsRows
-    ? (hidden.rowsBySheet[sheetId] ?? [])
-    : (hidden.colsBySheet[sheetId] ?? [])
-  const indices = sanitizeIndices(canonicalIndices).filter(
-    (index) => index >= selectionStart && index <= selectionEnd,
-  )
-  if (indices.length === 0) return blocked()
-
-  return Object.freeze({
-    kind: 'ready',
-    input: Object.freeze({
-      source,
-      sheetId,
-      action,
-      indices: Object.freeze(indices),
-      window: authorityWindow,
-    }),
-  })
-}
-
-/** Resolves an Unhide command from canonical selection and hidden-state authority. */
-export const runViewportHiddenSelectionMutationAtom = atom(
-  null,
-  async (
-    get,
-    set,
-    input: RunViewportHiddenSelectionMutationInput,
-  ): Promise<ViewportHiddenCommandOutcome> => {
-    if (get(activeViewportHiddenTicketAtom)?.mode === 'mutation') return 'blocked'
-
-    const resolution = resolveViewportHiddenSelectionMutation(get, input)
-    if (resolution.kind === 'blocked') {
-      setViewportHiddenLifecycle(set, 'blocked', {
-        action: resolution.action,
-        sheetId: resolution.sheetId,
-        window: resolution.window,
-        error: VIEWPORT_HIDDEN_SELECTION_BLOCKED_ERROR,
-      })
-      return 'blocked'
-    }
-
-    return set(runViewportHiddenMutationAtom, resolution.input)
-  },
-)
-runViewportHiddenSelectionMutationAtom.debugLabel =
-  'spreadsheet.viewport.runHiddenSelectionMutation'
+hydrateViewportSizeProjectionAtom.debugLabel = 'spreadsheet.viewport.hydrateSizeProjection'
 
 const EMPTY_WINDOW: VisibleWindow = { rowStart: 0, rowEnd: -1, colStart: 0, colEnd: -1 }
 

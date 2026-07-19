@@ -19,6 +19,8 @@ import {
   type HistoryRedoRequest,
   type HistoryUndoRequest,
 } from '../src/history'
+import { setFreezeConfigAtom, viewportFreezeAtom } from '../src/viewport/freeze'
+import { hideRowsAtom, viewportHiddenAtom } from '../src/viewport/hidden'
 
 function makeEntry(id: string, revision: number | string = 0): HistoryEntry {
   return {
@@ -435,5 +437,146 @@ describe('history Core lifecycle', () => {
     expect(store.setter(clearHistoryAtom)).toBe(true)
     expect(store.getter(historyStackAtom)).toMatchObject({ cursor: 0, inFlight: false })
     expect(store.getter(historyStackAtom).entries).toHaveLength(0)
+  })
+})
+
+describe('backend entries with local side payloads', () => {
+  function makeBackendSource(revisions: { undo: number; redo: number }): HistoryControllerPort & {
+    undoCalls: HistoryUndoRequest[]
+    redoCalls: HistoryRedoRequest[]
+  } {
+    const undoCalls: HistoryUndoRequest[] = []
+    const redoCalls: HistoryRedoRequest[] = []
+    return {
+      undoCalls,
+      redoCalls,
+      async undoTransaction(request) {
+        undoCalls.push(request)
+        return {
+          transactionId: request.transactionId,
+          requestId: request.requestId,
+          revision: revisions.undo,
+        }
+      },
+      async redoTransaction(request) {
+        redoCalls.push(request)
+        return {
+          transactionId: request.transactionId,
+          requestId: request.requestId,
+          revision: revisions.redo,
+        }
+      },
+    }
+  }
+
+  test('undo/redo of a structural entry replays its freeze and hidden side payloads', async () => {
+    const store = createStore()
+    // Establish the post-shift local facts (as the structural operation left them).
+    store.setter(setFreezeConfigAtom, { sheetId: 'sheet-1', rows: 2, cols: 1 })
+    store.setter(hideRowsAtom, { sheetId: 'sheet-1', indices: [4] })
+    // Two local entries were recorded; a backend structural entry follows.
+    store.setter(pushHistoryAtom, {
+      transactionId: 'tx-structural',
+      kind: 'row.delete',
+      sheetId: 'sheet-1',
+      projectionRevision: 10,
+      localSidePayloads: [
+        {
+          applyKey: 'viewport.freeze',
+          sheetId: 'sheet-1',
+          before: { rows: 4, cols: 1 },
+          after: { rows: 2, cols: 1 },
+        },
+        {
+          applyKey: 'viewport.hidden',
+          sheetId: 'sheet-1',
+          before: { rows: [2, 6], cols: [] },
+          after: { rows: [4], cols: [] },
+        },
+      ],
+    })
+
+    const source = makeBackendSource({ undo: 11, redo: 12 })
+    await expect(
+      store.setter(runUndoHistoryAtom, {
+        source,
+        refreshProjection: async () => undefined,
+      }),
+    ).resolves.toBe('completed')
+    // Backend transaction ran AND the local view facts were restored from
+    // the exact recorded snapshots — a delete's index membership cannot be
+    // recovered by inverting the shift.
+    expect(source.undoCalls).toHaveLength(1)
+    expect(store.getter(viewportFreezeAtom).rowsBySheet['sheet-1']).toBe(4)
+    expect(store.getter(viewportHiddenAtom).rowsBySheet['sheet-1']).toEqual([2, 6])
+
+    await expect(
+      store.setter(runRedoHistoryAtom, {
+        source,
+        refreshProjection: async () => undefined,
+      }),
+    ).resolves.toBe('completed')
+    expect(source.redoCalls).toHaveLength(1)
+    expect(store.getter(viewportFreezeAtom).rowsBySheet['sheet-1']).toBe(2)
+    expect(store.getter(viewportHiddenAtom).rowsBySheet['sheet-1']).toEqual([4])
+  })
+
+  test('side payloads still require the backend transaction to be acknowledged', async () => {
+    const store = createStore()
+    store.setter(hideRowsAtom, { sheetId: 'sheet-1', indices: [4] })
+    store.setter(pushHistoryAtom, {
+      transactionId: 'tx-structural',
+      kind: 'row.delete',
+      sheetId: 'sheet-1',
+      projectionRevision: 10,
+      localSidePayloads: [
+        {
+          applyKey: 'viewport.hidden',
+          sheetId: 'sheet-1',
+          before: { rows: [2, 6], cols: [] },
+          after: { rows: [4], cols: [] },
+        },
+      ],
+    })
+    const failing: HistoryControllerPort = {
+      async undoTransaction() {
+        throw new Error('undo offline')
+      },
+    }
+    await expect(
+      store.setter(runUndoHistoryAtom, {
+        source: failing,
+        refreshProjection: async () => undefined,
+      }),
+    ).resolves.toBe('outcome-unknown')
+    // No acknowledgement → no local restore.
+    expect(store.getter(viewportHiddenAtom).rowsBySheet['sheet-1']).toEqual([4])
+  })
+
+  test('side payloads are dropped from entries that also carry localReplay', () => {
+    const store = createStore()
+    store.setter(pushHistoryAtom, {
+      transactionId: 'tx-conflict',
+      kind: 'viewport.hidden',
+      sheetId: 'sheet-1',
+      projectionRevision: 'local',
+      localReplay: {
+        applyKey: 'viewport.hidden',
+        sheetId: 'sheet-1',
+        before: { rows: [] },
+        after: { rows: [1] },
+      },
+      localSidePayloads: [
+        {
+          applyKey: 'viewport.freeze',
+          sheetId: 'sheet-1',
+          before: null,
+          after: { rows: 1, cols: 0 },
+        },
+      ],
+    })
+    const entry = store.getter(historyStackAtom).entries[0]!
+    expect(entry.localReplay).toBeDefined()
+    expect(entry.localSidePayloads).toBeUndefined()
   })
 })

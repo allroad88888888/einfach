@@ -11,8 +11,21 @@ import type {
   ProjectionRevision,
 } from '../backend/types'
 import { nextHistoryTransactionId, pushHistoryAtom } from '../history'
+import type { HistoryLocalReplayPayload } from '../history'
 import type { CellCoord, CellRange } from '../shared'
-import { applyViewportFreezeStructuralShiftAtom } from '../viewport/freeze'
+import {
+  applyViewportFreezeStructuralShiftAtom,
+  getViewportFreezeForSheet,
+  VIEWPORT_FREEZE_REPLAY_KEY,
+  viewportFreezeAtom,
+} from '../viewport/freeze'
+import {
+  applyViewportHiddenStructuralShiftAtom,
+  getHiddenColumnsForSheet,
+  getHiddenRowsForSheet,
+  VIEWPORT_HIDDEN_REPLAY_KEY,
+  viewportHiddenAtom,
+} from '../viewport/hidden'
 
 export type SpreadsheetOperationSource =
   | 'keyboard'
@@ -524,6 +537,10 @@ function isProjectionRevision(value: unknown): value is ProjectionRevision {
   )
 }
 
+function sameIndexArrays(left: readonly number[], right: readonly number[]): boolean {
+  return left.length === right.length && left.every((value, offset) => value === right[offset])
+}
+
 function snapshotStructureOperationIntent(value: unknown): StructureOperationIntent | null {
   try {
     if (typeof value !== 'object' || value === null) return null
@@ -925,12 +942,53 @@ async function runStructureOperation(
   }
 
   // W3 structural-shift contract: displaced index space moves UI-core
-  // canonical view facts (freeze band today) before anything else reads
-  // post-mutation coordinates.
+  // canonical view facts (freeze band, hidden index sets) before anything
+  // else reads post-mutation coordinates. The pre/post snapshots become
+  // history side payloads: inverting a delete cannot restore hidden index
+  // membership, so undo/redo of this backend transaction replays the
+  // exact recorded view facts instead (see HistoryEntry.localSidePayloads).
+  const sheetId = ticket.intent.sheetId
+  const freezeBefore = getViewportFreezeForSheet(get(viewportFreezeAtom), sheetId)
+  const hiddenStateBefore = get(viewportHiddenAtom)
+  const hiddenRowsBefore = getHiddenRowsForSheet(hiddenStateBefore, sheetId)
+  const hiddenColsBefore = getHiddenColumnsForSheet(hiddenStateBefore, sheetId)
   if (acknowledgement.structuralShift) {
     set(applyViewportFreezeStructuralShiftAtom, {
-      sheetId: ticket.intent.sheetId,
+      sheetId,
       shift: acknowledgement.structuralShift,
+    })
+    set(applyViewportHiddenStructuralShiftAtom, {
+      sheetId,
+      shift: acknowledgement.structuralShift,
+    })
+  }
+  const localSidePayloads: HistoryLocalReplayPayload[] = []
+  const freezeAfter = getViewportFreezeForSheet(get(viewportFreezeAtom), sheetId)
+  if (
+    (freezeBefore === null) !== (freezeAfter === null) ||
+    (freezeBefore !== null &&
+      freezeAfter !== null &&
+      (freezeBefore.rows !== freezeAfter.rows || freezeBefore.cols !== freezeAfter.cols))
+  ) {
+    localSidePayloads.push({
+      applyKey: VIEWPORT_FREEZE_REPLAY_KEY,
+      sheetId,
+      before: freezeBefore,
+      after: freezeAfter,
+    })
+  }
+  const hiddenStateAfter = get(viewportHiddenAtom)
+  const hiddenRowsAfter = getHiddenRowsForSheet(hiddenStateAfter, sheetId)
+  const hiddenColsAfter = getHiddenColumnsForSheet(hiddenStateAfter, sheetId)
+  if (
+    !sameIndexArrays(hiddenRowsBefore, hiddenRowsAfter) ||
+    !sameIndexArrays(hiddenColsBefore, hiddenColsAfter)
+  ) {
+    localSidePayloads.push({
+      applyKey: VIEWPORT_HIDDEN_REPLAY_KEY,
+      sheetId,
+      before: { rows: [...hiddenRowsBefore], cols: [...hiddenColsBefore] },
+      after: { rows: [...hiddenRowsAfter], cols: [...hiddenColsAfter] },
     })
   }
 
@@ -940,6 +998,7 @@ async function runStructureOperation(
     sheetId: ticket.intent.sheetId,
     projectionRevision: acknowledgement.revision,
     ...(acknowledgement.affectedRange ? { affectedRange: acknowledgement.affectedRange } : {}),
+    ...(localSidePayloads.length > 0 ? { localSidePayloads } : {}),
   })
   if (!historyRecorded) {
     set(

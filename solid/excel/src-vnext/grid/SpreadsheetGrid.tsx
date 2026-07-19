@@ -29,6 +29,7 @@ import {
   getViewportRowHeight,
   getSelectionRange,
   hydrateViewportFreezeAtom,
+  hydrateViewportHiddenAtom,
   hydrateViewportSizeProjectionAtom,
   addSelectionRegionAtom,
   isMergeCovered,
@@ -152,11 +153,16 @@ function getWindowIndexes(start: number, end: number) {
 
 const GRID_ROW_HEADER_WIDTH = 44
 
+// Hidden rows/columns are UI-core canonical zero-size entries in the axis
+// math: a hidden index contributes 0px to offsets and spans, mirroring
+// the ui-core getVisibleWindowWithHidden semantics (the same pixel span
+// covers more indices when some of them are hidden).
 function getAxisOffsetForIndex(
   index: number,
   count: number,
   fallbackSize: number,
   overrides: Record<string, number> | undefined,
+  hidden?: ReadonlySet<number>,
 ) {
   const clampedIndex = Math.max(0, Math.min(count, Math.trunc(index)))
   let offset = clampedIndex * fallbackSize
@@ -165,7 +171,16 @@ function getAxisOffsetForIndex(
     const overrideIndex = Number(key)
     if (!Number.isInteger(overrideIndex)) continue
     if (overrideIndex < 0 || overrideIndex >= clampedIndex) continue
+    if (hidden?.has(overrideIndex)) continue
     offset += size - fallbackSize
+  }
+
+  if (hidden) {
+    for (const hiddenIndex of hidden) {
+      if (Number.isInteger(hiddenIndex) && hiddenIndex >= 0 && hiddenIndex < clampedIndex) {
+        offset -= fallbackSize
+      }
+    }
   }
 
   return Math.max(0, offset)
@@ -177,14 +192,15 @@ function getAxisSpanSize(
   count: number,
   fallbackSize: number,
   overrides: Record<string, number> | undefined,
+  hidden?: ReadonlySet<number>,
 ) {
   if (count <= 0 || end < start) return 0
   const clampedStart = Math.max(0, Math.min(count, Math.trunc(start)))
   const clampedEnd = Math.max(0, Math.min(count - 1, Math.trunc(end)))
   if (clampedEnd < clampedStart) return 0
   return (
-    getAxisOffsetForIndex(clampedEnd + 1, count, fallbackSize, overrides) -
-    getAxisOffsetForIndex(clampedStart, count, fallbackSize, overrides)
+    getAxisOffsetForIndex(clampedEnd + 1, count, fallbackSize, overrides, hidden) -
+    getAxisOffsetForIndex(clampedStart, count, fallbackSize, overrides, hidden)
   )
 }
 
@@ -193,6 +209,7 @@ function getAxisStartIndexAtOffset(
   count: number,
   fallbackSize: number,
   overrides: Record<string, number> | undefined,
+  hidden?: ReadonlySet<number>,
 ) {
   if (count <= 0) return 0
 
@@ -203,7 +220,7 @@ function getAxisStartIndexAtOffset(
 
   while (low <= high) {
     const mid = Math.floor((low + high) / 2)
-    const cellEnd = getAxisOffsetForIndex(mid + 1, count, fallbackSize, overrides)
+    const cellEnd = getAxisOffsetForIndex(mid + 1, count, fallbackSize, overrides, hidden)
     if (cellEnd > target) {
       result = mid
       high = mid - 1
@@ -220,6 +237,7 @@ function getAxisEndIndexAtOffset(
   count: number,
   fallbackSize: number,
   overrides: Record<string, number> | undefined,
+  hidden?: ReadonlySet<number>,
 ) {
   if (count <= 0) return -1
 
@@ -230,7 +248,7 @@ function getAxisEndIndexAtOffset(
 
   while (low <= high) {
     const mid = Math.floor((low + high) / 2)
-    const cellStart = getAxisOffsetForIndex(mid, count, fallbackSize, overrides)
+    const cellStart = getAxisOffsetForIndex(mid, count, fallbackSize, overrides, hidden)
     if (cellStart < target) {
       result = mid
       low = mid + 1
@@ -642,11 +660,21 @@ export function SpreadsheetGrid(props: SpreadsheetGridProps) {
     }
   }
 
+  function getHiddenRowSet(): ReadonlySet<number> {
+    return new Set(getHiddenRowsForSheet(store.getter(viewportHiddenAtom), props.sheetId))
+  }
+
+  function getHiddenColSet(): ReadonlySet<number> {
+    return new Set(getHiddenColumnsForSheet(store.getter(viewportHiddenAtom), props.sheetId))
+  }
+
   function getRenderedVisibleWindow(): CellRange {
     const metrics = store.getter(viewportMetricsAtom)
     const overrides = store.getter(viewportSizeOverridesAtom)
     const rowOverrides = overrides.rowHeightsBySheet[props.sheetId]
     const colOverrides = overrides.colWidthsBySheet[props.sheetId]
+    const hiddenRows = getHiddenRowSet()
+    const hiddenCols = getHiddenColSet()
 
     if (metrics.rowCount === 0 || metrics.colCount === 0) {
       return {
@@ -662,12 +690,14 @@ export function SpreadsheetGrid(props: SpreadsheetGridProps) {
       metrics.rowCount,
       metrics.rowHeight,
       rowOverrides,
+      hiddenRows,
     )
     const rawColStart = getAxisStartIndexAtOffset(
       metrics.scrollLeft,
       metrics.colCount,
       metrics.colWidth,
       colOverrides,
+      hiddenCols,
     )
     const rawRowEnd =
       metrics.viewportHeight <= 0
@@ -677,6 +707,7 @@ export function SpreadsheetGrid(props: SpreadsheetGridProps) {
             metrics.rowCount,
             metrics.rowHeight,
             rowOverrides,
+            hiddenRows,
           )
     const rawColEnd =
       metrics.viewportWidth <= 0
@@ -686,6 +717,7 @@ export function SpreadsheetGrid(props: SpreadsheetGridProps) {
             metrics.colCount,
             metrics.colWidth,
             colOverrides,
+            hiddenCols,
           )
 
     // When freeze is active for this sheet, expand the projection window so the
@@ -852,7 +884,7 @@ export function SpreadsheetGrid(props: SpreadsheetGridProps) {
       sheetId: props.sheetId,
       window,
     })
-    if (outcome === 'ready' || outcome === 'sizes-only') bumpRender()
+    if (outcome === 'ready') bumpRender()
   }
 
   function syncScrollElementToViewport() {
@@ -1015,6 +1047,15 @@ export function SpreadsheetGrid(props: SpreadsheetGridProps) {
     void store.setter(hydrateViewportFreezeAtom, {
       source: backend,
       sheetId: props.sheetId,
+    })
+    // Same seeded-sheets pattern for hidden rows/columns: the local sets
+    // are canonical; the backend mirror only seeds a sheet once.
+    const metrics = store.getter(viewportMetricsAtom)
+    void store.setter(hydrateViewportHiddenAtom, {
+      source: backend,
+      sheetId: props.sheetId,
+      rowCount: metrics.rowCount > 0 ? metrics.rowCount : props.viewport.rowCount,
+      colCount: metrics.colCount > 0 ? metrics.colCount : props.viewport.colCount,
     })
   })
 
@@ -2867,6 +2908,7 @@ export function SpreadsheetGrid(props: SpreadsheetGridProps) {
       metrics.rowCount,
       metrics.rowHeight,
       getRowOverridesForSheet(),
+      getHiddenRowSet(),
     )
   }
 
@@ -2878,6 +2920,7 @@ export function SpreadsheetGrid(props: SpreadsheetGridProps) {
       metrics.colCount,
       metrics.colWidth,
       getColOverridesForSheet(),
+      getHiddenColSet(),
     )
   }
 

@@ -20,6 +20,7 @@ export type HistoryEntryKind =
   | 'sheet.reorder'
   | 'format.set'
   | 'viewport.freeze'
+  | 'viewport.hidden'
 
 export interface HistoryAffectedRange {
   readonly rowStart: number
@@ -56,6 +57,17 @@ export interface HistoryEntry {
    * backend projection-revision witness.
    */
   readonly localReplay?: Readonly<HistoryLocalReplayPayload>
+  /**
+   * Optional side payloads on backend-transaction entries. A structural
+   * backend mutation can displace UI-core canonical view facts (freeze
+   * band, hidden index sets); inverting the structural shift cannot
+   * restore them (a delete erases index membership), so the operation
+   * snapshots the affected view facts as before/after payloads. After the
+   * backend acknowledges the transaction's undo/redo, each payload
+   * replays through the same local-replay applier registry to restore the
+   * local view facts. Mutually exclusive with `localReplay`.
+   */
+  readonly localSidePayloads?: readonly Readonly<HistoryLocalReplayPayload>[]
 }
 
 export interface HistoryStackState {

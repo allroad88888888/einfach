@@ -10,8 +10,9 @@ import {
   filterSortStateAtom,
   findReplaceOpenAtom,
   helpOverlayAtom,
+  hideColumnsAtom,
+  hideRowsAtom,
   historyStackAtom,
-  hydrateViewportSizeProjectionAtom,
   initializeSheetTabsAtom,
   pushHistoryAtom,
   MENU_BAR_ITEMS,
@@ -24,7 +25,6 @@ import {
   removeDuplicatesReadRequestIdAtom,
   removeDuplicatesSessionAtom,
   selectionAtom,
-  setViewportHiddenAtom,
   setWorkspaceActiveSheetAtom,
   sheetTabsAtom,
   sheetTabsSheetsAtom,
@@ -41,10 +41,8 @@ import {
   viewportShowHeadingsAtom,
   viewportFreezeAtom,
   viewportHiddenAtom,
-  viewportHiddenLifecycleAtom,
   workspaceSessionAtom,
   type AddSheetRequest,
-  type BackendMutationResult,
   type DisplayCell,
   type HideColumnsRequest,
   type HideRowsRequest,
@@ -58,8 +56,6 @@ import {
   type UnhideColumnsRequest,
   type UnhideRowsRequest,
   type VisibleProjectionRequest,
-  type ViewportSizeProjectionRequest,
-  type ViewportSizeProjectionResult,
 } from '@einfach/spreadsheet-ui-core'
 import { SpreadsheetUiProvider } from '../src-vnext/provider'
 import { SpreadsheetMenuBar } from '../src-vnext/menu-bar'
@@ -923,28 +919,15 @@ describe('SpreadsheetMenuBar', () => {
     expect(store.getter(validationRuleEditorAtom).status).toBe('editing')
   })
 
-  it('Format > Hide Row delegates to Core and waits for canonical readback before projecting state', async () => {
+  it('Format > Hide Row commits the local canonical state and mirrors the delta', async () => {
     const store = createStore()
     setupHiddenSelection(store)
-    store.setter(setViewportHiddenAtom, {
-      sheetId: 'sheet-1',
-      rows: [0, 8],
-      cols: [1, 9],
-    })
-    const before = store.getter(viewportHiddenAtom)
-    const mutation = deferred<BackendMutationResult>()
-    const readback = deferred<ViewportSizeProjectionResult>()
-    let mutationRequest: HideRowsRequest | undefined
-    let readRequest: ViewportSizeProjectionRequest | undefined
+    const hideRequests: HideRowsRequest[] = []
     const backend: SpreadsheetBackend = {
       ...createBaseBackend(),
-      hideRows(request) {
-        mutationRequest = request
-        return mutation.promise
-      },
-      readViewportSizeProjection(request) {
-        readRequest = request
-        return readback.promise
+      async hideRows(request) {
+        hideRequests.push(request)
+        return { sheetId: request.sheetId }
       },
     }
     const { container } = render(() => (
@@ -954,69 +937,25 @@ describe('SpreadsheetMenuBar', () => {
     ))
 
     await activateFormatMenuItem(container, 'format.hideRow')
-    await waitFor(() => expect(mutationRequest).toBeDefined())
-    expect(mutationRequest).toEqual({
+    // Local commit is synchronous — no readback lifecycle, no pending gate.
+    expect(store.getter(viewportHiddenAtom).rowsBySheet['sheet-1']).toEqual([2, 3, 4])
+    await waitFor(() => expect(hideRequests).toHaveLength(1))
+    expect(hideRequests[0]).toMatchObject({
       kind: 'hide-rows',
       sheetId: 'sheet-1',
       rowIndices: [2, 3, 4],
-      requestId: 1,
-    })
-    expect(store.getter(viewportHiddenLifecycleAtom).status).toBe('pending')
-    expect(store.getter(viewportHiddenAtom)).toBe(before)
-
-    mutation.resolve({ sheetId: 'sheet-1', requestId: 1, revision: 11 })
-    await waitFor(() => expect(readRequest).toBeDefined())
-    expect(readRequest).toEqual({
-      kind: 'viewport-size',
-      sheetId: 'sheet-1',
-      window: { rowStart: 2, rowEnd: 4, colStart: 3, colEnd: 5 },
-      requestId: 1,
-      revision: 11,
-    })
-    expect(store.getter(viewportHiddenAtom)).toBe(before)
-
-    readback.resolve({
-      kind: 'viewport-size',
-      sheetId: 'sheet-1',
-      window: { ...readRequest!.window },
-      requestId: readRequest!.requestId,
-      revision: 11,
-      rowHeights: [],
-      colWidths: [],
-      hiddenRowIndices: [2, 3, 4],
-      hiddenColIndices: [],
-    })
-    await waitFor(() => {
-      expect(store.getter(viewportHiddenLifecycleAtom).status).toBe('ready')
-    })
-    expect(store.getter(viewportHiddenAtom)).toEqual({
-      rowsBySheet: { 'sheet-1': [0, 2, 3, 4, 8] },
-      colsBySheet: { 'sheet-1': [1, 9] },
     })
   })
 
-  it('Format > Hide Column delegates the selected column window to Core', async () => {
+  it('Format > Hide Column commits the selected columns locally', async () => {
     const store = createStore()
     setupHiddenSelection(store)
-    let mutationRequest: HideColumnsRequest | undefined
+    const hideRequests: HideColumnsRequest[] = []
     const backend: SpreadsheetBackend = {
       ...createBaseBackend(),
       async hideColumns(request) {
-        mutationRequest = request
-        return { sheetId: request.sheetId, requestId: request.requestId, revision: 5 }
-      },
-      async readViewportSizeProjection(request) {
-        return {
-          kind: 'viewport-size',
-          sheetId: request.sheetId,
-          window: { ...request.window },
-          requestId: request.requestId,
-          revision: request.revision ?? 5,
-          rowHeights: [],
-          colWidths: [],
-          hiddenRowIndices: [],
-          hiddenColIndices: [3, 4, 5],
-        }
+        hideRequests.push(request)
+        return { sheetId: request.sheetId }
       },
     }
     const { container } = render(() => (
@@ -1026,26 +965,17 @@ describe('SpreadsheetMenuBar', () => {
     ))
 
     await activateFormatMenuItem(container, 'format.hideCol')
-    await waitFor(() => {
-      expect(store.getter(viewportHiddenLifecycleAtom).status).toBe('ready')
-    })
-    expect(mutationRequest).toEqual({
-      kind: 'hide-columns',
-      sheetId: 'sheet-1',
-      colIndices: [3, 4, 5],
-      requestId: 1,
-    })
     expect(store.getter(viewportHiddenAtom)).toEqual({
       rowsBySheet: { 'sheet-1': [] },
       colsBySheet: { 'sheet-1': [3, 4, 5] },
     })
+    await waitFor(() => expect(hideRequests).toHaveLength(1))
+    expect(hideRequests[0]?.colIndices).toEqual([3, 4, 5])
   })
 
-  it('Format > Hide Row reports unsupported without fabricating local hidden state', async () => {
+  it('Format > Hide Row works fully on a backend without hidden ports', async () => {
     const store = createStore()
     setupHiddenSelection(store)
-    store.setter(setViewportHiddenAtom, { sheetId: 'sheet-1', rows: [0], cols: [1] })
-    const before = store.getter(viewportHiddenAtom)
     const { container } = render(() => (
       <SpreadsheetUiProvider backend={createBaseBackend()} store={store}>
         <SpreadsheetMenuBar />
@@ -1053,62 +983,30 @@ describe('SpreadsheetMenuBar', () => {
     ))
 
     await activateFormatMenuItem(container, 'format.hideRow')
-    await waitFor(() => {
-      expect(store.getter(viewportHiddenLifecycleAtom).status).toBe('unsupported')
-    })
-    expect(store.getter(viewportHiddenAtom)).toBe(before)
+    // Pre-flip this reported 'unsupported'; hidden is UI-core canonical now.
+    expect(store.getter(viewportHiddenAtom).rowsBySheet['sheet-1']).toEqual([2, 3, 4])
   })
 
-  it('Format > Unhide Rows and Unhide Columns use Core canonical intersections and full-window readback', async () => {
+  it('Format > Unhide Rows and Unhide Columns use the full local truth intersection', async () => {
     const store = createStore()
     setupHiddenSelection(store)
-    const authorityWindow = { rowStart: 0, rowEnd: 9, colStart: 0, colEnd: 9 }
-    let rows = [1, 2, 4, 7]
-    let cols = [1, 3, 5, 8]
-    let revision = 20
+    // Local canonical facts — including indices no viewport window ever
+    // reported (rows 1/7, cols 1/8 are outside the 2..4 × 3..5 selection).
+    store.setter(hideRowsAtom, { sheetId: 'sheet-1', indices: [1, 2, 4, 7] })
+    store.setter(hideColumnsAtom, { sheetId: 'sheet-1', indices: [1, 3, 5, 8] })
     const rowMutations: UnhideRowsRequest[] = []
     const columnMutations: UnhideColumnsRequest[] = []
-    const reads: ViewportSizeProjectionRequest[] = []
     const backend: SpreadsheetBackend = {
       ...createBaseBackend(),
       async unhideRows(request) {
         rowMutations.push(request)
-        rows = rows.filter((index) => !request.rowIndices.includes(index))
-        revision += 1
-        return { sheetId: request.sheetId, requestId: request.requestId, revision }
+        return { sheetId: request.sheetId }
       },
       async unhideColumns(request) {
         columnMutations.push(request)
-        cols = cols.filter((index) => !request.colIndices.includes(index))
-        revision += 1
-        return { sheetId: request.sheetId, requestId: request.requestId, revision }
-      },
-      async readViewportSizeProjection(request) {
-        reads.push(request)
-        return {
-          kind: 'viewport-size',
-          sheetId: request.sheetId,
-          window: { ...request.window },
-          requestId: request.requestId,
-          revision: request.revision ?? revision,
-          rowHeights: [],
-          colWidths: [],
-          hiddenRowIndices: rows.filter(
-            (index) => index >= request.window.rowStart && index <= request.window.rowEnd,
-          ),
-          hiddenColIndices: cols.filter(
-            (index) => index >= request.window.colStart && index <= request.window.colEnd,
-          ),
-        }
+        return { sheetId: request.sheetId }
       },
     }
-    await expect(
-      store.setter(hydrateViewportSizeProjectionAtom, {
-        source: backend,
-        sheetId: 'sheet-1',
-        window: authorityWindow,
-      }),
-    ).resolves.toBe('ready')
 
     const { container } = render(() => (
       <SpreadsheetUiProvider backend={backend} store={store}>
@@ -1117,119 +1015,42 @@ describe('SpreadsheetMenuBar', () => {
     ))
 
     await activateFormatMenuItem(container, 'format.unhideRow')
+    expect(store.getter(viewportHiddenAtom).rowsBySheet['sheet-1']).toEqual([1, 7])
     await waitFor(() => expect(rowMutations).toHaveLength(1))
-    await waitFor(() => expect(store.getter(viewportHiddenLifecycleAtom).status).toBe('ready'))
-    expect(rowMutations[0]).toEqual({
+    expect(rowMutations[0]).toMatchObject({
       kind: 'unhide-rows',
       sheetId: 'sheet-1',
       rowIndices: [2, 4],
-      requestId: 2,
-      revision: 20,
     })
 
     await activateFormatMenuItem(container, 'format.unhideCol')
+    expect(store.getter(viewportHiddenAtom).colsBySheet['sheet-1']).toEqual([1, 8])
     await waitFor(() => expect(columnMutations).toHaveLength(1))
-    await waitFor(() => expect(store.getter(viewportHiddenLifecycleAtom).status).toBe('ready'))
-    expect(columnMutations[0]).toEqual({
-      kind: 'unhide-columns',
-      sheetId: 'sheet-1',
-      colIndices: [3, 5],
-      requestId: 3,
-      revision: 21,
-    })
-
-    expect(reads).toHaveLength(3)
-    for (const request of reads) expect(request.window).toEqual(authorityWindow)
-    expect(reads.map((request) => request.revision)).toEqual([undefined, 21, 22])
-    expect(store.getter(viewportHiddenAtom)).toEqual({
-      rowsBySheet: { 'sheet-1': [1, 7] },
-      colsBySheet: { 'sheet-1': [1, 8] },
-    })
+    expect(columnMutations[0]?.colIndices).toEqual([3, 5])
   })
 
-  it('Format > Unhide is zero-transport without authority or without a canonical intersection', async () => {
-    const noAuthorityStore = createStore()
-    setupHiddenSelection(noAuthorityStore)
-    let noAuthorityReads = 0
-    let noAuthorityMutations = 0
-    const noAuthorityBackend: SpreadsheetBackend = {
+  it('Format > Unhide without a hidden intersection changes nothing and sends no transport', async () => {
+    const store = createStore()
+    setupHiddenSelection(store)
+    store.setter(hideRowsAtom, { sheetId: 'sheet-1', indices: [7] })
+    let mutations = 0
+    const backend: SpreadsheetBackend = {
       ...createBaseBackend(),
       async unhideRows(request) {
-        noAuthorityMutations += 1
-        return { sheetId: request.sheetId, requestId: request.requestId, revision: 1 }
-      },
-      async readViewportSizeProjection(request) {
-        noAuthorityReads += 1
-        return {
-          kind: 'viewport-size',
-          sheetId: request.sheetId,
-          window: { ...request.window },
-          requestId: request.requestId,
-          revision: request.revision ?? 1,
-          rowHeights: [],
-          colWidths: [],
-          hiddenRowIndices: [],
-          hiddenColIndices: [],
-        }
+        mutations += 1
+        return { sheetId: request.sheetId }
       },
     }
-    const noAuthorityView = render(() => (
-      <SpreadsheetUiProvider backend={noAuthorityBackend} store={noAuthorityStore}>
+    const { container } = render(() => (
+      <SpreadsheetUiProvider backend={backend} store={store}>
         <SpreadsheetMenuBar />
       </SpreadsheetUiProvider>
     ))
 
-    await activateFormatMenuItem(noAuthorityView.container, 'format.unhideRow')
-    await waitFor(() =>
-      expect(noAuthorityStore.getter(viewportHiddenLifecycleAtom).status).toBe('blocked'),
-    )
-    expect(noAuthorityReads).toBe(0)
-    expect(noAuthorityMutations).toBe(0)
-
-    const emptyStore = createStore()
-    setupHiddenSelection(emptyStore)
-    let emptyReads = 0
-    let emptyMutations = 0
-    const emptyBackend: SpreadsheetBackend = {
-      ...createBaseBackend(),
-      async unhideRows(request) {
-        emptyMutations += 1
-        return { sheetId: request.sheetId, requestId: request.requestId, revision: 31 }
-      },
-      async readViewportSizeProjection(request) {
-        emptyReads += 1
-        return {
-          kind: 'viewport-size',
-          sheetId: request.sheetId,
-          window: { ...request.window },
-          requestId: request.requestId,
-          revision: request.revision ?? 30,
-          rowHeights: [],
-          colWidths: [],
-          hiddenRowIndices: [7],
-          hiddenColIndices: [],
-        }
-      },
-    }
-    await expect(
-      emptyStore.setter(hydrateViewportSizeProjectionAtom, {
-        source: emptyBackend,
-        sheetId: 'sheet-1',
-        window: { rowStart: 0, rowEnd: 9, colStart: 0, colEnd: 9 },
-      }),
-    ).resolves.toBe('ready')
-    const emptyView = render(() => (
-      <SpreadsheetUiProvider backend={emptyBackend} store={emptyStore}>
-        <SpreadsheetMenuBar />
-      </SpreadsheetUiProvider>
-    ))
-
-    await activateFormatMenuItem(emptyView.container, 'format.unhideRow')
-    await waitFor(() =>
-      expect(emptyStore.getter(viewportHiddenLifecycleAtom).status).toBe('blocked'),
-    )
-    expect(emptyReads).toBe(1)
-    expect(emptyMutations).toBe(0)
+    await activateFormatMenuItem(container, 'format.unhideRow')
+    await Promise.resolve()
+    expect(store.getter(viewportHiddenAtom).rowsBySheet['sheet-1']).toEqual([7])
+    expect(mutations).toBe(0)
   })
 
   it('renders English and Chinese labels for both Format unhide entries', async () => {
@@ -1279,7 +1100,9 @@ describe('SpreadsheetMenuBar', () => {
 
     expect(unhideStart).toBeGreaterThanOrEqual(0)
     expect(unhideEnd).toBeGreaterThan(unhideStart)
-    expect(unhideRoutes).toContain('runViewportHiddenSelectionMutationAtom')
+    // Selection∩hidden resolution lives in Core; the adapter passes only
+    // the action and the optional persistence mirror.
+    expect(unhideRoutes).toContain('unhideViewportSelectionAtom')
     expect(unhideRoutes).toContain("dispatch.kind === 'unhide-rows'")
     expect(unhideRoutes).toContain("? 'unhide-rows'")
     expect(unhideRoutes).toContain("'unhide-columns'")
@@ -1310,12 +1133,13 @@ describe('SpreadsheetMenuBar', () => {
 
     expect(hiddenStart).toBeGreaterThanOrEqual(0)
     expect(hiddenEnd).toBeGreaterThan(hiddenStart)
-    expect(hiddenRoutes).toContain('runViewportHiddenMutationAtom')
-    expect(hiddenRoutes).toContain("action: 'hide-rows'")
-    expect(hiddenRoutes).toContain("action: 'hide-columns'")
+    // Hidden state is UI-core canonical: routes call the local commands
+    // with the backend only as a fire-and-forget persistence mirror.
+    expect(hiddenRoutes).toContain('hideRowsAtom')
+    expect(hiddenRoutes).toContain('hideColumnsAtom')
     expect(hiddenRoutes).toContain('source: backend')
-    expect(hiddenRoutes).toContain('window: snap.range')
     expect(source).not.toContain('setViewportHiddenAtom')
+    expect(source).not.toContain('runViewportHiddenMutationAtom')
     expect(hiddenRoutes).not.toContain('backend.hideRows')
     expect(hiddenRoutes).not.toContain('backend.hideColumns')
   })

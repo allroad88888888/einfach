@@ -6,6 +6,8 @@ import type {
   StructureOperationRequest,
 } from '../src'
 import { historyStackAtom } from '../src/history'
+import { setFreezeConfigAtom, viewportFreezeAtom } from '../src/viewport/freeze'
+import { hideRowsAtom, viewportHiddenAtom } from '../src/viewport/hidden'
 import {
   createAddSheetOperation,
   createDeleteColumnsOperation,
@@ -509,5 +511,117 @@ describe('operations core', () => {
     expect(nextStructureOperationRequestId(-1)).toBe(-2)
     expect(nextStructureOperationRequestId(Number.MIN_SAFE_INTEGER)).toBeNull()
     expect(nextStructureOperationRequestId(Number.NaN)).toBeNull()
+  })
+})
+
+describe('structural shift → local view facts + history side payloads', () => {
+  interface ShiftSpec {
+    axis: 'row' | 'column'
+    kind: 'insert' | 'delete'
+    index: number
+    count: number
+  }
+
+  async function runShiftedOperation(
+    store: ReturnType<typeof createStore>,
+    intent:
+      | ReturnType<typeof createDeleteRowsOperation>
+      | ReturnType<typeof createInsertRowsOperation>,
+    shift: ShiftSpec,
+  ) {
+    const source: StructureOperationControllerPort = {
+      async insertRows(request) {
+        return {
+          sheetId: request.sheetId,
+          requestId: request.requestId,
+          revision: 90,
+          structuralShift: shift,
+        }
+      },
+      async deleteRows(request) {
+        return {
+          sheetId: request.sheetId,
+          requestId: request.requestId,
+          revision: 91,
+          structuralShift: shift,
+        }
+      },
+    }
+    await expect(
+      store.setter(runStructureOperationAtom, {
+        intent,
+        source,
+        refreshProjection: async () => undefined,
+      }),
+    ).resolves.toBe('completed')
+  }
+
+  test('delete rows drops hidden membership, remaps freeze, records payloads', async () => {
+    const store = createStore()
+    store.setter(setFreezeConfigAtom, { sheetId: 'sheet-1', rows: 4, cols: 1 })
+    store.setter(hideRowsAtom, { sheetId: 'sheet-1', indices: [2, 6] })
+    const entriesBefore = store.getter(historyStackAtom).entries.length
+
+    await runShiftedOperation(
+      store,
+      createDeleteRowsOperation({ sheetId: 'sheet-1', rowIndex: 2, count: 2 }),
+      { axis: 'row', kind: 'delete', index: 2, count: 2 },
+    )
+
+    // Hidden row 2 died with the deleted band; row 6 shifted to 4.
+    expect(store.getter(viewportHiddenAtom).rowsBySheet['sheet-1']).toEqual([4])
+    // Freeze band shrank by the in-band overlap.
+    expect(store.getter(viewportFreezeAtom).rowsBySheet['sheet-1']).toBe(2)
+
+    const entries = store.getter(historyStackAtom).entries
+    expect(entries).toHaveLength(entriesBefore + 1)
+    const entry = entries[entries.length - 1]!
+    expect(entry.localReplay).toBeUndefined()
+    expect(entry.localSidePayloads).toHaveLength(2)
+    expect(entry.localSidePayloads?.[0]).toMatchObject({
+      applyKey: 'viewport.freeze',
+      sheetId: 'sheet-1',
+      before: { rows: 4, cols: 1 },
+      after: { rows: 2, cols: 1 },
+    })
+    expect(entry.localSidePayloads?.[1]).toMatchObject({
+      applyKey: 'viewport.hidden',
+      sheetId: 'sheet-1',
+      before: { rows: [2, 6], cols: [] },
+      after: { rows: [4], cols: [] },
+    })
+  })
+
+  test('a shift that moves nothing records no side payloads', async () => {
+    const store = createStore()
+    store.setter(hideRowsAtom, { sheetId: 'sheet-1', indices: [1] })
+    await runShiftedOperation(
+      store,
+      createInsertRowsOperation({ sheetId: 'sheet-1', rowIndex: 5, count: 1 }),
+      { axis: 'row', kind: 'insert', index: 5, count: 1 },
+    )
+    const entries = store.getter(historyStackAtom).entries
+    expect(entries[entries.length - 1]?.localSidePayloads).toBeUndefined()
+    expect(store.getter(viewportHiddenAtom).rowsBySheet['sheet-1']).toEqual([1])
+  })
+
+  test('an acknowledgement without structuralShift leaves local view facts untouched', async () => {
+    const store = createStore()
+    store.setter(hideRowsAtom, { sheetId: 'sheet-1', indices: [3] })
+    const source: StructureOperationControllerPort = {
+      async insertRows(request) {
+        return { sheetId: request.sheetId, requestId: request.requestId, revision: 5 }
+      },
+    }
+    await expect(
+      store.setter(runStructureOperationAtom, {
+        intent: createInsertRowsOperation({ sheetId: 'sheet-1', rowIndex: 0, count: 1 }),
+        source,
+        refreshProjection: async () => undefined,
+      }),
+    ).resolves.toBe('completed')
+    expect(store.getter(viewportHiddenAtom).rowsBySheet['sheet-1']).toEqual([3])
+    const entries = store.getter(historyStackAtom).entries
+    expect(entries[entries.length - 1]?.localSidePayloads).toBeUndefined()
   })
 })

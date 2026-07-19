@@ -32,13 +32,14 @@ import {
   openValidationRuleEditorAtom,
   pasteSpecialCapabilityAtom,
   pasteClipboardAtom,
+  hideColumnsAtom,
+  hideRowsAtom,
   reportCopyAsStatusAtom,
   retryFilterSortRefreshAtom,
   removeDuplicatesCapabilityAtom,
   runFilterSortEntrypointAtom,
-  runViewportHiddenMutationAtom,
-  runViewportHiddenSelectionMutationAtom,
   runStructureOperationAtom,
+  unhideViewportSelectionAtom,
   runTextToColumnsEntrypointAtom,
   selectAllAtom,
   selectionSnapshotAtom,
@@ -432,19 +433,16 @@ export function SpreadsheetMenuBar(props: SpreadsheetMenuBarProps) {
         })
         return
       }
+      // hide-rows / hide-cols / unhide-rows / unhide-cols: hidden state is
+      // UI-core canonical — the commands commit locally and mirror into the
+      // backend ports only when present, so they work on every backend.
       case 'hide-rows': {
         const sheetId = getActiveSheetId()
         if (!sheetId) return
         const snap = store.getter(selectionSnapshotAtom)
         const rows: number[] = []
         for (let r = snap.range.rowStart; r <= snap.range.rowEnd; r += 1) rows.push(r)
-        void store.setter(runViewportHiddenMutationAtom, {
-          source: backend,
-          sheetId,
-          action: 'hide-rows',
-          indices: rows,
-          window: snap.range,
-        })
+        store.setter(hideRowsAtom, { sheetId, indices: rows, source: backend })
         return
       }
       case 'hide-cols': {
@@ -453,20 +451,14 @@ export function SpreadsheetMenuBar(props: SpreadsheetMenuBarProps) {
         const snap = store.getter(selectionSnapshotAtom)
         const cols: number[] = []
         for (let c = snap.range.colStart; c <= snap.range.colEnd; c += 1) cols.push(c)
-        void store.setter(runViewportHiddenMutationAtom, {
-          source: backend,
-          sheetId,
-          action: 'hide-columns',
-          indices: cols,
-          window: snap.range,
-        })
+        store.setter(hideColumnsAtom, { sheetId, indices: cols, source: backend })
         return
       }
       case 'unhide-rows':
       case 'unhide-cols':
-        void store.setter(runViewportHiddenSelectionMutationAtom, {
-          source: backend,
+        store.setter(unhideViewportSelectionAtom, {
           action: dispatch.kind === 'unhide-rows' ? 'unhide-rows' : 'unhide-columns',
+          source: backend,
         })
         return
       case 'freeze-panes': {

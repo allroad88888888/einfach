@@ -3,81 +3,50 @@ import { describe, expect, test } from '@jest/globals'
 import {
   clearMenuIntentAtom,
   dispatchMenuCommandAtom,
-  hydrateViewportSizeProjectionAtom,
+  hideRowsAtom,
   openMenuAtom,
   runViewportHiddenContextMenuCommandAtom,
   selectColumnsAtom,
   selectRowsAtom,
-  selectionAtom,
-  setViewportHiddenAtom,
   viewportHiddenAtom,
   viewportHiddenContextMenuCommandAvailabilityAtom,
-  viewportHiddenLifecycleAtom,
-  viewportHiddenProjectionAuthorityAtom,
   type HideColumnsRequest,
   type HideRowsRequest,
   type UnhideColumnsRequest,
   type UnhideRowsRequest,
-  type ViewportHiddenControllerPort,
-  type ViewportSizeProjectionRequest,
+  type ViewportHiddenPersistencePort,
 } from '../src'
 
-function createHiddenSource(initialRows: readonly number[] = [], initialCols: readonly number[] = []) {
-  let rows = [...initialRows]
-  let cols = [...initialCols]
-  let revision = 1
-  const reads: ViewportSizeProjectionRequest[] = []
+function flushMicrotasks(times = 3): Promise<void> {
+  let chain = Promise.resolve()
+  for (let index = 0; index < times; index += 1) chain = chain.then(() => undefined)
+  return chain
+}
+
+function createHiddenMirror() {
   const hideRows: HideRowsRequest[] = []
   const unhideRows: UnhideRowsRequest[] = []
   const hideColumns: HideColumnsRequest[] = []
   const unhideColumns: UnhideColumnsRequest[] = []
-
-  const source: ViewportHiddenControllerPort = {
-    async readViewportSizeProjection(request) {
-      reads.push(request)
-      return {
-        kind: 'viewport-size',
-        sheetId: request.sheetId,
-        window: { ...request.window },
-        requestId: request.requestId,
-        revision: request.revision ?? revision,
-        rowHeights: [],
-        colWidths: [],
-        hiddenRowIndices: rows.filter(
-          (index) => index >= request.window.rowStart && index <= request.window.rowEnd,
-        ),
-        hiddenColIndices: cols.filter(
-          (index) => index >= request.window.colStart && index <= request.window.colEnd,
-        ),
-      }
-    },
+  const source: ViewportHiddenPersistencePort = {
     async hideRows(request) {
       hideRows.push(request)
-      rows = [...new Set([...rows, ...request.rowIndices])].sort((left, right) => left - right)
-      revision += 1
-      return { sheetId: request.sheetId, requestId: request.requestId, revision }
+      return { sheetId: request.sheetId }
     },
     async unhideRows(request) {
       unhideRows.push(request)
-      rows = rows.filter((index) => !request.rowIndices.includes(index))
-      revision += 1
-      return { sheetId: request.sheetId, requestId: request.requestId, revision }
+      return { sheetId: request.sheetId }
     },
     async hideColumns(request) {
       hideColumns.push(request)
-      cols = [...new Set([...cols, ...request.colIndices])].sort((left, right) => left - right)
-      revision += 1
-      return { sheetId: request.sheetId, requestId: request.requestId, revision }
+      return { sheetId: request.sheetId }
     },
     async unhideColumns(request) {
       unhideColumns.push(request)
-      cols = cols.filter((index) => !request.colIndices.includes(index))
-      revision += 1
-      return { sheetId: request.sheetId, requestId: request.requestId, revision }
+      return { sheetId: request.sheetId }
     },
   }
-
-  return { source, reads, hideRows, unhideRows, hideColumns, unhideColumns }
+  return { source, hideRows, unhideRows, hideColumns, unhideColumns }
 }
 
 function openRowMenu(store: ReturnType<typeof createStore>, rowIndex: number) {
@@ -96,271 +65,127 @@ function openColumnMenu(store: ReturnType<typeof createStore>, colIndex: number)
   })
 }
 
-describe('hidden rows and columns context-menu routing', () => {
-  test('hides the complete same-axis row selection and commits canonical projection state', async () => {
+describe('hidden rows and columns context-menu routing (UI-core canonical)', () => {
+  test('hides the complete same-axis row selection locally and mirrors the delta', async () => {
     const store = createStore()
-    const backend = createHiddenSource()
+    const mirror = createHiddenMirror()
     store.setter(selectRowsAtom, { sheetId: 'sheet-1', rowAnchor: 2, rowFocus: 4 })
     openRowMenu(store, 3)
 
-    expect(
-      store.getter(viewportHiddenContextMenuCommandAvailabilityAtom)(backend.source, 'row.hide'),
-    ).toBe(true)
+    expect(store.getter(viewportHiddenContextMenuCommandAvailabilityAtom)('row.hide')).toBe(true)
     expect(store.setter(dispatchMenuCommandAtom, 'row.hide')).not.toBeNull()
 
-    await expect(
+    expect(
       store.setter(runViewportHiddenContextMenuCommandAtom, {
-        source: backend.source,
+        source: mirror.source,
         command: 'row.hide',
       }),
-    ).resolves.toBe('ready')
+    ).toBe('committed')
 
-    expect(backend.hideRows).toHaveLength(1)
-    expect(backend.hideRows[0]).toMatchObject({
+    // Local state commits synchronously — no readback, no authority gate.
+    expect(store.getter(viewportHiddenAtom).rowsBySheet['sheet-1']).toEqual([2, 3, 4])
+    await flushMicrotasks()
+    expect(mirror.hideRows).toHaveLength(1)
+    expect(mirror.hideRows[0]).toMatchObject({
       kind: 'hide-rows',
       sheetId: 'sheet-1',
       rowIndices: [2, 3, 4],
     })
-    expect(backend.reads.at(-1)?.window).toEqual({
-      rowStart: 2,
-      rowEnd: 4,
-      colStart: 0,
-      colEnd: 0,
-    })
-    expect(store.getter(viewportHiddenAtom).rowsBySheet['sheet-1']).toEqual([2, 3, 4])
   })
 
-  test('unhides only the canonically confirmed hidden intersection in a column selection', async () => {
+  test('unhide uses the full local truth — including indices no window ever reported', async () => {
     const store = createStore()
-    const backend = createHiddenSource([], [3, 8])
-    store.setter(selectColumnsAtom, { sheetId: 'sheet-1', colAnchor: 2, colFocus: 4 })
-    await expect(
-      store.setter(hydrateViewportSizeProjectionAtom, {
-        source: backend.source,
-        sheetId: 'sheet-1',
-        window: { rowStart: 0, rowEnd: 0, colStart: 2, colEnd: 4 },
-      }),
-    ).resolves.toBe('ready')
-    openColumnMenu(store, 2)
+    const mirror = createHiddenMirror()
+    store.setter(hideRowsAtom, { sheetId: 'sheet-1', indices: [3, 800] })
+    store.setter(selectRowsAtom, { sheetId: 'sheet-1', rowAnchor: 2, rowFocus: 4 })
+    openRowMenu(store, 2)
 
+    expect(store.getter(viewportHiddenContextMenuCommandAvailabilityAtom)('row.unhide')).toBe(true)
+    expect(store.setter(dispatchMenuCommandAtom, 'row.unhide')).not.toBeNull()
     expect(
-      store.getter(viewportHiddenContextMenuCommandAvailabilityAtom)(
-        backend.source,
-        'column.unhide',
-      ),
-    ).toBe(true)
-    expect(store.setter(dispatchMenuCommandAtom, 'column.unhide')).not.toBeNull()
-
-    await expect(
       store.setter(runViewportHiddenContextMenuCommandAtom, {
-        source: backend.source,
-        command: 'column.unhide',
+        source: mirror.source,
+        command: 'row.unhide',
       }),
-    ).resolves.toBe('ready')
+    ).toBe('committed')
 
-    expect(backend.unhideColumns).toHaveLength(1)
-    expect(backend.unhideColumns[0]?.colIndices).toEqual([3])
+    expect(store.getter(viewportHiddenAtom).rowsBySheet['sheet-1']).toEqual([800])
+    await flushMicrotasks()
+    expect(mirror.unhideRows).toHaveLength(1)
+    expect(mirror.unhideRows[0]?.rowIndices).toEqual([3])
+  })
+
+  test('column commands are symmetric and work without any backend source', () => {
+    const store = createStore()
+    store.setter(selectColumnsAtom, { sheetId: 'sheet-1', colAnchor: 1, colFocus: 2 })
+    openColumnMenu(store, 1)
+
+    expect(store.getter(viewportHiddenContextMenuCommandAvailabilityAtom)('column.hide')).toBe(true)
+    expect(store.setter(dispatchMenuCommandAtom, 'column.hide')).not.toBeNull()
+    expect(
+      store.setter(runViewportHiddenContextMenuCommandAtom, { command: 'column.hide' }),
+    ).toBe('committed')
+    expect(store.getter(viewportHiddenAtom).colsBySheet['sheet-1']).toEqual([1, 2])
+
+    openColumnMenu(store, 1)
+    store.setter(selectColumnsAtom, { sheetId: 'sheet-1', colAnchor: 1, colFocus: 2 })
+    openColumnMenu(store, 1)
+    expect(store.getter(viewportHiddenContextMenuCommandAvailabilityAtom)('column.unhide')).toBe(
+      true,
+    )
+    expect(store.setter(dispatchMenuCommandAtom, 'column.unhide')).not.toBeNull()
+    expect(
+      store.setter(runViewportHiddenContextMenuCommandAtom, { command: 'column.unhide' }),
+    ).toBe('committed')
     expect(store.getter(viewportHiddenAtom).colsBySheet['sheet-1']).toEqual([])
   })
 
-  test('fails closed with zero transport for unsupported or mismatched selection targets', async () => {
+  test('availability never depends on backend hidden ports', () => {
     const store = createStore()
-    const unsupported: ViewportHiddenControllerPort = {}
     store.setter(selectRowsAtom, { sheetId: 'sheet-1', rowAnchor: 2, rowFocus: 4 })
     openRowMenu(store, 3)
-
-    expect(
-      store.getter(viewportHiddenContextMenuCommandAvailabilityAtom)(unsupported, 'row.hide'),
-    ).toBe(false)
-    expect(store.setter(dispatchMenuCommandAtom, 'row.hide')).not.toBeNull()
-    await expect(
-      store.setter(runViewportHiddenContextMenuCommandAtom, {
-        source: unsupported,
-        command: 'row.hide',
-      }),
-    ).resolves.toBe('unsupported')
-
-    const backend = createHiddenSource()
-    openRowMenu(store, 9)
-    expect(
-      store.getter(viewportHiddenContextMenuCommandAvailabilityAtom)(backend.source, 'row.hide'),
-    ).toBe(false)
-    expect(store.setter(dispatchMenuCommandAtom, 'row.hide')).not.toBeNull()
-    await expect(
-      store.setter(runViewportHiddenContextMenuCommandAtom, {
-        source: backend.source,
-        command: 'row.hide',
-      }),
-    ).resolves.toBe('blocked')
-    expect(backend.hideRows).toHaveLength(0)
-    expect(backend.reads).toHaveLength(0)
+    // hide: always available for a matching selection — even with no ports anywhere.
+    expect(store.getter(viewportHiddenContextMenuCommandAvailabilityAtom)('row.hide')).toBe(true)
+    // unhide: gated only by the local selection∩hidden intersection.
+    expect(store.getter(viewportHiddenContextMenuCommandAvailabilityAtom)('row.unhide')).toBe(false)
+    store.setter(hideRowsAtom, { sheetId: 'sheet-1', indices: [3] })
+    openRowMenu(store, 2)
+    expect(store.getter(viewportHiddenContextMenuCommandAvailabilityAtom)('row.unhide')).toBe(true)
   })
 
-  test('revokes stale intents and preserves an active canonical lifecycle with zero extra transport', async () => {
+  test('rejects mismatched selection targets with zero state change', () => {
     const store = createStore()
-    let resolveMutation!: (value: { sheetId: string; requestId?: number; revision: number }) => void
-    const mutation = new Promise<{ sheetId: string; requestId?: number; revision: number }>(
-      (resolve) => {
-        resolveMutation = resolve
-      },
+    store.setter(selectRowsAtom, { sheetId: 'sheet-1', rowAnchor: 2, rowFocus: 4 })
+    // Target outside the selected rows: grid resets selection on real
+    // right-clicks, but Core still fails closed on a stale intent.
+    openRowMenu(store, 9)
+    expect(store.getter(viewportHiddenContextMenuCommandAvailabilityAtom)('row.hide')).toBe(false)
+    expect(store.setter(dispatchMenuCommandAtom, 'row.hide')).not.toBeNull()
+    expect(store.setter(runViewportHiddenContextMenuCommandAtom, { command: 'row.hide' })).toBe(
+      'invalid',
     )
-    let hideCalls = 0
-    let readCalls = 0
-    let activeRequest: HideRowsRequest | undefined
-    const source: ViewportHiddenControllerPort = {
-      hideRows(request) {
-        hideCalls += 1
-        activeRequest = request
-        return mutation
-      },
-      async readViewportSizeProjection(request) {
-        readCalls += 1
-        return {
-          kind: 'viewport-size',
-          sheetId: request.sheetId,
-          window: { ...request.window },
-          requestId: request.requestId,
-          revision: request.revision ?? 1,
-          rowHeights: [],
-          colWidths: [],
-          hiddenRowIndices: [2, 3, 4],
-          hiddenColIndices: [],
-        }
-      },
-    }
+    expect(store.getter(viewportHiddenAtom)).toEqual({ rowsBySheet: {}, colsBySheet: {} })
+  })
+
+  test('revokes cleared intents with zero state change', () => {
+    const store = createStore()
     store.setter(selectRowsAtom, { sheetId: 'sheet-1', rowAnchor: 2, rowFocus: 4 })
     openRowMenu(store, 3)
     store.setter(dispatchMenuCommandAtom, 'row.hide')
-
-    const first = store.setter(runViewportHiddenContextMenuCommandAtom, {
-      source,
-      command: 'row.hide',
-    })
-    expect(store.getter(viewportHiddenLifecycleAtom).status).toBe('pending')
-    await expect(
-      store.setter(runViewportHiddenContextMenuCommandAtom, {
-        source,
-        command: 'row.hide',
-      }),
-    ).resolves.toBe('blocked')
-    expect(hideCalls).toBe(1)
-    expect(readCalls).toBe(0)
-    expect(store.getter(viewportHiddenLifecycleAtom).status).toBe('pending')
-
-    resolveMutation({
-      sheetId: 'sheet-1',
-      requestId: activeRequest?.requestId,
-      revision: 2,
-    })
-    await expect(first).resolves.toBe('ready')
-
-    store.setter(selectRowsAtom, { sheetId: 'sheet-1', rowAnchor: 5, rowFocus: 5 })
-    openRowMenu(store, 5)
-    await expect(
-      store.setter(runViewportHiddenContextMenuCommandAtom, {
-        source,
-        command: 'row.hide',
-      }),
-    ).resolves.toBe('blocked')
-    expect(hideCalls).toBe(1)
-    expect(readCalls).toBe(1)
-    expect(store.getter(selectionAtom)).toMatchObject({ rowAnchor: 5, rowFocus: 5 })
+    store.setter(clearMenuIntentAtom)
+    expect(store.setter(runViewportHiddenContextMenuCommandAtom, { command: 'row.hide' })).toBe(
+      'invalid',
+    )
+    expect(store.getter(viewportHiddenAtom)).toEqual({ rowsBySheet: {}, colsBySheet: {} })
   })
 
-  test('revalidates revoked capability, canonical revision authority, and intent with zero transport', async () => {
-    const capabilityStore = createStore()
-    const capabilityBackend = createHiddenSource()
-    capabilityStore.setter(selectRowsAtom, {
-      sheetId: 'sheet-1',
-      rowAnchor: 2,
-      rowFocus: 4,
-    })
-    openRowMenu(capabilityStore, 3)
-    capabilityStore.setter(dispatchMenuCommandAtom, 'row.hide')
-    expect(
-      capabilityStore.getter(viewportHiddenContextMenuCommandAvailabilityAtom)(
-        capabilityBackend.source,
-        'row.hide',
-      ),
-    ).toBe(true)
-
-    delete capabilityBackend.source.hideRows
-    expect(
-      capabilityStore.getter(viewportHiddenContextMenuCommandAvailabilityAtom)(
-        capabilityBackend.source,
-        'row.hide',
-      ),
-    ).toBe(false)
-    await expect(
-      capabilityStore.setter(runViewportHiddenContextMenuCommandAtom, {
-        source: capabilityBackend.source,
-        command: 'row.hide',
-      }),
-    ).resolves.toBe('unsupported')
-    expect(capabilityBackend.hideRows).toHaveLength(0)
-    expect(capabilityBackend.reads).toHaveLength(0)
-
-    const revisionStore = createStore()
-    const revisionBackend = createHiddenSource([3])
-    revisionStore.setter(selectRowsAtom, {
-      sheetId: 'sheet-1',
-      rowAnchor: 2,
-      rowFocus: 4,
-    })
-    await revisionStore.setter(hydrateViewportSizeProjectionAtom, {
-      source: revisionBackend.source,
-      sheetId: 'sheet-1',
-      window: { rowStart: 2, rowEnd: 4, colStart: 0, colEnd: 0 },
-    })
-    openRowMenu(revisionStore, 2)
-    revisionStore.setter(dispatchMenuCommandAtom, 'row.unhide')
-    expect(
-      revisionStore.getter(viewportHiddenContextMenuCommandAvailabilityAtom)(
-        revisionBackend.source,
-        'row.unhide',
-      ),
-    ).toBe(true)
-    revisionBackend.reads.length = 0
-
-    revisionStore.setter(setViewportHiddenAtom, { sheetId: 'sheet-1', rows: [3] })
-    expect(revisionStore.getter(viewportHiddenProjectionAuthorityAtom)).toMatchObject({
-      ready: false,
-      revision: null,
-    })
-    expect(
-      revisionStore.getter(viewportHiddenContextMenuCommandAvailabilityAtom)(
-        revisionBackend.source,
-        'row.unhide',
-      ),
-    ).toBe(false)
-    await expect(
-      revisionStore.setter(runViewportHiddenContextMenuCommandAtom, {
-        source: revisionBackend.source,
-        command: 'row.unhide',
-      }),
-    ).resolves.toBe('blocked')
-    expect(revisionBackend.unhideRows).toHaveLength(0)
-    expect(revisionBackend.reads).toHaveLength(0)
-
-    const intentStore = createStore()
-    const intentBackend = createHiddenSource()
-    intentStore.setter(selectRowsAtom, { sheetId: 'sheet-1', rowAnchor: 2, rowFocus: 4 })
-    openRowMenu(intentStore, 3)
-    intentStore.setter(dispatchMenuCommandAtom, 'row.hide')
-    intentStore.setter(clearMenuIntentAtom)
-    expect(
-      intentStore.getter(viewportHiddenContextMenuCommandAvailabilityAtom)(
-        intentBackend.source,
-        'row.hide',
-      ),
-    ).toBe(true)
-    await expect(
-      intentStore.setter(runViewportHiddenContextMenuCommandAtom, {
-        source: intentBackend.source,
-        command: 'row.hide',
-      }),
-    ).resolves.toBe('blocked')
-    expect(intentBackend.hideRows).toHaveLength(0)
-    expect(intentBackend.reads).toHaveLength(0)
+  test('an unhide with no hidden intersection reports unchanged', () => {
+    const store = createStore()
+    store.setter(selectRowsAtom, { sheetId: 'sheet-1', rowAnchor: 2, rowFocus: 4 })
+    openRowMenu(store, 3)
+    store.setter(dispatchMenuCommandAtom, 'row.unhide')
+    expect(store.setter(runViewportHiddenContextMenuCommandAtom, { command: 'row.unhide' })).toBe(
+      'unchanged',
+    )
   })
 })

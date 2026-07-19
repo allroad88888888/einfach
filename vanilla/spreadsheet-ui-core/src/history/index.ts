@@ -92,6 +92,19 @@ function snapshotEntry(entry: HistoryEntry): HistoryEntry {
         after: entry.localReplay.after,
       })
     : undefined
+  const localSidePayloads =
+    !localReplay && entry.localSidePayloads && entry.localSidePayloads.length > 0
+      ? Object.freeze(
+          entry.localSidePayloads.map((payload) =>
+            Object.freeze({
+              applyKey: payload.applyKey,
+              sheetId: payload.sheetId,
+              before: payload.before,
+              after: payload.after,
+            }),
+          ),
+        )
+      : undefined
   return Object.freeze({
     transactionId: entry.transactionId,
     kind: entry.kind,
@@ -99,6 +112,7 @@ function snapshotEntry(entry: HistoryEntry): HistoryEntry {
     projectionRevision: entry.projectionRevision,
     ...(affectedRange ? { affectedRange } : {}),
     ...(localReplay ? { localReplay } : {}),
+    ...(localSidePayloads ? { localSidePayloads } : {}),
   })
 }
 
@@ -510,6 +524,18 @@ async function runHistoryAction(
 
   set(historyStackBackingAtom, stackState(ticket.historyWitness.entries, ticket.cursorAfter))
   set(historyProjectionRevisionBackingAtom, acknowledgedRevision)
+  // Backend-transaction entries may carry side payloads for UI-core
+  // canonical view facts the transaction displaced (freeze band, hidden
+  // sets). The backend has already replayed its own facts; restore the
+  // local ones through the same stateless applier registry. The backend
+  // outcome is committed, so an applier miss cannot roll it back — the
+  // local restore is best-effort by construction.
+  if (ticket.entry.localSidePayloads) {
+    for (const payload of ticket.entry.localSidePayloads) {
+      const applier = getHistoryLocalReplayApplier(payload.applyKey)
+      if (applier !== null) applier(get, set, payload, ticket.action, input?.source)
+    }
+  }
   set(
     historyLifecycleBackingAtom,
     lifecycleForTicket('local-acknowledged', ticket, acknowledgedRevision),

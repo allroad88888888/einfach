@@ -76,9 +76,3 @@ export interface ViewportHiddenState {
   rowsBySheet: Record<string, number[]>
   colsBySheet: Record<string, number[]>
 }
-
-export interface SetViewportHiddenInput {
-  sheetId: string
-  rows?: number[]
-  cols?: number[]
-}

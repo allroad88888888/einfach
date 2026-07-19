@@ -46,8 +46,10 @@ import {
   applyPresenceUpdateAtom,
   setFreezeConfigAtom,
   setViewportColumnWidthAtom,
-  setViewportHiddenAtom,
   setViewportRowHeightAtom,
+  hideColumnsAtom,
+  hideRowsAtom,
+  viewportHiddenDiagnosticAtom,
 } from '@einfach/spreadsheet-ui-core'
 import {
   createWorkerWorkbookSpreadsheetBackend,
@@ -669,7 +671,7 @@ describe('vNext SpreadsheetGrid', () => {
     expect((runs[1] as HTMLElement).style.color).toBe('rgb(15, 118, 110)')
   })
 
-  it('skips rows and columns marked hidden by viewport projection metadata', async () => {
+  it('skips seeded hidden rows/columns and inflates the window so the viewport stays full', async () => {
     const store = createStore()
     const { backend } = createFakeBackend({
       hiddenRowIndices: [1],
@@ -694,8 +696,10 @@ describe('vNext SpreadsheetGrid', () => {
       </SpreadsheetUiProvider>
     ))
 
+    // Hidden entries are zero-height/zero-width in the scroll math, so a
+    // 3×3 pixel viewport still shows 3 visible rows × 3 visible cols.
     await waitFor(() => {
-      expect(container.querySelectorAll('td.spreadsheet-grid-cell')).toHaveLength(4)
+      expect(container.querySelectorAll('td.spreadsheet-grid-cell')).toHaveLength(9)
     })
 
     expect(store.getter(viewportHiddenAtom)).toEqual({
@@ -707,6 +711,55 @@ describe('vNext SpreadsheetGrid', () => {
     expect(container.querySelector('[data-cell-addr="A1"]')).not.toBeNull()
     expect(container.querySelector('[data-cell-addr="A2"]')).toBeNull()
     expect(container.querySelector('[data-cell-addr="C1"]')).toBeNull()
+    // The window inflates past the raw span: rows 0,2,3 and cols 0,1,3.
+    expect(container.querySelector('[data-cell-addr="A4"]')).not.toBeNull()
+    expect(container.querySelector('[data-cell-addr="D1"]')).not.toBeNull()
+  })
+
+  it('treats hidden rows as zero-height in the scroll offset math (spacers and total width)', async () => {
+    const store = createStore()
+    // Local canonical hidden state — no backend hidden support at all.
+    store.setter(hideRowsAtom, { sheetId: 'sheet-1', indices: [0, 1] })
+    store.setter(hideColumnsAtom, { sheetId: 'sheet-1', indices: [0] })
+    const { backend } = createFakeBackend()
+    const viewport = {
+      scrollTop: 2,
+      scrollLeft: 0,
+      viewportHeight: 3,
+      viewportWidth: 3,
+      rowHeight: 1,
+      colWidth: 1,
+      rowCount: 10,
+      colCount: 10,
+      overscanRows: 0,
+      overscanCols: 0,
+    }
+
+    const { container } = render(() => (
+      <SpreadsheetUiProvider backend={backend} store={store}>
+        <SpreadsheetGrid sheetId="sheet-1" viewport={viewport} />
+      </SpreadsheetUiProvider>
+    ))
+
+    await waitFor(() => {
+      expect(container.querySelectorAll('td.spreadsheet-grid-cell').length).toBeGreaterThan(0)
+    })
+
+    // Rows 0 and 1 are hidden (0px): scrollTop=2 lands on row 4, and the
+    // top spacer spans rows 0..3 at 2 visible pixels — NOT 4. Before the
+    // flip the spacer math counted hidden rows at full height, so the
+    // grid drifted by one hidden-row-height per hidden row above.
+    const topSpacer = container.querySelector(
+      '.spreadsheet-grid-virtual-spacer-row td',
+    ) as HTMLElement
+    expect(topSpacer).not.toBeNull()
+    expect(topSpacer.style.height).toBe('2px')
+    expect(container.querySelector('[data-cell-addr="B5"]')).not.toBeNull()
+
+    // Total table width shrinks by the hidden column's width:
+    // heading (44) + 9 visible columns × 1px.
+    const table = container.querySelector('table.spreadsheet-grid-table') as HTMLElement
+    expect(table.style.width).toBe('53px')
   })
 
   it('renders merged projection cells as one spanned anchor and selects the full merge', async () => {
@@ -1933,8 +1986,13 @@ describe('vNext SpreadsheetGrid', () => {
       ).toBe('132px')
     })
 
-    expect(sizeRequests).toHaveLength(1)
-    expect(sizeRequests[0].window).toEqual({
+    // One windowed sizes hydration (with requestId) plus the one-shot
+    // full-sheet hidden seed (without requestId).
+    const windowedSizeRequests = sizeRequests.filter(
+      (request) => request.requestId !== undefined,
+    )
+    expect(windowedSizeRequests).toHaveLength(1)
+    expect(windowedSizeRequests[0].window).toEqual({
       rowStart: 0,
       rowEnd: 1,
       colStart: 0,
@@ -1958,7 +2016,7 @@ describe('vNext SpreadsheetGrid', () => {
     ).toBe('40px')
   })
 
-  it('reconciles only the hydrated window and preserves off-window metadata', async () => {
+  it('reconciles only the hydrated sizes window and never clobbers locally owned hidden state', async () => {
     const store = createStore()
     store.setter(setViewportRowHeightAtom, {
       sheetId: 'sheet-1',
@@ -1970,11 +2028,9 @@ describe('vNext SpreadsheetGrid', () => {
       colIndex: 4,
       widthPx: 154,
     })
-    store.setter(setViewportHiddenAtom, {
-      sheetId: 'sheet-1',
-      rows: [4],
-      cols: [4],
-    })
+    // Local canonical hidden commands claim the sheet before mount.
+    store.setter(hideRowsAtom, { sheetId: 'sheet-1', indices: [4] })
+    store.setter(hideColumnsAtom, { sheetId: 'sheet-1', indices: [4] })
     const { backend } = createFakeBackend({
       rowHeights: [{ rowIndex: 1, heightPx: 41 }],
       colWidths: [{ colIndex: 1, widthPx: 131 }],
@@ -2006,9 +2062,11 @@ describe('vNext SpreadsheetGrid', () => {
         colWidthsBySheet: { 'sheet-1': { '1': 131, '4': 154 } },
       })
     })
+    // The one-shot seed skipped: local commands own the sheet, and the
+    // backend mirror's hidden slices can never clobber local truth.
     expect(store.getter(viewportHiddenAtom)).toEqual({
-      rowsBySheet: { 'sheet-1': [1, 4] },
-      colsBySheet: { 'sheet-1': [1, 4] },
+      rowsBySheet: { 'sheet-1': [4] },
+      colsBySheet: { 'sheet-1': [4] },
     })
   })
 
@@ -2021,6 +2079,19 @@ describe('vNext SpreadsheetGrid', () => {
     }> = []
     backend.readViewportSizeProjection = (request) => {
       sizeRequests.push(request)
+      // The one-shot hidden seed reads without a requestId; answer it
+      // immediately as hidden-unsupported so only the windowed sizes
+      // hydrations stay pending for the out-of-order race.
+      if (request.requestId === undefined) {
+        return Promise.resolve({
+          kind: 'viewport-size',
+          sheetId: request.sheetId,
+          window: { ...request.window },
+          revision: 1,
+          rowHeights: [],
+          colWidths: [],
+        })
+      }
       return new Promise<ViewportSizeProjectionResult>((resolve) => {
         pending.push({ request, resolve: (result) => resolve(result) })
       })
@@ -2093,11 +2164,8 @@ describe('vNext SpreadsheetGrid', () => {
 
   it('commits sizes-only metadata from the worker backend without replacing hidden state', async () => {
     const store = createStore()
-    store.setter(setViewportHiddenAtom, {
-      sheetId: 'sheet-1',
-      rows: [4],
-      cols: [4],
-    })
+    store.setter(hideRowsAtom, { sheetId: 'sheet-1', indices: [4] })
+    store.setter(hideColumnsAtom, { sheetId: 'sheet-1', indices: [4] })
     const hiddenBefore = store.getter(viewportHiddenAtom)
     const client = {
       async initWorkbook(names?: string[]) {
@@ -2168,25 +2236,12 @@ describe('vNext SpreadsheetGrid', () => {
     backend.dispose()
   })
 
-  it('does not partially commit valid sizes when hidden metadata is malformed', async () => {
+  it('commits sizes independently and fails the hidden seed closed on malformed hidden payloads', async () => {
     const store = createStore()
-    store.setter(setViewportRowHeightAtom, {
-      sheetId: 'sheet-1',
-      rowIndex: 4,
-      heightPx: 54,
-    })
-    store.setter(setViewportColumnWidthAtom, {
-      sheetId: 'sheet-1',
-      colIndex: 4,
-      widthPx: 154,
-    })
-    store.setter(setViewportHiddenAtom, {
-      sheetId: 'sheet-1',
-      rows: [4],
-      cols: [4],
-    })
-    const sizesBefore = store.getter(viewportSizeOverridesAtom)
     const hiddenBefore = store.getter(viewportHiddenAtom)
+    // hiddenColIndices missing while hiddenRowIndices is present: the
+    // hidden seed rejects the payload; the sizes hydration is unaffected
+    // because hidden is no longer part of the sizes contract.
     const { backend, sizeRequests } = createFakeBackend({
       rowHeights: [{ rowIndex: 1, heightPx: 41 }],
       colWidths: [{ colIndex: 1, widthPx: 141 }],
@@ -2211,10 +2266,19 @@ describe('vNext SpreadsheetGrid', () => {
       </SpreadsheetUiProvider>
     ))
 
-    await waitFor(() => expect(sizeRequests).toHaveLength(1))
+    await waitFor(() => expect(sizeRequests.length).toBeGreaterThanOrEqual(2))
     await flushMicrotasks()
-    expect(store.getter(viewportSizeOverridesAtom)).toBe(sizesBefore)
+    await waitFor(() => {
+      expect(store.getter(viewportSizeOverridesAtom)).toEqual({
+        rowHeightsBySheet: { 'sheet-1': { '1': 41 } },
+        colWidthsBySheet: { 'sheet-1': { '1': 141 } },
+      })
+    })
     expect(store.getter(viewportHiddenAtom)).toBe(hiddenBefore)
+    expect(store.getter(viewportHiddenDiagnosticAtom)).toMatchObject({
+      kind: 'hydrate-failed',
+      sheetId: 'sheet-1',
+    })
   })
 
   it('keeps Grid metadata hydration behind the UI-core command boundary', () => {
@@ -2224,6 +2288,7 @@ describe('vNext SpreadsheetGrid', () => {
     )
 
     expect(source).toContain('store.setter(hydrateViewportSizeProjectionAtom')
+    expect(source).toContain('store.setter(hydrateViewportHiddenAtom')
     expect(source).not.toMatch(/\bbackend\s*\.\s*readViewportSizeProjection\b/)
     expect(source).not.toContain('setViewportHiddenAtom')
   })

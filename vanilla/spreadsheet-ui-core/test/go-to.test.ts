@@ -47,7 +47,7 @@ import {
 import { setSheetTabsSheetsAtom } from '../src/sheet-tabs'
 import type { CellRange } from '../src/shared'
 import type { SelectionState } from '../src/selection'
-import { setViewportMetricsAtom } from '../src/viewport'
+import { hideColumnsAtom, hideRowsAtom, setViewportMetricsAtom } from '../src/viewport'
 import { setWorkspaceActiveSheetAtom } from '../src/workspace'
 import type { RangeProjectionRequest, RangeProjectionResult } from '../src/backend'
 
@@ -1483,5 +1483,41 @@ describe('go-to locator engine', () => {
 
   test('GO_TO_SCAN_MAX_CELLS constant is exported and >= 100k', () => {
     expect(GO_TO_SCAN_MAX_CELLS).toBeGreaterThanOrEqual(100_000)
+  })
+})
+
+describe('go-to special × UI-core canonical hidden state', () => {
+  test('visible-cells-only reads the full local hidden truth, not a windowed mirror', async () => {
+    const store = createStore()
+    prepareSpecialStore(store)
+    // Local canonical hide commands — including row 15, far outside any
+    // viewport window a backend mirror would ever have reported.
+    store.setter(hideRowsAtom, { sheetId: 'sheet1', indices: [3, 15] })
+    store.setter(hideColumnsAtom, { sheetId: 'sheet1', indices: [2] })
+    store.setter(setGoToLocatorAtom, { kind: 'visible-cells-only' })
+
+    await store.setter(runGoToSpecialScanAtom, {
+      port: {
+        async readRangeProjection(request) {
+          return projectionFor(request)
+        },
+      },
+    })
+
+    const regions = store.getter(selectionRegionsAtom)
+    expect(regions.length).toBeGreaterThan(0)
+    // 20 rows × 8 cols minus 2 hidden rows and 1 hidden col: 18 × 7.
+    expect(coveredCellCount(regions)).toBe(18 * 7)
+    for (const region of regions) {
+      if (region.kind === 'cell') {
+        expect([3, 15]).not.toContain(region.anchor.row)
+        expect(region.anchor.col).not.toBe(2)
+      } else if (region.kind === 'range') {
+        for (const hiddenRow of [3, 15]) {
+          expect(hiddenRow < region.anchor.row || hiddenRow > region.focus.row).toBe(true)
+        }
+        expect(2 < region.anchor.col || 2 > region.focus.col).toBe(true)
+      }
+    }
   })
 })

@@ -115,6 +115,18 @@ function sheetFreeze(
   return Object.freeze({ rows: rows ?? 0, cols: cols ?? 0 })
 }
 
+/**
+ * Per-sheet freeze snapshot, or null when the sheet holds no local freeze
+ * state. Used by structural operations to capture the freeze side payload
+ * for backend-transaction history entries.
+ */
+export function getViewportFreezeForSheet(
+  state: ViewportFreezeState,
+  sheetId: string,
+): Readonly<ViewportFreezeConfig> | null {
+  return sheetFreeze(state, sheetId)
+}
+
 function writeSheetFreeze(
   set: Setter,
   state: ViewportFreezeState,

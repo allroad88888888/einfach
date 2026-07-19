@@ -314,7 +314,7 @@ describe('package boundary', () => {
     ).toThrow()
     expect(store.getter(viewportHiddenAtom)).toBe(before)
 
-    const source = readFileSync(join(SRC_ROOT, 'viewport/window.ts'), 'utf8')
+    const source = readFileSync(join(SRC_ROOT, 'viewport/hidden.ts'), 'utf8')
     expect(source).toMatch(/export const viewportHiddenAtom: Atom<ViewportHiddenState>/)
     expect(source).not.toMatch(/set\(viewportHiddenAtom\s*[,)]/)
   })
