@@ -2,6 +2,7 @@ import { atom } from '@einfach/core'
 import type { Atom, Getter, Setter } from '@einfach/core'
 import type {
   BackendMutationResult,
+  BackendStructuralShift,
   DeleteColumnsRequest,
   DeleteRowsRequest,
   InsertColumnsRequest,
@@ -11,6 +12,7 @@ import type {
 } from '../backend/types'
 import { nextHistoryTransactionId, pushHistoryAtom } from '../history'
 import type { CellCoord, CellRange } from '../shared'
+import { applyViewportFreezeStructuralShiftAtom } from '../viewport/freeze'
 
 export type SpreadsheetOperationSource =
   | 'keyboard'
@@ -460,6 +462,7 @@ interface StructureOperationTicket {
 interface StructureOperationAcknowledgement {
   readonly revision: ProjectionRevision
   readonly affectedRange?: Readonly<CellRange>
+  readonly structuralShift?: Readonly<BackendStructuralShift>
 }
 
 type StructureOperationExecutor = (
@@ -664,13 +667,36 @@ function acknowledgedStructureOperation(
     }
 
     const affectedRange = snapshotAffectedRange(result.affectedRange)
+    const structuralShift = snapshotStructuralShift(result.structuralShift)
     return Object.freeze({
       revision: result.revision,
       ...(affectedRange ? { affectedRange } : {}),
+      ...(structuralShift ? { structuralShift } : {}),
     })
   } catch {
     return null
   }
+}
+
+function snapshotStructuralShift(value: unknown): Readonly<BackendStructuralShift> | null {
+  if (typeof value !== 'object' || value === null) return null
+  const shift = value as Partial<BackendStructuralShift>
+  if (
+    (shift.axis !== 'row' && shift.axis !== 'column') ||
+    (shift.kind !== 'insert' && shift.kind !== 'delete') ||
+    !Number.isSafeInteger(shift.index) ||
+    (shift.index as number) < 0 ||
+    !Number.isSafeInteger(shift.count) ||
+    (shift.count as number) <= 0
+  ) {
+    return null
+  }
+  return Object.freeze({
+    axis: shift.axis,
+    kind: shift.kind,
+    index: shift.index as number,
+    count: shift.count as number,
+  })
 }
 
 function snapshotAffectedRange(value: unknown): Readonly<CellRange> | null {
@@ -896,6 +922,16 @@ async function runStructureOperation(
       ),
     )
     return 'outcome-unknown'
+  }
+
+  // W3 structural-shift contract: displaced index space moves UI-core
+  // canonical view facts (freeze band today) before anything else reads
+  // post-mutation coordinates.
+  if (acknowledgement.structuralShift) {
+    set(applyViewportFreezeStructuralShiftAtom, {
+      sheetId: ticket.intent.sheetId,
+      shift: acknowledgement.structuralShift,
+    })
   }
 
   const historyRecorded = set(pushHistoryAtom, {

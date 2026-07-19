@@ -20,18 +20,15 @@ import {
   pasteSpecialCapabilityAtom,
   issueProjectionRequestIdAtom,
   isViewportHiddenContextMenuCommand,
-  isViewportFreezeProjectionReady,
   rejectProjectionAtom,
   reportProjectionErrorAtom,
   resolveProjectionAtom,
-  runViewportFreezeMutationAtom,
   runViewportHiddenContextMenuCommandAtom,
   runStructureOperationAtom,
   serializeClipboardTsv,
   setClipboardErrorAtom,
-  supportsViewportFreezeAuthority,
+  setFreezeConfigAtom,
   viewportFreezeAtom,
-  viewportFreezeProjectionAuthorityAtom,
   viewportHiddenContextMenuCommandAvailabilityAtom,
   type CellCoord,
   type CellRange,
@@ -123,14 +120,6 @@ const commandsByTargetKind: Record<MenuTargetKind, ContextMenuCommandKind[]> = {
   'sheet-tab': [],
 }
 
-function isViewportFreezeCommand(command: ContextMenuCommandKind): boolean {
-  return (
-    command === 'view.freezeRowsHere' ||
-    command === 'view.freezeColsHere' ||
-    command === 'view.freezePanes' ||
-    command === 'view.unfreeze'
-  )
-}
 
 const CLIPBOARD_CELL_LIMIT = 10_000
 
@@ -580,7 +569,7 @@ export function SpreadsheetContextMenu(props: SpreadsheetContextMenuProps) {
                 ? target.range.rowStart
                 : null
         if (rowIndex === null) return
-        await store.setter(runViewportFreezeMutationAtom, {
+        store.setter(setFreezeConfigAtom, {
           source: backend,
           sheetId: target.sheetId,
           rows: rowIndex,
@@ -597,7 +586,7 @@ export function SpreadsheetContextMenu(props: SpreadsheetContextMenuProps) {
                 ? target.range.colStart
                 : null
         if (colIndex === null) return
-        await store.setter(runViewportFreezeMutationAtom, {
+        store.setter(setFreezeConfigAtom, {
           source: backend,
           sheetId: target.sheetId,
           cols: colIndex,
@@ -611,7 +600,7 @@ export function SpreadsheetContextMenu(props: SpreadsheetContextMenuProps) {
             target.kind === 'cell'
               ? { row: target.cell.row, col: target.cell.col }
               : { row: target.range.rowStart, col: target.range.colStart }
-          await store.setter(runViewportFreezeMutationAtom, {
+          store.setter(setFreezeConfigAtom, {
             source: backend,
             sheetId: target.sheetId,
             rows: anchor.row,
@@ -620,7 +609,7 @@ export function SpreadsheetContextMenu(props: SpreadsheetContextMenuProps) {
         }
         return
       case 'view.unfreeze':
-        await store.setter(runViewportFreezeMutationAtom, {
+        store.setter(setFreezeConfigAtom, {
           source: backend,
           sheetId: target.sheetId,
           rows: 0,
@@ -648,7 +637,6 @@ export function SpreadsheetContextMenu(props: SpreadsheetContextMenuProps) {
       closeMenu('committed')
       return
     }
-    if (isViewportFreezeCommand(command) && !supportsViewportFreezeAuthority(backend)) return
     if (
       isViewportHiddenContextMenuCommand(command) &&
       !viewportHiddenCommandAvailable()(backend, command)
@@ -738,7 +726,6 @@ export function SpreadsheetContextMenu(props: SpreadsheetContextMenuProps) {
 
   const t = useT()
   const freezeState = useAtomValue(viewportFreezeAtom)
-  const freezeProjectionAuthority = useAtomValue(viewportFreezeProjectionAuthorityAtom)
 
   function labelFor(command: ContextMenuCommandKind): string {
     return t(commandLabelKeys[command])
@@ -780,17 +767,11 @@ export function SpreadsheetContextMenu(props: SpreadsheetContextMenuProps) {
     if (isViewportHiddenContextMenuCommand(command)) {
       return viewportHiddenCommandAvailable()(backend, command)
     }
-    if (isViewportFreezeCommand(command) && !supportsViewportFreezeAuthority(backend)) {
-      return false
-    }
-    const freezeProjectionReady = isViewportFreezeProjectionReady(
-      freezeProjectionAuthority(),
-      backend,
-      target.sheetId,
-    )
+    // Freeze is UI-core canonical: entry visibility reads the local view
+    // fact directly and never depends on backend freeze ports.
     const freeze = freezeState()
-    const rows = freezeProjectionReady ? (freeze.rowsBySheet[target.sheetId] ?? 0) : 0
-    const cols = freezeProjectionReady ? (freeze.colsBySheet[target.sheetId] ?? 0) : 0
+    const rows = freeze.rowsBySheet[target.sheetId] ?? 0
+    const cols = freeze.colsBySheet[target.sheetId] ?? 0
     const frozen = rows > 0 || cols > 0
     switch (command) {
       case 'view.freezeRowsHere':

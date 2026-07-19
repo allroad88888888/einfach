@@ -1,4 +1,5 @@
 export * from './types'
 export * from './window'
+export * from './freeze'
 export * from './chrome'
 export * from './structural-remap'

@@ -8,7 +8,6 @@ import {
   selectionRangeAtom,
   selectionRegionsAtom,
   viewportFreezeAtom,
-  viewportFreezeProjectionAuthorityAtom,
   viewportHiddenAtom,
   viewportMetricsAtom,
   viewportSizeOverridesAtom,
@@ -95,7 +94,6 @@ export function SpreadsheetGridOverlaySvg(props: SpreadsheetGridOverlaySvgProps)
     // these fires; selection-only changes do not.
     unsubscribes.push(store.sub(viewportMetricsAtom, bumpGeometry))
     unsubscribes.push(store.sub(viewportFreezeAtom, bumpGeometry))
-    unsubscribes.push(store.sub(viewportFreezeProjectionAuthorityAtom, bumpGeometry))
     unsubscribes.push(store.sub(viewportSizeOverridesAtom, bumpGeometry))
     unsubscribes.push(store.sub(viewportHiddenAtom, bumpGeometry))
     unsubscribes.push(store.sub(spreadsheetProjectionSnapshotAtom, bumpGeometry))

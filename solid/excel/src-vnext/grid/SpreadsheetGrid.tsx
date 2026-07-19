@@ -28,9 +28,9 @@ import {
   getViewportColumnWidth,
   getViewportRowHeight,
   getSelectionRange,
+  hydrateViewportFreezeAtom,
   hydrateViewportSizeProjectionAtom,
   addSelectionRegionAtom,
-  isViewportFreezeProjectionReady,
   isMergeCovered,
   markClipboardReadyAtom,
   nextHistoryTransactionId,
@@ -60,7 +60,6 @@ import {
   setSelectionBoundsAtom,
   setViewportRowHeightAtom,
   setViewportMetricsAtom,
-  supportsViewportFreezeAuthority,
   sheetTabsSheetsAtom,
   startPointerAtom,
   startEditingAtom,
@@ -76,7 +75,6 @@ import {
   notifyActiveSheetChangedAtom,
   remoteCursorsAtom,
   rejectProjectionAtom,
-  readViewportFreezeCanonicalAtom,
   resetProjectionAtom,
   resolveContentMutationAtom,
   resolveProjectionAtom,
@@ -96,7 +94,6 @@ import {
   type SpreadsheetCellFormat,
   type ViewportMetrics,
   viewportFreezeAtom,
-  viewportFreezeProjectionAuthorityAtom,
   viewportHiddenAtom,
   viewportMetricsAtom,
   viewportShowGridlinesAtom,
@@ -567,7 +564,6 @@ function measureAutoFitHeight(source: HTMLElement): number {
 export function SpreadsheetGrid(props: SpreadsheetGridProps) {
   const store = useSpreadsheetUiStore()
   const backend = useSpreadsheetBackend()
-  const freezeAuthoritySupported = supportsViewportFreezeAuthority(backend)
   const [renderTick, setRenderTick] = createSignal(0)
   let gridRoot: HTMLDivElement | undefined
   let scrollRoot: HTMLDivElement | undefined
@@ -579,7 +575,6 @@ export function SpreadsheetGrid(props: SpreadsheetGridProps) {
   let unsubscribeSizes: (() => void) | null = null
   let unsubscribeHidden: (() => void) | null = null
   let unsubscribeFreeze: (() => void) | null = null
-  let unsubscribeFreezeAuthority: (() => void) | null = null
   let unsubscribePointer: (() => void) | null = null
   let unsubscribePresence: (() => void) | null = null
   let unsubscribeFilterSort: (() => void) | null = null
@@ -638,14 +633,8 @@ export function SpreadsheetGrid(props: SpreadsheetGridProps) {
   }
 
   function getEffectiveFreezeProjection() {
-    const authority = store.getter(viewportFreezeProjectionAuthorityAtom)
-    if (
-      !freezeAuthoritySupported ||
-      !isViewportFreezeProjectionReady(authority, backend, props.sheetId)
-    ) {
-      return { rows: 0, cols: 0 }
-    }
-
+    // Freeze is UI-core canonical: read the local view fact directly.
+    // No authority gate — the projection is always valid.
     const freezeState = store.getter(viewportFreezeAtom)
     return {
       rows: freezeState.rowsBySheet[props.sheetId] ?? 0,
@@ -724,30 +713,14 @@ export function SpreadsheetGrid(props: SpreadsheetGridProps) {
     return store.getter(viewportHiddenAtom)
   }
 
-  function freezeProjectionReady(): boolean {
-    renderTick()
-    return (
-      freezeAuthoritySupported &&
-      isViewportFreezeProjectionReady(
-        store.getter(viewportFreezeProjectionAuthorityAtom),
-        backend,
-        props.sheetId,
-      )
-    )
-  }
-
   function freezeRowCount(): number {
     renderTick()
-    return freezeProjectionReady()
-      ? (store.getter(viewportFreezeAtom).rowsBySheet[props.sheetId] ?? 0)
-      : 0
+    return store.getter(viewportFreezeAtom).rowsBySheet[props.sheetId] ?? 0
   }
 
   function freezeColCount(): number {
     renderTick()
-    return freezeProjectionReady()
-      ? (store.getter(viewportFreezeAtom).colsBySheet[props.sheetId] ?? 0)
-      : 0
+    return store.getter(viewportFreezeAtom).colsBySheet[props.sheetId] ?? 0
   }
 
   function getFreezeBoundaryY(): number {
@@ -1037,7 +1010,9 @@ export function SpreadsheetGrid(props: SpreadsheetGridProps) {
   }
 
   createEffect(() => {
-    void store.setter(readViewportFreezeCanonicalAtom, {
+    // One-shot hydration seed from the optional persistence hook. Freeze
+    // itself is UI-core canonical and does not wait for this to resolve.
+    void store.setter(hydrateViewportFreezeAtom, {
       source: backend,
       sheetId: props.sheetId,
     })
@@ -1051,13 +1026,7 @@ export function SpreadsheetGrid(props: SpreadsheetGridProps) {
     unsubscribeViewport = store.sub(viewportMetricsAtom, refreshViewportProjection)
     unsubscribeSizes = store.sub(viewportSizeOverridesAtom, bumpRender)
     unsubscribeHidden = store.sub(viewportHiddenAtom, bumpRender)
-    // Backing and authority commit independently. Deduplicate their callbacks
-    // against the ready, backend-and-sheet-scoped freeze that consumers may use.
     unsubscribeFreeze = store.sub(viewportFreezeAtom, refreshEffectiveFreezeProjection)
-    unsubscribeFreezeAuthority = store.sub(
-      viewportFreezeProjectionAuthorityAtom,
-      refreshEffectiveFreezeProjection,
-    )
     unsubscribePointer = store.sub(pointerSessionAtom, bumpRender)
     unsubscribePresence = store.sub(presenceStateAtom, bumpRender)
     unsubscribeFilterSort = store.sub(filterSortStateAtom, bumpRender)
@@ -1105,7 +1074,6 @@ export function SpreadsheetGrid(props: SpreadsheetGridProps) {
     unsubscribeSizes?.()
     unsubscribeHidden?.()
     unsubscribeFreeze?.()
-    unsubscribeFreezeAuthority?.()
     unsubscribePointer?.()
     unsubscribePresence?.()
     unsubscribeFilterSort?.()

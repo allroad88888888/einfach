@@ -15,12 +15,17 @@ import type {
 } from './types'
 
 export * from './types'
+export * from './local-replay'
+
+import { getHistoryLocalReplayApplier } from './local-replay'
 
 export const DEFAULT_HISTORY_CAP = 100
 export const DEFAULT_HISTORY_TIMEOUT_MS = 15_000
 
 export const HISTORY_CAPABILITY_ERROR =
   'History action is unavailable because this workbook does not provide the required transport.'
+export const HISTORY_LOCAL_REPLAY_ERROR =
+  'History local replay failed: no applier accepted the entry payload.'
 export const HISTORY_REVISION_ERROR =
   'History action is unavailable because the current projection revision is invalid.'
 export const HISTORY_PENDING_ERROR = 'Another history action already owns the transport lane.'
@@ -79,12 +84,21 @@ const INITIAL_HISTORY_LIFECYCLE: HistoryLifecycleState = Object.freeze({
 
 function snapshotEntry(entry: HistoryEntry): HistoryEntry {
   const affectedRange = entry.affectedRange ? Object.freeze({ ...entry.affectedRange }) : undefined
+  const localReplay = entry.localReplay
+    ? Object.freeze({
+        applyKey: entry.localReplay.applyKey,
+        sheetId: entry.localReplay.sheetId,
+        before: entry.localReplay.before,
+        after: entry.localReplay.after,
+      })
+    : undefined
   return Object.freeze({
     transactionId: entry.transactionId,
     kind: entry.kind,
     sheetId: entry.sheetId,
     projectionRevision: entry.projectionRevision,
     ...(affectedRange ? { affectedRange } : {}),
+    ...(localReplay ? { localReplay } : {}),
   })
 }
 
@@ -288,7 +302,12 @@ export const pushHistoryAtom = atom(
     const capped =
       next.length > DEFAULT_HISTORY_CAP ? next.slice(next.length - DEFAULT_HISTORY_CAP) : next
     set(historyStackBackingAtom, stackState(capped, capped.length))
-    set(historyProjectionRevisionBackingAtom, snapshot.projectionRevision)
+    // Local-replay entries never advance the backend revision witness —
+    // their revisions are session-local labels and mixing them into the
+    // strict backend witness would poison later transactional undo.
+    if (!snapshot.localReplay) {
+      set(historyProjectionRevisionBackingAtom, snapshot.projectionRevision)
+    }
     set(
       historyLifecycleBackingAtom,
       lifecycleFor('ready', { sessionId: get(historySessionSequenceAtom) }),
@@ -312,6 +331,36 @@ async function runHistoryAction(
       ? historyWitness.entries[historyWitness.cursor - 1]
       : historyWitness.entries[historyWitness.cursor]
   if (!entry) return 'blocked'
+
+  // Local-replay entries close their loop inside UI-core: no backend
+  // transport, no revision witness, no ticket — the applier writes the
+  // recorded payload synchronously, so nothing can drift mid-flight.
+  if (entry.localReplay) {
+    const applier = getHistoryLocalReplayApplier(entry.localReplay.applyKey)
+    const applied =
+      applier !== null && applier(get, set, entry.localReplay, action, input?.source)
+    if (!applied) {
+      set(
+        historyLifecycleBackingAtom,
+        lifecycleFor('blocked', {
+          sessionId: get(historySessionSequenceAtom),
+          action,
+          transactionId: entry.transactionId,
+          error: HISTORY_LOCAL_REPLAY_ERROR,
+        }),
+      )
+      return 'blocked'
+    }
+    set(
+      historyStackBackingAtom,
+      stackState(historyWitness.entries, historyWitness.cursor + (action === 'undo' ? -1 : 1)),
+    )
+    set(
+      historyLifecycleBackingAtom,
+      lifecycleFor('ready', { sessionId: get(historySessionSequenceAtom) }),
+    )
+    return 'completed'
+  }
 
   const revision = get(historyProjectionRevisionBackingAtom)
   if (!isProjectionRevision(revision)) {

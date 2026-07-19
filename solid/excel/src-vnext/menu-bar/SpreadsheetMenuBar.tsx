@@ -38,12 +38,11 @@ import {
   runFilterSortEntrypointAtom,
   runViewportHiddenMutationAtom,
   runViewportHiddenSelectionMutationAtom,
-  runViewportFreezeMutationAtom,
   runStructureOperationAtom,
   runTextToColumnsEntrypointAtom,
   selectAllAtom,
   selectionSnapshotAtom,
-  supportsViewportFreezeAuthority,
+  setFreezeConfigAtom,
   toggleFormulaBarAtom,
   toggleGridlinesAtom,
   toggleHeadingsAtom,
@@ -98,6 +97,23 @@ export function SpreadsheetMenuBar(props: SpreadsheetMenuBarProps) {
     store.setter(captureRemoveDuplicatesCapabilityAtom, backend)
   })
 
+  // Worker backends resolve their fail-closed runtime capability witness
+  // asynchronously (describeCapabilities lands after initWorkbook), so
+  // port presence sampled at mount can be pre-witness. Recapture once the
+  // backend reports ready so the capability atoms hold post-witness
+  // truth. Backends without ready() (static, test doubles) are already
+  // truthful at mount and skip this.
+  onMount(() => {
+    const readyable = backend as typeof backend & { ready?: () => Promise<unknown> }
+    void readyable.ready
+      ?.call(backend)
+      .then(() => {
+        store.setter(captureFilterSortCapabilityAtom, backend)
+        store.setter(captureRemoveDuplicatesCapabilityAtom, backend)
+      })
+      .catch(() => {})
+  })
+
   function checkedForDispatch(dispatch: MenuItemDispatch): boolean | undefined {
     switch (dispatch.kind) {
       case 'toggle-gridlines':
@@ -113,11 +129,8 @@ export function SpreadsheetMenuBar(props: SpreadsheetMenuBarProps) {
 
   function disabledReasonForDispatch(dispatch: MenuItemDispatch): string | null {
     switch (dispatch.kind) {
-      case 'freeze-panes':
-      case 'unfreeze-panes':
-        return supportsViewportFreezeAuthority(backend)
-          ? null
-          : 'Freeze panes are unavailable for this workbook backend.'
+      // freeze-panes / unfreeze-panes: freeze is UI-core canonical — the
+      // view fact is always available regardless of backend ports.
       case 'open-filter-dropdown':
       case 'sort-asc':
       case 'sort-desc':
@@ -135,6 +148,12 @@ export function SpreadsheetMenuBar(props: SpreadsheetMenuBarProps) {
    *   - `'textToColumns'` → host backend implements `importCellChunks`
    *   - `'removeRows'`    → Core reports exact range-read and row-removal
    *                         capabilities (Data → Remove Duplicates)
+   *   - `'insertRows'` / `'insertColumns'` → host backend exposes the
+   *     structural port. Read directly off the backend PER dropdown
+   *     render (the dropdown remounts on every open), NOT captured at
+   *     mount: worker backends withhold these ports once their async
+   *     fail-closed capability witness resolves, so post-ready opens
+   *     must see the withheld truth.
    * Returning false makes the dropdown entry hide entirely (vs.
    * show-as-disabled for the placeholder case).
    */
@@ -147,6 +166,10 @@ export function SpreadsheetMenuBar(props: SpreadsheetMenuBarProps) {
         return textToColumnsSupported()
       case 'removeRows':
         return removeDuplicatesCapability().canRead && removeDuplicatesCapability().canRemove
+      case 'insertRows':
+        return backend.insertRows != null
+      case 'insertColumns':
+        return backend.insertColumns != null
       default:
         return false
     }
@@ -450,7 +473,7 @@ export function SpreadsheetMenuBar(props: SpreadsheetMenuBarProps) {
         const sheetId = getActiveSheetId()
         if (!sheetId) return
         const snap = store.getter(selectionSnapshotAtom)
-        void store.setter(runViewportFreezeMutationAtom, {
+        store.setter(setFreezeConfigAtom, {
           source: backend,
           sheetId,
           rows: snap.activeCell.row,
@@ -461,7 +484,7 @@ export function SpreadsheetMenuBar(props: SpreadsheetMenuBarProps) {
       case 'unfreeze-panes': {
         const sheetId = getActiveSheetId()
         if (!sheetId) return
-        void store.setter(runViewportFreezeMutationAtom, {
+        store.setter(setFreezeConfigAtom, {
           source: backend,
           sheetId,
           rows: 0,

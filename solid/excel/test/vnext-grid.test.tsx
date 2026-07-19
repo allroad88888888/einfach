@@ -44,7 +44,7 @@ import {
   setFilterSortAtom,
   filterDropdownAtom,
   applyPresenceUpdateAtom,
-  readViewportFreezeCanonicalAtom,
+  setFreezeConfigAtom,
   setViewportColumnWidthAtom,
   setViewportHiddenAtom,
   setViewportRowHeightAtom,
@@ -3752,7 +3752,10 @@ describe('vNext SpreadsheetGrid', () => {
   })
 
   describe('freeze boundary attributes', () => {
-    it('masks backend A freeze until backend B canonical hydration completes in the same store', async () => {
+    it('keeps the locally seeded freeze across a backend swap in the same store', async () => {
+      // UI-core canonical: the first mount's one-shot hydration seeds the
+      // sheet; a later backend's hydration must not clobber the local
+      // view fact, and the divider never disappears while ports resolve.
       const store = createStore()
       const first = createFakeBackend({ freeze: { rows: 2, cols: 2 } })
       const viewport = {
@@ -3781,15 +3784,16 @@ describe('vNext SpreadsheetGrid', () => {
       firstMount.unmount()
 
       const second = createFakeBackend({ freeze: { rows: 1, cols: 0 } })
-      let pendingRequestId: number | undefined
-      let resolveRead!: (
-        value: Awaited<ReturnType<NonNullable<SpreadsheetBackend['readFreezeConfig']>>>,
-      ) => void
-      second.backend.readFreezeConfig = (request) => {
-        pendingRequestId = request.requestId
-        return new Promise((resolve) => {
-          resolveRead = resolve
-        })
+      let readCalls = 0
+      second.backend.readFreezeConfig = async (request) => {
+        readCalls += 1
+        return {
+          kind: 'freeze-config',
+          sheetId: request.sheetId,
+          requestId: request.requestId,
+          revision: 7,
+          freeze: { rows: 1, cols: 0 },
+        }
       }
 
       const secondMount = render(() => (
@@ -3797,31 +3801,20 @@ describe('vNext SpreadsheetGrid', () => {
           <SpreadsheetGrid sheetId="sheet-1" viewport={viewport} />
         </SpreadsheetUiProvider>
       ))
-      await waitFor(() => expect(pendingRequestId).toBeDefined())
-      await waitFor(() => expect(second.requests).toHaveLength(1))
-      expect(secondMount.container.querySelector('svg.spreadsheet-grid-freeze-boundary')).toBeNull()
-
-      resolveRead({
-        kind: 'freeze-config',
-        sheetId: 'sheet-1',
-        requestId: pendingRequestId,
-        revision: 7,
-        freeze: { rows: 1, cols: 0 },
-      })
-      await waitFor(() => {
-        expect(
-          secondMount.container.querySelector('[data-testid="freeze-boundary-horizontal"]'),
-        ).not.toBeNull()
-      })
-      expect(second.requests).toHaveLength(2)
+      await flushMicrotasks()
+      // The local canonical freeze (2,2) survives the swap: both dividers
+      // stay up and backend B's differing persisted value is ignored.
+      expect(
+        secondMount.container.querySelector('[data-testid="freeze-boundary-horizontal"]'),
+      ).not.toBeNull()
       expect(
         secondMount.container.querySelector('[data-testid="freeze-boundary-vertical"]'),
-      ).toBeNull()
+      ).not.toBeNull()
+      expect(readCalls).toBe(0)
     })
 
-    it('does not render a divider for a read-only freeze backend', async () => {
+    it('renders the divider from local canonical freeze without backend ports', async () => {
       const store = createStore()
-      const first = createFakeBackend({ freeze: { rows: 2, cols: 2 } })
       const viewport = {
         scrollTop: 0,
         scrollLeft: 0,
@@ -3834,25 +3827,27 @@ describe('vNext SpreadsheetGrid', () => {
         overscanRows: 0,
         overscanCols: 0,
       }
-      await store.setter(readViewportFreezeCanonicalAtom, {
-        source: first.backend,
-        sheetId: 'sheet-1',
-      })
-      const readOnlyBackend: SpreadsheetBackend = {
-        ...createFakeBackend({ freeze: { rows: 3, cols: 3 } }).backend,
+      store.setter(setFreezeConfigAtom, { sheetId: 'sheet-1', rows: 2, cols: 2 })
+      const portlessBackend: SpreadsheetBackend = {
+        ...createFakeBackend().backend,
+        readFreezeConfig: undefined,
         setFreezeConfig: undefined,
       }
 
       const { container } = render(() => (
-        <SpreadsheetUiProvider backend={readOnlyBackend} store={store}>
+        <SpreadsheetUiProvider backend={portlessBackend} store={store}>
           <SpreadsheetGrid sheetId="sheet-1" viewport={viewport} />
         </SpreadsheetUiProvider>
       ))
       await flushMicrotasks()
 
-      expect(container.querySelector('svg.spreadsheet-grid-freeze-boundary')).toBeNull()
-      expect(container.querySelectorAll('[data-freeze-boundary-bottom="true"]')).toHaveLength(0)
-      expect(container.querySelectorAll('[data-freeze-boundary-right="true"]')).toHaveLength(0)
+      expect(container.querySelector('svg.spreadsheet-grid-freeze-boundary')).not.toBeNull()
+      expect(
+        container.querySelectorAll('[data-freeze-boundary-bottom="true"]').length,
+      ).toBeGreaterThan(0)
+      expect(
+        container.querySelectorAll('[data-freeze-boundary-right="true"]').length,
+      ).toBeGreaterThan(0)
     })
 
     it('flags the last frozen row and column with data-freeze-boundary-* on cells and headers', async () => {

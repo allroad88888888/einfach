@@ -19,6 +19,7 @@ export type HistoryEntryKind =
   | 'sheet.rename'
   | 'sheet.reorder'
   | 'format.set'
+  | 'viewport.freeze'
 
 export interface HistoryAffectedRange {
   readonly rowStart: number
@@ -27,12 +28,34 @@ export interface HistoryAffectedRange {
   readonly colEnd: number
 }
 
+export type HistoryLocalReplayDirection = 'undo' | 'redo'
+
+/**
+ * Payload for entries that replay inside UI-core instead of through a
+ * backend transaction. `applyKey` names an applier registered via
+ * `registerHistoryLocalReplayApplier`; `before` / `after` are the exact
+ * state snapshots the applier writes on undo / redo respectively.
+ */
+export interface HistoryLocalReplayPayload {
+  readonly applyKey: string
+  readonly sheetId: string
+  readonly before: unknown
+  readonly after: unknown
+}
+
 export interface HistoryEntry {
   readonly transactionId: HistoryTransactionId
   readonly kind: HistoryEntryKind
   readonly sheetId: string | null
   readonly projectionRevision: ProjectionRevision
   readonly affectedRange?: Readonly<HistoryAffectedRange>
+  /**
+   * Present only on local-replay entries (UI-core canonical view facts,
+   * e.g. freeze). Undo/redo of such entries never touches the backend
+   * `undoTransaction` / `redoTransaction` ports and does not consume the
+   * backend projection-revision witness.
+   */
+  readonly localReplay?: Readonly<HistoryLocalReplayPayload>
 }
 
 export interface HistoryStackState {

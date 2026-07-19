@@ -23,10 +23,10 @@ import type {
 import {
   clipboardStateAtom,
   historyStackAtom,
+  hydrateViewportFreezeAtom,
   menuCommandIntentAtom,
   menuStateAtom,
   openMenuAtom,
-  readViewportFreezeCanonicalAtom,
   structureOperationLifecycleAtom,
   viewportFreezeAtom,
 } from '@einfach/spreadsheet-ui-core'
@@ -280,7 +280,7 @@ async function hydrateFreeze(
   store: ReturnType<typeof createStore>,
   backend: SpreadsheetBackend,
 ) {
-  await store.setter(readViewportFreezeCanonicalAtom, {
+  await store.setter(hydrateViewportFreezeAtom, {
     source: backend,
     sheetId: 'sheet-1',
   })
@@ -1401,24 +1401,17 @@ describe('vNext SpreadsheetContextMenu', () => {
     })
   })
 
-  it('does not expose the previous backend freeze while the next authority is hydrating', async () => {
+  it('keeps locally seeded freeze when a later backend hydration resolves', async () => {
+    // One-shot seed semantics: the first hydration (or any local command)
+    // owns the sheet — a second backend's late hydration result must not
+    // clobber the local canonical state.
     const store = createStore()
     const first = createFakeBackend()
     first.seedFreeze({ rows: 2, cols: 1 })
     await hydrateFreeze(store, first.backend)
 
     const second = createFakeBackend()
-    let pendingRequestId: number | undefined
-    let resolveRead!: (
-      value: Awaited<ReturnType<NonNullable<SpreadsheetBackend['readFreezeConfig']>>>,
-    ) => void
-    second.backend.readFreezeConfig = (request) => {
-      pendingRequestId = request.requestId
-      return new Promise((resolve) => {
-        resolveRead = resolve
-      })
-    }
-    const hydration = store.setter(readViewportFreezeCanonicalAtom, {
+    const hydration = store.setter(hydrateViewportFreezeAtom, {
       source: second.backend,
       sheetId: 'sheet-1',
     })
@@ -1436,23 +1429,21 @@ describe('vNext SpreadsheetContextMenu', () => {
       </SpreadsheetUiProvider>
     ))
 
-    expect(queryByTestId('context-menu-command-view.unfreeze')).toBeNull()
-    await waitFor(() => expect(pendingRequestId).toBeDefined())
-    resolveRead({
-      kind: 'freeze-config',
-      sheetId: 'sheet-1',
-      requestId: pendingRequestId,
-      revision: 0,
-      freeze: { rows: 0, cols: 0 },
+    // The locally owned freeze stays visible: Unfreeze is offered.
+    expect(queryByTestId('context-menu-command-view.unfreeze')).not.toBeNull()
+    await expect(hydration).resolves.toBe('skipped')
+    expect(store.getter(viewportFreezeAtom)).toEqual({
+      rowsBySheet: { 'sheet-1': 2 },
+      colsBySheet: { 'sheet-1': 1 },
     })
-    await expect(hydration).resolves.toBe('committed')
   })
 
-  it('hides freeze commands and dispatches nothing when either authority port is missing', () => {
+  it('offers freeze commands and commits locally without backend freeze ports', async () => {
     const store = createStore()
     const fake = createFakeBackend()
-    const readOnlyBackend: SpreadsheetBackend = {
+    const portlessBackend: SpreadsheetBackend = {
       ...fake.backend,
+      readFreezeConfig: undefined,
       setFreezeConfig: undefined,
     }
     store.setter(openMenuAtom, {
@@ -1462,16 +1453,23 @@ describe('vNext SpreadsheetContextMenu', () => {
       source: 'pointer',
     })
 
-    const { queryByTestId } = render(() => (
-      <SpreadsheetUiProvider backend={readOnlyBackend} store={store}>
+    const { getByTestId } = render(() => (
+      <SpreadsheetUiProvider backend={portlessBackend} store={store}>
         <SpreadsheetContextMenu />
       </SpreadsheetUiProvider>
     ))
 
-    expect(queryByTestId('context-menu-command-view.freezePanes')).toBeNull()
-    expect(queryByTestId('context-menu-command-view.freezeRowsHere')).toBeNull()
-    expect(queryByTestId('context-menu-command-view.freezeColsHere')).toBeNull()
-    expect(queryByTestId('context-menu-command-view.unfreeze')).toBeNull()
+    expect(getByTestId('context-menu-command-view.freezePanes')).not.toBeNull()
+    expect(getByTestId('context-menu-command-view.freezeRowsHere')).not.toBeNull()
+    expect(getByTestId('context-menu-command-view.freezeColsHere')).not.toBeNull()
+
+    fireEvent.click(getByTestId('context-menu-command-view.freezePanes'))
+    await waitFor(() => {
+      const freeze = store.getter(viewportFreezeAtom)
+      expect(freeze.rowsBySheet['sheet-1']).toBe(2)
+      expect(freeze.colsBySheet['sheet-1']).toBe(2)
+    })
+    // Portless backend: nothing was mirrored, nothing failed.
     expect(fake.setFreezeConfigRequests).toEqual([])
   })
 })

@@ -8,7 +8,7 @@ import {
   addSelectionRegionAtom,
   copyClipboardAtom,
   cutClipboardAtom,
-  readViewportFreezeCanonicalAtom,
+  hydrateViewportFreezeAtom,
   selectCellAtom,
   setSelectionAtom,
   startPointerAtom,
@@ -278,7 +278,7 @@ describe('SpreadsheetGridOverlaySvg', () => {
     // selection still drawn for that cell."
     const store = createStore()
     const backend = createFakeBackend({ rows: 2, cols: 2 })
-    await store.setter(readViewportFreezeCanonicalAtom, {
+    await store.setter(hydrateViewportFreezeAtom, {
       source: backend,
       sheetId: 'sheet-1',
     })

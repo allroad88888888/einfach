@@ -5,8 +5,6 @@ import { createStore } from '@einfach/core'
 import { cleanup, render, waitFor, fireEvent } from '@solidjs/testing-library'
 import type {
   DisplayCell,
-  ReadFreezeConfigRequest,
-  SetFreezeConfigRequest,
   SpreadsheetBackend,
   VisibleProjectionRequest,
   VisibleProjectionResult,
@@ -16,8 +14,8 @@ import {
   clipboardStateAtom,
   copyClipboardAtom,
   cutClipboardAtom,
-  readViewportFreezeCanonicalAtom,
   selectCellAtom,
+  setFreezeConfigAtom,
   setSelectionAtom,
   visibleWindowAtom,
 } from '@einfach/spreadsheet-ui-core'
@@ -207,28 +205,12 @@ function findFillRectForColor(calls: CtxCall[], color: string): CtxCall[] {
   )
 }
 
-async function hydrateFreezeProjection(
+function setLocalFreeze(
   store: ReturnType<typeof createStore>,
   freeze: { rows: number; cols: number },
 ) {
-  const source = {
-    async readFreezeConfig(request: ReadFreezeConfigRequest) {
-      return {
-        kind: 'freeze-config' as const,
-        sheetId: request.sheetId,
-        requestId: request.requestId,
-        revision: 1,
-        freeze: { ...freeze },
-      }
-    },
-    async setFreezeConfig(request: SetFreezeConfigRequest) {
-      return { sheetId: request.sheetId, requestId: request.requestId, revision: 1 }
-    },
-  }
-  await store.setter(readViewportFreezeCanonicalAtom, {
-    source,
-    sheetId: 'sheet-1',
-  })
+  // Freeze is UI-core canonical — no backend port involved.
+  store.setter(setFreezeConfigAtom, { sheetId: 'sheet-1', ...freeze })
 }
 
 describe('OverlayRenderer', () => {
@@ -398,9 +380,9 @@ describe('OverlayRenderer', () => {
     renderer.detach()
   })
 
-  it('draws a frozen pane divider when the canonical projection is ready', async () => {
+  it('draws a frozen pane divider from the local canonical freeze state', async () => {
     const store = createStore()
-    await hydrateFreezeProjection(store, { rows: 2, cols: 1 })
+    setLocalFreeze(store, { rows: 2, cols: 1 })
 
     const { ctx, calls } = createRecordingContext()
     const renderer = new OverlayRenderer(() => ctx)
@@ -426,11 +408,9 @@ describe('OverlayRenderer', () => {
     renderer.detach()
   })
 
-  it('does not draw a stale divider while the projection authority is not ready', async () => {
+  it('does not draw a divider when no local freeze is set', async () => {
     const store = createStore()
-    await hydrateFreezeProjection(store, { rows: 2, cols: 1 })
     const viewport = makeViewportProvider(store)
-    viewport.isFreezeProjectionReady = () => false
 
     const { ctx, calls } = createRecordingContext()
     const renderer = new OverlayRenderer(() => ctx)
