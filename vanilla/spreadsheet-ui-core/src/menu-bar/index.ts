@@ -373,6 +373,28 @@ const FORMAT_ITEMS: readonly MenuBarEntry[] = [
     dispatch: { kind: 'freeze-panes' },
     isAvailable: 'always',
   },
+  { kind: 'separator', id: 'format.sep-5' },
+  // Protection is UI-core canonical (#40): the entries are always
+  // available regardless of backend ports — commands commit locally and
+  // mirror into the optional persistence hook only when present.
+  {
+    id: 'format.protectSheet',
+    label: 'menuBar.format.protectSheet',
+    dispatch: { kind: 'protect-sheet' },
+    isAvailable: 'always',
+  },
+  {
+    id: 'format.unprotectSheet',
+    label: 'menuBar.format.unprotectSheet',
+    dispatch: { kind: 'unprotect-sheet' },
+    isAvailable: 'always',
+  },
+  {
+    id: 'format.unlockRange',
+    label: 'menuBar.format.unlockRange',
+    dispatch: { kind: 'unlock-range' },
+    isAvailable: 'always',
+  },
 ]
 
 const DATA_ITEMS: readonly MenuBarEntry[] = [

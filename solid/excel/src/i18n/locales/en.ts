@@ -144,6 +144,9 @@ export const messages: Record<string, string> = {
   'menuBar.format.hideCol': 'Hide Column',
   'menuBar.format.unhideCol': 'Unhide Columns',
   'menuBar.format.freezePanes': 'Freeze Panes',
+  'menuBar.format.protectSheet': 'Protect Sheet',
+  'menuBar.format.unprotectSheet': 'Unprotect Sheet',
+  'menuBar.format.unlockRange': 'Unlock Range…',
   // Menu bar — Data
   'menuBar.data.sortAsc': 'Sort Ascending',
   'menuBar.data.sortDesc': 'Sort Descending',

@@ -38,7 +38,6 @@ import type {
   ReadSheetProtectionRequest,
   ReadSheetProtectionResult,
   SetRangeLockRequest,
-  SetRangeLockResult,
   SetSheetProtectionRequest,
 } from '../protection/types'
 import type { PasteRangeRequest, PasteRangeResult } from '../paste-special/types'
@@ -78,7 +77,6 @@ export type {
   ReadSheetProtectionRequest,
   ReadSheetProtectionResult,
   SetRangeLockRequest,
-  SetRangeLockResult,
   SetSheetProtectionRequest,
 }
 
@@ -863,7 +861,11 @@ export interface SpreadsheetBackend {
   publishLocalPresence?(request: PublishLocalPresenceRequest): Promise<void>
   // filter-sort
   setFilterSort?(request: SetFilterSortRequest): Promise<BackendMutationResult>
-  // protection
+  // protection — UI-core canonical (#40). These ports are an optional
+  // persistence hook: `setSheetProtection` / `setRangeLock` receive a
+  // fire-and-forget mirror of local commits and `readSheetProtection`
+  // seeds a one-shot hydration. Backends that omit them keep the full
+  // protection feature; enforcement runs in the UI-core mutation gateway.
   setSheetProtection?(request: SetSheetProtectionRequest): Promise<BackendMutationResult>
   setRangeLock?(request: SetRangeLockRequest): Promise<BackendMutationResult>
   readSheetProtection?(request: ReadSheetProtectionRequest): Promise<ReadSheetProtectionResult>

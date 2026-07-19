@@ -4,8 +4,8 @@ import { createStore } from '@einfach/core'
 import { describe, expect, test } from '@jest/globals'
 import type {
   BackendMutationResult,
-  SetRangeLockPort,
   SetRangeLockRequest,
+  SheetProtectionPersistencePort,
   SpreadsheetBackend,
 } from '../src'
 import {
@@ -345,7 +345,7 @@ describe('package boundary', () => {
     }
   })
 
-  test('keeps a generic backend range-lock mutation assignable to the strict command port', async () => {
+  test('keeps a generic backend assignable to the protection persistence hook', async () => {
     const legacySetRangeLock = async (
       request: SetRangeLockRequest,
     ): Promise<BackendMutationResult> => ({
@@ -357,10 +357,15 @@ describe('package boundary', () => {
     const backend: Pick<SpreadsheetBackend, 'setRangeLock'> = {
       setRangeLock: legacySetRangeLock,
     }
-    const commandPort: SetRangeLockPort = backend.setRangeLock!
+    // Protection is UI-core canonical (#40): backend protection ports are
+    // an optional persistence hook, so any SpreadsheetBackend — with or
+    // without the ports — must satisfy the hook interface structurally.
+    const withPort: SheetProtectionPersistencePort = backend
+    const portless: SheetProtectionPersistencePort = {} satisfies Pick<SpreadsheetBackend, never>
 
+    expect(portless.setRangeLock).toBeUndefined()
     await expect(
-      commandPort({
+      withPort.setRangeLock!({
         kind: 'set-range-lock',
         sheetId: 'sheet-1',
         range: { rowStart: 0, rowEnd: 0, colStart: 0, colEnd: 0 },

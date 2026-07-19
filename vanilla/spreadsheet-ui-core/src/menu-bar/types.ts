@@ -92,6 +92,9 @@ export type MenuItemDispatch =
   | { kind: 'unhide-cols' }
   | { kind: 'freeze-panes' }
   | { kind: 'unfreeze-panes' }
+  | { kind: 'protect-sheet' }
+  | { kind: 'unprotect-sheet' }
+  | { kind: 'unlock-range' }
   | { kind: 'sort-asc' }
   | { kind: 'sort-desc' }
   | { kind: 'toggle-formula-bar' }

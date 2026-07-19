@@ -18,6 +18,7 @@ import {
   MENU_BAR_ITEMS,
   openTopMenuAtom,
   printPreviewOpenAtom,
+  protectionUnlockStateAtom,
   removeDuplicatesCapabilityAtom,
   removeDuplicatesErrorAtom,
   removeDuplicatesLifecycleAtom,
@@ -25,7 +26,9 @@ import {
   removeDuplicatesReadRequestIdAtom,
   removeDuplicatesSessionAtom,
   selectionAtom,
+  selectionLockedAtom,
   setWorkspaceActiveSheetAtom,
+  sheetProtectionAtom,
   sheetTabsAtom,
   sheetTabsSheetsAtom,
   openTextToColumnsAtom,
@@ -51,6 +54,7 @@ import {
   type RangeProjectionRequest,
   type RangeProjectionResult,
   type RemoveDuplicatesControllerPort,
+  type SetSheetProtectionRequest,
   type SpreadsheetBackend,
   type SpreadsheetSheetMetadata,
   type UnhideColumnsRequest,
@@ -985,6 +989,76 @@ describe('SpreadsheetMenuBar', () => {
     await activateFormatMenuItem(container, 'format.hideRow')
     // Pre-flip this reported 'unsupported'; hidden is UI-core canonical now.
     expect(store.getter(viewportHiddenAtom).rowsBySheet['sheet-1']).toEqual([2, 3, 4])
+  })
+
+  it('Format > Protect Sheet commits locally on a backend without protection ports', async () => {
+    const store = createStore()
+    setupHiddenSelection(store)
+    const { container } = render(() => (
+      <SpreadsheetUiProvider backend={createBaseBackend()} store={store}>
+        <SpreadsheetMenuBar />
+      </SpreadsheetUiProvider>
+    ))
+
+    await activateFormatMenuItem(container, 'format.protectSheet')
+    // Local commit is synchronous; the worker demo path needs no port.
+    expect(store.getter(sheetProtectionAtom)['sheet-1']).toEqual({
+      mode: 'protected',
+      unlockedRanges: [],
+    })
+    expect(store.getter(selectionLockedAtom)).toBe('locked')
+
+    await activateFormatMenuItem(container, 'format.unprotectSheet')
+    expect(store.getter(sheetProtectionAtom)['sheet-1'].mode).toBe('open')
+    expect(store.getter(selectionLockedAtom)).toBe('open')
+  })
+
+  it('Format > Protect Sheet mirrors into setSheetProtection fire-and-forget when present', async () => {
+    const store = createStore()
+    setupHiddenSelection(store)
+    const protectionRequests: SetSheetProtectionRequest[] = []
+    const backend: SpreadsheetBackend = {
+      ...createBaseBackend(),
+      async setSheetProtection(request) {
+        protectionRequests.push(request)
+        return { sheetId: request.sheetId }
+      },
+    }
+    const { container } = render(() => (
+      <SpreadsheetUiProvider backend={backend} store={store}>
+        <SpreadsheetMenuBar />
+      </SpreadsheetUiProvider>
+    ))
+
+    await activateFormatMenuItem(container, 'format.protectSheet')
+    expect(store.getter(sheetProtectionAtom)['sheet-1'].mode).toBe('protected')
+    await waitFor(() => expect(protectionRequests).toHaveLength(1))
+    expect(protectionRequests[0]).toMatchObject({
+      kind: 'set-sheet-protection',
+      sheetId: 'sheet-1',
+      mode: 'protected',
+      unlockedRanges: [],
+    })
+  })
+
+  it('Format > Unlock Range opens the unlock dialog for the current selection', async () => {
+    const store = createStore()
+    setupHiddenSelection(store)
+    const { container } = render(() => (
+      <SpreadsheetUiProvider backend={createBaseBackend()} store={store}>
+        <SpreadsheetMenuBar />
+      </SpreadsheetUiProvider>
+    ))
+
+    await activateFormatMenuItem(container, 'format.unlockRange')
+    expect(store.getter(protectionUnlockStateAtom)).toMatchObject({
+      phase: 'editing',
+      isOpen: true,
+      target: {
+        sheetId: 'sheet-1',
+        range: { rowStart: 2, rowEnd: 4, colStart: 3, colEnd: 5 },
+      },
+    })
   })
 
   it('Format > Unhide Rows and Unhide Columns use the full local truth intersection', async () => {

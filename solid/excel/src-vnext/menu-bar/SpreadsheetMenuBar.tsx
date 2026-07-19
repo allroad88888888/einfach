@@ -27,11 +27,13 @@ import {
   openHelpOverlayAtom,
   openNameManagerAtom,
   openPasteSpecialAtom,
+  openProtectionUnlockAtom,
   openRemoveDuplicatesFromSelectionAtom,
   openTopMenuAtom,
   openValidationRuleEditorAtom,
   pasteSpecialCapabilityAtom,
   pasteClipboardAtom,
+  protectSheetAtom,
   hideColumnsAtom,
   hideRowsAtom,
   reportCopyAsStatusAtom,
@@ -48,6 +50,7 @@ import {
   toggleGridlinesAtom,
   toggleHeadingsAtom,
   togglePrintPreviewAtom,
+  unprotectSheetAtom,
   topMenuOpenAtom,
   textToColumnsEntrypointProjectionAtom,
   viewportShowFormulaBarAtom,
@@ -482,6 +485,30 @@ export function SpreadsheetMenuBar(props: SpreadsheetMenuBarProps) {
           rows: 0,
           cols: 0,
         })
+        return
+      }
+      // protect-sheet / unprotect-sheet / unlock-range: protection is
+      // UI-core canonical — commands commit locally and mirror into the
+      // optional backend persistence ports only when present, so they
+      // work on every backend (including the worker runtimes, which
+      // expose no protection port).
+      case 'protect-sheet': {
+        const sheetId = getActiveSheetId()
+        if (!sheetId) return
+        store.setter(protectSheetAtom, { sheetId, source: backend })
+        return
+      }
+      case 'unprotect-sheet': {
+        const sheetId = getActiveSheetId()
+        if (!sheetId) return
+        store.setter(unprotectSheetAtom, { sheetId, source: backend })
+        return
+      }
+      case 'unlock-range': {
+        const sheetId = getActiveSheetId()
+        if (!sheetId) return
+        const snap = store.getter(selectionSnapshotAtom)
+        store.setter(openProtectionUnlockAtom, { sheetId, range: snap.range })
         return
       }
       case 'sort-asc':

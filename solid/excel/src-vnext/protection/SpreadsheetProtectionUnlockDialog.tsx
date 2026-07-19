@@ -7,7 +7,6 @@ import {
   closeProtectionUnlockAtom,
   protectionUnlockPasswordAtom,
   protectionUnlockStateAtom,
-  refreshProtectionUnlockAtom,
   setProtectionUnlockPasswordAtom,
   submitProtectionUnlockAtom,
   type SubmitProtectionUnlockInput,
@@ -18,10 +17,14 @@ import { useSpreadsheetBackend, useSpreadsheetUiStore } from '../provider/hooks'
 export interface SpreadsheetProtectionUnlockDialogProps {
   class?: string
   'data-testid'?: string
-  /** Optional host password verifier. A rejection prevents the range-lock mutation. */
+  /** Optional host password verifier. A rejection prevents the local unlock commit. */
   verifySheetProtection?: VerifySheetProtectionPort
 }
 
+// Protection is UI-core canonical (#40): confirming commits the unlock
+// locally and synchronously; the backend, when it implements the optional
+// persistence ports, only receives a fire-and-forget mirror. The dialog
+// works on every backend, including ones with no protection port at all.
 export function SpreadsheetProtectionUnlockDialog(props: SpreadsheetProtectionUnlockDialogProps) {
   const t = useT()
   const store = useSpreadsheetUiStore()
@@ -49,16 +52,9 @@ export function SpreadsheetProtectionUnlockDialog(props: SpreadsheetProtectionUn
     const verifySheetProtection = props.verifySheetProtection
     const input: SubmitProtectionUnlockInput = {
       ...(verifySheetProtection ? { verifySheetProtection } : {}),
-      setRangeLock: backend.setRangeLock?.bind(backend),
-      readSheetProtection: backend.readSheetProtection?.bind(backend),
+      source: backend,
     }
-    return store.setter(submitProtectionUnlockAtom, input)
-  }
-
-  function handleRefresh() {
-    const readSheetProtection = backend.readSheetProtection?.bind(backend)
-    if (!readSheetProtection) return
-    return store.setter(refreshProtectionUnlockAtom, { readSheetProtection })
+    store.setter(submitProtectionUnlockAtom, input)
   }
 
   function targetLabel(): string {
@@ -110,12 +106,12 @@ export function SpreadsheetProtectionUnlockDialog(props: SpreadsheetProtectionUn
             data-testid="protection-unlock-password"
             type="password"
             value={password()}
-            disabled={state().pending || state().recoveryRequired}
+            disabled={state().pending}
             onInput={(e) => store.setter(setProtectionUnlockPasswordAtom, e.currentTarget.value)}
             onKeyDown={(e) => {
-              if (e.key === 'Enter' && !state().recoveryRequired) {
+              if (e.key === 'Enter') {
                 e.preventDefault()
-                void handleUnlock()
+                handleUnlock()
               }
             }}
           />
@@ -128,30 +124,15 @@ export function SpreadsheetProtectionUnlockDialog(props: SpreadsheetProtectionUn
         </Show>
 
         <div class="protection-unlock-actions">
-          <Show
-            when={state().recoveryRequired}
-            fallback={
-              <button
-                type="button"
-                class="protection-unlock-btn"
-                data-testid="protection-unlock-confirm"
-                disabled={state().pending}
-                onClick={() => void handleUnlock()}
-              >
-                {t('protection.unlock.confirm')}
-              </button>
-            }
+          <button
+            type="button"
+            class="protection-unlock-btn"
+            data-testid="protection-unlock-confirm"
+            disabled={state().pending}
+            onClick={handleUnlock}
           >
-            <button
-              type="button"
-              class="protection-unlock-btn"
-              data-testid="protection-unlock-refresh"
-              disabled={state().pending}
-              onClick={() => void handleRefresh()}
-            >
-              {t('protection.unlock.refresh')}
-            </button>
-          </Show>
+            {t('protection.unlock.confirm')}
+          </button>
           <button
             type="button"
             class="protection-unlock-btn protection-unlock-btn-cancel"

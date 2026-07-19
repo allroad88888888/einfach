@@ -28,6 +28,7 @@ import {
   getViewportColumnWidth,
   getViewportRowHeight,
   getSelectionRange,
+  hydrateSheetProtectionAtom,
   hydrateViewportFreezeAtom,
   hydrateViewportHiddenAtom,
   hydrateViewportSizeProjectionAtom,
@@ -1056,6 +1057,12 @@ export function SpreadsheetGrid(props: SpreadsheetGridProps) {
       sheetId: props.sheetId,
       rowCount: metrics.rowCount > 0 ? metrics.rowCount : props.viewport.rowCount,
       colCount: metrics.colCount > 0 ? metrics.colCount : props.viewport.colCount,
+    })
+    // Same pattern for sheet protection (#40): the local canonical map is
+    // authoritative; `readSheetProtection` only seeds a sheet once.
+    void store.setter(hydrateSheetProtectionAtom, {
+      source: backend,
+      sheetId: props.sheetId,
     })
   })
 

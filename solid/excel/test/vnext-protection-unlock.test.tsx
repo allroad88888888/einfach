@@ -4,22 +4,27 @@ import { afterEach, describe, expect, it, jest } from '@jest/globals'
 import { createStore } from '@einfach/core'
 import { cleanup, fireEvent, render, waitFor } from '@solidjs/testing-library'
 import type {
-  ReadSheetProtectionRequest,
-  ReadSheetProtectionResult,
   SetRangeLockRequest,
-  SetRangeLockResult,
   SpreadsheetBackend,
+  VerifySheetProtectionPort,
 } from '@einfach/spreadsheet-ui-core'
 import {
+  isRangeFullyUnlocked,
   openProtectionUnlockAtom,
-  protectionUnlockMutationBlockedAtom,
   protectionUnlockPasswordAtom,
   protectionUnlockStateAtom,
+  setSheetProtectionAtom,
+  sheetProtectionAtom,
 } from '@einfach/spreadsheet-ui-core'
 import { SpreadsheetUiProvider } from '../src-vnext/provider'
 import { SpreadsheetProtectionUnlockDialog } from '../src-vnext/protection'
 
 afterEach(cleanup)
+
+// Protection is UI-core canonical (#40): the dialog commits the unlock
+// locally and synchronously. The backend `setRangeLock` port, when
+// present, only receives a fire-and-forget mirror — the worker backends
+// implement no protection port at all and the flow must still work.
 
 const sampleTarget = {
   sheetId: 'sheet-1',
@@ -40,40 +45,11 @@ function createBaseBackend(): SpreadsheetBackend {
   }
 }
 
-function createUnlockBackend(
-  setRangeLock?: (request: SetRangeLockRequest) => Promise<SetRangeLockResult>,
-  readSheetProtection?: (request: ReadSheetProtectionRequest) => Promise<ReadSheetProtectionResult>,
-): SpreadsheetBackend {
-  return { ...createBaseBackend(), setRangeLock, readSheetProtection }
-}
-
-function acknowledged(request: SetRangeLockRequest, revision = 1): SetRangeLockResult {
-  if (!Number.isSafeInteger(request.requestId)) throw new Error('missing requestId')
-  return {
-    kind: 'set-range-lock',
-    requestId: request.requestId!,
-    sheetId: request.sheetId,
-    affectedRange: { ...request.range },
-    outcome: 'acknowledged',
-    revision,
-  }
-}
-
-function canonical(
-  request: ReadSheetProtectionRequest,
-  unlocked: boolean,
-  revision = 1,
-): ReadSheetProtectionResult {
-  return {
-    kind: 'read-sheet-protection',
-    requestId: request.requestId,
-    sheetId: request.sheetId,
-    revision,
-    protection: {
-      mode: 'protected',
-      unlockedRanges: unlocked ? [{ ...sampleTarget.range }] : [],
-    },
-  }
+function protectSampleSheet(store: ReturnType<typeof createStore>) {
+  store.setter(setSheetProtectionAtom, {
+    sheetId: sampleTarget.sheetId,
+    state: { mode: 'protected', unlockedRanges: [] },
+  })
 }
 
 function createDeferred<T>() {
@@ -120,73 +96,129 @@ describe('SpreadsheetProtectionUnlockDialog', () => {
     expect(view.queryByTestId('protection-unlock-dialog')).toBeNull()
   })
 
-  it('preflights both mutation and canonical-read ports before verification', async () => {
+  it('commits the unlock locally on a backend without any protection port', () => {
     const store = createStore()
-    const setRangeLock = jest.fn(async (request: SetRangeLockRequest) => acknowledged(request))
-    const verify = jest.fn(async () => ({ ok: true }))
+    protectSampleSheet(store)
     store.setter(openProtectionUnlockAtom, sampleTarget)
     const view = render(() => (
-      <SpreadsheetUiProvider backend={createUnlockBackend(setRangeLock)} store={store}>
-        <SpreadsheetProtectionUnlockDialog verifySheetProtection={verify} />
-      </SpreadsheetUiProvider>
-    ))
-
-    fireEvent.click(view.getByTestId('protection-unlock-confirm'))
-    await waitFor(() =>
-      expect(store.getter(protectionUnlockStateAtom)).toMatchObject({
-        phase: 'editing',
-        error: 'Protection editing and status refresh are unavailable.',
-      }),
-    )
-    expect(verify).not.toHaveBeenCalled()
-    expect(setRangeLock).not.toHaveBeenCalled()
-  })
-
-  it('treats password verification as optional and closes only after canonical readback', async () => {
-    const store = createStore()
-    const setRangeLock = jest.fn(async (request: SetRangeLockRequest) => acknowledged(request))
-    const readSheetProtection = jest.fn(async (request: ReadSheetProtectionRequest) =>
-      canonical(request, true),
-    )
-    store.setter(openProtectionUnlockAtom, sampleTarget)
-    const view = render(() => (
-      <SpreadsheetUiProvider
-        backend={createUnlockBackend(setRangeLock, readSheetProtection)}
-        store={store}
-      >
+      <SpreadsheetUiProvider backend={createBaseBackend()} store={store}>
         <SpreadsheetProtectionUnlockDialog />
       </SpreadsheetUiProvider>
     ))
 
     fireEvent.click(view.getByTestId('protection-unlock-confirm'))
 
-    await waitFor(() => expect(store.getter(protectionUnlockStateAtom).phase).toBe('closed'))
-    expect(setRangeLock).toHaveBeenCalledTimes(1)
-    expect(setRangeLock.mock.calls[0]![0]).toMatchObject({
+    // Local canonical commit is synchronous — no transport round-trip.
+    expect(store.getter(protectionUnlockStateAtom).phase).toBe('closed')
+    expect(
+      isRangeFullyUnlocked(
+        store.getter(sheetProtectionAtom),
+        sampleTarget.sheetId,
+        sampleTarget.range,
+      ),
+    ).toBe(true)
+  })
+
+  it('mirrors the committed unlock through setRangeLock fire-and-forget when present', async () => {
+    const store = createStore()
+    protectSampleSheet(store)
+    const rangeLockRequests: SetRangeLockRequest[] = []
+    const backend: SpreadsheetBackend = {
+      ...createBaseBackend(),
+      async setRangeLock(request) {
+        rangeLockRequests.push(request)
+        return { sheetId: request.sheetId, revision: 1 }
+      },
+    }
+    store.setter(openProtectionUnlockAtom, sampleTarget)
+    const view = render(() => (
+      <SpreadsheetUiProvider backend={backend} store={store}>
+        <SpreadsheetProtectionUnlockDialog />
+      </SpreadsheetUiProvider>
+    ))
+
+    fireEvent.click(view.getByTestId('protection-unlock-confirm'))
+
+    expect(store.getter(protectionUnlockStateAtom).phase).toBe('closed')
+    await waitFor(() => expect(rangeLockRequests).toHaveLength(1))
+    expect(rangeLockRequests[0]).toMatchObject({
       kind: 'set-range-lock',
       sheetId: 'sheet-1',
       range: sampleTarget.range,
       locked: false,
     })
-    expect(readSheetProtection).toHaveBeenCalledTimes(1)
-    expect(readSheetProtection.mock.calls[0]![0].requestId).toBe(
-      setRangeLock.mock.calls[0]![0].requestId,
-    )
+  })
+
+  it('a mirror failure never rolls back the local unlock', async () => {
+    const store = createStore()
+    protectSampleSheet(store)
+    const backend: SpreadsheetBackend = {
+      ...createBaseBackend(),
+      async setRangeLock() {
+        throw new Error('worker disconnected')
+      },
+    }
+    store.setter(openProtectionUnlockAtom, sampleTarget)
+    const view = render(() => (
+      <SpreadsheetUiProvider backend={backend} store={store}>
+        <SpreadsheetProtectionUnlockDialog />
+      </SpreadsheetUiProvider>
+    ))
+
+    fireEvent.click(view.getByTestId('protection-unlock-confirm'))
+    await Promise.resolve()
+
+    expect(store.getter(protectionUnlockStateAtom).phase).toBe('closed')
+    expect(
+      isRangeFullyUnlocked(
+        store.getter(sheetProtectionAtom),
+        sampleTarget.sheetId,
+        sampleTarget.range,
+      ),
+    ).toBe(true)
+  })
+
+  it('passes the typed password to the host verifier and commits on success', async () => {
+    const store = createStore()
+    protectSampleSheet(store)
+    const verify = jest.fn<VerifySheetProtectionPort>(async () => ({ ok: true }))
+    store.setter(openProtectionUnlockAtom, sampleTarget)
+    const view = render(() => (
+      <SpreadsheetUiProvider backend={createBaseBackend()} store={store}>
+        <SpreadsheetProtectionUnlockDialog verifySheetProtection={verify} />
+      </SpreadsheetUiProvider>
+    ))
+
+    fireEvent.input(view.getByTestId('protection-unlock-password'), {
+      target: { value: 'workbook-password' },
+    })
+    fireEvent.click(view.getByTestId('protection-unlock-confirm'))
+
+    await waitFor(() => expect(store.getter(protectionUnlockStateAtom).phase).toBe('closed'))
+    expect(verify).toHaveBeenCalledWith({
+      sheetId: 'sheet-1',
+      range: sampleTarget.range,
+      password: 'workbook-password',
+    })
+    expect(
+      isRangeFullyUnlocked(
+        store.getter(sheetProtectionAtom),
+        sampleTarget.sheetId,
+        sampleTarget.range,
+      ),
+    ).toBe(true)
   })
 
   it('returns to Editing when password verification rejects the attempt', async () => {
     const store = createStore()
-    const setRangeLock = jest.fn(async (request: SetRangeLockRequest) => acknowledged(request))
-    const readSheetProtection = jest.fn(async (request: ReadSheetProtectionRequest) =>
-      canonical(request, true),
-    )
-    const verify = jest.fn(async () => ({ ok: false, message: 'Incorrect workbook password.' }))
+    protectSampleSheet(store)
+    const verify = jest.fn<VerifySheetProtectionPort>(async () => ({
+      ok: false,
+      message: 'Incorrect workbook password.',
+    }))
     store.setter(openProtectionUnlockAtom, sampleTarget)
     const view = render(() => (
-      <SpreadsheetUiProvider
-        backend={createUnlockBackend(setRangeLock, readSheetProtection)}
-        store={store}
-      >
+      <SpreadsheetUiProvider backend={createBaseBackend()} store={store}>
         <SpreadsheetProtectionUnlockDialog verifySheetProtection={verify} />
       </SpreadsheetUiProvider>
     ))
@@ -202,270 +234,93 @@ describe('SpreadsheetProtectionUnlockDialog', () => {
         error: 'Incorrect workbook password.',
       }),
     )
-    expect(setRangeLock).not.toHaveBeenCalled()
-    expect(readSheetProtection).not.toHaveBeenCalled()
+    expect(view.getByTestId('protection-unlock-error').textContent).toBe(
+      'Incorrect workbook password.',
+    )
+    expect(store.getter(sheetProtectionAtom)['sheet-1'].unlockedRanges).toEqual([])
     expect(store.getter(protectionUnlockPasswordAtom)).toBe('incorrect')
   })
 
-  it('returns to Editing when the adapter confirms the change was not applied', async () => {
+  it('disables the form while verifying and re-enables it after a failure', async () => {
     const store = createStore()
-    const setRangeLock = jest.fn(
-      async (request: SetRangeLockRequest): Promise<SetRangeLockResult> => ({
-        kind: 'set-range-lock',
-        requestId: request.requestId!,
-        sheetId: request.sheetId,
-        affectedRange: { ...request.range },
-        outcome: 'confirmed-not-applied',
-        code: 'PERMISSION_DENIED',
-        message: 'The sheet is protected.',
-      }),
-    )
-    const readSheetProtection = jest.fn(async (request: ReadSheetProtectionRequest) =>
-      canonical(request, false),
-    )
+    protectSampleSheet(store)
+    const verification = createDeferred<{ ok: boolean; message?: string }>()
+    const verify = jest.fn<VerifySheetProtectionPort>(() => verification.promise)
     store.setter(openProtectionUnlockAtom, sampleTarget)
     const view = render(() => (
-      <SpreadsheetUiProvider
-        backend={createUnlockBackend(setRangeLock, readSheetProtection)}
-        store={store}
-      >
-        <SpreadsheetProtectionUnlockDialog />
-      </SpreadsheetUiProvider>
-    ))
-
-    fireEvent.click(view.getByTestId('protection-unlock-confirm'))
-    await waitFor(() =>
-      expect(store.getter(protectionUnlockStateAtom)).toMatchObject({
-        phase: 'editing',
-        error: 'The sheet is protected.',
-      }),
-    )
-    expect(setRangeLock).toHaveBeenCalledTimes(1)
-    expect(readSheetProtection).not.toHaveBeenCalled()
-  })
-
-  it('keeps Editing when canonical readback says the range is still locked', async () => {
-    const store = createStore()
-    const setRangeLock = jest.fn(async (request: SetRangeLockRequest) => acknowledged(request))
-    const readSheetProtection = jest.fn(async (request: ReadSheetProtectionRequest) =>
-      canonical(request, false),
-    )
-    store.setter(openProtectionUnlockAtom, sampleTarget)
-    const view = render(() => (
-      <SpreadsheetUiProvider
-        backend={createUnlockBackend(setRangeLock, readSheetProtection)}
-        store={store}
-      >
-        <SpreadsheetProtectionUnlockDialog />
-      </SpreadsheetUiProvider>
-    ))
-
-    fireEvent.click(view.getByTestId('protection-unlock-confirm'))
-    await waitFor(() =>
-      expect(store.getter(protectionUnlockStateAtom)).toMatchObject({
-        phase: 'editing',
-        error: 'The range is still locked. Try again.',
-      }),
-    )
-    expect(setRangeLock).toHaveBeenCalledTimes(1)
-    expect(readSheetProtection).toHaveBeenCalledTimes(1)
-  })
-
-  it('uses read-only refresh after an unknown mutation outcome and never resends it', async () => {
-    const store = createStore()
-    const setRangeLock = jest.fn(async (): Promise<SetRangeLockResult> => {
-      throw new Error('worker disconnected')
-    })
-    const readSheetProtection = jest.fn(async (request: ReadSheetProtectionRequest) =>
-      canonical(request, true),
-    )
-    store.setter(openProtectionUnlockAtom, sampleTarget)
-    const view = render(() => (
-      <SpreadsheetUiProvider
-        backend={createUnlockBackend(setRangeLock, readSheetProtection)}
-        store={store}
-      >
-        <SpreadsheetProtectionUnlockDialog />
-      </SpreadsheetUiProvider>
-    ))
-
-    fireEvent.click(view.getByTestId('protection-unlock-confirm'))
-    await waitFor(() =>
-      expect(store.getter(protectionUnlockStateAtom).phase).toBe('recovery-required'),
-    )
-    expect(view.queryByTestId('protection-unlock-confirm')).toBeNull()
-    fireEvent.click(view.getByTestId('protection-unlock-refresh'))
-
-    await waitFor(() => expect(store.getter(protectionUnlockStateAtom).phase).toBe('closed'))
-    expect(setRangeLock).toHaveBeenCalledTimes(1)
-    expect(readSheetProtection).toHaveBeenCalledTimes(1)
-  })
-
-  it('keeps dispatched sheet A recovery authoritative across close and attempted reopen on B', async () => {
-    const store = createStore()
-    const deferredMutation = createDeferred<SetRangeLockResult>()
-    const setRangeLock = jest.fn((request: SetRangeLockRequest) => deferredMutation.promise)
-    const readSheetProtection = jest.fn(async (request: ReadSheetProtectionRequest) =>
-      canonical(request, true),
-    )
-    const sheetBTarget = {
-      sheetId: 'sheet-2',
-      range: { rowStart: 8, rowEnd: 9, colStart: 4, colEnd: 5 },
-    }
-    store.setter(openProtectionUnlockAtom, sampleTarget)
-    const view = render(() => (
-      <SpreadsheetUiProvider
-        backend={createUnlockBackend(setRangeLock, readSheetProtection)}
-        store={store}
-      >
-        <SpreadsheetProtectionUnlockDialog />
+      <SpreadsheetUiProvider backend={createBaseBackend()} store={store}>
+        <SpreadsheetProtectionUnlockDialog verifySheetProtection={verify} />
       </SpreadsheetUiProvider>
     ))
 
     fireEvent.click(view.getByTestId('protection-unlock-confirm'))
     await waitFor(() => {
-      expect(setRangeLock).toHaveBeenCalledTimes(1)
-      expect(store.getter(protectionUnlockStateAtom).phase).toBe('mutation-pending')
+      expect(
+        (view.getByTestId('protection-unlock-confirm') as HTMLButtonElement).disabled,
+      ).toBe(true)
+      expect(
+        (view.getByTestId('protection-unlock-password') as HTMLInputElement).disabled,
+      ).toBe(true)
     })
-    const dispatchedRequest = setRangeLock.mock.calls[0]![0]
+    // Single flight: a second click while verifying is ignored.
+    fireEvent.click(view.getByTestId('protection-unlock-confirm'))
+    expect(verify).toHaveBeenCalledTimes(1)
 
+    verification.resolve({ ok: false, message: 'Nope.' })
+    await waitFor(() =>
+      expect(
+        (view.getByTestId('protection-unlock-confirm') as HTMLButtonElement).disabled,
+      ).toBe(false),
+    )
+    expect(store.getter(protectionUnlockStateAtom)).toMatchObject({
+      phase: 'editing',
+      error: 'Nope.',
+    })
+  })
+
+  it('discards a verification that settles after the dialog closed', async () => {
+    const store = createStore()
+    protectSampleSheet(store)
+    const verification = createDeferred<{ ok: boolean }>()
+    const verify = jest.fn<VerifySheetProtectionPort>(() => verification.promise)
+    store.setter(openProtectionUnlockAtom, sampleTarget)
+    const view = render(() => (
+      <SpreadsheetUiProvider backend={createBaseBackend()} store={store}>
+        <SpreadsheetProtectionUnlockDialog verifySheetProtection={verify} />
+      </SpreadsheetUiProvider>
+    ))
+
+    fireEvent.click(view.getByTestId('protection-unlock-confirm'))
     fireEvent.click(view.getByTestId('protection-unlock-cancel'))
     expect(store.getter(protectionUnlockStateAtom).phase).toBe('closed')
-    expect(store.getter(protectionUnlockMutationBlockedAtom)).toBe(true)
-    store.setter(openProtectionUnlockAtom, sheetBTarget)
 
-    await waitFor(() => {
-      expect(store.getter(protectionUnlockStateAtom)).toMatchObject({
-        phase: 'recovery-required',
-        target: sampleTarget,
-        recoveryRequired: true,
-      })
-      expect(view.getByTestId('protection-unlock-target').textContent).toContain('sheet-1')
-    })
+    verification.resolve({ ok: true })
+    await Promise.resolve()
+    await Promise.resolve()
 
-    deferredMutation.resolve(acknowledged(dispatchedRequest))
-    await deferredMutation.promise
-    await new Promise<void>((resolve) => setTimeout(resolve, 0))
+    // The stale verification can never commit against the closed session.
+    expect(store.getter(sheetProtectionAtom)['sheet-1'].unlockedRanges).toEqual([])
+    expect(store.getter(protectionUnlockStateAtom).phase).toBe('closed')
+  })
+
+  it('shows a retryable editing error when the target lacks a range', () => {
+    const store = createStore()
+    protectSampleSheet(store)
+    store.setter(openProtectionUnlockAtom, { sheetId: 'sheet-1' })
+    const view = render(() => (
+      <SpreadsheetUiProvider backend={createBaseBackend()} store={store}>
+        <SpreadsheetProtectionUnlockDialog />
+      </SpreadsheetUiProvider>
+    ))
+
+    fireEvent.click(view.getByTestId('protection-unlock-confirm'))
 
     expect(store.getter(protectionUnlockStateAtom)).toMatchObject({
-      phase: 'recovery-required',
-      target: sampleTarget,
-      recoveryRequired: true,
+      phase: 'editing',
+      error: 'Select a range to unlock.',
     })
-    expect(store.getter(protectionUnlockMutationBlockedAtom)).toBe(true)
-    expect(readSheetProtection).not.toHaveBeenCalled()
-    expect(view.getByTestId('protection-unlock-target').textContent).toContain('sheet-1')
-
-    fireEvent.click(view.getByTestId('protection-unlock-refresh'))
-    await waitFor(() => expect(store.getter(protectionUnlockStateAtom).phase).toBe('closed'))
-    expect(setRangeLock).toHaveBeenCalledTimes(1)
-    expect(readSheetProtection).toHaveBeenCalledTimes(1)
-    expect(readSheetProtection.mock.calls[0]![0]).toMatchObject({
-      sheetId: 'sheet-1',
-      requestId: dispatchedRequest.requestId,
-    })
-
-    store.setter(openProtectionUnlockAtom, sheetBTarget)
-    await waitFor(() => {
-      expect(store.getter(protectionUnlockStateAtom)).toMatchObject({
-        phase: 'editing',
-        target: sheetBTarget,
-        recoveryRequired: false,
-      })
-      expect(view.getByTestId('protection-unlock-target').textContent).toContain('sheet-2')
-    })
-  })
-
-  it('uses read-only refresh after ACK readback fails and preserves request identity', async () => {
-    const store = createStore()
-    const setRangeLock = jest.fn(async (request: SetRangeLockRequest) => acknowledged(request))
-    let reads = 0
-    const readSheetProtection = jest.fn(async (request: ReadSheetProtectionRequest) => {
-      reads += 1
-      if (reads === 1) throw new Error('readback unavailable')
-      return canonical(request, true)
-    })
-    store.setter(openProtectionUnlockAtom, sampleTarget)
-    const view = render(() => (
-      <SpreadsheetUiProvider
-        backend={createUnlockBackend(setRangeLock, readSheetProtection)}
-        store={store}
-      >
-        <SpreadsheetProtectionUnlockDialog />
-      </SpreadsheetUiProvider>
-    ))
-
-    fireEvent.click(view.getByTestId('protection-unlock-confirm'))
-    await waitFor(() =>
-      expect(store.getter(protectionUnlockStateAtom).phase).toBe('recovery-required'),
+    expect(view.getByTestId('protection-unlock-error').textContent).toBe(
+      'Select a range to unlock.',
     )
-    const firstRequestId = readSheetProtection.mock.calls[0]![0].requestId
-    fireEvent.click(view.getByTestId('protection-unlock-refresh'))
-
-    await waitFor(() => expect(store.getter(protectionUnlockStateAtom).phase).toBe('closed'))
-    expect(setRangeLock).toHaveBeenCalledTimes(1)
-    expect(readSheetProtection).toHaveBeenCalledTimes(2)
-    expect(readSheetProtection.mock.calls[1]![0].requestId).toBe(firstRequestId)
-  })
-
-  it('requires read-only recovery when canonical revision differs from the mutation ACK', async () => {
-    const store = createStore()
-    const setRangeLock = jest.fn(async (request: SetRangeLockRequest) => acknowledged(request, 7))
-    let reads = 0
-    const readSheetProtection = jest.fn(async (request: ReadSheetProtectionRequest) => {
-      reads += 1
-      return canonical(request, true, reads === 1 ? 8 : 7)
-    })
-    store.setter(openProtectionUnlockAtom, sampleTarget)
-    const view = render(() => (
-      <SpreadsheetUiProvider
-        backend={createUnlockBackend(setRangeLock, readSheetProtection)}
-        store={store}
-      >
-        <SpreadsheetProtectionUnlockDialog />
-      </SpreadsheetUiProvider>
-    ))
-
-    fireEvent.click(view.getByTestId('protection-unlock-confirm'))
-    await waitFor(() =>
-      expect(store.getter(protectionUnlockStateAtom).phase).toBe('recovery-required'),
-    )
-    fireEvent.click(view.getByTestId('protection-unlock-refresh'))
-
-    await waitFor(() => expect(store.getter(protectionUnlockStateAtom).phase).toBe('closed'))
-    expect(setRangeLock).toHaveBeenCalledTimes(1)
-    expect(readSheetProtection).toHaveBeenCalledTimes(2)
-    expect(readSheetProtection.mock.calls[1]![0].requestId).toBe(
-      readSheetProtection.mock.calls[0]![0].requestId,
-    )
-  })
-
-  it('requires recovery for a response with the wrong request identity', async () => {
-    const store = createStore()
-    const setRangeLock = jest.fn(
-      async (request: SetRangeLockRequest): Promise<SetRangeLockResult> => ({
-        ...acknowledged(request),
-        requestId: request.requestId! + 1,
-      }),
-    )
-    const readSheetProtection = jest.fn(async (request: ReadSheetProtectionRequest) =>
-      canonical(request, true),
-    )
-    store.setter(openProtectionUnlockAtom, sampleTarget)
-    const view = render(() => (
-      <SpreadsheetUiProvider
-        backend={createUnlockBackend(setRangeLock, readSheetProtection)}
-        store={store}
-      >
-        <SpreadsheetProtectionUnlockDialog />
-      </SpreadsheetUiProvider>
-    ))
-
-    fireEvent.click(view.getByTestId('protection-unlock-confirm'))
-    await waitFor(() =>
-      expect(store.getter(protectionUnlockStateAtom).phase).toBe('recovery-required'),
-    )
-    expect(setRangeLock).toHaveBeenCalledTimes(1)
-    expect(readSheetProtection).not.toHaveBeenCalled()
   })
 })

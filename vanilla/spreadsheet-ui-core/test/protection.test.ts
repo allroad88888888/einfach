@@ -1,44 +1,41 @@
 import { describe, expect, jest, test } from '@jest/globals'
 import { createStore, type Store } from '@einfach/core'
 import type { BackendMutationResult, DisplayCell } from '../src/backend/types'
+import { resolveContentMutationAtom } from '../src/editing'
+import { historyStackAtom } from '../src/history'
 import type { CellRange } from '../src/shared'
 import {
   DEFAULT_PROTECTION_UNLOCK_STATE,
   DEFAULT_SHEET_PROTECTION,
-  DEFAULT_SHEET_PROTECTION_LOAD_STATE,
   MAX_UNLOCKED_RANGES,
   activeCellLockedAtom,
-  applyWorkbookRestoredProtectionAtom,
+  addUnlockedRangeAtom,
   clearSheetProtectionAtom,
   closeProtectionUnlockAtom,
   getSheetProtection,
+  hydrateSheetProtectionAtom,
   isCoordUnlocked,
   isRangeFullyUnlocked,
   isRangePartiallyUnlocked,
-  loadSheetProtectionAtom,
   openProtectionUnlockAtom,
-  protectionUnlockMutationBlockedAtom,
+  protectSheetAtom,
   protectionUnlockPasswordAtom,
   protectionUnlockPhaseAtom,
-  protectionUnlockRecoveryRequiredAtom,
   protectionUnlockStateAtom,
   rangesIntersect,
-  refreshProtectionUnlockAtom,
+  removeUnlockedRangeAtom,
   selectionLockedAtom,
   setProtectionUnlockPasswordAtom,
   setSheetProtectionAtom,
   sheetProtectionAtom,
-  sheetProtectionLoadStateAtom,
+  sheetProtectionDiagnosticAtom,
   submitProtectionUnlockAtom,
-  type CorrelatedSetRangeLockRequest,
-  type ReadSheetProtectionPort,
+  unprotectSheetAtom,
   type ReadSheetProtectionRequest,
   type ReadSheetProtectionResult,
-  type SetRangeLockConfirmedNotAppliedError,
-  type SetRangeLockAcknowledgedResult,
-  type SetRangeLockPort,
   type SetRangeLockRequest,
-  type SetRangeLockResult,
+  type SetSheetProtectionRequest,
+  type SheetProtectionPersistencePort,
   type SheetProtectionState,
   type VerifySheetProtectionPort,
 } from '../src/protection'
@@ -84,52 +81,34 @@ function copyRange(range: Readonly<CellRange>): CellRange {
   }
 }
 
-function acknowledged(
-  request: CorrelatedSetRangeLockRequest,
-  revision: ReadSheetProtectionResult['revision'] = 2,
-): SetRangeLockAcknowledgedResult {
-  return {
-    kind: 'set-range-lock',
-    outcome: 'acknowledged',
-    requestId: request.requestId,
-    sheetId: request.sheetId,
-    affectedRange: copyRange(request.range),
-    revision,
-  }
+function mutationResult(sheetId: string): BackendMutationResult {
+  return { sheetId, revision: 1 }
 }
 
-function confirmedNotApplied(request: CorrelatedSetRangeLockRequest): SetRangeLockResult {
-  return {
-    kind: 'set-range-lock',
-    outcome: 'confirmed-not-applied',
-    code: 'PERMISSION_DENIED',
-    message: 'You cannot edit this protected range.',
-    requestId: request.requestId,
-    sheetId: request.sheetId,
-    affectedRange: copyRange(request.range),
-  }
+interface RecordingPort extends SheetProtectionPersistencePort {
+  readonly sheetProtectionRequests: SetSheetProtectionRequest[]
+  readonly rangeLockRequests: SetRangeLockRequest[]
 }
 
-function canonicalResult(
-  request: ReadSheetProtectionRequest,
-  protection: SheetProtectionState,
-  revision: ReadSheetProtectionResult['revision'] = 2,
-): ReadSheetProtectionResult {
-  return {
-    kind: 'read-sheet-protection',
-    requestId: request.requestId,
-    sheetId: request.sheetId,
-    revision,
-    protection,
+function createRecordingPort(
+  options: { withSetRangeLock?: boolean; withSetSheetProtection?: boolean } = {},
+): RecordingPort {
+  const sheetProtectionRequests: SetSheetProtectionRequest[] = []
+  const rangeLockRequests: SetRangeLockRequest[] = []
+  const port: RecordingPort = { sheetProtectionRequests, rangeLockRequests }
+  if (options.withSetSheetProtection !== false) {
+    port.setSheetProtection = async (request) => {
+      sheetProtectionRequests.push(request)
+      return mutationResult(request.sheetId)
+    }
   }
-}
-
-function unlockedCanonicalRead(): ReadSheetProtectionPort {
-  return async (request) =>
-    canonicalResult(request, {
-      mode: 'protected',
-      unlockedRanges: [copyRange(TARGET_RANGE)],
-    })
+  if (options.withSetRangeLock !== false) {
+    port.setRangeLock = async (request) => {
+      rangeLockRequests.push(request)
+      return mutationResult(request.sheetId)
+    }
+  }
+  return port
 }
 
 function openLockedRange(
@@ -145,7 +124,7 @@ function openLockedRange(
 }
 
 describe('canonical protection state', () => {
-  test('keeps the online Excel defaults and explicitly rejects more than 256 ranges', () => {
+  test('keeps the online Excel defaults and rejects more than 256 ranges as invalid', () => {
     expect(MAX_UNLOCKED_RANGES).toBe(256)
     expect(DEFAULT_SHEET_PROTECTION).toEqual({ mode: 'open', unlockedRanges: [] })
 
@@ -156,16 +135,17 @@ describe('canonical protection state', () => {
       colStart: 0,
       colEnd: 0,
     }))
-    store.setter(setSheetProtectionAtom, {
-      sheetId: 'sheet-1',
-      state: { mode: 'protected', unlockedRanges: ranges },
-    })
-
+    expect(
+      store.setter(setSheetProtectionAtom, {
+        sheetId: 'sheet-1',
+        state: { mode: 'protected', unlockedRanges: ranges },
+      }),
+    ).toBe('committed')
     expect(store.getter(sheetProtectionAtom)['sheet-1'].unlockedRanges).toHaveLength(
       MAX_UNLOCKED_RANGES,
     )
 
-    expect(() =>
+    expect(
       store.setter(setSheetProtectionAtom, {
         sheetId: 'sheet-1',
         state: {
@@ -181,7 +161,7 @@ describe('canonical protection state', () => {
           ],
         },
       }),
-    ).toThrow(`Sheet protection cannot contain more than ${MAX_UNLOCKED_RANGES} unlocked ranges.`)
+    ).toBe('invalid')
     expect(store.getter(sheetProtectionAtom)['sheet-1'].unlockedRanges).toHaveLength(
       MAX_UNLOCKED_RANGES,
     )
@@ -206,19 +186,55 @@ describe('canonical protection state', () => {
     expect(Object.isFrozen(canonical['sheet-1'].unlockedRanges[0])).toBe(true)
   })
 
-  test('stores and clears sheet entries through commands', () => {
+  test('stores and clears sheet entries through commands with outcome semantics', () => {
     const store = createStore()
-    store.setter(setSheetProtectionAtom, {
-      sheetId: 'sheet-A',
-      state: { mode: 'protected', unlockedRanges: [TARGET_RANGE] },
-    })
+    expect(
+      store.setter(setSheetProtectionAtom, {
+        sheetId: 'sheet-A',
+        state: { mode: 'protected', unlockedRanges: [TARGET_RANGE] },
+      }),
+    ).toBe('committed')
+    expect(
+      store.setter(setSheetProtectionAtom, {
+        sheetId: 'sheet-A',
+        state: { mode: 'protected', unlockedRanges: [copyRange(TARGET_RANGE)] },
+      }),
+    ).toBe('unchanged')
     expect(getSheetProtection(store.getter(sheetProtectionAtom), 'sheet-A').mode).toBe('protected')
 
-    store.setter(clearSheetProtectionAtom, 'sheet-A')
+    expect(store.setter(clearSheetProtectionAtom, 'sheet-A')).toBe('committed')
+    expect(store.setter(clearSheetProtectionAtom, 'sheet-A')).toBe('unchanged')
     expect(store.getter(sheetProtectionAtom)['sheet-A']).toBeUndefined()
     expect(getSheetProtection(store.getter(sheetProtectionAtom), 'sheet-A')).toBe(
       DEFAULT_SHEET_PROTECTION,
     )
+  })
+
+  test('rejects malformed inputs without touching canonical state', () => {
+    const store = createStore()
+    expect(
+      store.setter(setSheetProtectionAtom, {
+        sheetId: '',
+        state: { mode: 'protected', unlockedRanges: [] },
+      }),
+    ).toBe('invalid')
+    expect(
+      store.setter(setSheetProtectionAtom, {
+        sheetId: 'sheet-1',
+        state: {
+          mode: 'protected',
+          unlockedRanges: [{ rowStart: 2, rowEnd: 1, colStart: 0, colEnd: 0 }],
+        },
+      }),
+    ).toBe('invalid')
+    expect(
+      store.setter(setSheetProtectionAtom, {
+        sheetId: 'sheet-1',
+        state: { mode: 'locked', unlockedRanges: [] } as unknown as SheetProtectionState,
+      }),
+    ).toBe('invalid')
+    expect(store.setter(clearSheetProtectionAtom, '')).toBe('invalid')
+    expect(store.getter(sheetProtectionAtom)).toEqual({})
   })
 
   test.each(['__proto__', 'constructor', 'toString'])(
@@ -259,518 +275,419 @@ describe('canonical protection state', () => {
   })
 })
 
-describe('canonical protection load lifecycle', () => {
-  test('starts idle and does not present the open fallback as loaded backend state', () => {
+describe('protect / unprotect commands', () => {
+  test('protectSheet preserves existing unlocked ranges and reports unchanged repeats', () => {
     const store = createStore()
-
-    expect(store.getter(sheetProtectionLoadStateAtom)).toBe(DEFAULT_SHEET_PROTECTION_LOAD_STATE)
-    expect(Object.isFrozen(store.getter(sheetProtectionLoadStateAtom))).toBe(true)
-    expect(getSheetProtection(store.getter(sheetProtectionAtom), 'not-loaded')).toBe(
-      DEFAULT_SHEET_PROTECTION,
-    )
-    expect(store.getter(sheetProtectionLoadStateAtom).phase).not.toBe('ready')
-  })
-
-  test('loads one exact read result into frozen canonical and readiness snapshots', async () => {
-    const store = createStore()
-    const response = deferred<ReadSheetProtectionResult>()
-    const readSheetProtection = jest.fn<ReadSheetProtectionPort>((request) => {
-      expect(Object.isFrozen(request)).toBe(true)
-      return response.promise
-    })
-    const setRangeLock = jest.fn<SetRangeLockPort>()
-
-    store.setter(loadSheetProtectionAtom, {
+    store.setter(setSheetProtectionAtom, {
       sheetId: 'sheet-1',
-      readSheetProtection,
+      state: { mode: 'open', unlockedRanges: [TARGET_RANGE] },
     })
 
-    const request = readSheetProtection.mock.calls[0][0]
-    expect(request).toEqual({
-      kind: 'read-sheet-protection',
-      sheetId: 'sheet-1',
-      requestId: 1,
-    })
-    expect(store.getter(sheetProtectionLoadStateAtom)).toMatchObject({
-      phase: 'loading',
-      sheetId: 'sheet-1',
-      requestId: 1,
-      revision: null,
-      pending: true,
-      error: null,
-    })
-    expect(setRangeLock).not.toHaveBeenCalled()
-
-    response.resolve(
-      canonicalResult(
-        request,
-        { mode: 'protected', unlockedRanges: [copyRange(TARGET_RANGE)] },
-        'sheet-1-revision-4',
-      ),
-    )
-    await flushAsyncWork()
-
-    const load = store.getter(sheetProtectionLoadStateAtom)
-    const canonical = store.getter(sheetProtectionAtom)['sheet-1']
-    expect(load).toEqual({
-      phase: 'ready',
-      sheetId: 'sheet-1',
-      requestId: 1,
-      revision: 'sheet-1-revision-4',
-      pending: false,
-      error: null,
-    })
-    expect(canonical).toEqual({
+    expect(store.setter(protectSheetAtom, { sheetId: 'sheet-1' })).toBe('committed')
+    expect(store.getter(sheetProtectionAtom)['sheet-1']).toEqual({
       mode: 'protected',
       unlockedRanges: [TARGET_RANGE],
     })
-    expect(Object.isFrozen(load)).toBe(true)
-    expect(Object.isFrozen(canonical)).toBe(true)
-    expect(Object.isFrozen(canonical.unlockedRanges)).toBe(true)
-    expect(Object.isFrozen(canonical.unlockedRanges[0])).toBe(true)
+    expect(store.setter(protectSheetAtom, { sheetId: 'sheet-1' })).toBe('unchanged')
   })
 
-  test.each(['success', 'error'] as const)(
-    'ignores a late sheet A %s after sheet B becomes the load target',
-    async (lateOutcome) => {
-      const store = createStore()
-      const sheetA = deferred<ReadSheetProtectionResult>()
-      const sheetB = deferred<ReadSheetProtectionResult>()
-      const requests: ReadSheetProtectionRequest[] = []
-      const readSheetProtection: ReadSheetProtectionPort = (request) => {
-        requests.push(request)
-        return request.sheetId === 'sheet-A' ? sheetA.promise : sheetB.promise
-      }
-      const oldSheetA: SheetProtectionState = {
-        mode: 'protected',
-        unlockedRanges: [],
-      }
-      store.setter(setSheetProtectionAtom, { sheetId: 'sheet-A', state: oldSheetA })
-
-      store.setter(loadSheetProtectionAtom, { sheetId: 'sheet-A', readSheetProtection })
-      store.setter(loadSheetProtectionAtom, { sheetId: 'sheet-B', readSheetProtection })
-      expect(requests.map(({ sheetId, requestId }) => ({ sheetId, requestId }))).toEqual([
-        { sheetId: 'sheet-A', requestId: 1 },
-        { sheetId: 'sheet-B', requestId: 2 },
-      ])
-
-      if (lateOutcome === 'success') {
-        sheetA.resolve(
-          canonicalResult(requests[0], { mode: 'open', unlockedRanges: [] }, 'stale-A'),
-        )
-      } else {
-        sheetA.reject(new Error('stale A failed'))
-      }
-      await flushAsyncWork()
-
-      expect(store.getter(sheetProtectionLoadStateAtom)).toMatchObject({
-        phase: 'loading',
-        sheetId: 'sheet-B',
-        requestId: 2,
-        pending: true,
-        error: null,
-      })
-      expect(store.getter(sheetProtectionAtom)['sheet-A']).toEqual(oldSheetA)
-
-      sheetB.resolve(
-        canonicalResult(
-          requests[1],
-          { mode: 'protected', unlockedRanges: [copyRange(TARGET_RANGE)] },
-          'current-B',
-        ),
-      )
-      await flushAsyncWork()
-
-      expect(store.getter(sheetProtectionLoadStateAtom)).toMatchObject({
-        phase: 'ready',
-        sheetId: 'sheet-B',
-        requestId: 2,
-        revision: 'current-B',
-        pending: false,
-        error: null,
-      })
-      expect(store.getter(sheetProtectionAtom)['sheet-B']).toEqual({
-        mode: 'protected',
-        unlockedRanges: [TARGET_RANGE],
-      })
-    },
-  )
-
-  test('reports a missing read capability without manufacturing canonical open state', () => {
+  test('protectSheet can replace unlocked ranges and validates the replacement', () => {
     const store = createStore()
-
-    store.setter(loadSheetProtectionAtom, { sheetId: 'sheet-unsupported' })
-
-    expect(store.getter(sheetProtectionLoadStateAtom)).toEqual({
-      phase: 'unsupported',
-      sheetId: 'sheet-unsupported',
-      requestId: null,
-      revision: null,
-      pending: false,
-      error: 'Protection status loading is unavailable.',
-    })
     expect(
-      Object.prototype.hasOwnProperty.call(store.getter(sheetProtectionAtom), 'sheet-unsupported'),
-    ).toBe(false)
-    expect(store.getter(sheetProtectionLoadStateAtom).phase).not.toBe('ready')
+      store.setter(protectSheetAtom, { sheetId: 'sheet-1', unlockedRanges: [TARGET_RANGE] }),
+    ).toBe('committed')
+    expect(store.getter(sheetProtectionAtom)['sheet-1']).toEqual({
+      mode: 'protected',
+      unlockedRanges: [TARGET_RANGE],
+    })
+
+    expect(
+      store.setter(protectSheetAtom, {
+        sheetId: 'sheet-1',
+        unlockedRanges: [{ rowStart: -1, rowEnd: 0, colStart: 0, colEnd: 0 }],
+      }),
+    ).toBe('invalid')
+    expect(store.setter(protectSheetAtom, { sheetId: '' })).toBe('invalid')
+    expect(store.getter(sheetProtectionAtom)['sheet-1'].unlockedRanges).toEqual([TARGET_RANGE])
   })
 
-  test('reports read failure and retains the previous canonical sheet snapshot', async () => {
+  test('unprotectSheet opens the sheet, preserves ranges, and is unchanged when open', () => {
     const store = createStore()
-    const oldCanonical: SheetProtectionState = {
-      mode: 'protected',
-      unlockedRanges: [copyRange(TARGET_RANGE)],
-    }
-    store.setter(setSheetProtectionAtom, { sheetId: 'sheet-1', state: oldCanonical })
+    expect(store.setter(unprotectSheetAtom, { sheetId: 'sheet-1' })).toBe('unchanged')
 
-    store.setter(loadSheetProtectionAtom, {
-      sheetId: 'sheet-1',
-      readSheetProtection: async () => {
-        throw new Error('Workbook read failed')
-      },
+    store.setter(protectSheetAtom, { sheetId: 'sheet-1', unlockedRanges: [TARGET_RANGE] })
+    expect(store.setter(unprotectSheetAtom, { sheetId: 'sheet-1' })).toBe('committed')
+    expect(store.getter(sheetProtectionAtom)['sheet-1']).toEqual({
+      mode: 'open',
+      unlockedRanges: [TARGET_RANGE],
     })
-    await flushAsyncWork()
+    expect(store.setter(unprotectSheetAtom, { sheetId: 'sheet-1' })).toBe('unchanged')
 
-    expect(store.getter(sheetProtectionLoadStateAtom)).toMatchObject({
-      phase: 'error',
-      sheetId: 'sheet-1',
-      requestId: 1,
-      revision: null,
-      pending: false,
-      error: 'Workbook read failed',
-    })
-    expect(store.getter(sheetProtectionAtom)['sheet-1']).toEqual(oldCanonical)
+    // Re-protect restores enforcement with the preserved allow-edit ranges.
+    expect(store.setter(protectSheetAtom, { sheetId: 'sheet-1' })).toBe('committed')
+    expect(store.getter(sheetProtectionAtom)['sheet-1'].mode).toBe('protected')
+    expect(store.getter(sheetProtectionAtom)['sheet-1'].unlockedRanges).toEqual([TARGET_RANGE])
+  })
+})
+
+describe('unlocked-range commands', () => {
+  test('adds and removes unlocked ranges with outcome semantics', () => {
+    const store = createStore()
+    store.setter(protectSheetAtom, { sheetId: 'sheet-1' })
+
+    expect(store.setter(addUnlockedRangeAtom, { sheetId: 'sheet-1', range: TARGET_RANGE })).toBe(
+      'committed',
+    )
+    expect(store.getter(sheetProtectionAtom)['sheet-1'].unlockedRanges).toEqual([TARGET_RANGE])
+    // Already editable — including any sub-range of an existing entry.
+    expect(store.setter(addUnlockedRangeAtom, { sheetId: 'sheet-1', range: TARGET_RANGE })).toBe(
+      'unchanged',
+    )
+    expect(
+      store.setter(addUnlockedRangeAtom, {
+        sheetId: 'sheet-1',
+        range: { rowStart: 3, rowEnd: 3, colStart: 4, colEnd: 4 },
+      }),
+    ).toBe('unchanged')
+
+    expect(
+      store.setter(removeUnlockedRangeAtom, { sheetId: 'sheet-1', range: TARGET_RANGE }),
+    ).toBe('committed')
+    expect(store.getter(sheetProtectionAtom)['sheet-1'].unlockedRanges).toEqual([])
+    expect(
+      store.setter(removeUnlockedRangeAtom, { sheetId: 'sheet-1', range: TARGET_RANGE }),
+    ).toBe('unchanged')
   })
 
-  test.each([
-    [
-      'requestId',
-      (request: ReadSheetProtectionRequest) => ({
-        ...canonicalResult(request, { mode: 'open', unlockedRanges: [] }),
-        requestId: request.requestId + 1,
-      }),
-    ],
-    [
-      'sheetId',
-      (request: ReadSheetProtectionRequest) => ({
-        ...canonicalResult(request, { mode: 'open', unlockedRanges: [] }),
-        sheetId: 'another-sheet',
-      }),
-    ],
-    [
-      'revision',
-      (request: ReadSheetProtectionRequest) => ({
-        ...canonicalResult(request, { mode: 'open', unlockedRanges: [] }),
-        revision: '   ',
-      }),
-    ],
-  ] as const)(
-    'rejects a response with mismatched %s and retains old canonical',
-    async (_, make) => {
-      const store = createStore()
-      const oldCanonical: SheetProtectionState = {
-        mode: 'protected',
-        unlockedRanges: [],
-      }
-      store.setter(setSheetProtectionAtom, { sheetId: 'sheet-1', state: oldCanonical })
-      store.setter(loadSheetProtectionAtom, {
-        sheetId: 'sheet-1',
-        readSheetProtection: async (request) => make(request) as ReadSheetProtectionResult,
-      })
-      await flushAsyncWork()
-
-      expect(store.getter(sheetProtectionLoadStateAtom)).toMatchObject({
-        phase: 'error',
-        sheetId: 'sheet-1',
-        pending: false,
-        error: 'Protection status response did not match the request.',
-      })
-      expect(store.getter(sheetProtectionAtom)['sheet-1']).toEqual(oldCanonical)
-    },
-  )
-
-  test('rejects more than 256 backend ranges and retains old canonical', async () => {
+  test('add reports unchanged on an open sheet and invalid at the range cap', () => {
     const store = createStore()
-    const oldCanonical: SheetProtectionState = {
-      mode: 'protected',
-      unlockedRanges: [copyRange(TARGET_RANGE)],
-    }
-    const tooManyRanges = Array.from({ length: MAX_UNLOCKED_RANGES + 1 }, (_, row) => ({
+    // Open sheets are fully editable — nothing to unlock.
+    expect(store.setter(addUnlockedRangeAtom, { sheetId: 'sheet-1', range: TARGET_RANGE })).toBe(
+      'unchanged',
+    )
+
+    const ranges = Array.from({ length: MAX_UNLOCKED_RANGES }, (_, row) => ({
       rowStart: row,
       rowEnd: row,
       colStart: 0,
       colEnd: 0,
     }))
-    store.setter(setSheetProtectionAtom, { sheetId: 'sheet-1', state: oldCanonical })
-
-    store.setter(loadSheetProtectionAtom, {
-      sheetId: 'sheet-1',
-      readSheetProtection: async (request) =>
-        canonicalResult(request, { mode: 'protected', unlockedRanges: tooManyRanges }),
+    store.setter(setSheetProtectionAtom, {
+      sheetId: 'sheet-cap',
+      state: { mode: 'protected', unlockedRanges: ranges },
     })
-    await flushAsyncWork()
-
-    expect(store.getter(sheetProtectionLoadStateAtom)).toMatchObject({
-      phase: 'error',
-      sheetId: 'sheet-1',
-      pending: false,
-      error: 'Protection status response did not match the request.',
-    })
-    expect(store.getter(sheetProtectionAtom)['sheet-1']).toEqual(oldCanonical)
+    expect(
+      store.setter(addUnlockedRangeAtom, {
+        sheetId: 'sheet-cap',
+        range: {
+          rowStart: MAX_UNLOCKED_RANGES,
+          rowEnd: MAX_UNLOCKED_RANGES,
+          colStart: 0,
+          colEnd: 0,
+        },
+      }),
+    ).toBe('invalid')
+    expect(store.getter(sheetProtectionAtom)['sheet-cap'].unlockedRanges).toHaveLength(
+      MAX_UNLOCKED_RANGES,
+    )
   })
 
-  test.each(['__proto__', 'constructor', 'toString'])(
-    'loads the legal sheet id %s as an own canonical map key',
-    async (sheetId) => {
-      const store = createStore()
-      store.setter(loadSheetProtectionAtom, {
-        sheetId,
-        readSheetProtection: async (request) =>
-          canonicalResult(request, {
-            mode: 'protected',
-            unlockedRanges: [copyRange(TARGET_RANGE)],
-          }),
-      })
-      await flushAsyncWork()
-
-      const canonical = store.getter(sheetProtectionAtom)
-      expect(Object.prototype.hasOwnProperty.call(canonical, sheetId)).toBe(true)
-      expect(canonical[sheetId]).toEqual({
-        mode: 'protected',
-        unlockedRanges: [TARGET_RANGE],
-      })
-      expect(store.getter(sheetProtectionLoadStateAtom)).toMatchObject({
-        phase: 'ready',
-        sheetId,
-      })
-    },
-  )
+  test('rejects malformed ranges before touching state', () => {
+    const store = createStore()
+    store.setter(protectSheetAtom, { sheetId: 'sheet-1' })
+    for (const range of [
+      { rowStart: -1, rowEnd: 1, colStart: 0, colEnd: 1 },
+      { rowStart: 0.5, rowEnd: 1, colStart: 0, colEnd: 1 },
+      { rowStart: 2, rowEnd: 1, colStart: 0, colEnd: 1 },
+      { rowStart: 0, rowEnd: 1, colStart: 2, colEnd: 1 },
+    ]) {
+      expect(store.setter(addUnlockedRangeAtom, { sheetId: 'sheet-1', range })).toBe('invalid')
+      expect(store.setter(removeUnlockedRangeAtom, { sheetId: 'sheet-1', range })).toBe('invalid')
+    }
+    expect(store.getter(sheetProtectionAtom)['sheet-1'].unlockedRanges).toEqual([])
+  })
 })
 
-describe('workbook restore protection refresh', () => {
-  test('clears every cached sheet and reloads the restored current sheet exactly once', async () => {
+describe('protection never records undo history', () => {
+  test('protect, unlock, and clear commands leave the history stack empty', () => {
     const store = createStore()
-    store.setter(selectionAtom, {
-      kind: 'cell',
-      sheetId: 'sheet-current',
-      anchor: { row: 0, col: 0 },
-      focus: { row: 0, col: 0 },
-    })
+    store.setter(protectSheetAtom, { sheetId: 'sheet-1' })
+    store.setter(addUnlockedRangeAtom, { sheetId: 'sheet-1', range: TARGET_RANGE })
+    store.setter(removeUnlockedRangeAtom, { sheetId: 'sheet-1', range: TARGET_RANGE })
+    store.setter(unprotectSheetAtom, { sheetId: 'sheet-1' })
+    store.setter(clearSheetProtectionAtom, 'sheet-1')
+    store.setter(openProtectionUnlockAtom, { sheetId: 'sheet-1', range: TARGET_RANGE })
+    store.setter(submitProtectionUnlockAtom)
+
+    expect(store.getter(historyStackAtom).entries).toHaveLength(0)
+  })
+})
+
+describe('persistence mirror (fire-and-forget)', () => {
+  test('full-state commands mirror the committed snapshot via setSheetProtection', async () => {
+    const store = createStore()
+    const port = createRecordingPort()
+
     store.setter(setSheetProtectionAtom, {
-      sheetId: 'sheet-current',
-      state: { mode: 'protected', unlockedRanges: [] },
+      sheetId: 'sheet-1',
+      state: { mode: 'protected', unlockedRanges: [TARGET_RANGE] },
+      source: port,
     })
-    store.setter(setSheetProtectionAtom, {
-      sheetId: 'sheet-stale',
-      state: { mode: 'protected', unlockedRanges: [copyRange(TARGET_RANGE)] },
-    })
-    const readSheetProtection = jest.fn<ReadSheetProtectionPort>(async (request) =>
-      canonicalResult(
-        request,
-        { mode: 'protected', unlockedRanges: [copyRange(TARGET_RANGE)] },
-        'restored-revision',
-      ),
-    )
-
-    store.setter(applyWorkbookRestoredProtectionAtom, {
-      restored: {
-        kind: 'workbook-restored',
-        sheetIds: ['sheet-current', 'sheet-restored'],
-      },
-      readSheetProtection,
-    })
-
-    expect(store.getter(sheetProtectionAtom)).toEqual({})
-    expect(readSheetProtection).toHaveBeenCalledTimes(1)
-    expect(readSheetProtection.mock.calls[0][0]).toEqual({
-      kind: 'read-sheet-protection',
-      sheetId: 'sheet-current',
-      requestId: 1,
-    })
-    expect(store.getter(sheetProtectionLoadStateAtom)).toMatchObject({
-      phase: 'loading',
-      sheetId: 'sheet-current',
-      requestId: 1,
-      pending: true,
-    })
-
+    store.setter(unprotectSheetAtom, { sheetId: 'sheet-1', source: port })
+    store.setter(clearSheetProtectionAtom, { sheetId: 'sheet-1', source: port })
     await flushAsyncWork()
 
-    expect(store.getter(sheetProtectionAtom)).toEqual({
-      'sheet-current': {
+    expect(port.sheetProtectionRequests).toEqual([
+      {
+        kind: 'set-sheet-protection',
+        sheetId: 'sheet-1',
         mode: 'protected',
         unlockedRanges: [TARGET_RANGE],
       },
-    })
-    expect(store.getter(sheetProtectionLoadStateAtom)).toMatchObject({
-      phase: 'ready',
-      sheetId: 'sheet-current',
-      revision: 'restored-revision',
-      pending: false,
-    })
+      {
+        kind: 'set-sheet-protection',
+        sheetId: 'sheet-1',
+        mode: 'open',
+        unlockedRanges: [TARGET_RANGE],
+      },
+      { kind: 'set-sheet-protection', sheetId: 'sheet-1', mode: 'open', unlockedRanges: [] },
+    ])
+    expect(port.rangeLockRequests).toHaveLength(0)
   })
 
-  test('leaves the load idle when restore removes the selected sheet and ignores the old read', async () => {
+  test('range commands prefer setRangeLock and fall back to setSheetProtection', async () => {
     const store = createStore()
-    store.setter(selectionAtom, {
-      kind: 'cell',
-      sheetId: 'sheet-removed',
-      anchor: { row: 0, col: 0 },
-      focus: { row: 0, col: 0 },
+    const withRangeLock = createRecordingPort()
+    store.setter(protectSheetAtom, { sheetId: 'sheet-1', source: withRangeLock })
+    store.setter(addUnlockedRangeAtom, {
+      sheetId: 'sheet-1',
+      range: TARGET_RANGE,
+      source: withRangeLock,
     })
-    store.setter(setSheetProtectionAtom, {
-      sheetId: 'sheet-removed',
-      state: { mode: 'protected', unlockedRanges: [] },
+    store.setter(removeUnlockedRangeAtom, {
+      sheetId: 'sheet-1',
+      range: TARGET_RANGE,
+      source: withRangeLock,
     })
-    const staleRead = deferred<ReadSheetProtectionResult>()
-    const requests: ReadSheetProtectionRequest[] = []
-    const readSheetProtection: ReadSheetProtectionPort = (request) => {
-      requests.push(request)
-      return staleRead.promise
-    }
-    store.setter(loadSheetProtectionAtom, {
-      sheetId: 'sheet-removed',
-      readSheetProtection,
-    })
-
-    store.setter(applyWorkbookRestoredProtectionAtom, {
-      restored: { kind: 'workbook-restored', sheetIds: ['sheet-survivor'] },
-      readSheetProtection,
-    })
-
-    expect(requests).toHaveLength(1)
-    expect(store.getter(sheetProtectionAtom)).toEqual({})
-    expect(store.getter(sheetProtectionLoadStateAtom)).toEqual({
-      phase: 'idle',
-      sheetId: null,
-      requestId: null,
-      revision: null,
-      pending: false,
-      error: null,
-    })
-
-    staleRead.resolve(
-      canonicalResult(
-        requests[0],
-        { mode: 'protected', unlockedRanges: [copyRange(TARGET_RANGE)] },
-        'stale-revision',
-      ),
-    )
     await flushAsyncWork()
+    expect(withRangeLock.rangeLockRequests).toEqual([
+      { kind: 'set-range-lock', sheetId: 'sheet-1', range: TARGET_RANGE, locked: false },
+      { kind: 'set-range-lock', sheetId: 'sheet-1', range: TARGET_RANGE, locked: true },
+    ])
+    // protectSheet is a full-state mirror; the range deltas are not.
+    expect(withRangeLock.sheetProtectionRequests).toHaveLength(1)
 
-    expect(store.getter(sheetProtectionAtom)).toEqual({})
-    expect(store.getter(sheetProtectionLoadStateAtom).phase).toBe('idle')
-  })
-
-  test('uses the existing unsupported state when the restored current sheet has no read port', () => {
-    const store = createStore()
-    store.setter(selectionAtom, {
-      kind: 'cell',
-      sheetId: 'sheet-current',
-      anchor: { row: 0, col: 0 },
-      focus: { row: 0, col: 0 },
+    const fallbackOnly = createRecordingPort({ withSetRangeLock: false })
+    store.setter(protectSheetAtom, { sheetId: 'sheet-2', source: fallbackOnly })
+    store.setter(addUnlockedRangeAtom, {
+      sheetId: 'sheet-2',
+      range: TARGET_RANGE,
+      source: fallbackOnly,
     })
-    store.setter(setSheetProtectionAtom, {
-      sheetId: 'sheet-current',
-      state: { mode: 'protected', unlockedRanges: [] },
-    })
-
-    store.setter(applyWorkbookRestoredProtectionAtom, {
-      restored: { kind: 'workbook-restored', sheetIds: ['sheet-current'] },
-    })
-
-    expect(store.getter(sheetProtectionAtom)).toEqual({})
-    expect(store.getter(sheetProtectionLoadStateAtom)).toEqual({
-      phase: 'unsupported',
-      sheetId: 'sheet-current',
-      requestId: null,
-      revision: null,
-      pending: false,
-      error: 'Protection status loading is unavailable.',
-    })
-  })
-
-  test('keeps only the newest rapid-restore read result', async () => {
-    const store = createStore()
-    store.setter(selectionAtom, {
-      kind: 'cell',
-      sheetId: 'sheet-current',
-      anchor: { row: 0, col: 0 },
-      focus: { row: 0, col: 0 },
-    })
-    const reads = [deferred<ReadSheetProtectionResult>(), deferred<ReadSheetProtectionResult>()]
-    const requests: ReadSheetProtectionRequest[] = []
-    const readSheetProtection: ReadSheetProtectionPort = (request) => {
-      const response = reads[requests.length]
-      requests.push(request)
-      return response.promise
-    }
-
-    store.setter(applyWorkbookRestoredProtectionAtom, {
-      restored: { kind: 'workbook-restored', sheetIds: ['sheet-current'] },
-      readSheetProtection,
-    })
-    store.setter(applyWorkbookRestoredProtectionAtom, {
-      restored: { kind: 'workbook-restored', sheetIds: ['sheet-current'] },
-      readSheetProtection,
-    })
-
-    expect(requests.map(({ requestId }) => requestId)).toEqual([1, 2])
-    reads[1].resolve(
-      canonicalResult(
-        requests[1],
-        { mode: 'protected', unlockedRanges: [copyRange(TARGET_RANGE)] },
-        'newest-revision',
-      ),
-    )
     await flushAsyncWork()
-    reads[0].resolve(
-      canonicalResult(requests[0], { mode: 'open', unlockedRanges: [] }, 'stale-revision'),
-    )
-    await flushAsyncWork()
-
-    expect(store.getter(sheetProtectionAtom)['sheet-current']).toEqual({
+    expect(fallbackOnly.rangeLockRequests).toHaveLength(0)
+    expect(fallbackOnly.sheetProtectionRequests[1]).toEqual({
+      kind: 'set-sheet-protection',
+      sheetId: 'sheet-2',
       mode: 'protected',
       unlockedRanges: [TARGET_RANGE],
     })
-    expect(store.getter(sheetProtectionLoadStateAtom)).toMatchObject({
-      phase: 'ready',
-      requestId: 2,
-      revision: 'newest-revision',
-      pending: false,
+  })
+
+  test('a mirror failure records a diagnostic and never rolls back local state', async () => {
+    const store = createStore()
+    const failing: SheetProtectionPersistencePort = {
+      setSheetProtection: async () => {
+        throw new Error('Transport lost')
+      },
+    }
+
+    expect(
+      store.setter(protectSheetAtom, { sheetId: 'sheet-1', source: failing }),
+    ).toBe('committed')
+    await flushAsyncWork()
+
+    expect(store.getter(sheetProtectionAtom)['sheet-1'].mode).toBe('protected')
+    expect(store.getter(sheetProtectionDiagnosticAtom)).toEqual({
+      kind: 'persist-failed',
+      sheetId: 'sheet-1',
+      message: 'Transport lost',
     })
   })
 
-  test('reports the new read error after clearing restored protection state', async () => {
+  test('commands commit without any port and record no diagnostic', () => {
     const store = createStore()
-    store.setter(selectionAtom, {
-      kind: 'cell',
-      sheetId: 'sheet-current',
-      anchor: { row: 0, col: 0 },
-      focus: { row: 0, col: 0 },
-    })
-    store.setter(setSheetProtectionAtom, {
-      sheetId: 'sheet-current',
-      state: { mode: 'protected', unlockedRanges: [copyRange(TARGET_RANGE)] },
-    })
+    expect(store.setter(protectSheetAtom, { sheetId: 'sheet-1' })).toBe('committed')
+    expect(
+      store.setter(addUnlockedRangeAtom, { sheetId: 'sheet-1', range: TARGET_RANGE }),
+    ).toBe('committed')
+    expect(store.getter(sheetProtectionDiagnosticAtom)).toBeNull()
+  })
 
-    store.setter(applyWorkbookRestoredProtectionAtom, {
-      restored: { kind: 'workbook-restored', sheetIds: ['sheet-current'] },
-      readSheetProtection: async () => {
-        throw new Error('Restored workbook protection read failed')
-      },
-    })
+  test('unchanged and invalid outcomes never reach the mirror', async () => {
+    const store = createStore()
+    const port = createRecordingPort()
+    store.setter(protectSheetAtom, { sheetId: 'sheet-1' })
+
+    expect(store.setter(protectSheetAtom, { sheetId: 'sheet-1', source: port })).toBe('unchanged')
+    expect(
+      store.setter(addUnlockedRangeAtom, {
+        sheetId: 'sheet-1',
+        range: { rowStart: 1, rowEnd: 0, colStart: 0, colEnd: 0 },
+        source: port,
+      }),
+    ).toBe('invalid')
     await flushAsyncWork()
 
-    expect(store.getter(sheetProtectionAtom)).toEqual({})
-    expect(store.getter(sheetProtectionLoadStateAtom)).toMatchObject({
-      phase: 'error',
-      sheetId: 'sheet-current',
-      requestId: 1,
-      revision: null,
-      pending: false,
-      error: 'Restored workbook protection read failed',
+    expect(port.sheetProtectionRequests).toHaveLength(0)
+    expect(port.rangeLockRequests).toHaveLength(0)
+  })
+})
+
+describe('one-shot hydration seed', () => {
+  function readPort(
+    protection: SheetProtectionState,
+    requests: ReadSheetProtectionRequest[] = [],
+  ): SheetProtectionPersistencePort {
+    return {
+      readSheetProtection: async (request) => {
+        requests.push(request)
+        return {
+          kind: 'read-sheet-protection',
+          requestId: request.requestId,
+          sheetId: request.sheetId,
+          revision: 1,
+          protection,
+        }
+      },
+    }
+  }
+
+  test('hydrates a sheet once and skips afterwards', async () => {
+    const store = createStore()
+    const requests: ReadSheetProtectionRequest[] = []
+    const source = readPort({ mode: 'protected', unlockedRanges: [TARGET_RANGE] }, requests)
+
+    const hydrate = () => store.setter(hydrateSheetProtectionAtom, { sheetId: 'sheet-1', source })
+    await expect(hydrate()).resolves.toBe('hydrated')
+    expect(store.getter(sheetProtectionAtom)['sheet-1']).toEqual({
+      mode: 'protected',
+      unlockedRanges: [TARGET_RANGE],
     })
+    await expect(hydrate()).resolves.toBe('skipped')
+    expect(requests).toHaveLength(1)
+  })
+
+  test('reports unsupported without a read port and never manufactures state', async () => {
+    const store = createStore()
+    await expect(
+      store.setter(hydrateSheetProtectionAtom, { sheetId: 'sheet-1', source: {} }),
+    ).resolves.toBe('unsupported')
+    expect(store.getter(sheetProtectionAtom)).toEqual({})
+    expect(store.getter(sheetProtectionDiagnosticAtom)).toBeNull()
+  })
+
+  test('a local command claims the sheet; the seed is skipped even mid-flight', async () => {
+    const store = createStore()
+    const read = deferred<ReadSheetProtectionResult>()
+    const source: SheetProtectionPersistencePort = {
+      readSheetProtection: () => read.promise,
+    }
+
+    const hydration = store.setter(hydrateSheetProtectionAtom, { sheetId: 'sheet-1', source })
+    store.setter(protectSheetAtom, { sheetId: 'sheet-1', unlockedRanges: [TARGET_RANGE] })
+    read.resolve({
+      kind: 'read-sheet-protection',
+      requestId: 1,
+      sheetId: 'sheet-1',
+      revision: 9,
+      protection: { mode: 'open', unlockedRanges: [] },
+    })
+    await expect(hydration).resolves.toBe('skipped')
+
+    expect(store.getter(sheetProtectionAtom)['sheet-1']).toEqual({
+      mode: 'protected',
+      unlockedRanges: [TARGET_RANGE],
+    })
+  })
+
+  test('a locally owned sheet is never re-read', async () => {
+    const store = createStore()
+    const requests: ReadSheetProtectionRequest[] = []
+    const source = readPort({ mode: 'open', unlockedRanges: [] }, requests)
+    store.setter(protectSheetAtom, { sheetId: 'sheet-1' })
+
+    const hydrate = () => store.setter(hydrateSheetProtectionAtom, { sheetId: 'sheet-1', source })
+    await expect(hydrate()).resolves.toBe('skipped')
+    expect(requests).toHaveLength(0)
+    expect(store.getter(sheetProtectionAtom)['sheet-1'].mode).toBe('protected')
+  })
+
+  test.each([
+    ['mismatched sheetId', { sheetId: 'other-sheet' }],
+    ['invalid mode', { protection: { mode: 'locked', unlockedRanges: [] } }],
+    [
+      'over-cap ranges',
+      {
+        protection: {
+          mode: 'protected',
+          unlockedRanges: Array.from({ length: MAX_UNLOCKED_RANGES + 1 }, (_, row) => ({
+            rowStart: row,
+            rowEnd: row,
+            colStart: 0,
+            colEnd: 0,
+          })),
+        },
+      },
+    ],
+  ] as const)('rejects an invalid payload (%s) with a diagnostic', async (_label, overrides) => {
+    const store = createStore()
+    const source: SheetProtectionPersistencePort = {
+      readSheetProtection: async (request) =>
+        ({
+          kind: 'read-sheet-protection',
+          requestId: request.requestId,
+          sheetId: request.sheetId,
+          revision: 1,
+          protection: { mode: 'open', unlockedRanges: [] },
+          ...overrides,
+        }) as ReadSheetProtectionResult,
+    }
+    const hydrate = () => store.setter(hydrateSheetProtectionAtom, { sheetId: 'sheet-1', source })
+    await expect(hydrate()).resolves.toBe('error')
+    expect(store.getter(sheetProtectionAtom)).toEqual({})
+    expect(store.getter(sheetProtectionDiagnosticAtom)).toMatchObject({
+      kind: 'hydrate-failed',
+      sheetId: 'sheet-1',
+    })
+  })
+
+  test('a read failure reports error and leaves the sheet unclaimed for a retry', async () => {
+    const store = createStore()
+    let calls = 0
+    const source: SheetProtectionPersistencePort = {
+      readSheetProtection: async (request) => {
+        calls += 1
+        if (calls === 1) throw new Error('Worker restarting')
+        return {
+          kind: 'read-sheet-protection',
+          requestId: request.requestId,
+          sheetId: request.sheetId,
+          revision: 1,
+          protection: { mode: 'protected', unlockedRanges: [] },
+        }
+      },
+    }
+
+    const hydrate = () => store.setter(hydrateSheetProtectionAtom, { sheetId: 'sheet-1', source })
+    await expect(hydrate()).resolves.toBe('error')
+    expect(store.getter(sheetProtectionDiagnosticAtom)).toEqual({
+      kind: 'hydrate-failed',
+      sheetId: 'sheet-1',
+      message: 'Worker restarting',
+    })
+    await expect(hydrate()).resolves.toBe('hydrated')
+    expect(store.getter(sheetProtectionAtom)['sheet-1'].mode).toBe('protected')
   })
 })
 
@@ -949,7 +866,12 @@ describe('unlock dialog state commands', () => {
     expect(store.getter(protectionUnlockPasswordAtom)).toBe('password')
 
     store.setter(closeProtectionUnlockAtom)
-    expect(store.getter(protectionUnlockStateAtom)).toEqual(DEFAULT_PROTECTION_UNLOCK_STATE)
+    expect(store.getter(protectionUnlockStateAtom)).toMatchObject({
+      phase: 'closed',
+      isOpen: false,
+      target: null,
+      error: null,
+    })
     expect(store.getter(protectionUnlockPasswordAtom)).toBe('')
   })
 
@@ -981,120 +903,148 @@ describe('unlock dialog state commands', () => {
     expect(Object.isFrozen(state.target?.range)).toBe(true)
   })
 
-  test('keeps form and request identity isolated between stores', async () => {
+  test('keeps dialog sessions isolated between stores', () => {
     const first = createStore()
     const second = createStore()
     openLockedRange(first)
     openLockedRange(second)
     first.setter(setProtectionUnlockPasswordAtom, 'first')
 
-    const requests: CorrelatedSetRangeLockRequest[] = []
-    const setRangeLock: SetRangeLockPort = async (request) => {
-      requests.push(request)
-      return acknowledged(request)
-    }
-    first.setter(submitProtectionUnlockAtom, {
-      setRangeLock,
-      readSheetProtection: unlockedCanonicalRead(),
-    })
-    second.setter(submitProtectionUnlockAtom, {
-      setRangeLock,
-      readSheetProtection: unlockedCanonicalRead(),
-    })
-    await flushAsyncWork()
-
-    expect(requests.map((request) => request.requestId)).toEqual([1, 1])
-    expect(first.getter(protectionUnlockPasswordAtom)).toBe('')
+    first.setter(submitProtectionUnlockAtom)
+    expect(first.getter(protectionUnlockStateAtom).phase).toBe('closed')
+    expect(second.getter(protectionUnlockStateAtom).phase).toBe('editing')
     expect(second.getter(protectionUnlockPasswordAtom)).toBe('')
   })
 })
 
-describe('unlock capability and verification gates', () => {
-  test('requires set and canonical read before verifier or mutation runs', () => {
+describe('unlock local commit', () => {
+  test('confirms synchronously without a verifier, unlocks the range, and closes', () => {
     const store = createStore()
     openLockedRange(store)
-    const verifySheetProtection = jest.fn(async () => ({ ok: true }))
-    const setRangeLock = jest.fn<SetRangeLockPort>()
+    expect(store.getter(selectionLockedAtom)).toBeDefined()
 
-    store.setter(submitProtectionUnlockAtom, {
-      verifySheetProtection,
-      setRangeLock,
-    })
+    store.setter(submitProtectionUnlockAtom)
 
-    expect(verifySheetProtection).not.toHaveBeenCalled()
-    expect(setRangeLock).not.toHaveBeenCalled()
-    expect(store.getter(protectionUnlockStateAtom)).toMatchObject({
-      phase: 'editing',
-      pending: false,
-      error: 'Protection editing and status refresh are unavailable.',
+    expect(store.getter(protectionUnlockStateAtom).phase).toBe('closed')
+    expect(store.getter(sheetProtectionAtom)['sheet-1']).toEqual({
+      mode: 'protected',
+      unlockedRanges: [TARGET_RANGE],
     })
+    expect(isRangeFullyUnlocked(store.getter(sheetProtectionAtom), 'sheet-1', TARGET_RANGE)).toBe(
+      true,
+    )
   })
 
-  test('rejects a target without a range before invoking any port', () => {
+  test('mirrors the committed unlock through setRangeLock fire-and-forget', async () => {
     const store = createStore()
+    const port = createRecordingPort()
+    openLockedRange(store)
+
+    store.setter(submitProtectionUnlockAtom, { source: port })
+    await flushAsyncWork()
+
+    expect(port.rangeLockRequests).toEqual([
+      { kind: 'set-range-lock', sheetId: 'sheet-1', range: TARGET_RANGE, locked: false },
+    ])
+    expect(store.getter(protectionUnlockStateAtom).phase).toBe('closed')
+  })
+
+  test('an already-editable target closes without growing the range list', () => {
+    const store = createStore()
+    store.setter(protectSheetAtom, { sheetId: 'sheet-1', unlockedRanges: [TARGET_RANGE] })
+    store.setter(openProtectionUnlockAtom, { sheetId: 'sheet-1', range: TARGET_RANGE })
+
+    store.setter(submitProtectionUnlockAtom)
+
+    expect(store.getter(protectionUnlockStateAtom).phase).toBe('closed')
+    expect(store.getter(sheetProtectionAtom)['sheet-1'].unlockedRanges).toEqual([TARGET_RANGE])
+  })
+
+  test('a cap violation keeps the dialog editing with an error', () => {
+    const store = createStore()
+    const ranges = Array.from({ length: MAX_UNLOCKED_RANGES }, (_, row) => ({
+      rowStart: row,
+      rowEnd: row,
+      colStart: 0,
+      colEnd: 0,
+    }))
+    store.setter(setSheetProtectionAtom, {
+      sheetId: 'sheet-1',
+      state: { mode: 'protected', unlockedRanges: ranges },
+    })
+    store.setter(openProtectionUnlockAtom, {
+      sheetId: 'sheet-1',
+      range: { rowStart: MAX_UNLOCKED_RANGES, rowEnd: MAX_UNLOCKED_RANGES, colStart: 0, colEnd: 0 },
+    })
+
+    store.setter(submitProtectionUnlockAtom)
+
+    expect(store.getter(protectionUnlockStateAtom)).toMatchObject({
+      phase: 'editing',
+      error: `Cannot unlock more than ${MAX_UNLOCKED_RANGES} ranges on one sheet.`,
+    })
+    expect(store.getter(sheetProtectionAtom)['sheet-1'].unlockedRanges).toHaveLength(
+      MAX_UNLOCKED_RANGES,
+    )
+  })
+
+  test('rejects a target without a range before committing anything', () => {
+    const store = createStore()
+    store.setter(setSheetProtectionAtom, {
+      sheetId: 'sheet-1',
+      state: { mode: 'protected', unlockedRanges: [] },
+    })
     store.setter(openProtectionUnlockAtom, { sheetId: 'sheet-1' })
-    const setRangeLock = jest.fn<SetRangeLockPort>()
-    const readSheetProtection = jest.fn<ReadSheetProtectionPort>()
-    store.setter(submitProtectionUnlockAtom, { setRangeLock, readSheetProtection })
 
-    expect(setRangeLock).not.toHaveBeenCalled()
-    expect(readSheetProtection).not.toHaveBeenCalled()
-    expect(store.getter(protectionUnlockStateAtom).error).toBe('Select a range to unlock.')
-  })
+    store.setter(submitProtectionUnlockAtom)
 
-  test.each([
-    ['negative coordinate', { rowStart: -1, rowEnd: 1, colStart: 0, colEnd: 1 }],
-    ['fractional coordinate', { rowStart: 0.5, rowEnd: 1, colStart: 0, colEnd: 1 }],
-    [
-      'unsafe coordinate',
-      { rowStart: 0, rowEnd: Number.MAX_SAFE_INTEGER + 1, colStart: 0, colEnd: 1 },
-    ],
-    ['reversed rows', { rowStart: 2, rowEnd: 1, colStart: 0, colEnd: 1 }],
-    ['reversed columns', { rowStart: 0, rowEnd: 1, colStart: 2, colEnd: 1 }],
-  ])('rejects an ordinary invalid range (%s) before invoking any port', (_label, range) => {
-    const store = createStore()
-    openLockedRange(store, 'sheet-1', range)
-    const verifySheetProtection = jest.fn<VerifySheetProtectionPort>()
-    const setRangeLock = jest.fn<SetRangeLockPort>()
-    const readSheetProtection = jest.fn<ReadSheetProtectionPort>()
-
-    store.setter(submitProtectionUnlockAtom, {
-      verifySheetProtection,
-      setRangeLock,
-      readSheetProtection,
-    })
-
-    expect(verifySheetProtection).not.toHaveBeenCalled()
-    expect(setRangeLock).not.toHaveBeenCalled()
-    expect(readSheetProtection).not.toHaveBeenCalled()
     expect(store.getter(protectionUnlockStateAtom)).toMatchObject({
       phase: 'editing',
-      error: 'Select a valid range to unlock.',
+      error: 'Select a range to unlock.',
     })
+    expect(store.getter(sheetProtectionAtom)['sheet-1'].unlockedRanges).toEqual([])
   })
+})
 
-  test('verification rejection remains Editing and never mutates', async () => {
+describe('unlock verification session', () => {
+  test('a passing verifier receives the typed password and commits the unlock', async () => {
     const store = createStore()
     openLockedRange(store)
-    const setRangeLock = jest.fn<SetRangeLockPort>()
+    store.setter(setProtectionUnlockPasswordAtom, 'workbook-password')
+    const verifySheetProtection = jest.fn<VerifySheetProtectionPort>(async () => ({ ok: true }))
+
+    store.setter(submitProtectionUnlockAtom, { verifySheetProtection })
+    expect(store.getter(protectionUnlockPhaseAtom)).toBe('verifying')
+    expect(store.getter(protectionUnlockStateAtom).pending).toBe(true)
+    await flushAsyncWork()
+
+    expect(verifySheetProtection).toHaveBeenCalledWith({
+      sheetId: 'sheet-1',
+      range: TARGET_RANGE,
+      password: 'workbook-password',
+    })
+    expect(store.getter(protectionUnlockStateAtom).phase).toBe('closed')
+    expect(isRangeFullyUnlocked(store.getter(sheetProtectionAtom), 'sheet-1', TARGET_RANGE)).toBe(
+      true,
+    )
+  })
+
+  test('verification rejection remains Editing and never commits', async () => {
+    const store = createStore()
+    openLockedRange(store)
     const verifySheetProtection: VerifySheetProtectionPort = async () => ({
       ok: false,
       message: 'Incorrect password',
     })
-    store.setter(submitProtectionUnlockAtom, {
-      verifySheetProtection,
-      setRangeLock,
-      readSheetProtection: unlockedCanonicalRead(),
-    })
-    expect(store.getter(protectionUnlockPhaseAtom)).toBe('verifying')
+
+    store.setter(submitProtectionUnlockAtom, { verifySheetProtection })
     await flushAsyncWork()
 
-    expect(setRangeLock).not.toHaveBeenCalled()
     expect(store.getter(protectionUnlockStateAtom)).toMatchObject({
       phase: 'editing',
       error: 'Incorrect password',
     })
-    expect(store.getter(protectionUnlockMutationBlockedAtom)).toBe(false)
+    expect(store.getter(sheetProtectionAtom)['sheet-1'].unlockedRanges).toEqual([])
   })
 
   test('verifier Promise rejection and timeout are retryable Editing failures', async () => {
@@ -1104,8 +1054,6 @@ describe('unlock capability and verification gates', () => {
       verifySheetProtection: async () => {
         throw new Error('Verifier unavailable')
       },
-      setRangeLock: async (request) => acknowledged(request),
-      readSheetProtection: unlockedCanonicalRead(),
     })
     await flushAsyncWork()
     expect(rejectedStore.getter(protectionUnlockStateAtom)).toMatchObject({
@@ -1116,694 +1064,189 @@ describe('unlock capability and verification gates', () => {
     const timeoutStore = createStore()
     openLockedRange(timeoutStore)
     const verification = deferred<{ ok: boolean }>()
-    const setRangeLock = jest.fn<SetRangeLockPort>()
     timeoutStore.setter(submitProtectionUnlockAtom, {
       verifySheetProtection: () => verification.promise,
-      setRangeLock,
-      readSheetProtection: unlockedCanonicalRead(),
       verifyTimeoutMs: 5,
     })
     await wait(15)
-    expect(setRangeLock).not.toHaveBeenCalled()
     expect(timeoutStore.getter(protectionUnlockStateAtom)).toMatchObject({
       phase: 'editing',
       error: 'Password verification timed out. Try again.',
     })
+    expect(timeoutStore.getter(sheetProtectionAtom)['sheet-1'].unlockedRanges).toEqual([])
   })
 
-  test('deduplicates repeated submit while verification is pending', async () => {
+  test('deduplicates repeated submit while verification is pending (single flight)', async () => {
     const store = createStore()
     openLockedRange(store)
     const verification = deferred<{ ok: boolean }>()
     const verifySheetProtection = jest.fn(() => verification.promise)
-    const setRangeLock = jest.fn(async (request: CorrelatedSetRangeLockRequest) =>
-      acknowledged(request),
-    )
-    const input = {
-      verifySheetProtection,
-      setRangeLock,
-      readSheetProtection: unlockedCanonicalRead(),
-    }
+    const input = { verifySheetProtection }
+
     store.setter(submitProtectionUnlockAtom, input)
     store.setter(submitProtectionUnlockAtom, input)
     expect(verifySheetProtection).toHaveBeenCalledTimes(1)
-    expect(setRangeLock).not.toHaveBeenCalled()
 
     verification.resolve({ ok: true })
     await flushAsyncWork()
-    expect(setRangeLock).toHaveBeenCalledTimes(1)
     expect(store.getter(protectionUnlockStateAtom).phase).toBe('closed')
+    expect(store.getter(sheetProtectionAtom)['sheet-1'].unlockedRanges).toEqual([TARGET_RANGE])
   })
 
-  test('closing and reopening while verifying prevents the stale mutation', async () => {
+  test('a late verification after close never commits against the stale target', async () => {
     const store = createStore()
     openLockedRange(store, 'sheet-old')
     const verification = deferred<{ ok: boolean }>()
-    const setRangeLock = jest.fn<SetRangeLockPort>()
     store.setter(submitProtectionUnlockAtom, {
       verifySheetProtection: () => verification.promise,
-      setRangeLock,
-      readSheetProtection: unlockedCanonicalRead(),
     })
     store.setter(closeProtectionUnlockAtom)
     openLockedRange(store, 'sheet-new')
+
     verification.resolve({ ok: true })
     await flushAsyncWork()
 
-    expect(setRangeLock).not.toHaveBeenCalled()
+    expect(store.getter(sheetProtectionAtom)['sheet-old'].unlockedRanges).toEqual([])
     expect(store.getter(protectionUnlockStateAtom)).toMatchObject({
       phase: 'editing',
       target: { sheetId: 'sheet-new' },
-    })
-  })
-})
-
-describe('mutation result classification', () => {
-  test('a generic backend result without a strict ACK requires recovery', async () => {
-    const store = createStore()
-    openLockedRange(store)
-    const setRangeLock = jest.fn(
-      async (request: SetRangeLockRequest): Promise<BackendMutationResult> => ({
-        sheetId: request.sheetId,
-        requestId: request.requestId,
-        revision: 2,
-        affectedRange: copyRange(request.range),
-      }),
-    )
-    const readSheetProtection = jest.fn(unlockedCanonicalRead())
-
-    store.setter(submitProtectionUnlockAtom, { setRangeLock, readSheetProtection })
-    await flushAsyncWork()
-
-    expect(setRangeLock).toHaveBeenCalledTimes(1)
-    expect(readSheetProtection).not.toHaveBeenCalled()
-    expect(store.getter(protectionUnlockStateAtom)).toMatchObject({
-      phase: 'recovery-required',
-      error: 'The protection response did not match the request. Refresh before retrying.',
-    })
-    expect(store.getter(sheetProtectionAtom)['sheet-1']).toEqual({
-      mode: 'protected',
-      unlockedRanges: [],
+      error: null,
     })
   })
 
-  test('a generic synchronous backend throw requires recovery and is never replayed', async () => {
-    const store = createStore()
-    openLockedRange(store)
-    const setRangeLock = jest.fn((_request: CorrelatedSetRangeLockRequest) => {
-      throw new Error('Backend unavailable before dispatch')
-    })
-    const input = {
-      setRangeLock,
-      readSheetProtection: unlockedCanonicalRead(),
-    }
-    store.setter(submitProtectionUnlockAtom, input)
-    await flushAsyncWork()
-
-    expect(setRangeLock).toHaveBeenCalledTimes(1)
-    expect(store.getter(protectionUnlockStateAtom)).toMatchObject({
-      phase: 'recovery-required',
-      error: 'The protection change outcome is unknown. Refresh before retrying.',
-    })
-    expect(store.getter(protectionUnlockMutationBlockedAtom)).toBe(true)
-
-    store.setter(submitProtectionUnlockAtom, input)
-    await flushAsyncWork()
-    expect(setRangeLock).toHaveBeenCalledTimes(1)
-  })
-
-  test('an exactly correlated synchronous confirmed-not-applied error remains Editing', async () => {
-    const store = createStore()
-    openLockedRange(store)
-    const setRangeLock: SetRangeLockPort = (request) => {
-      const error: SetRangeLockConfirmedNotAppliedError = Object.assign(
-        new Error('Permission denied before applying the change'),
-        {
-          kind: 'set-range-lock-error' as const,
-          outcome: 'confirmed-not-applied' as const,
-          code: 'PERMISSION_DENIED' as const,
-          requestId: request.requestId,
-          sheetId: request.sheetId,
-          affectedRange: copyRange(request.range),
-        },
-      )
-      throw error
-    }
-    store.setter(submitProtectionUnlockAtom, {
-      setRangeLock,
-      readSheetProtection: unlockedCanonicalRead(),
-    })
-    await flushAsyncWork()
-
-    expect(store.getter(protectionUnlockStateAtom)).toMatchObject({
-      phase: 'editing',
-      error: 'Permission denied before applying the change',
-    })
-    expect(store.getter(protectionUnlockRecoveryRequiredAtom)).toBe(false)
-  })
-
-  test('typed PermissionDenied Promise rejection remains Editing', async () => {
-    const store = createStore()
-    openLockedRange(store)
-    const setRangeLock: SetRangeLockPort = async (request) => {
-      const error: SetRangeLockConfirmedNotAppliedError = Object.assign(
-        new Error('Permission denied'),
-        {
-          kind: 'set-range-lock-error' as const,
-          outcome: 'confirmed-not-applied' as const,
-          code: 'PERMISSION_DENIED' as const,
-          requestId: request.requestId,
-          sheetId: request.sheetId,
-          affectedRange: copyRange(request.range),
-        },
-      )
-      throw error
-    }
-    store.setter(submitProtectionUnlockAtom, {
-      setRangeLock,
-      readSheetProtection: unlockedCanonicalRead(),
-    })
-    await flushAsyncWork()
-
-    expect(store.getter(protectionUnlockStateAtom)).toMatchObject({
-      phase: 'editing',
-      error: 'Permission denied',
-    })
-    expect(store.getter(protectionUnlockRecoveryRequiredAtom)).toBe(false)
-  })
-
-  test('confirmed-not-applied result remains Editing', async () => {
-    const store = createStore()
-    openLockedRange(store)
-    const setRangeLock = jest.fn(async (request: CorrelatedSetRangeLockRequest) =>
-      confirmedNotApplied(request),
-    )
-    store.setter(submitProtectionUnlockAtom, {
-      setRangeLock,
-      readSheetProtection: unlockedCanonicalRead(),
-    })
-    await flushAsyncWork()
-
-    expect(setRangeLock).toHaveBeenCalledTimes(1)
-    expect(store.getter(protectionUnlockStateAtom)).toMatchObject({
-      phase: 'editing',
-      error: 'You cannot edit this protected range.',
-    })
-  })
-
-  test('generic Promise rejection requires recovery and blocks mutation replay', async () => {
-    const store = createStore()
-    openLockedRange(store)
-    const setRangeLock = jest.fn(async () => {
-      throw new Error('Connection lost after dispatch')
-    })
-    const input = {
-      setRangeLock,
-      readSheetProtection: unlockedCanonicalRead(),
-    }
-    store.setter(submitProtectionUnlockAtom, input)
-    await flushAsyncWork()
-
-    expect(store.getter(protectionUnlockStateAtom).phase).toBe('recovery-required')
-    expect(store.getter(protectionUnlockRecoveryRequiredAtom)).toBe(true)
-    store.setter(submitProtectionUnlockAtom, input)
-    await flushAsyncWork()
-    expect(setRangeLock).toHaveBeenCalledTimes(1)
-  })
-
-  test('explicit outcome-unknown requires recovery', async () => {
-    const store = createStore()
-    openLockedRange(store)
-    const setRangeLock: SetRangeLockPort = async (request) => ({
-      kind: 'set-range-lock',
-      outcome: 'outcome-unknown',
-      message: 'Server is reconciling the change.',
-      requestId: request.requestId,
-      sheetId: request.sheetId,
-      affectedRange: copyRange(request.range),
-    })
-    store.setter(submitProtectionUnlockAtom, {
-      setRangeLock,
-      readSheetProtection: unlockedCanonicalRead(),
-    })
-    await flushAsyncWork()
-
-    expect(store.getter(protectionUnlockStateAtom)).toMatchObject({
-      phase: 'recovery-required',
-      error: 'Server is reconciling the change.',
-    })
-  })
-
-  test.each([
-    [
-      'missing affectedRange',
-      (request: CorrelatedSetRangeLockRequest) => ({
-        kind: 'set-range-lock',
-        outcome: 'acknowledged',
-        requestId: request.requestId,
-        sheetId: request.sheetId,
-      }),
-    ],
-    [
-      'wrong requestId',
-      (request: CorrelatedSetRangeLockRequest) => ({
-        ...acknowledged(request),
-        requestId: request.requestId + 1,
-      }),
-    ],
-    [
-      'wrong sheetId',
-      (request: CorrelatedSetRangeLockRequest) => ({
-        ...acknowledged(request),
-        sheetId: 'another-sheet',
-      }),
-    ],
-    [
-      'wrong affectedRange',
-      (request: CorrelatedSetRangeLockRequest) => ({
-        ...acknowledged(request),
-        affectedRange: { ...copyRange(request.range), rowEnd: request.range.rowEnd + 1 },
-      }),
-    ],
-  ])('plain malformed ACK (%s) requires recovery', async (_label, makeResult) => {
-    const store = createStore()
-    openLockedRange(store)
-    const setRangeLock: SetRangeLockPort = async (request) =>
-      makeResult(request) as SetRangeLockResult
-    store.setter(submitProtectionUnlockAtom, {
-      setRangeLock,
-      readSheetProtection: unlockedCanonicalRead(),
-    })
-    await flushAsyncWork()
-
-    expect(store.getter(protectionUnlockStateAtom).phase).toBe('recovery-required')
-    expect(store.getter(protectionUnlockStateAtom).error).toContain('did not match')
-  })
-
-  test.each([undefined, -1, 1.5, Number.MAX_SAFE_INTEGER + 1, '', '   '])(
-    'an acknowledged result with invalid revision (%p) requires recovery',
-    async (revision) => {
-      const store = createStore()
-      openLockedRange(store)
-      const readSheetProtection = jest.fn<ReadSheetProtectionPort>()
-      store.setter(submitProtectionUnlockAtom, {
-        setRangeLock: async (request) =>
-          ({ ...acknowledged(request), revision }) as SetRangeLockResult,
-        readSheetProtection,
-      })
-      await flushAsyncWork()
-
-      expect(store.getter(protectionUnlockStateAtom)).toMatchObject({
-        phase: 'recovery-required',
-        error: 'The protection response did not include a valid canonical revision.',
-      })
-      expect(readSheetProtection).not.toHaveBeenCalled()
-    },
-  )
-})
-
-describe('strict ACK and canonical refresh', () => {
-  test('strict ACK enters CanonicalRefreshing, updates Core canonical state, then closes', async () => {
-    const store = createStore()
-    openLockedRange(store)
-    const canonicalRead = deferred<ReadSheetProtectionResult>()
-    const setRangeLock = jest.fn(async (request: CorrelatedSetRangeLockRequest) =>
-      acknowledged(request),
-    )
-    const readSheetProtection = jest.fn((request: ReadSheetProtectionRequest) => {
-      expect(request.kind).toBe('read-sheet-protection')
-      return canonicalRead.promise
-    })
-    store.setter(submitProtectionUnlockAtom, { setRangeLock, readSheetProtection })
-    await flushAsyncWork()
-
-    expect(store.getter(protectionUnlockPhaseAtom)).toBe('canonical-refreshing')
-    expect(setRangeLock).toHaveBeenCalledTimes(1)
-    expect(readSheetProtection).toHaveBeenCalledTimes(1)
-    const mutationRequest = setRangeLock.mock.calls[0][0]
-    const readRequest = readSheetProtection.mock.calls[0][0]
-    expect(readRequest.requestId).toBe(mutationRequest.requestId)
-
-    canonicalRead.resolve(
-      canonicalResult(readRequest, {
-        mode: 'protected',
-        unlockedRanges: [TARGET_RANGE],
-      }),
-    )
-    await flushAsyncWork()
-
-    expect(store.getter(protectionUnlockStateAtom).phase).toBe('closed')
-    expect(store.getter(sheetProtectionAtom)['sheet-1']).toEqual({
-      mode: 'protected',
-      unlockedRanges: [TARGET_RANGE],
-    })
-    expect(store.getter(selectionLockedAtom)).toBe('open')
-  })
-
-  test('canonical open sheet closes the dialog', async () => {
-    const store = createStore()
-    openLockedRange(store)
-    store.setter(submitProtectionUnlockAtom, {
-      setRangeLock: async (request) => acknowledged(request),
-      readSheetProtection: async (request) =>
-        canonicalResult(request, { mode: 'open', unlockedRanges: [] }),
-    })
-    await flushAsyncWork()
-
-    expect(store.getter(protectionUnlockStateAtom).phase).toBe('closed')
-    expect(store.getter(sheetProtectionAtom)['sheet-1'].mode).toBe('open')
-  })
-
-  test('a large target closes when multiple canonical ranges jointly cover it', async () => {
-    const largeRange: CellRange = {
-      rowStart: 0,
-      rowEnd: 100,
-      colStart: 0,
-      colEnd: 100,
-    }
-    const store = createStore()
-    openLockedRange(store, 'sheet-large', largeRange)
-    store.setter(submitProtectionUnlockAtom, {
-      setRangeLock: async (request) => acknowledged(request),
-      readSheetProtection: async (request) =>
-        canonicalResult(request, {
-          mode: 'protected',
-          unlockedRanges: [
-            { ...largeRange, rowEnd: 49 },
-            { ...largeRange, rowStart: 50 },
-          ],
-        }),
-    })
-    await flushAsyncWork()
-
-    expect(store.getter(protectionUnlockStateAtom).phase).toBe('closed')
-    expect(isRangeFullyUnlocked(store.getter(sheetProtectionAtom), 'sheet-large', largeRange)).toBe(
-      true,
-    )
-  })
-
-  test('canonical still-locked state returns to retryable Editing', async () => {
-    const store = createStore()
-    openLockedRange(store)
-    const setRangeLock = jest.fn(async (request: CorrelatedSetRangeLockRequest) =>
-      acknowledged(request),
-    )
-    store.setter(submitProtectionUnlockAtom, {
-      setRangeLock,
-      readSheetProtection: async (request) =>
-        canonicalResult(request, { mode: 'protected', unlockedRanges: [] }),
-    })
-    await flushAsyncWork()
-
-    expect(store.getter(protectionUnlockStateAtom)).toMatchObject({
-      phase: 'editing',
-      error: 'The range is still locked. Try again.',
-    })
-    expect(store.getter(protectionUnlockMutationBlockedAtom)).toBe(false)
-    expect(setRangeLock).toHaveBeenCalledTimes(1)
-  })
-
-  test('canonical refresh rejection enters RecoveryRequired', async () => {
-    const store = createStore()
-    openLockedRange(store)
-    store.setter(submitProtectionUnlockAtom, {
-      setRangeLock: async (request) => acknowledged(request),
-      readSheetProtection: async () => {
-        throw new Error('Read failed')
-      },
-    })
-    await flushAsyncWork()
-
-    expect(store.getter(protectionUnlockStateAtom)).toMatchObject({
-      phase: 'recovery-required',
-      error: 'Read failed',
-    })
-  })
-
-  test('malformed canonical response enters RecoveryRequired', async () => {
-    const store = createStore()
-    openLockedRange(store)
-    store.setter(submitProtectionUnlockAtom, {
-      setRangeLock: async (request) => acknowledged(request),
-      readSheetProtection: async (request) =>
-        ({
-          ...canonicalResult(request, { mode: 'open', unlockedRanges: [] }),
-          sheetId: 'wrong-sheet',
-        }) as ReadSheetProtectionResult,
-    })
-    await flushAsyncWork()
-
-    expect(store.getter(protectionUnlockStateAtom).phase).toBe('recovery-required')
-    expect(store.getter(protectionUnlockStateAtom).error).toContain('did not match')
-  })
-
-  test('canonical response over the unlocked-range cap requires recovery without truncation', async () => {
-    const target = {
-      rowStart: MAX_UNLOCKED_RANGES,
-      rowEnd: MAX_UNLOCKED_RANGES,
-      colStart: 0,
-      colEnd: 0,
-    }
-    const store = createStore()
-    openLockedRange(store, 'sheet-cap', target)
-    const setRangeLock = jest.fn(async (request: CorrelatedSetRangeLockRequest) =>
-      acknowledged(request),
-    )
-    const unlockedRanges = Array.from({ length: MAX_UNLOCKED_RANGES + 1 }, (_, row) => ({
-      rowStart: row,
-      rowEnd: row,
-      colStart: 0,
-      colEnd: 0,
-    }))
-    store.setter(submitProtectionUnlockAtom, {
-      setRangeLock,
-      readSheetProtection: async (request) =>
-        canonicalResult(request, { mode: 'protected', unlockedRanges }),
-    })
-    await flushAsyncWork()
-
-    expect(store.getter(protectionUnlockStateAtom)).toMatchObject({
-      phase: 'recovery-required',
-      error: 'Protection status response did not match the request.',
-    })
-    expect(store.getter(sheetProtectionAtom)['sheet-cap']).toEqual({
-      mode: 'protected',
-      unlockedRanges: [],
-    })
-    expect(setRangeLock).toHaveBeenCalledTimes(1)
-  })
-
-  test.each([-1, 1.5, Number.MAX_SAFE_INTEGER + 1, '', '   '])(
-    'rejects an invalid canonical revision (%p)',
-    async (revision) => {
-      const store = createStore()
-      openLockedRange(store)
-      store.setter(submitProtectionUnlockAtom, {
-        setRangeLock: async (request) => acknowledged(request),
-        readSheetProtection: async (request) =>
-          ({
-            ...canonicalResult(request, { mode: 'open', unlockedRanges: [] }),
-            revision,
-          }) as ReadSheetProtectionResult,
-      })
-      await flushAsyncWork()
-
-      expect(store.getter(protectionUnlockStateAtom)).toMatchObject({
-        phase: 'recovery-required',
-        error: 'Protection status response did not match the request.',
-      })
-    },
-  )
-
-  test('canonical refresh requires the exact acknowledged revision', async () => {
-    const store = createStore()
-    openLockedRange(store)
-    const setRangeLock = jest.fn(async (request: CorrelatedSetRangeLockRequest) =>
-      acknowledged(request, 'revision-2'),
-    )
-    const staleRead = jest.fn(async (request: ReadSheetProtectionRequest) =>
-      canonicalResult(
-        request,
-        { mode: 'protected', unlockedRanges: [copyRange(TARGET_RANGE)] },
-        'revision-1',
-      ),
-    )
-    store.setter(submitProtectionUnlockAtom, { setRangeLock, readSheetProtection: staleRead })
-    await flushAsyncWork()
-
-    expect(store.getter(protectionUnlockStateAtom)).toMatchObject({
-      phase: 'recovery-required',
-      error: 'Protection status response did not match the request.',
-    })
-    expect(store.getter(sheetProtectionAtom)['sheet-1']).toEqual({
-      mode: 'protected',
-      unlockedRanges: [],
-    })
-
-    const matchingRead = jest.fn(async (request: ReadSheetProtectionRequest) =>
-      canonicalResult(
-        request,
-        { mode: 'protected', unlockedRanges: [copyRange(TARGET_RANGE)] },
-        'revision-2',
-      ),
-    )
-    store.setter(refreshProtectionUnlockAtom, { readSheetProtection: matchingRead })
-    await flushAsyncWork()
-
-    expect(store.getter(protectionUnlockStateAtom).phase).toBe('closed')
-    expect(setRangeLock).toHaveBeenCalledTimes(1)
-    expect(staleRead).toHaveBeenCalledTimes(1)
-    expect(matchingRead).toHaveBeenCalledTimes(1)
-  })
-
-  test('refresh recovery retries read only and never resends setRangeLock', async () => {
-    const store = createStore()
-    openLockedRange(store)
-    const setRangeLock = jest.fn(async (request: CorrelatedSetRangeLockRequest) =>
-      acknowledged(request),
-    )
-    const failedRead = jest.fn(async () => {
-      throw new Error('Temporary read failure')
-    })
-    store.setter(submitProtectionUnlockAtom, {
-      setRangeLock,
-      readSheetProtection: failedRead,
-    })
-    await flushAsyncWork()
-    expect(store.getter(protectionUnlockPhaseAtom)).toBe('recovery-required')
-
-    const recoveryRead = jest.fn(unlockedCanonicalRead())
-    store.setter(refreshProtectionUnlockAtom, { readSheetProtection: recoveryRead })
-    await flushAsyncWork()
-
-    expect(setRangeLock).toHaveBeenCalledTimes(1)
-    expect(failedRead).toHaveBeenCalledTimes(1)
-    expect(recoveryRead).toHaveBeenCalledTimes(1)
-    expect(store.getter(protectionUnlockStateAtom).phase).toBe('closed')
-    expect(store.getter(protectionUnlockRecoveryRequiredAtom)).toBe(false)
-  })
-
-  test('mutation timeout ignores late ACK until a canonical-only recovery refresh', async () => {
-    const store = createStore()
-    openLockedRange(store)
-    const mutation = deferred<SetRangeLockResult>()
-    let mutationRequest: CorrelatedSetRangeLockRequest | undefined
-    const setRangeLock = jest.fn((request: CorrelatedSetRangeLockRequest) => {
-      mutationRequest = request
-      return mutation.promise
-    })
-    const automaticRead = jest.fn<ReadSheetProtectionPort>()
-    store.setter(submitProtectionUnlockAtom, {
-      setRangeLock,
-      readSheetProtection: automaticRead,
-      mutationTimeoutMs: 5,
-    })
-    await wait(15)
-    expect(store.getter(protectionUnlockPhaseAtom)).toBe('recovery-required')
-
-    mutation.resolve(acknowledged(mutationRequest!))
-    await flushAsyncWork()
-    expect(store.getter(protectionUnlockPhaseAtom)).toBe('recovery-required')
-    expect(automaticRead).not.toHaveBeenCalled()
-
-    const recoveryRead = jest.fn(unlockedCanonicalRead())
-    store.setter(refreshProtectionUnlockAtom, { readSheetProtection: recoveryRead })
-    await flushAsyncWork()
-    expect(setRangeLock).toHaveBeenCalledTimes(1)
-    expect(recoveryRead).toHaveBeenCalledTimes(1)
-    expect(store.getter(protectionUnlockPhaseAtom)).toBe('closed')
-  })
-
-  test('a stale canonical read cannot overwrite state after close and attempted A-to-B retarget', async () => {
-    const store = createStore()
-    openLockedRange(store, 'sheet-a')
-    store.setter(setProtectionUnlockPasswordAtom, 'sheet-a-secret')
-    const canonicalRead = deferred<ReadSheetProtectionResult>()
-    const setRangeLock = jest.fn(async (request: CorrelatedSetRangeLockRequest) =>
-      acknowledged(request),
-    )
-    const readSheetProtection = jest.fn(
-      (_request: ReadSheetProtectionRequest) => canonicalRead.promise,
-    )
-    store.setter(submitProtectionUnlockAtom, { setRangeLock, readSheetProtection })
-    await flushAsyncWork()
-
-    expect(store.getter(protectionUnlockPhaseAtom)).toBe('canonical-refreshing')
-    const readRequest = readSheetProtection.mock.calls[0][0]
-    store.setter(closeProtectionUnlockAtom)
-    openLockedRange(store, 'sheet-b')
-
-    expect(store.getter(protectionUnlockStateAtom)).toMatchObject({
-      phase: 'recovery-required',
-      target: { sheetId: 'sheet-a' },
-    })
-    expect(store.getter(protectionUnlockPasswordAtom)).toBe('')
-
-    canonicalRead.resolve(
-      canonicalResult(readRequest, {
-        mode: 'protected',
-        unlockedRanges: [TARGET_RANGE],
-      }),
-    )
-    await flushAsyncWork()
-
-    expect(setRangeLock).toHaveBeenCalledTimes(1)
-    expect(readSheetProtection).toHaveBeenCalledTimes(1)
-    expect(store.getter(sheetProtectionAtom)['sheet-a']).toEqual({
-      mode: 'protected',
-      unlockedRanges: [],
-    })
-    expect(store.getter(protectionUnlockStateAtom)).toMatchObject({
-      phase: 'recovery-required',
-      target: { sheetId: 'sheet-a' },
-    })
-
-    const recoveryRead = jest.fn(unlockedCanonicalRead())
-    store.setter(refreshProtectionUnlockAtom, { readSheetProtection: recoveryRead })
-    await flushAsyncWork()
-
-    expect(setRangeLock).toHaveBeenCalledTimes(1)
-    expect(recoveryRead).toHaveBeenCalledTimes(1)
-    expect(store.getter(protectionUnlockStateAtom).phase).toBe('closed')
-    openLockedRange(store, 'sheet-b')
-    expect(store.getter(protectionUnlockStateAtom)).toMatchObject({
-      phase: 'editing',
-      target: { sheetId: 'sheet-b' },
-    })
-  })
-
-  test('unresolved mutation for A keeps recovery bound to A instead of masquerading as B', async () => {
+  test('a late verification failure after reopen never leaks into the new session', async () => {
     const store = createStore()
     openLockedRange(store, 'sheet-old')
-    const mutation = deferred<SetRangeLockResult>()
-    let request!: CorrelatedSetRangeLockRequest
+    const verification = deferred<{ ok: boolean }>()
     store.setter(submitProtectionUnlockAtom, {
-      setRangeLock: (input) => {
-        request = input
-        return mutation.promise
-      },
-      readSheetProtection: async (input) =>
-        canonicalResult(input, { mode: 'open', unlockedRanges: [] }),
+      verifySheetProtection: () => verification.promise,
     })
-    store.setter(closeProtectionUnlockAtom)
     openLockedRange(store, 'sheet-new')
 
-    expect(store.getter(protectionUnlockStateAtom)).toMatchObject({
-      phase: 'recovery-required',
-      target: { sheetId: 'sheet-old' },
-    })
-
-    mutation.resolve(acknowledged(request))
+    verification.reject(new Error('stale failure'))
     await flushAsyncWork()
 
     expect(store.getter(protectionUnlockStateAtom)).toMatchObject({
-      phase: 'recovery-required',
-      target: { sheetId: 'sheet-old' },
+      phase: 'editing',
+      target: { sheetId: 'sheet-new' },
+      error: null,
     })
-    expect(store.getter(sheetProtectionAtom)['sheet-old']).toEqual({
-      mode: 'protected',
-      unlockedRanges: [],
+  })
+})
+
+describe('W2 gateway enforcement without protection ports (worker-parity contract)', () => {
+  // Mirrors the worker backends: content transports exist, protection
+  // ports do not. Protection must be fully enforceable locally.
+  function createPortlessBackendProbe() {
+    return {
+      readVisibleProjection: jest.fn(),
+      readRangeProjection: jest.fn(),
+      setCellInput: jest.fn(),
+      clearRange: jest.fn(),
+      fillRange: jest.fn(),
+      pasteRange: jest.fn(),
+      // No setSheetProtection / setRangeLock / readSheetProtection.
+    }
+  }
+
+  test('a protected sheet blocks edit, paste, fill, and clear before any transport', () => {
+    const store = createStore()
+    const backend = createPortlessBackendProbe()
+    expect(
+      store.setter(setSheetProtectionAtom, {
+        sheetId: 'sheet-1',
+        state: { mode: 'protected', unlockedRanges: [copyRange(TARGET_RANGE)] },
+      }),
+    ).toBe('committed')
+
+    const lockedCell = { row: 10, col: 10 }
+    const lockedRange = { rowStart: 9, rowEnd: 11, colStart: 9, colEnd: 11 }
+    const resolutions = [
+      store.setter(resolveContentMutationAtom, {
+        kind: 'set-cell-input',
+        sheetId: 'sheet-1',
+        cell: lockedCell,
+      }),
+      store.setter(resolveContentMutationAtom, {
+        kind: 'paste-range',
+        sheetId: 'sheet-1',
+        range: lockedRange,
+      }),
+      store.setter(resolveContentMutationAtom, {
+        kind: 'fill-range',
+        sheetId: 'sheet-1',
+        range: lockedRange,
+      }),
+      store.setter(resolveContentMutationAtom, {
+        kind: 'clear-range',
+        sheetId: 'sheet-1',
+        range: lockedRange,
+      }),
+    ]
+
+    for (const resolution of resolutions) {
+      expect(resolution.status).toBe('blocked')
+      expect(resolution).toMatchObject({ reason: 'locked' })
+    }
+    // Zero transport: neither the mutation ports nor any protection port ran.
+    for (const transport of Object.values(backend)) {
+      expect(transport).not.toHaveBeenCalled()
+    }
+  })
+
+  test('cells inside unlockedRanges stay editable on the same protected sheet', () => {
+    const store = createStore()
+    store.setter(setSheetProtectionAtom, {
+      sheetId: 'sheet-1',
+      state: { mode: 'protected', unlockedRanges: [copyRange(TARGET_RANGE)] },
     })
+
+    const cellResolution = store.setter(resolveContentMutationAtom, {
+      kind: 'set-cell-input',
+      sheetId: 'sheet-1',
+      cell: { row: TARGET_RANGE.rowStart, col: TARGET_RANGE.colStart },
+    })
+    const rangeResolution = store.setter(resolveContentMutationAtom, {
+      kind: 'paste-range',
+      sheetId: 'sheet-1',
+      range: copyRange(TARGET_RANGE),
+    })
+
+    expect(cellResolution).toMatchObject({
+      status: 'allowed',
+      cell: { row: TARGET_RANGE.rowStart, col: TARGET_RANGE.colStart },
+    })
+    expect(rangeResolution).toMatchObject({ status: 'allowed' })
+  })
+
+  test('the dialog unlock flow flips a locked target to editable with zero transport', () => {
+    const store = createStore()
+    const backend = createPortlessBackendProbe()
+    store.setter(setSheetProtectionAtom, {
+      sheetId: 'sheet-1',
+      state: { mode: 'protected', unlockedRanges: [] },
+    })
+
+    const blocked = store.setter(resolveContentMutationAtom, {
+      kind: 'set-cell-input',
+      sheetId: 'sheet-1',
+      cell: { row: TARGET_RANGE.rowStart, col: TARGET_RANGE.colStart },
+    })
+    expect(blocked.status).toBe('blocked')
+
+    store.setter(openProtectionUnlockAtom, { sheetId: 'sheet-1', range: TARGET_RANGE })
+    store.setter(submitProtectionUnlockAtom, { source: backend })
+
+    expect(store.getter(protectionUnlockStateAtom).phase).toBe('closed')
+    const allowed = store.setter(resolveContentMutationAtom, {
+      kind: 'set-cell-input',
+      sheetId: 'sheet-1',
+      cell: { row: TARGET_RANGE.rowStart, col: TARGET_RANGE.colStart },
+    })
+    expect(allowed.status).toBe('allowed')
+    for (const transport of Object.values(backend)) {
+      expect(transport).not.toHaveBeenCalled()
+    }
   })
 })
 
