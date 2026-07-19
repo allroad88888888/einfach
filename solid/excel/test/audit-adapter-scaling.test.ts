@@ -403,8 +403,14 @@ describe('audit D-4 · P-D · FIXED — worker backend deleteSheet drops per-she
   })
 })
 
-describe('audit D-7 · P-A · FIXED — worker filter/sort capability truth', () => {
-  test('omits the unsupported port and keeps canonical reads window-bounded', async () => {
+describe('audit D-7 · P-A · FLIPPED — worker filter/sort is a supported bounded display permutation', () => {
+  // Was: the adapter omitted `setFilterSort` and the projection stayed
+  // canonical. Parity slice #29 lands the port: the adapter mirrors the
+  // ui-core canonical rules, computes the permutation at projection time
+  // with the shared pure helper, and reads stay explicitly bounded — a
+  // single-column predicate scan per predicate column plus a
+  // window-bounded `readCells` batch. Engine data is never reordered.
+  test('implements the port with bounded predicate scans and originalRow projections', async () => {
     const client = createWorkerWorkbook({ workerFactory: () => createInProcessWorker() })
     const readRanges: SparseRangeWire[] = []
     const spyClient: typeof client = {
@@ -421,7 +427,7 @@ describe('audit D-7 · P-A · FIXED — worker filter/sort capability truth', ()
     })
     await backend.ready()
 
-    // Descending values make a leaked ascending host projection obvious.
+    // Descending values make the ascending display permutation obvious.
     await backend.importCells?.({
       kind: 'import-cells',
       sheetId: 'sheet-1',
@@ -437,29 +443,52 @@ describe('audit D-7 · P-A · FIXED — worker filter/sort capability truth', ()
     const before = await backend.readVisibleProjection(
       createVisibleProjectionRequest({ sheetId: 'sheet-1', requestId: 1, window }),
     )
+    expect(before.cells.find((cell) => cell.row === 1 && cell.col === 0)?.displayValue).toBe('99')
 
-    expect(backend.setFilterSort).toBeUndefined()
-    expect(
-      await backend.setFilterSort?.({
-        kind: 'set-filter-sort',
-        sheetId: 'sheet-1',
-        rules: [],
-        directives: [{ colIndex: 0, direction: 'asc' }],
-        requestId: 2,
-      }),
-    ).toBeUndefined()
+    expect(typeof backend.setFilterSort).toBe('function')
+    const ack = await backend.setFilterSort!({
+      kind: 'set-filter-sort',
+      sheetId: 'sheet-1',
+      rules: [],
+      directives: [{ colIndex: 0, direction: 'asc' }],
+      requestId: 2,
+    })
+    expect(ack).toMatchObject({ sheetId: 'sheet-1', requestId: 2 })
 
     const after = await backend.readVisibleProjection(
       createVisibleProjectionRequest({ sheetId: 'sheet-1', requestId: 3, window }),
     )
 
+    // Exactly two sparse-range reads: the unfiltered window read and ONE
+    // single-column predicate scan (col 0 doubles as the summary probe).
+    // The filtered window read itself goes through a bounded readCells
+    // batch, never a widened sparse read.
     expect(readRanges).toEqual([
       { sheet: 0, startRow: 0, endRow: 20, startCol: 0, endCol: 5 },
-      { sheet: 0, startRow: 0, endRow: 20, startCol: 0, endCol: 5 },
+      { sheet: 0, startRow: 0, endRow: 30, startCol: 0, endCol: 0 },
     ])
-    expect(after.revision).toBe(before.revision)
-    expect(after.cells.find((cell) => cell.row === 1 && cell.col === 0)?.displayValue).toBe('99')
-    expect(after.cells.some((cell) => cell.originalRow !== undefined)).toBe(false)
+    // Header row 0 passes through; data rows sort ascending by value, so
+    // display row 1 is source row 30 (value 70) with its originalRow fact.
+    expect(after.cells.find((cell) => cell.row === 0 && cell.col === 0)?.displayValue).toBe('100')
+    expect(after.cells.find((cell) => cell.row === 1 && cell.col === 0)).toMatchObject({
+      displayValue: '70',
+      originalRow: 30,
+    })
+    // The mutation ACK bumped the revision; the engine rows themselves
+    // did not move (clearing the state restores the canonical order).
+    expect(after.revision).not.toBe(before.revision)
+    await backend.setFilterSort!({
+      kind: 'set-filter-sort',
+      sheetId: 'sheet-1',
+      rules: [],
+      directives: [],
+      requestId: 4,
+    })
+    const cleared = await backend.readVisibleProjection(
+      createVisibleProjectionRequest({ sheetId: 'sheet-1', requestId: 5, window }),
+    )
+    expect(cleared.cells.find((cell) => cell.row === 1 && cell.col === 0)?.displayValue).toBe('99')
+    expect(cleared.cells.some((cell) => cell.originalRow !== undefined)).toBe(false)
 
     backend.dispose()
   })

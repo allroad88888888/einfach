@@ -45,6 +45,8 @@ import {
 type FakeWorkerWorkbookClient = WorkerWorkbookClient & {
   calls: {
     initWorkbook: string[][]
+    listNonEmpty: number
+    readCells: CellRefWire[][]
     readSparseRange: SparseRangeWire[]
     snapshotRangeSparse: SparseRangeWire[]
     setCell: Array<{ sheet: number; addr: string; value: CellWire }>
@@ -138,6 +140,8 @@ function createFakeWorkerWorkbookClient(): FakeWorkerWorkbookClient {
   const hydratedListeners = new Set<(cells: CellSnapshotWire[]) => void>()
   const calls: FakeWorkerWorkbookClient['calls'] = {
     initWorkbook: [],
+    listNonEmpty: 0,
+    readCells: [],
     readSparseRange: [],
     snapshotRangeSparse: [],
     setCell: [],
@@ -603,11 +607,23 @@ function createFakeWorkerWorkbookClient(): FakeWorkerWorkbookClient {
       calls.cancelImport.push(sessionId)
       return true
     },
-    async readCells() {
-      throw new Error('not used')
+    async readCells(refs) {
+      calls.readCells.push(refs.map((ref) => ({ ...ref })))
+      return refs.map(
+        (ref) =>
+          cells.get(key(ref.sheet, ref.addr)) ?? {
+            sheet: ref.sheet,
+            addr: ref.addr.toUpperCase(),
+            display: '',
+            type: 'null' as const,
+            isError: false,
+            formula: '',
+          },
+      )
     },
     async listNonEmpty() {
-      throw new Error('not used')
+      calls.listNonEmpty += 1
+      return [...cells.values()].map((cell) => ({ sheet: cell.sheet, addr: cell.addr }))
     },
     async snapshotSparse() {
       throw new Error('not used')
@@ -1096,7 +1112,7 @@ describe('vnext adapter', () => {
     expect(projected.cells.some((cell) => cell.displayValue === 'East')).toBe(false)
   })
 
-  it('advertises worker filter/sort as unsupported and keeps reads canonical and window-bounded', async () => {
+  it('applies worker filter/sort as a bounded display permutation carrying originalRow', async () => {
     const client = createFakeWorkerWorkbookClient()
     const backend = createWorkerWorkbookSpreadsheetBackend({
       client,
@@ -1126,16 +1142,21 @@ describe('vnext adapter', () => {
       })
     })
 
-    expect(backend.setFilterSort).toBeUndefined()
-    expect(
-      await backend.setFilterSort?.({
-        kind: 'set-filter-sort',
-        sheetId: 'sheet-1',
-        rules: [],
-        directives: [{ colIndex: 1, direction: 'desc' }],
-        requestId: 100,
-      }),
-    ).toBeUndefined()
+    expect(typeof backend.setFilterSort).toBe('function')
+    const ack = await backend.setFilterSort!({
+      kind: 'set-filter-sort',
+      sheetId: 'sheet-1',
+      rules: [],
+      directives: [{ colIndex: 1, direction: 'desc' }],
+      requestId: 100,
+    })
+    expect(ack).toMatchObject({ sheetId: 'sheet-1', requestId: 100, revision: 8 })
+    // The predicate scan is column-bounded: one single-column read per
+    // predicate column (col 0 summary probe + the directive column).
+    expect(client.calls.readSparseRange).toEqual([
+      { sheet: 0, startRow: 0, endRow: 3, startCol: 0, endCol: 0 },
+      { sheet: 0, startRow: 0, endRow: 3, startCol: 1, endCol: 1 },
+    ])
 
     const projected = await backend.readVisibleProjection(
       createVisibleProjectionRequest({
@@ -1145,14 +1166,23 @@ describe('vnext adapter', () => {
       }),
     )
 
-    expect(client.calls.readSparseRange).toEqual([
-      { sheet: 0, startRow: 0, endRow: 2, startCol: 0, endCol: 1 },
-    ])
-    expect(projected.revision).toBe(7)
+    // The window fetch is a readCells batch bounded by the window itself
+    // (3 mapped rows x 2 columns), never a full-sheet read.
+    expect(client.calls.readCells).toHaveLength(1)
+    expect(client.calls.readCells[0]).toHaveLength(6)
+    expect(projected.revision).toBe(8)
+    // Sort is a display permutation: rows reorder, each carries its source row.
     expect(
-      projected.cells.filter((cell) => cell.col === 0).map((cell) => cell.displayValue),
-    ).toEqual(['Region', 'North', 'South'])
-    expect(projected.cells.some((cell) => cell.originalRow !== undefined)).toBe(false)
+      projected.cells
+        .filter((cell) => cell.col === 0)
+        .map((cell) => [cell.displayValue, cell.originalRow]),
+    ).toEqual([
+      ['Region', 0],
+      ['East', 3],
+      ['North', 1],
+    ])
+    // Engine data untouched — no writes were issued.
+    expect(client.calls.setCell).toHaveLength(0)
 
     backend.dispose()
   })

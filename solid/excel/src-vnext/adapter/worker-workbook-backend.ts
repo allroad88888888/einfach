@@ -10,6 +10,7 @@ import type {
   DeleteNamedRangeRequest,
   DeleteRowsRequest,
   DisplayCell,
+  FilterSortState,
   ImportCellChunksRequest,
   InsertColumnsRequest,
   InsertRowsRequest,
@@ -37,6 +38,7 @@ import type {
   SetCellInputRequest,
   SetColumnWidthRequest,
   SetConditionalFormatRuleRequest,
+  SetFilterSortRequest,
   SetFormatRangeRequest,
   SetNamedRangeRequest,
   SetRowHeightRequest,
@@ -54,9 +56,11 @@ import type {
   VisibleProjectionResult,
 } from '@einfach/spreadsheet-ui-core'
 import {
+  buildFilterSortDisplayRows,
   cloneCell,
   cloneConditionalFormatRule,
   cloneConditionalFormatRuleEntry,
+  cloneFilterSortState,
   cloneFormat,
   cloneNamedRange,
   cloneRange,
@@ -65,6 +69,7 @@ import {
   DEFAULT_WORKBOOK_LOCALE,
   estimateUtf8Bytes,
   evaluateValidationLocal,
+  filterSortHasEffect,
   formatNumberValue,
   isCoordInsideRange,
   keyFor,
@@ -86,6 +91,7 @@ import {
 import {
   createWorkerWorkbook,
   type CellFormatJSON,
+  type CellRefWire,
   type CellSnapshotWire,
   type CellWire,
   type FormatRangeSnapshot,
@@ -143,6 +149,22 @@ const DEFAULT_SHEETS = ['Sheet1']
 const DEFAULT_IMPORT_CELLS_PER_CHUNK = 10_000
 const MIN_IMPORT_CELLS_PER_CHUNK = 1
 const MAX_IMPORT_CELLS_PER_CHUNK = 10_000
+
+/**
+ * Bounded predicate scan for filter/sort visibility (parity item #29).
+ *
+ * The shared pure helper `buildFilterSortDisplayRows` needs the display
+ * value of every data row in each predicate column (column 0 for the
+ * summary-row probe, plus every rule/directive column). On the worker
+ * path those values live behind RPC, so the scan must be explicitly
+ * bounded: `dataRowCount x predicateColumnCount` may not exceed this cap
+ * (same 50k-cell budget as `DEFAULT_MAX_PROJECTION_CELLS` and
+ * `STATUS_BAR_AGGREGATE_MEMBERSHIP_CHECKS_MAX` in ui-core). Crossing it
+ * is a structured rejection (`FILTER_SORT_SOURCE_TOO_LARGE`) — the
+ * filter does NOT activate and nothing is silently truncated.
+ */
+export const MAX_FILTER_SORT_PREDICATE_CELLS = 50_000
+export const FILTER_SORT_SOURCE_TOO_LARGE = 'FILTER_SORT_SOURCE_TOO_LARGE'
 function normalizeSheetInputs(
   sheets: readonly (string | WorkerWorkbookBackendSheetInput)[] | undefined,
 ): WorkerWorkbookBackendSheetInput[] {
@@ -336,10 +358,22 @@ type WorkerValidationRuleLayer = {
   mode: ValidationMode
 }
 
+/** One projected row while filter/sort is active: where it renders and where it lives. */
+type MappedDisplayRow = { displayRow: number; sourceRow: number }
+
+/**
+ * `range` is the coordinate space the rule ranges are compared against —
+ * the display window on the plain path, the SOURCE bounding range when
+ * filter/sort is active (rule scopes are source facts). `mappedRows`
+ * switches the blank-cell fill from the identity row walk to the
+ * display→source mapping so synthesized cells land on projected rows and
+ * carry `originalRow` like every other filtered cell.
+ */
 function applyValidationOverlay(
   cells: DisplayCell[],
   range: CellRange,
   rules: readonly WorkerValidationRuleLayer[],
+  mappedRows?: readonly MappedDisplayRow[],
 ): DisplayCell[] {
   if (rules.length === 0) return cells
   const byDisplay = new Map(cells.map((cell) => [keyFor(cell.row, cell.col), cloneCell(cell)]))
@@ -361,10 +395,35 @@ function applyValidationOverlay(
           }
     }
 
-    const rowStart = Math.max(range.rowStart, layer.range.rowStart)
-    const rowEnd = Math.min(range.rowEnd, layer.range.rowEnd)
     const colStart = Math.max(range.colStart, layer.range.colStart)
     const colEnd = Math.min(range.colEnd, layer.range.colEnd)
+    const blankValidation = () => ({
+      code: `validation.${layer.rule.kind}`,
+      severity: validationSeverityForMode(layer.mode),
+      message: validationMessageForRule(layer.rule),
+    })
+
+    if (mappedRows) {
+      for (const { displayRow, sourceRow } of mappedRows) {
+        if (sourceRow < layer.range.rowStart || sourceRow > layer.range.rowEnd) continue
+        for (let col = colStart; col <= colEnd; col += 1) {
+          const key = keyFor(displayRow, col)
+          if (byDisplay.has(key)) continue
+          byDisplay.set(key, {
+            row: displayRow,
+            col,
+            displayValue: '',
+            valueKind: 'blank',
+            originalRow: sourceRow,
+            validation: blankValidation(),
+          })
+        }
+      }
+      continue
+    }
+
+    const rowStart = Math.max(range.rowStart, layer.range.rowStart)
+    const rowEnd = Math.min(range.rowEnd, layer.range.rowEnd)
     for (let row = rowStart; row <= rowEnd; row += 1) {
       for (let col = colStart; col <= colEnd; col += 1) {
         const key = keyFor(row, col)
@@ -374,11 +433,7 @@ function applyValidationOverlay(
           col,
           displayValue: '',
           valueKind: 'blank',
-          validation: {
-            code: `validation.${layer.rule.kind}`,
-            severity: validationSeverityForMode(layer.mode),
-            message: validationMessageForRule(layer.rule),
-          },
+          validation: blankValidation(),
         })
       }
     }
@@ -776,6 +831,24 @@ export function createWorkerWorkbookSpreadsheetBackend(
   // that point these Maps should disappear (not be extended).
   const validationRulesBySheetId = new Map<string, WorkerValidationRuleLayer[]>()
   const conditionalFormatRulesBySheetId = new Map<string, ConditionalFormatRuleEntry[]>()
+  /**
+   * Parity item #29 (filter visibility = UI-core view fact). UI-core's
+   * `filterSortStateAtom` is the canonical rule store; this Map is the
+   * adapter's projection-side MIRROR of the last ACKed `setFilterSort`
+   * payload — never read back by the UI, never a second truth source.
+   * Bounded by the workbook's sheet count; rule payload size is bounded
+   * upstream by ui-core normalization (`MAX_FILTER_LIST_VALUES`).
+   */
+  const filterSortStateBySheetId = new Map<string, FilterSortState>()
+  /**
+   * Computed display-row permutations (one entry per sheet with an
+   * active filter, array length <= data extent, itself bounded by
+   * MAX_FILTER_SORT_PREDICATE_CELLS / predicate columns). Invalidated
+   * wholesale by `bumpRevision()` — every acknowledged mutation and
+   * every worker `cellsDirty` push routes through it — so the next
+   * projection read recomputes from fresh engine values.
+   */
+  const filterSortDisplayRowsBySheetId = new Map<string, number[]>()
   let namedRanges: NamedRange[] = []
   let namedRangeMutationTail: Promise<void> = Promise.resolve()
   /**
@@ -841,6 +914,12 @@ export function createWorkerWorkbookSpreadsheetBackend(
   })
 
   function bumpRevision(): ProjectionRevision {
+    // Conservative filter/sort invalidation: any acknowledged mutation
+    // (and any worker-initiated cellsDirty push — the onCellsDirty
+    // handler calls bumpRevision) may change predicate values, so drop
+    // every cached display-row permutation. The rule mirror survives;
+    // the permutation is recomputed on the next projection read.
+    filterSortDisplayRowsBySheetId.clear()
     if (typeof revision === 'number' && Number.isFinite(revision)) {
       revision += 1
     }
@@ -887,11 +966,14 @@ export function createWorkerWorkbookSpreadsheetBackend(
    * sheet's id IS reused by the next added sheet — stale entries are not
    * just leaks, they get inherited. Per-sheet-keyed state in this
    * backend: `validationRulesBySheetId`, `conditionalFormatRulesBySheetId`,
-   * and the sheet-scoped entries of `namedRanges`.
+   * `filterSortStateBySheetId`, `filterSortDisplayRowsBySheetId`, and the
+   * sheet-scoped entries of `namedRanges`.
    */
   function dropSheetOverlayState(sheetId: string): void {
     validationRulesBySheetId.delete(sheetId)
     conditionalFormatRulesBySheetId.delete(sheetId)
+    filterSortStateBySheetId.delete(sheetId)
+    filterSortDisplayRowsBySheetId.delete(sheetId)
     namedRanges = namedRanges.filter(
       (item) => item.scope === 'workbook' || item.scope.sheetId !== sheetId,
     )
@@ -970,12 +1052,200 @@ export function createWorkerWorkbookSpreadsheetBackend(
     return sheet
   }
 
+  /** Column 0 (summary-row probe) plus every rule and directive column. */
+  function filterSortPredicateColumns(state: FilterSortState): number[] {
+    const cols = new Set<number>([0])
+    for (const rule of state.rules) cols.add(rule.colIndex)
+    for (const directive of state.directives) cols.add(directive.colIndex)
+    return [...cols]
+  }
+
+  /**
+   * Bounded predicate scan + shared pure permutation. Mirrors the static
+   * backend exactly (headerRow 0, data rows 1..maxRow, summary-row
+   * pass-through) but reads engine display values over existing RPCs:
+   * `listNonEmpty` as the exact per-sheet extent probe, then ONE
+   * `readSparseRange` per predicate column, all inside the declared
+   * MAX_FILTER_SORT_PREDICATE_CELLS budget. Over-budget sources reject
+   * with a structured error instead of truncating.
+   */
+  async function computeFilterSortDisplayRows(
+    sheet: WorkerWorkbookBackendSheet,
+    state: FilterSortState,
+  ): Promise<number[]> {
+    const cols = filterSortPredicateColumns(state)
+    const refs = await client.listNonEmpty()
+    let maxRow = -1
+    for (const ref of refs) {
+      if (ref.sheet !== sheet.idx) continue
+      const coord = parseA1(ref.addr)
+      if (coord && coord.row > maxRow) maxRow = coord.row
+    }
+    const rowCount = maxRow + 1
+    const predicateCells = rowCount * cols.length
+    if (predicateCells > MAX_FILTER_SORT_PREDICATE_CELLS) {
+      throw createBackendError(
+        FILTER_SORT_SOURCE_TOO_LARGE,
+        `filter/sort predicate scan needs ${predicateCells} cells (${rowCount} rows x ` +
+          `${cols.length} columns) but the adapter cap is ${MAX_FILTER_SORT_PREDICATE_CELLS}; ` +
+          'filter and sort were not applied',
+      )
+    }
+
+    const values = new Map<string, string>()
+    if (rowCount > 0) {
+      await Promise.all(
+        cols.map(async (col) => {
+          const snapshots = await client.readSparseRange({
+            sheet: sheet.idx,
+            startRow: 0,
+            endRow: maxRow,
+            startCol: col,
+            endCol: col,
+          })
+          for (const snapshot of snapshots) {
+            const coord = parseA1(snapshot.addr)
+            if (coord) values.set(keyFor(coord.row, coord.col), snapshot.display)
+          }
+        }),
+      )
+    }
+
+    return (
+      buildFilterSortDisplayRows(state, { headerRow: 0, startRow: 1, endRow: rowCount }, (row, col) =>
+        values.get(keyFor(row, col)) ?? '',
+      ) ?? []
+    )
+  }
+
+  /** `null` when no filter/sort is active for the sheet; cached permutation otherwise. */
+  async function activeFilterSortDisplayRows(
+    sheetId: string,
+    sheet: WorkerWorkbookBackendSheet,
+  ): Promise<number[] | null> {
+    const state = filterSortStateBySheetId.get(sheetId)
+    if (!state) return null
+    const cached = filterSortDisplayRowsBySheetId.get(sheetId)
+    if (cached) return cached
+    const displayRows = await computeFilterSortDisplayRows(sheet, state)
+    filterSortDisplayRowsBySheetId.set(sheetId, displayRows)
+    return displayRows
+  }
+
+  /**
+   * Projection read while filter/sort is active. Display rows in the
+   * requested window remap through the permutation to source rows; the
+   * cell fetch is a `readCells` batch bounded by the window itself
+   * (window rows x window cols refs), formats/validation/conditional
+   * overlays resolve against SOURCE coordinates, and every emitted cell
+   * carries `originalRow` so the ui-core mutation gateway can map edits
+   * back to source rows.
+   */
+  async function readFilteredRange(
+    sheetId: string,
+    sheet: WorkerWorkbookBackendSheet,
+    range: CellRange,
+    displayRows: readonly number[],
+    requestRevision?: ProjectionRevision,
+  ): Promise<{ cells: DisplayCell[]; revision?: ProjectionRevision }> {
+    const mapped: MappedDisplayRow[] = []
+    for (let row = range.rowStart; row <= range.rowEnd; row += 1) {
+      const sourceRow = displayRows[row]
+      if (sourceRow !== undefined) mapped.push({ displayRow: row, sourceRow })
+    }
+    if (mapped.length === 0) {
+      return { cells: [], revision: requestRevision ?? revision }
+    }
+
+    let minSourceRow = mapped[0].sourceRow
+    let maxSourceRow = mapped[0].sourceRow
+    for (const { sourceRow } of mapped) {
+      if (sourceRow < minSourceRow) minSourceRow = sourceRow
+      if (sourceRow > maxSourceRow) maxSourceRow = sourceRow
+    }
+    const sourceRange: CellRange = {
+      rowStart: minSourceRow,
+      rowEnd: maxSourceRow,
+      colStart: range.colStart,
+      colEnd: range.colEnd,
+    }
+
+    const refs: CellRefWire[] = []
+    for (const { sourceRow } of mapped) {
+      for (let col = range.colStart; col <= range.colEnd; col += 1) {
+        refs.push({ sheet: sheet.idx, addr: toA1(sourceRow, col) })
+      }
+    }
+
+    const sparseSourceRange = toSparseRange(sheet.idx, sourceRange)
+    const [snapshots, formatSnapshot] = await Promise.all([
+      client.readCells(refs),
+      runtimeSupports('formatSnapshots')
+        ? client.snapshotFormatRange(sparseSourceRange)
+        : Promise.resolve(emptyFormatRangeSnapshot(sparseSourceRange)),
+    ])
+
+    const sourceCells = new Map<string, DisplayCell>()
+    for (const snapshot of snapshots) {
+      const cell = snapshotToDisplayCell(snapshot)
+      if (cell) sourceCells.set(keyFor(cell.row, cell.col), cell)
+    }
+
+    const { cellFormats, rangeFormats } = preprocessFormatSnapshot(formatSnapshot)
+    const cells: DisplayCell[] = []
+    for (const { displayRow, sourceRow } of mapped) {
+      for (let col = range.colStart; col <= range.colEnd; col += 1) {
+        const source = sourceCells.get(keyFor(sourceRow, col))
+        const format = getEffectiveFormat(sourceRow, col, cellFormats, rangeFormats)
+        if (source) {
+          const cell = cloneCell(source)
+          cell.row = displayRow
+          cell.originalRow = sourceRow
+          if (format) cell.format = format
+          cells.push(cell)
+        } else if (format) {
+          cells.push({
+            row: displayRow,
+            col,
+            displayValue: '',
+            valueKind: 'blank',
+            format,
+            originalRow: sourceRow,
+          })
+        }
+      }
+    }
+
+    const numberFormattedCells = applyNumberFormatsToCells(cells)
+    const validatedCells = applyValidationOverlay(
+      numberFormattedCells,
+      sourceRange,
+      validationRulesBySheetId.get(sheetId) ?? [],
+      mapped,
+    )
+
+    return {
+      cells: applyConditionalFormatOverlay(
+        validatedCells,
+        conditionalFormatRulesBySheetId.get(sheetId) ?? [],
+        sourceRange,
+      ).sort((left, right) =>
+        left.row === right.row ? left.col - right.col : left.row - right.row,
+      ),
+      revision: requestRevision ?? revision,
+    }
+  }
+
   async function readRange(
     sheetId: string,
     range: CellRange,
     requestRevision?: ProjectionRevision,
   ): Promise<{ cells: DisplayCell[]; revision?: ProjectionRevision }> {
     const sheet = await resolveSheet(sheetId)
+    const filterSortDisplayRows = await activeFilterSortDisplayRows(sheetId, sheet)
+    if (filterSortDisplayRows !== null) {
+      return readFilteredRange(sheetId, sheet, range, filterSortDisplayRows, requestRevision)
+    }
     const sparseRange = toSparseRange(sheet.idx, range)
     const [snapshots, formatSnapshot] = await Promise.all([
       client.readSparseRange(sparseRange),
@@ -1965,6 +2235,49 @@ export function createWorkerWorkbookSpreadsheetBackend(
         sheetId: request.sheetId,
         requestId: request.requestId,
         revision: request.revision ?? bumpRevision(),
+      }
+    },
+
+    /**
+     * Parity item #29 — filter visibility on the worker path. The rules
+     * stay ui-core canonical (this ACK is what lets ui-core commit
+     * them); the adapter mirrors the payload and computes the display
+     * permutation with the shared pure helper at projection time, so the
+     * engine data is never reordered (sort is a display permutation;
+     * physical engine sort is later-phase data-fact work). The
+     * permutation is computed BEFORE acknowledging: an over-cap source
+     * rejects with FILTER_SORT_SOURCE_TOO_LARGE and the filter never
+     * activates — fail-closed, no silent truncation. Clearing (a
+     * no-effect payload) never scans and therefore always succeeds, so
+     * an over-cap state can always be exited.
+     */
+    async setFilterSort(request: SetFilterSortRequest): Promise<BackendMutationResult> {
+      const sheet = await resolveSheet(request.sheetId)
+      const next = cloneFilterSortState({
+        rules: request.rules,
+        directives: request.directives,
+      })
+
+      if (!filterSortHasEffect(next)) {
+        filterSortStateBySheetId.delete(request.sheetId)
+        const nextRevision = bumpRevision()
+        return {
+          sheetId: request.sheetId,
+          requestId: request.requestId,
+          revision: request.revision ?? nextRevision,
+        }
+      }
+
+      const displayRows = await computeFilterSortDisplayRows(sheet, next)
+      filterSortStateBySheetId.set(request.sheetId, next)
+      // bumpRevision clears the whole display-row cache; store the fresh
+      // permutation after it so the first projection read reuses it.
+      const nextRevision = bumpRevision()
+      filterSortDisplayRowsBySheetId.set(request.sheetId, displayRows)
+      return {
+        sheetId: request.sheetId,
+        requestId: request.requestId,
+        revision: request.revision ?? nextRevision,
       }
     },
 
