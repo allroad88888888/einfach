@@ -97,6 +97,10 @@ export type MenuItemDispatch =
   | { kind: 'unlock-range' }
   | { kind: 'sort-asc' }
   | { kind: 'sort-desc' }
+  | { kind: 'outline-group-rows' }
+  | { kind: 'outline-ungroup-rows' }
+  | { kind: 'outline-group-cols' }
+  | { kind: 'outline-ungroup-cols' }
   | { kind: 'toggle-formula-bar' }
   | { kind: 'toggle-gridlines' }
   | { kind: 'toggle-headings' }

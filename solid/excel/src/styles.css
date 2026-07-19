@@ -562,6 +562,101 @@ thead .row-header {
   z-index: 5;
 }
 
+/* Outline (grouping) gutter — renders only when the sheet has row/column
+ * groups. Row gutter cells stick to the left edge like row headers; the
+ * column band sticks to the top like column headers. Slot layout lives in
+ * an inner flex wrapper because flex on a th breaks table column sizing. */
+.spreadsheet-grid-outline-row-cell,
+.spreadsheet-grid-outline-header,
+.spreadsheet-grid-outline-col-cell,
+.spreadsheet-grid-outline-corner {
+  border: 1px solid #d8d8d8;
+  padding: 0;
+  background: #eef1f4;
+  user-select: none;
+}
+.spreadsheet-grid-outline-row-cell {
+  position: sticky;
+  left: 0;
+  z-index: 2;
+}
+.spreadsheet-grid-outline-col-cell {
+  position: sticky;
+  top: 0;
+  z-index: 2;
+}
+.spreadsheet-grid-outline-header {
+  position: sticky;
+  left: 0;
+  top: 0;
+  z-index: 4;
+}
+.spreadsheet-grid-outline-corner {
+  position: sticky;
+  left: 0;
+  top: 0;
+  z-index: 4;
+}
+.spreadsheet-outline-slots {
+  display: flex;
+  width: 100%;
+  height: 100%;
+  align-items: stretch;
+  justify-content: center;
+}
+.spreadsheet-outline-slots[data-axis='column'] {
+  flex-direction: column;
+}
+.spreadsheet-outline-slot {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  flex: 0 0 14px;
+  min-width: 0;
+  min-height: 0;
+}
+.spreadsheet-outline-line {
+  display: block;
+  background: #9aa4af;
+}
+.spreadsheet-outline-slots[data-axis='row'] .spreadsheet-outline-line {
+  width: 2px;
+  height: 100%;
+}
+.spreadsheet-outline-slots[data-axis='column'] .spreadsheet-outline-line {
+  height: 2px;
+  width: 100%;
+}
+.spreadsheet-outline-toggle,
+.spreadsheet-outline-level-button {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 12px;
+  height: 12px;
+  padding: 0;
+  border: 1px solid #9aa4af;
+  border-radius: 2px;
+  background: #fff;
+  color: #444;
+  font-size: 9px;
+  line-height: 1;
+  cursor: pointer;
+}
+.spreadsheet-outline-toggle:hover,
+.spreadsheet-outline-level-button:hover {
+  background: #e8f0fe;
+}
+.spreadsheet-grid-outline-header,
+.spreadsheet-grid-outline-corner {
+  text-align: center;
+  vertical-align: middle;
+}
+.spreadsheet-grid-outline-header .spreadsheet-outline-level-button,
+.spreadsheet-grid-outline-corner .spreadsheet-outline-level-button {
+  margin: 1px;
+}
+
 /* Freeze boundary divider — single SVG overlay drawn once per grid root
  * (NOT inside the scroll viewport), so it sits at the seam between pinned
  * and scrollable regions without participating in scroll. The line positions

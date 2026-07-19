@@ -21,6 +21,7 @@ export type HistoryEntryKind =
   | 'format.set'
   | 'viewport.freeze'
   | 'viewport.hidden'
+  | 'outline'
 
 export interface HistoryAffectedRange {
   readonly rowStart: number

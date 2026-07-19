@@ -4,6 +4,7 @@ import {
   beginProjectionAtom,
   cancelPointerAtom,
   clipboardStateAtom,
+  collapseOutlineToLevelAtom,
   commitPointerAtom,
   copyClipboardAtom,
   createClipboardTsvPastePlan,
@@ -21,6 +22,8 @@ import {
   pickFormulaReferenceAtom,
   getHiddenColumnsForSheet,
   getHiddenRowsForSheet,
+  getOutlineLeveledGroupsForSheet,
+  getOutlineMaxLevelForSheet,
   getAdjacentSheetId,
   getFillHandleSourceCoord,
   getFillHandleWriteRange,
@@ -65,6 +68,7 @@ import {
   sheetTabsSheetsAtom,
   startPointerAtom,
   startEditingAtom,
+  toggleOutlineGroupCollapsedAtom,
   updatePointerAtom,
   activeCellLockedAtom,
   issueProjectionRequestIdAtom,
@@ -75,6 +79,7 @@ import {
   openFilterDropdownAtom,
   openFormatCellsAtom,
   notifyActiveSheetChangedAtom,
+  outlineAtom,
   remoteCursorsAtom,
   rejectProjectionAtom,
   resetProjectionAtom,
@@ -88,6 +93,8 @@ import {
   type DisplayCellRichValue,
   type FormatToggleField,
   type MenuOpenInput,
+  type OutlineAxis,
+  type OutlineGroupWithLevel,
   type PointerFillHandleCommitIntent,
   type RangeProjectionResult,
   type RichTextRunFormat,
@@ -152,6 +159,12 @@ function getWindowIndexes(start: number, end: number) {
 }
 
 const GRID_ROW_HEADER_WIDTH = 44
+
+// Outline (grouping) gutter geometry: one fixed-size slot per nesting
+// level. The gutter renders only when the sheet has groups on that axis,
+// so sheets without outlines keep their exact pre-outline layout.
+const OUTLINE_GUTTER_SLOT_PX = 14
+const OUTLINE_GUTTER_PADDING_PX = 6
 
 // Hidden rows/columns are UI-core canonical zero-size entries in the axis
 // math: a hidden index contributes 0px to offsets and spans, mirroring
@@ -592,6 +605,7 @@ export function SpreadsheetGrid(props: SpreadsheetGridProps) {
   let unsubscribeViewport: (() => void) | null = null
   let unsubscribeSizes: (() => void) | null = null
   let unsubscribeHidden: (() => void) | null = null
+  let unsubscribeOutline: (() => void) | null = null
   let unsubscribeFreeze: (() => void) | null = null
   let unsubscribePointer: (() => void) | null = null
   let unsubscribePresence: (() => void) | null = null
@@ -743,6 +757,96 @@ export function SpreadsheetGrid(props: SpreadsheetGridProps) {
   function hiddenState() {
     renderTick()
     return store.getter(viewportHiddenAtom)
+  }
+
+  // ── Outline (grouping) gutter ─────────────────────────────────────────
+  // Outline metadata is UI-core canonical; the gutter only renders when
+  // the sheet has groups on the axis, so group-free sheets keep their
+  // exact layout. Collapse toggles route through the UI-core command,
+  // which syncs the hidden canonical sets (grid rows/cols react via the
+  // existing hidden subscription).
+
+  function outlineState() {
+    renderTick()
+    return store.getter(outlineAtom)
+  }
+
+  function getOutlineGroups(axis: OutlineAxis): readonly OutlineGroupWithLevel[] {
+    return getOutlineLeveledGroupsForSheet(outlineState(), props.sheetId, axis)
+  }
+
+  function hasRowOutline(): boolean {
+    return getOutlineGroups('row').length > 0
+  }
+
+  function hasColOutline(): boolean {
+    return getOutlineGroups('column').length > 0
+  }
+
+  function getOutlineMaxLevel(axis: OutlineAxis): number {
+    return getOutlineMaxLevelForSheet(outlineState(), props.sheetId, axis)
+  }
+
+  function getRowOutlineGutterWidth(): number {
+    return hasRowOutline()
+      ? getOutlineMaxLevel('row') * OUTLINE_GUTTER_SLOT_PX + OUTLINE_GUTTER_PADDING_PX
+      : 0
+  }
+
+  function getColOutlineBandHeight(): number {
+    return hasColOutline()
+      ? getOutlineMaxLevel('column') * OUTLINE_GUTTER_SLOT_PX + OUTLINE_GUTTER_PADDING_PX
+      : 0
+  }
+
+  function getOutlineLevelSlots(axis: OutlineAxis): number[] {
+    return Array.from({ length: getOutlineMaxLevel(axis) }, (_, index) => index + 1)
+  }
+
+  function getOutlineLevelButtons(axis: OutlineAxis): number[] {
+    return Array.from({ length: getOutlineMaxLevel(axis) + 1 }, (_, index) => index + 1)
+  }
+
+  /** Excel places the +/− toggle on the summary index right after the group. */
+  function getOutlineToggleAt(
+    axis: OutlineAxis,
+    index: number,
+    level: number,
+  ): OutlineGroupWithLevel | undefined {
+    return getOutlineGroups(axis).find(
+      (group) => group.end + 1 === index && group.level === level,
+    )
+  }
+
+  function outlineSlotHasLine(axis: OutlineAxis, index: number, level: number): boolean {
+    return getOutlineGroups(axis).some(
+      (group) =>
+        !group.collapsed && group.level === level && index >= group.start && index <= group.end,
+    )
+  }
+
+  function toggleOutlineGroup(axis: OutlineAxis, group: OutlineGroupWithLevel) {
+    store.setter(toggleOutlineGroupCollapsedAtom, {
+      sheetId: props.sheetId,
+      axis,
+      start: group.start,
+      end: group.end,
+      level: group.level,
+      source: backend,
+    })
+    bumpRender()
+    focusGrid()
+  }
+
+  function collapseOutlineLevel(axis: OutlineAxis, level: number) {
+    store.setter(collapseOutlineToLevelAtom, {
+      sheetId: props.sheetId,
+      axis,
+      level,
+      source: backend,
+    })
+    bumpRender()
+    focusGrid()
   }
 
   function freezeRowCount(): number {
@@ -1073,6 +1177,7 @@ export function SpreadsheetGrid(props: SpreadsheetGridProps) {
     unsubscribeViewport = store.sub(viewportMetricsAtom, refreshViewportProjection)
     unsubscribeSizes = store.sub(viewportSizeOverridesAtom, bumpRender)
     unsubscribeHidden = store.sub(viewportHiddenAtom, bumpRender)
+    unsubscribeOutline = store.sub(outlineAtom, bumpRender)
     unsubscribeFreeze = store.sub(viewportFreezeAtom, refreshEffectiveFreezeProjection)
     unsubscribePointer = store.sub(pointerSessionAtom, bumpRender)
     unsubscribePresence = store.sub(presenceStateAtom, bumpRender)
@@ -1120,6 +1225,7 @@ export function SpreadsheetGrid(props: SpreadsheetGridProps) {
     unsubscribeViewport?.()
     unsubscribeSizes?.()
     unsubscribeHidden?.()
+    unsubscribeOutline?.()
     unsubscribeFreeze?.()
     unsubscribePointer?.()
     unsubscribePresence?.()
@@ -2910,10 +3016,14 @@ export function SpreadsheetGrid(props: SpreadsheetGridProps) {
     const style: Record<string, string> = {
       width: `${getRenderedColumnWidth(col)}px`,
     }
+    if (hasColOutline()) {
+      // Keep the sticky column headers below the outline band.
+      style.top = `${getColOutlineBandHeight()}px`
+    }
     if (col < freezeColCount()) {
       const headingWidth = showHeadings() ? GRID_ROW_HEADER_WIDTH : 0
       const stackedLeft = col === 0 ? 0 : getColumnSpanWidth(0, col - 1)
-      style.left = `${headingWidth + stackedLeft}px`
+      style.left = `${getRowOutlineGutterWidth() + headingWidth + stackedLeft}px`
     }
     return style
   }
@@ -2927,12 +3037,12 @@ export function SpreadsheetGrid(props: SpreadsheetGridProps) {
       // visually rather than overlapping the header (z-index 2 vs cell 1).
       const headingHeight = showHeadings() ? viewportMetrics().rowHeight : 0
       const stackedAbove = row === 0 ? 0 : getRowSpanHeight(0, row - 1)
-      style.top = `${headingHeight + stackedAbove}px`
+      style.top = `${getColOutlineBandHeight() + headingHeight + stackedAbove}px`
     }
     if (frozenCols > 0 && col < frozenCols) {
       const headingWidth = showHeadings() ? GRID_ROW_HEADER_WIDTH : 0
       const stackedLeft = col === 0 ? 0 : getColumnSpanWidth(0, col - 1)
-      style.left = `${headingWidth + stackedLeft}px`
+      style.left = `${getRowOutlineGutterWidth() + headingWidth + stackedLeft}px`
     }
     return style
   }
@@ -2990,11 +3100,22 @@ export function SpreadsheetGrid(props: SpreadsheetGridProps) {
     const style: Record<string, string> = {
       height: `${getRenderedRowHeight(row)}px`,
     }
+    if (hasRowOutline()) {
+      // Keep the sticky row headers to the right of the outline gutter.
+      style.left = `${getRowOutlineGutterWidth()}px`
+    }
     if (row < freezeRowCount()) {
       const headingHeight = showHeadings() ? viewportMetrics().rowHeight : 0
       const stackedAbove = row === 0 ? 0 : getRowSpanHeight(0, row - 1)
-      style.top = `${headingHeight + stackedAbove}px`
+      style.top = `${getColOutlineBandHeight() + headingHeight + stackedAbove}px`
     }
+    return style
+  }
+
+  function getCornerStyle(): Record<string, string> {
+    const style: Record<string, string> = {}
+    if (hasRowOutline()) style.left = `${getRowOutlineGutterWidth()}px`
+    if (hasColOutline()) style.top = `${getColOutlineBandHeight()}px`
     return style
   }
 
@@ -3003,7 +3124,7 @@ export function SpreadsheetGrid(props: SpreadsheetGridProps) {
     const headingHeight = showHeadings() ? metrics.rowHeight : 0
     return {
       width: '100%',
-      height: `${metrics.viewportHeight + headingHeight}px`,
+      height: `${metrics.viewportHeight + headingHeight + getColOutlineBandHeight()}px`,
     }
   }
 
@@ -3042,7 +3163,7 @@ export function SpreadsheetGrid(props: SpreadsheetGridProps) {
   function getTotalTableWidth() {
     const metrics = viewportMetrics()
     const headingWidth = showHeadings() ? GRID_ROW_HEADER_WIDTH : 0
-    return headingWidth + getColumnSpanWidth(0, metrics.colCount - 1)
+    return getRowOutlineGutterWidth() + headingWidth + getColumnSpanWidth(0, metrics.colCount - 1)
   }
 
   function getTopSpacerHeight() {
@@ -3069,6 +3190,7 @@ export function SpreadsheetGrid(props: SpreadsheetGridProps) {
 
   function getVirtualColumnSpan() {
     return (
+      (hasRowOutline() ? 1 : 0) +
       (showHeadings() ? 1 : 0) +
       getCols().length +
       (getLeftSpacerWidth() > 0 ? 1 : 0) +
@@ -3437,6 +3559,72 @@ export function SpreadsheetGrid(props: SpreadsheetGridProps) {
     }
   }
 
+  function renderOutlineSlots(axis: OutlineAxis, index: number) {
+    return (
+      <span class="spreadsheet-outline-slots" data-axis={axis}>
+        <For each={getOutlineLevelSlots(axis)}>
+          {(level) => {
+            const toggle = () => getOutlineToggleAt(axis, index, level)
+            return (
+              <span class="spreadsheet-outline-slot">
+                <Show
+                  when={toggle()}
+                  fallback={
+                    <Show when={outlineSlotHasLine(axis, index, level)}>
+                      <span class="spreadsheet-outline-line" aria-hidden="true" />
+                    </Show>
+                  }
+                >
+                  {(group) => (
+                    <button
+                      type="button"
+                      class="spreadsheet-outline-toggle"
+                      data-testid={`outline-${axis === 'row' ? 'row' : 'col'}-toggle-${
+                        group().start
+                      }-${group().end}`}
+                      data-collapsed={group().collapsed ? 'true' : 'false'}
+                      aria-expanded={group().collapsed ? 'false' : 'true'}
+                      aria-label={`${group().collapsed ? 'Expand' : 'Collapse'} ${
+                        axis === 'row' ? 'rows' : 'columns'
+                      } ${group().start + 1}-${group().end + 1}`}
+                      onClick={(event) => {
+                        event.stopPropagation()
+                        toggleOutlineGroup(axis, group())
+                      }}
+                    >
+                      {group().collapsed ? '+' : '−'}
+                    </button>
+                  )}
+                </Show>
+              </span>
+            )
+          }}
+        </For>
+      </span>
+    )
+  }
+
+  function renderOutlineLevelButtons(axis: OutlineAxis) {
+    return (
+      <For each={getOutlineLevelButtons(axis)}>
+        {(level) => (
+          <button
+            type="button"
+            class="spreadsheet-outline-level-button"
+            data-testid={`outline-${axis === 'row' ? 'row' : 'col'}-level-${level}`}
+            aria-label={`Show ${axis === 'row' ? 'row' : 'column'} outline level ${level}`}
+            onClick={(event) => {
+              event.stopPropagation()
+              collapseOutlineLevel(axis, level)
+            }}
+          >
+            {level}
+          </button>
+        )}
+      </For>
+    )
+  }
+
   return (
     <div
       ref={gridRoot}
@@ -3469,10 +3657,62 @@ export function SpreadsheetGrid(props: SpreadsheetGridProps) {
       >
         <tbody>
           <Show when={getRows().length > 0 && getCols().length > 0}>
+            <Show when={hasColOutline()}>
+              <tr class="spreadsheet-grid-outline-col-row" data-testid="outline-col-band">
+                <Show when={hasRowOutline() || showHeadings()}>
+                  <th
+                    class="spreadsheet-grid-outline-corner"
+                    data-testid="outline-col-levels"
+                    colSpan={(hasRowOutline() ? 1 : 0) + (showHeadings() ? 1 : 0)}
+                    style={{ height: `${getColOutlineBandHeight()}px` }}
+                  >
+                    {renderOutlineLevelButtons('column')}
+                  </th>
+                </Show>
+                <Show when={getLeftSpacerWidth() > 0}>
+                  <th
+                    class="spreadsheet-grid-virtual-spacer"
+                    aria-hidden="true"
+                    style={{ width: `${getLeftSpacerWidth()}px` }}
+                  />
+                </Show>
+                <For each={getCols()}>
+                  {(col) => (
+                    <th
+                      class="spreadsheet-grid-outline-col-cell"
+                      data-outline-col={col}
+                      style={{ height: `${getColOutlineBandHeight()}px` }}
+                    >
+                      {renderOutlineSlots('column', col)}
+                    </th>
+                  )}
+                </For>
+                <Show when={getRightSpacerWidth() > 0}>
+                  <th
+                    class="spreadsheet-grid-virtual-spacer"
+                    aria-hidden="true"
+                    style={{ width: `${getRightSpacerWidth()}px` }}
+                  />
+                </Show>
+              </tr>
+            </Show>
             <Show when={showHeadings()}>
             <tr>
+              <Show when={hasRowOutline()}>
+                <th
+                  class="spreadsheet-grid-outline-header"
+                  data-testid="outline-row-levels"
+                  style={{
+                    width: `${getRowOutlineGutterWidth()}px`,
+                    ...(hasColOutline() ? { top: `${getColOutlineBandHeight()}px` } : {}),
+                  }}
+                >
+                  {renderOutlineLevelButtons('row')}
+                </th>
+              </Show>
               <th
                 class="spreadsheet-grid-corner"
+                style={getCornerStyle()}
                 data-selected={isAllSelected() ? 'true' : 'false'}
                 onClick={() => {
                   store.setter(selectAllAtom, props.sheetId)
@@ -3573,6 +3813,18 @@ export function SpreadsheetGrid(props: SpreadsheetGridProps) {
             <For each={getRows()}>
               {(row) => (
                 <tr class="spreadsheet-grid-row">
+                  <Show when={hasRowOutline()}>
+                    <th
+                      class="spreadsheet-grid-outline-row-cell"
+                      data-outline-row={row}
+                      style={{
+                        width: `${getRowOutlineGutterWidth()}px`,
+                        height: `${getRenderedRowHeight(row)}px`,
+                      }}
+                    >
+                      {renderOutlineSlots('row', row)}
+                    </th>
+                  </Show>
                   <Show when={showHeadings()}>
                   <th
                     class={`spreadsheet-grid-row-header ${

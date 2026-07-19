@@ -439,6 +439,34 @@ const DATA_ITEMS: readonly MenuBarEntry[] = [
     capabilityKey: 'removeRows',
   },
   { kind: 'separator', id: 'data.sep-2' },
+  // Outline grouping is UI-core canonical (#07): the commands commit
+  // locally (collapse visibility reuses the hidden canonical sets), so
+  // the entries are always available regardless of backend ports.
+  {
+    id: 'data.groupRows',
+    label: 'menuBar.data.groupRows',
+    dispatch: { kind: 'outline-group-rows' },
+    isAvailable: 'always',
+  },
+  {
+    id: 'data.ungroupRows',
+    label: 'menuBar.data.ungroupRows',
+    dispatch: { kind: 'outline-ungroup-rows' },
+    isAvailable: 'always',
+  },
+  {
+    id: 'data.groupCols',
+    label: 'menuBar.data.groupCols',
+    dispatch: { kind: 'outline-group-cols' },
+    isAvailable: 'always',
+  },
+  {
+    id: 'data.ungroupCols',
+    label: 'menuBar.data.ungroupCols',
+    dispatch: { kind: 'outline-ungroup-cols' },
+    isAvailable: 'always',
+  },
+  { kind: 'separator', id: 'data.sep-3' },
   {
     id: 'data.validation',
     label: 'menuBar.data.validation',

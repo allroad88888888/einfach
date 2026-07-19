@@ -153,6 +153,10 @@ export const messages: Record<string, string> = {
   'menuBar.data.filter': 'Filter…',
   'menuBar.data.textToColumns': 'Text to Columns…',
   'menuBar.data.removeDuplicates': 'Remove Duplicates…',
+  'menuBar.data.groupRows': 'Group Rows',
+  'menuBar.data.ungroupRows': 'Ungroup Rows',
+  'menuBar.data.groupCols': 'Group Columns',
+  'menuBar.data.ungroupCols': 'Ungroup Columns',
   'menuBar.data.validation': 'Data Validation…',
   // Menu bar — View
   'menuBar.view.zoomIn': 'Zoom In',

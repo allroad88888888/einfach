@@ -15,6 +15,7 @@ import {
   dispatchToolbarFormatCommandAtom,
   filterSortEntrypointProjectionAtom,
   findMenuByAccessKey,
+  groupSelectionAtom,
   helpOverlayAtom,
   isMenuItemDescriptor,
   MENU_BAR_ITEMS,
@@ -51,6 +52,7 @@ import {
   toggleHeadingsAtom,
   togglePrintPreviewAtom,
   unprotectSheetAtom,
+  ungroupSelectionAtom,
   topMenuOpenAtom,
   textToColumnsEntrypointProjectionAtom,
   viewportShowFormulaBarAtom,
@@ -511,6 +513,23 @@ export function SpreadsheetMenuBar(props: SpreadsheetMenuBarProps) {
         store.setter(openProtectionUnlockAtom, { sheetId, range: snap.range })
         return
       }
+      // outline-group / outline-ungroup: outline metadata is UI-core
+      // canonical — the commands resolve the current selection and commit
+      // locally; collapse visibility reuses the hidden canonical sets.
+      case 'outline-group-rows':
+      case 'outline-group-cols':
+        store.setter(groupSelectionAtom, {
+          axis: dispatch.kind === 'outline-group-rows' ? 'row' : 'column',
+          source: backend,
+        })
+        return
+      case 'outline-ungroup-rows':
+      case 'outline-ungroup-cols':
+        store.setter(ungroupSelectionAtom, {
+          axis: dispatch.kind === 'outline-ungroup-rows' ? 'row' : 'column',
+          source: backend,
+        })
+        return
       case 'sort-asc':
       case 'sort-desc': {
         const direction = dispatch.kind === 'sort-asc' ? 'asc' : 'desc'

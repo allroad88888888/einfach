@@ -12,6 +12,13 @@ import type {
 } from '../backend/types'
 import { nextHistoryTransactionId, pushHistoryAtom } from '../history'
 import type { HistoryLocalReplayPayload } from '../history'
+import {
+  applyOutlineStructuralShiftAtom,
+  getOutlineGroupsForSheet,
+  OUTLINE_REPLAY_KEY,
+  outlineAtom,
+  type OutlineGroup,
+} from '../outline'
 import type { CellCoord, CellRange } from '../shared'
 import {
   applyViewportFreezeStructuralShiftAtom,
@@ -541,6 +548,21 @@ function sameIndexArrays(left: readonly number[], right: readonly number[]): boo
   return left.length === right.length && left.every((value, offset) => value === right[offset])
 }
 
+function sameOutlineGroupArrays(
+  left: readonly OutlineGroup[],
+  right: readonly OutlineGroup[],
+): boolean {
+  return (
+    left.length === right.length &&
+    left.every(
+      (group, offset) =>
+        group.start === right[offset].start &&
+        group.end === right[offset].end &&
+        group.collapsed === right[offset].collapsed,
+    )
+  )
+}
+
 function snapshotStructureOperationIntent(value: unknown): StructureOperationIntent | null {
   try {
     if (typeof value !== 'object' || value === null) return null
@@ -952,12 +974,19 @@ async function runStructureOperation(
   const hiddenStateBefore = get(viewportHiddenAtom)
   const hiddenRowsBefore = getHiddenRowsForSheet(hiddenStateBefore, sheetId)
   const hiddenColsBefore = getHiddenColumnsForSheet(hiddenStateBefore, sheetId)
+  const outlineStateBefore = get(outlineAtom)
+  const outlineRowsBefore = getOutlineGroupsForSheet(outlineStateBefore, sheetId, 'row')
+  const outlineColsBefore = getOutlineGroupsForSheet(outlineStateBefore, sheetId, 'column')
   if (acknowledgement.structuralShift) {
     set(applyViewportFreezeStructuralShiftAtom, {
       sheetId,
       shift: acknowledgement.structuralShift,
     })
     set(applyViewportHiddenStructuralShiftAtom, {
+      sheetId,
+      shift: acknowledgement.structuralShift,
+    })
+    set(applyOutlineStructuralShiftAtom, {
       sheetId,
       shift: acknowledgement.structuralShift,
     })
@@ -989,6 +1018,20 @@ async function runStructureOperation(
       sheetId,
       before: { rows: [...hiddenRowsBefore], cols: [...hiddenColsBefore] },
       after: { rows: [...hiddenRowsAfter], cols: [...hiddenColsAfter] },
+    })
+  }
+  const outlineStateAfter = get(outlineAtom)
+  const outlineRowsAfter = getOutlineGroupsForSheet(outlineStateAfter, sheetId, 'row')
+  const outlineColsAfter = getOutlineGroupsForSheet(outlineStateAfter, sheetId, 'column')
+  if (
+    !sameOutlineGroupArrays(outlineRowsBefore, outlineRowsAfter) ||
+    !sameOutlineGroupArrays(outlineColsBefore, outlineColsAfter)
+  ) {
+    localSidePayloads.push({
+      applyKey: OUTLINE_REPLAY_KEY,
+      sheetId,
+      before: { rows: [...outlineRowsBefore], cols: [...outlineColsBefore] },
+      after: { rows: [...outlineRowsAfter], cols: [...outlineColsAfter] },
     })
   }
 
