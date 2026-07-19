@@ -2679,10 +2679,17 @@ function applyStaticRowsRemoval(
   const rowHeights = getDimensionMap(state.rowHeightsBySheetId, sheetId)
   const hiddenRows = state.hiddenRowsBySheetId.get(sheetId)
 
+  // Each descending row is a single-row delete band. Applying the W3
+  // delete-shift semantics (shiftMergeRanges / shiftFreezeConfig) once
+  // per row, bottom-up, composes to exactly the same result as applying
+  // one shift per contiguous band: indices below the current band are
+  // untouched, so earlier (lower) bands keep their original coordinates.
   for (const rowIndex of descendingRows) {
     shiftRows(cells, cellFormats, rangeFormats, rowIndex, 1, -1)
     shiftDimensionMap(rowHeights, rowIndex, 1, -1)
     if (hiddenRows) shiftHiddenIndexSet(hiddenRows, rowIndex, 1, -1)
+    shiftMergeRanges(state, sheetId, 'row', rowIndex, 1, -1)
+    shiftFreezeConfig(state, sheetId, 'row', rowIndex, 1, -1)
   }
   if (hiddenRows?.size === 0) state.hiddenRowsBySheetId.delete(sheetId)
 

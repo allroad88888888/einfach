@@ -1,12 +1,14 @@
 import { atom } from '@einfach/core'
 import type { Atom, Getter, Setter } from '@einfach/core'
 import type {
+  BackendStructuralShift,
   DisplayCell,
   ProjectionRequestId,
   ProjectionRevision,
   RangeProjectionResult,
 } from '../backend/types'
 import { pushHistoryAtom } from '../history'
+import type { HistoryLocalReplayPayload } from '../history'
 import {
   primarySelectionRegionAtom,
   selectionAuthorityWitnessAtom,
@@ -14,6 +16,19 @@ import {
   type SelectionAuthorityWitness,
 } from '../selection'
 import type { CellRange } from '../shared'
+import {
+  applyViewportFreezeStructuralShiftAtom,
+  getViewportFreezeForSheet,
+  VIEWPORT_FREEZE_REPLAY_KEY,
+  viewportFreezeAtom,
+} from '../viewport/freeze'
+import {
+  applyViewportHiddenStructuralShiftAtom,
+  getHiddenColumnsForSheet,
+  getHiddenRowsForSheet,
+  VIEWPORT_HIDDEN_REPLAY_KEY,
+  viewportHiddenAtom,
+} from '../viewport/hidden'
 import {
   workspaceActiveSheetAuthorityWitnessAtom,
   workspaceSessionAtom,
@@ -940,6 +955,29 @@ function sameNumberList(left: readonly number[], right: readonly number[]): bool
   return left.length === right.length && left.every((value, index) => value === right[index])
 }
 
+/**
+ * Collapse strictly-ascending removed row indices into contiguous delete
+ * bands, returned in bottom-up application order. Applying the bands
+ * descending keeps every band's `index` valid in the pre-mutation
+ * coordinate space — the same order the exact backend removes them — so
+ * each band reuses the single-shift `BackendStructuralShift` delete
+ * semantics that `runStructureOperationAtom` already dispatches.
+ */
+function descendingRowDeleteShifts(
+  rows: readonly number[],
+): readonly Readonly<BackendStructuralShift>[] {
+  const shifts: BackendStructuralShift[] = []
+  for (const row of rows) {
+    const band = shifts[0]
+    if (band !== undefined && row === band.index + band.count) {
+      band.count += 1
+    } else {
+      shifts.unshift({ axis: 'row', kind: 'delete', index: row, count: 1 })
+    }
+  }
+  return shifts
+}
+
 function acknowledgementMatches(
   acknowledgement: unknown,
   ticket: RemoveDuplicatesMutationTicket,
@@ -1184,6 +1222,54 @@ export const runRemoveDuplicatesConfirmAtom = atom(
       acknowledgement: exactAcknowledgement,
     })
     set(activeRemoveDuplicatesMutationAtom, acknowledgedTicket)
+
+    // W3 structural-shift contract, extended to the exact removal path:
+    // the acknowledged removedRowIndices fully determine the row-space
+    // displacement, so Core derives one delete shift per contiguous band
+    // and replays them bottom-up through the same viewport appliers that
+    // `runStructureOperationAtom` uses. The pre/post snapshots become
+    // history side payloads: inverting a delete cannot restore hidden
+    // index membership, so undo/redo of this backend transaction replays
+    // the exact recorded view facts (see HistoryEntry.localSidePayloads).
+    const mutatedSheetId = ticket.target.sheetId
+    const freezeBefore = getViewportFreezeForSheet(get(viewportFreezeAtom), mutatedSheetId)
+    const hiddenStateBefore = get(viewportHiddenAtom)
+    const hiddenRowsBefore = getHiddenRowsForSheet(hiddenStateBefore, mutatedSheetId)
+    const hiddenColsBefore = getHiddenColumnsForSheet(hiddenStateBefore, mutatedSheetId)
+    for (const shift of descendingRowDeleteShifts(ticket.target.removedRowIndices)) {
+      set(applyViewportFreezeStructuralShiftAtom, { sheetId: mutatedSheetId, shift })
+      set(applyViewportHiddenStructuralShiftAtom, { sheetId: mutatedSheetId, shift })
+    }
+    const localSidePayloads: HistoryLocalReplayPayload[] = []
+    const freezeAfter = getViewportFreezeForSheet(get(viewportFreezeAtom), mutatedSheetId)
+    if (
+      (freezeBefore === null) !== (freezeAfter === null) ||
+      (freezeBefore !== null &&
+        freezeAfter !== null &&
+        (freezeBefore.rows !== freezeAfter.rows || freezeBefore.cols !== freezeAfter.cols))
+    ) {
+      localSidePayloads.push({
+        applyKey: VIEWPORT_FREEZE_REPLAY_KEY,
+        sheetId: mutatedSheetId,
+        before: freezeBefore,
+        after: freezeAfter,
+      })
+    }
+    const hiddenStateAfter = get(viewportHiddenAtom)
+    const hiddenRowsAfter = getHiddenRowsForSheet(hiddenStateAfter, mutatedSheetId)
+    const hiddenColsAfter = getHiddenColumnsForSheet(hiddenStateAfter, mutatedSheetId)
+    if (
+      !sameNumberList(hiddenRowsBefore, hiddenRowsAfter) ||
+      !sameNumberList(hiddenColsBefore, hiddenColsAfter)
+    ) {
+      localSidePayloads.push({
+        applyKey: VIEWPORT_HIDDEN_REPLAY_KEY,
+        sheetId: mutatedSheetId,
+        before: { rows: [...hiddenRowsBefore], cols: [...hiddenColsBefore] },
+        after: { rows: [...hiddenRowsAfter], cols: [...hiddenColsAfter] },
+      })
+    }
+
     set(pushHistoryAtom, {
       transactionId: `remove-duplicates-${ticket.sessionId}-${ticket.target.requestId}`,
       kind: 'row.delete',
@@ -1195,6 +1281,7 @@ export const runRemoveDuplicatesConfirmAtom = atom(
         colStart: exactAcknowledgement.affectedRange!.startCol,
         colEnd: exactAcknowledgement.affectedRange!.endCol,
       },
+      ...(localSidePayloads.length > 0 ? { localSidePayloads } : {}),
     })
     set(
       removeDuplicatesLifecycleStateAtom,

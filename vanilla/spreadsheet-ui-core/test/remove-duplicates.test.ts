@@ -8,6 +8,8 @@ import type {
 } from '../src/backend/types'
 import { historyStackAtom } from '../src/history'
 import { selectionAtom } from '../src/selection'
+import { setFreezeConfigAtom, viewportFreezeAtom } from '../src/viewport/freeze'
+import { hideRowsAtom, viewportHiddenAtom } from '../src/viewport/hidden'
 import {
   setWorkspaceActiveSheetAtom,
   workspaceActiveSheetAuthorityWitnessAtom,
@@ -1116,5 +1118,106 @@ describe('remove-duplicates Core lifecycle', () => {
     expect(store.getter(historyStackAtom).entries).toHaveLength(1)
     expect(store.getter(removeDuplicatesMutationRequestIdAtom)).toBe(1)
     expect(store.getter(removeDuplicatesLifecycleAtom).status).toBe('closed')
+  })
+})
+
+describe('remove-duplicates structural remap of local view facts', () => {
+  test('multi-band exact removal remaps freeze/hidden per band and records side payloads', async () => {
+    const store = createStore()
+    // Duplicates land in two bands: contiguous rows [2, 3] and row [5].
+    const cells: DisplayCell[] = [
+      cell(0, 0, 'Key'),
+      cell(1, 0, 'x'),
+      cell(2, 0, 'x'),
+      cell(3, 0, 'x'),
+      cell(4, 0, 'y'),
+      cell(5, 0, 'y'),
+      cell(6, 0, 'z'),
+    ]
+    store.setter(setWorkspaceActiveSheetAtom, { sheetId: SHEET_ID })
+    store.setter(selectionAtom, {
+      kind: 'range',
+      sheetId: SHEET_ID,
+      anchor: { row: 0, col: 0 },
+      focus: { row: 6, col: 0 },
+    })
+    const source: RemoveDuplicatesControllerPort = {
+      async readRangeProjection(request) {
+        return rangeAcknowledgement(request, cells)
+      },
+      async removeRowsExact(request) {
+        return mutationAcknowledgement(request)
+      },
+    }
+    await expect(store.setter(openRemoveDuplicatesFromSelectionAtom, { source })).resolves.toBe(
+      'editing',
+    )
+    const sessionId = store.getter(removeDuplicatesSessionAtom)!.sessionId
+    expect(store.getter(removeDuplicatesPreviewAtom)?.duplicateRows).toEqual([2, 3, 5])
+
+    store.setter(setFreezeConfigAtom, { sheetId: SHEET_ID, rows: 5, cols: 1 })
+    store.setter(hideRowsAtom, { sheetId: SHEET_ID, indices: [1, 3, 6] })
+    const entriesBefore = store.getter(historyStackAtom).entries.length
+
+    await expect(
+      store.setter(runRemoveDuplicatesConfirmAtom, {
+        source,
+        sessionId,
+        refreshProjection: async () => {},
+      }),
+    ).resolves.toBe('completed')
+
+    // Bands apply bottom-up: (5,1) leaves the frozen [0..4] band alone and
+    // shifts hidden 6 → 5; (2,2) then shrinks the freeze band by 2 and
+    // drops hidden 3 while shifting the earlier 5 → 3.
+    expect(store.getter(viewportFreezeAtom).rowsBySheet[SHEET_ID]).toBe(3)
+    expect(store.getter(viewportHiddenAtom).rowsBySheet[SHEET_ID]).toEqual([1, 3])
+
+    const entries = store.getter(historyStackAtom).entries
+    expect(entries).toHaveLength(entriesBefore + 1)
+    const entry = entries[entries.length - 1]!
+    expect(entry.kind).toBe('row.delete')
+    expect(entry.localReplay).toBeUndefined()
+    expect(entry.localSidePayloads).toHaveLength(2)
+    expect(entry.localSidePayloads?.[0]).toMatchObject({
+      applyKey: 'viewport.freeze',
+      sheetId: SHEET_ID,
+      before: { rows: 5, cols: 1 },
+      after: { rows: 3, cols: 1 },
+    })
+    expect(entry.localSidePayloads?.[1]).toMatchObject({
+      applyKey: 'viewport.hidden',
+      sheetId: SHEET_ID,
+      before: { rows: [1, 3, 6], cols: [] },
+      after: { rows: [1, 3], cols: [] },
+    })
+  })
+
+  test('a removal that displaces no local view facts records no side payloads', async () => {
+    const store = createStore()
+    const source: RemoveDuplicatesControllerPort = {
+      async readRangeProjection(request) {
+        return rangeAcknowledgement(request)
+      },
+      async removeRowsExact(request) {
+        return mutationAcknowledgement(request)
+      },
+    }
+    const sessionId = await hydrate(store, source)
+    selectRegionColumnOnly(store)
+
+    await expect(
+      store.setter(runRemoveDuplicatesConfirmAtom, {
+        source,
+        sessionId,
+        refreshProjection: async () => {},
+      }),
+    ).resolves.toBe('completed')
+
+    const entries = store.getter(historyStackAtom).entries
+    expect(entries).toHaveLength(1)
+    expect(entries[0]?.localSidePayloads).toBeUndefined()
+    expect(store.getter(viewportFreezeAtom).rowsBySheet[SHEET_ID]).toBeUndefined()
+    expect(store.getter(viewportHiddenAtom).rowsBySheet[SHEET_ID]).toBeUndefined()
   })
 })

@@ -295,3 +295,136 @@ describe('static backend structural freeze remap', () => {
     expect(await readFreeze(backend)).toEqual({ rows: 0, cols: 0 })
   })
 })
+
+// removeRowsExact / legacy removeRows share applyStaticRowsRemoval: every
+// descending single-row band must apply the same delete-shift semantics
+// to merges and freeze panes as the W3 deleteRows path above.
+describe('static backend removeRowsExact structural remap', () => {
+  function mergeAnchors(cells: DisplayCell[]) {
+    return cells
+      .filter((cell) => cell.mergedSpan)
+      .map(({ row, col, mergedSpan }) => ({ row, col, mergedSpan }))
+      .sort((a, b) => (a.row === b.row ? a.col - b.col : a.row - b.row))
+  }
+
+  async function currentRevision(backend: ReturnType<typeof seededBackend>) {
+    return (await backend.listSheets!()).revision as number
+  }
+
+  // Bands for rows [2, 3, 5]: contiguous (2, count 2) and (5, count 1).
+  async function seedMergesAndFreeze(backend: ReturnType<typeof seededBackend>) {
+    // M1 rows 0..1 — entirely above both bands, must stay put.
+    await backend.mergeRange?.({
+      kind: 'merge-range',
+      sheetId: SHEET,
+      range: { rowStart: 0, rowEnd: 1, colStart: 0, colEnd: 1 },
+    })
+    // M2 rows 2..3 — fully covered by band (2,2), must be removed.
+    await backend.mergeRange?.({
+      kind: 'merge-range',
+      sheetId: SHEET,
+      range: { rowStart: 2, rowEnd: 3, colStart: 0, colEnd: 1 },
+    })
+    // M3 rows 1..4 — overlaps band (2,2), must shrink to rows 1..2.
+    await backend.mergeRange?.({
+      kind: 'merge-range',
+      sheetId: SHEET,
+      range: { rowStart: 1, rowEnd: 4, colStart: 2, colEnd: 3 },
+    })
+    // M4 rows 4..5 — loses row 5 to band (5,1), then shifts up to row 2.
+    await backend.mergeRange?.({
+      kind: 'merge-range',
+      sheetId: SHEET,
+      range: { rowStart: 4, rowEnd: 5, colStart: 0, colEnd: 1 },
+    })
+    await backend.setFreezeConfig?.({
+      kind: 'set-freeze-config',
+      sheetId: SHEET,
+      freeze: { rows: 5, cols: 2 },
+    })
+  }
+
+  async function removeMultiBand(backend: ReturnType<typeof seededBackend>) {
+    return backend.removeRowsExact({
+      kind: 'remove-rows',
+      requestId: 41,
+      sheetId: SHEET,
+      targetRange: { rowStart: 0, rowEnd: 5, colStart: 0, colEnd: 3 },
+      rows: [2, 3, 5],
+      revision: await currentRevision(backend),
+    })
+  }
+
+  it('multi-band exact removal remaps merges per band and keeps the exact ACK shape', async () => {
+    const backend = seededBackend()
+    await seedMergesAndFreeze(backend)
+    const revision = await currentRevision(backend)
+
+    const result = await removeMultiBand(backend)
+    expect(result).toEqual({
+      requestId: 41,
+      sheetId: SHEET,
+      targetRange: { rowStart: 0, rowEnd: 5, colStart: 0, colEnd: 3 },
+      removedRowIndices: [2, 3, 5],
+      removedRows: 3,
+      affectedRange: { startRow: 2, endRow: 5, startCol: 0, endCol: 3 },
+      revision: revision + 1,
+    })
+
+    const cells = await readCells(backend, { rowStart: 0, rowEnd: 5, colStart: 0, colEnd: 3 })
+    expect(mergeAnchors(cells)).toEqual([
+      { row: 0, col: 0, mergedSpan: { rows: 2, cols: 2 } },
+      { row: 1, col: 2, mergedSpan: { rows: 2, cols: 2 } },
+      { row: 2, col: 0, mergedSpan: { rows: 1, cols: 2 } },
+    ])
+  })
+
+  it('multi-band exact removal shrinks the freeze band only by the in-band overlap', async () => {
+    const backend = seededBackend()
+    await seedMergesAndFreeze(backend)
+    await removeMultiBand(backend)
+    // Band (5,1) sits outside the frozen [0..4] band; band (2,2) is inside.
+    expect(await readFreeze(backend)).toEqual({ rows: 3, cols: 2 })
+  })
+
+  it('undoTransaction restores pre-removal merge and freeze facts via the fullSheet capture', async () => {
+    const backend = seededBackend()
+    await seedMergesAndFreeze(backend)
+    await removeMultiBand(backend)
+    await backend.undoTransaction?.({ kind: 'undo-transaction', transactionId: 't-remove' })
+
+    const cells = await readCells(backend, { rowStart: 0, rowEnd: 5, colStart: 0, colEnd: 3 })
+    expect(mergeAnchors(cells)).toEqual([
+      { row: 0, col: 0, mergedSpan: { rows: 2, cols: 2 } },
+      { row: 1, col: 2, mergedSpan: { rows: 4, cols: 2 } },
+      { row: 2, col: 0, mergedSpan: { rows: 2, cols: 2 } },
+      { row: 4, col: 0, mergedSpan: { rows: 2, cols: 2 } },
+    ])
+    expect(await readFreeze(backend)).toEqual({ rows: 5, cols: 2 })
+  })
+
+  it('legacy removeRows shares the merge/freeze remap for unordered multi-band input', async () => {
+    const backend = seededBackend()
+    await backend.mergeRange?.({
+      kind: 'merge-range',
+      sheetId: SHEET,
+      range: { rowStart: 1, rowEnd: 4, colStart: 0, colEnd: 1 },
+    })
+    await backend.setFreezeConfig?.({
+      kind: 'set-freeze-config',
+      sheetId: SHEET,
+      freeze: { rows: 5, cols: 0 },
+    })
+
+    const result = await backend.removeRows?.({
+      kind: 'remove-rows',
+      sheetId: SHEET,
+      rows: [5, 3, 2],
+    })
+    expect(result).toMatchObject({ sheetId: SHEET, removedRows: 3 })
+
+    const cells = await readCells(backend, { rowStart: 0, rowEnd: 5, colStart: 0, colEnd: 3 })
+    expect(mergeAnchors(cells)).toEqual([{ row: 1, col: 0, mergedSpan: { rows: 2, cols: 2 } }])
+    expect(await readFreeze(backend)).toEqual({ rows: 3, cols: 0 })
+  })
+})
