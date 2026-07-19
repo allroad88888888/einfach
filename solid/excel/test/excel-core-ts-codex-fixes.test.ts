@@ -6,8 +6,11 @@
  *   P1.2  a formula that evaluates to an Excel error (#N/A, #DIV/0!, ...)
  *         is a valid mutation — `setFormulaDetailed` must return ok=true.
  *   P2.1  rangeLookup over `A:A` / `A:XFD` must bound materialization.
- *   P2.2  spill targets must appear in `snapshotRangeSparse` / `readSparseRange`,
- *         not just in single-cell reads.
+ *   P2.2  spill targets must appear in `readSparseRange` (projection),
+ *         not just in single-cell reads — but NOT in `snapshotRangeSparse`
+ *         (undo/persistence snapshots feed `restoreSparse`, which would
+ *         materialize the projections as literal cells; WASM no_eval
+ *         parity).
  *   P2.3  moveSheet must keep contents attached to the renamed sheet name,
  *         not zip positionally against the new order.
  */
@@ -157,8 +160,8 @@ describe('codex review fixes', () => {
     })
   })
 
-  describe('P2.2 — spill targets appear in snapshotRangeSparse', () => {
-    test('=SEQUENCE(2,2) at A1 — snapshot returns 4 cells (anchor + 3 spill targets)', async () => {
+  describe('P2.2 — spill targets appear in readSparseRange, never in snapshots', () => {
+    test('=SEQUENCE(2,2) at A1 — projection returns 4 cells (anchor + 3 spill targets)', async () => {
       const { rpc } = makeRpc()
       await rpc({ cmd: 'initWorkbook', sheets: ['Sheet1'] })
       await rpc({
@@ -167,13 +170,37 @@ describe('codex review fixes', () => {
         addr: 'A1',
         formula: '=SEQUENCE(2, 2)',
       })
+      // Hydrate the anchor so the lazy spill enumeration sees it as clean.
+      await rpc({ cmd: 'readCells', cells: [{ sheet: 0, addr: 'A1' }] })
+      const projected = (await rpc({
+        cmd: 'readSparseRange',
+        range: { sheet: 0, startRow: 0, endRow: 4, startCol: 0, endCol: 4 },
+      })) as Array<{ addr: string }>
+      // Anchor A1 (formula), B1/A2/B2 (projected scalars).
+      expect(projected.map((c) => c.addr).sort()).toEqual(['A1', 'A2', 'B1', 'B2'])
+    })
+
+    test('=SEQUENCE(2,2) at A1 — snapshot returns ONLY the anchor formula', async () => {
+      const { rpc } = makeRpc()
+      await rpc({ cmd: 'initWorkbook', sheets: ['Sheet1'] })
+      await rpc({
+        cmd: 'setFormulaDetailed',
+        sheet: 0,
+        addr: 'A1',
+        formula: '=SEQUENCE(2, 2)',
+      })
+      await rpc({ cmd: 'readCells', cells: [{ sheet: 0, addr: 'A1' }] })
+      // Undo/persistence snapshots must NOT serialize spill projections as
+      // literal records: restoreSparse would materialize them as real cells
+      // that shadow the spill and go stale on the next anchor edit.
       const sparse = (await rpc({
         cmd: 'snapshotRangeSparse',
         range: { sheet: 0, startRow: 0, endRow: 4, startCol: 0, endCol: 4 },
-      })) as Array<{ addr: string; kind: string }>
-      const addrs = sparse.map((c) => c.addr).sort()
-      // Anchor A1 (formula), B1/A2/B2 (projected scalars).
-      expect(addrs).toEqual(['A1', 'A2', 'B1', 'B2'])
+      })) as Array<{ addr: string; kind: string; value: unknown }>
+      expect(sparse).toHaveLength(1)
+      expect(sparse[0].addr).toBe('A1')
+      expect(sparse[0].kind).toBe('formula')
+      expect(sparse[0].value).toBe('=SEQUENCE(2, 2)')
     })
   })
 

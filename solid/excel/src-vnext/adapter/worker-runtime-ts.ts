@@ -572,9 +572,11 @@ function collectCellsInBounds(
 /**
  * Enumerate the (row, col) coords of *spill targets* — cells with no own
  * formula/literal that fall inside the array-region of an anchor in this
- * sheet. Used by the range projectors so a spilled SEQUENCE/TRANSPOSE/SORT
- * surface in `readSparseRange` / `snapshotRangeSparse`, not just at the
- * boundary read path (`readCellValue`).
+ * sheet. Used by the PROJECTION reader (`readSparseRange`) so a spilled
+ * SEQUENCE/TRANSPOSE/SORT surfaces beyond the boundary read path
+ * (`readCellValue`). Deliberately NOT used by `snapshotRangeSparse`:
+ * snapshots feed `restoreSparse`, and serializing projections as literal
+ * records would materialize them as real cells on restore.
  *
  * The enumeration walks every formula cell once and consults its computed
  * value through `formulaCellAtom`; if it returns `kind:'array'`, every
@@ -652,12 +654,18 @@ function snapshotRangeSparse(state: RuntimeState, range: SparseRangeWire): Spars
   const cells = state.workbook.store.getter(target.sheetAtom)
   const out: SparseCellWire[] = []
   // Audit D-8: O(window ∩ existing) enumeration, not a full map walk.
+  //
+  // Snapshots deliberately EXCLUDE spill-projected cells: a spill target
+  // has no own entry in the sheet map — its value derives from the
+  // anchor's formula, which the snapshot already carries as source. If
+  // the projections were serialized as literal records (the pre-fix
+  // behavior), `restoreSparse` after an undo would MATERIALIZE them as
+  // real cells that shadow the spill and go stale on the next anchor
+  // edit. This also matches the WASM engine's no_eval snapshot, which
+  // only ever walks existing cells. Projection reads (`readSparseRange`,
+  // `readCells`) still surface spill values via `collectSpillTargets` /
+  // `getSpillProjectedValue`.
   for (const { row, col } of collectCellsInBounds(cells, bounds)) {
-    const sparse = readSparseCell(state, sheet, row, col)
-    if (sparse) out.push(sparse)
-  }
-  // Add spill-projected cells from in-bounds anchors.
-  for (const { row, col } of collectSpillTargets(state, sheet, bounds)) {
     const sparse = readSparseCell(state, sheet, row, col)
     if (sparse) out.push(sparse)
   }

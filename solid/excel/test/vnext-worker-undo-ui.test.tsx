@@ -163,6 +163,136 @@ describe('worker path Ctrl+Z semantics (grid + history timeline)', () => {
     backend.dispose()
   })
 
+  it('multi-cell paste records ONE cells.import entry; Ctrl+Z reverts the whole paste', async () => {
+    const worker = createInProcessTsWorker()
+    const backend = createWorkerWorkbookSpreadsheetBackend({
+      workerFactory: () => worker,
+      sheets: [{ id: 'sheet-1', name: 'Sheet1' }],
+    })
+    await backend.ready()
+
+    Object.defineProperty(navigator, 'clipboard', {
+      configurable: true,
+      value: { readText: async () => '1\t2\n3\t4' },
+    })
+
+    const store = createStore()
+    const { container } = render(() => (
+      <SpreadsheetUiProvider backend={backend} store={store}>
+        <SpreadsheetGrid sheetId="sheet-1" viewport={VIEWPORT} data-testid="grid" />
+      </SpreadsheetUiProvider>
+    ))
+    await waitFor(() => {
+      expect(container.querySelectorAll('td.spreadsheet-grid-cell').length).toBeGreaterThan(0)
+    })
+
+    const grid = container.querySelector('[data-testid="grid"]')!
+    fireEvent.click(
+      container.querySelector('[data-cell-addr="A1"] .spreadsheet-grid-cell-button')!,
+    )
+    fireEvent.keyDown(grid, { key: 'v', ctrlKey: true })
+
+    // The 4-cell paste is ONE transport (importCells) = ONE adapter
+    // transaction record = ONE UI history entry.
+    await waitFor(() => {
+      expect(gridCellText(container, 'A1')).toBe('1')
+      expect(gridCellText(container, 'B1')).toBe('2')
+      expect(gridCellText(container, 'A2')).toBe('3')
+      expect(gridCellText(container, 'B2')).toBe('4')
+      expect(store.getter(historyStackAtom).entries).toHaveLength(1)
+    })
+    expect(store.getter(historyStackAtom).entries[0].kind).toBe('cells.import')
+
+    // One Ctrl+Z reverts EVERY pasted cell (the pre-batch path only
+    // reverted the last cell and left the stacks permanently offset).
+    fireEvent.keyDown(grid, { key: 'z', ctrlKey: true })
+    await waitFor(() => {
+      expect(gridCellText(container, 'A1')).toBe('')
+      expect(gridCellText(container, 'B1')).toBe('')
+      expect(gridCellText(container, 'A2')).toBe('')
+      expect(gridCellText(container, 'B2')).toBe('')
+      expect(store.getter(historyStackAtom).cursor).toBe(0)
+      expect(store.getter(historyLifecycleAtom).status).toBe('ready')
+    })
+
+    // Ctrl+Y restores the whole paste.
+    fireEvent.keyDown(grid, { key: 'y', ctrlKey: true })
+    await waitFor(() => {
+      expect(gridCellText(container, 'A1')).toBe('1')
+      expect(gridCellText(container, 'B1')).toBe('2')
+      expect(gridCellText(container, 'A2')).toBe('3')
+      expect(gridCellText(container, 'B2')).toBe('4')
+      expect(store.getter(historyStackAtom).cursor).toBe(1)
+    })
+
+    backend.dispose()
+  })
+
+  it('multi-region Delete records one entry per region and undoes region by region', async () => {
+    const worker = createInProcessTsWorker()
+    const backend = createWorkerWorkbookSpreadsheetBackend({
+      workerFactory: () => worker,
+      sheets: [{ id: 'sheet-1', name: 'Sheet1' }],
+    })
+    await backend.ready()
+
+    const store = createStore()
+    const { container } = render(() => (
+      <SpreadsheetUiProvider backend={backend} store={store}>
+        <SpreadsheetGrid sheetId="sheet-1" viewport={VIEWPORT} data-testid="grid" />
+      </SpreadsheetUiProvider>
+    ))
+    await waitFor(() => {
+      expect(container.querySelectorAll('td.spreadsheet-grid-cell').length).toBeGreaterThan(0)
+    })
+
+    await commitCellEdit(container, 'A1', 'x')
+    await commitCellEdit(container, 'C3', 'y')
+    await waitFor(() => {
+      expect(gridCellText(container, 'A1')).toBe('x')
+      expect(gridCellText(container, 'C3')).toBe('y')
+      expect(store.getter(historyStackAtom).entries).toHaveLength(2)
+    })
+
+    // Two disjoint regions: A1 plus Ctrl+click C3, then Delete.
+    const grid = container.querySelector('[data-testid="grid"]')!
+    fireEvent.click(
+      container.querySelector('[data-cell-addr="A1"] .spreadsheet-grid-cell-button')!,
+    )
+    fireEvent.click(
+      container.querySelector('[data-cell-addr="C3"] .spreadsheet-grid-cell-button')!,
+      { ctrlKey: true },
+    )
+    fireEvent.keyDown(grid, { key: 'Delete' })
+
+    // N regions = N clearRange transports = N history entries (N:N with
+    // the adapter's per-clear transaction records).
+    await waitFor(() => {
+      expect(gridCellText(container, 'A1')).toBe('')
+      expect(gridCellText(container, 'C3')).toBe('')
+      expect(store.getter(historyStackAtom).entries).toHaveLength(4)
+    })
+    const stack = store.getter(historyStackAtom)
+    expect(stack.entries[2].kind).toBe('range.clear')
+    expect(stack.entries[3].kind).toBe('range.clear')
+
+    // Undo pops the LAST region's clear first (C3), then A1's.
+    fireEvent.keyDown(grid, { key: 'z', ctrlKey: true })
+    await waitFor(() => {
+      expect(gridCellText(container, 'C3')).toBe('y')
+      expect(gridCellText(container, 'A1')).toBe('')
+      expect(store.getter(historyLifecycleAtom).status).toBe('ready')
+    })
+    fireEvent.keyDown(grid, { key: 'z', ctrlKey: true })
+    await waitFor(() => {
+      expect(gridCellText(container, 'A1')).toBe('x')
+      expect(gridCellText(container, 'C3')).toBe('y')
+      expect(store.getter(historyStackAtom).cursor).toBe(2)
+    })
+
+    backend.dispose()
+  })
+
   it('timeline undo button drives the worker backend too', async () => {
     const worker = createInProcessTsWorker()
     const backend = createWorkerWorkbookSpreadsheetBackend({

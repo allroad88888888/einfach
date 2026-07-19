@@ -1221,26 +1221,31 @@ export function SpreadsheetGrid(props: SpreadsheetGridProps) {
       return
     }
 
-    const clearResults = await Promise.all(
-      resolvedRanges.flat().map((range) =>
-        backend.clearRange!({
-          kind: 'clear-range',
-          sheetId: props.sheetId,
-          range,
-          target,
-        }),
-      ),
-    )
-    const lastRev = clearResults
-      .map((r) => (typeof r?.revision === 'number' ? r.revision : Number(r?.revision ?? 0) || 0))
-      .reduce((a, b) => Math.max(a, b), 0)
-    store.setter(pushHistoryAtom, {
-      transactionId: nextHistoryTransactionId(),
-      kind: 'range.clear',
-      sheetId: props.sheetId,
-      projectionRevision: lastRev,
-      affectedRange: resolvedRanges[0][0],
-    })
+    // One UI history entry PER clearRange transport (N:N). Both reference
+    // adapters record one undo transaction per clearRange call, so a single
+    // entry over N region clears would leave the adapter stack N-1 records
+    // deeper than the UI stack and every later undo would replay the wrong
+    // snapshot. Sequential on purpose: entry order must match the adapter's
+    // record order (positional alignment).
+    for (const range of resolvedRanges.flat()) {
+      const result = await backend.clearRange({
+        kind: 'clear-range',
+        sheetId: props.sheetId,
+        range,
+        target,
+      })
+      const revision =
+        typeof result?.revision === 'number'
+          ? result.revision
+          : Number(result?.revision ?? 0) || 0
+      store.setter(pushHistoryAtom, {
+        transactionId: nextHistoryTransactionId(),
+        kind: 'range.clear',
+        sheetId: props.sheetId,
+        projectionRevision: revision,
+        affectedRange: result?.affectedRange ? { ...result.affectedRange } : { ...range },
+      })
+    }
     await loadProjection(requestProjection())
   }
 
@@ -2386,22 +2391,6 @@ export function SpreadsheetGrid(props: SpreadsheetGridProps) {
       }
     }
 
-    let lastRevision = 0
-    for (const write of writes) {
-      const r = await backend.setCellInput({
-        kind: 'set-cell-input',
-        sheetId: props.sheetId,
-        row: write.row,
-        col: write.col,
-        input: write.input,
-      })
-      const rev =
-        typeof r?.revision === 'number'
-          ? r.revision
-          : Number(r?.revision ?? 0) || 0
-      if (rev > lastRevision) lastRevision = rev
-    }
-
     const affectedRanges = resolution.ranges ?? [pasteRange]
     const affectedRange = affectedRanges.reduce(
       (acc, range) => ({
@@ -2412,13 +2401,56 @@ export function SpreadsheetGrid(props: SpreadsheetGridProps) {
       }),
       { ...affectedRanges[0] },
     )
-    store.setter(pushHistoryAtom, {
-      transactionId: nextHistoryTransactionId(),
-      kind: 'cells.import',
-      sheetId: props.sheetId,
-      projectionRevision: lastRevision,
-      affectedRange,
-    })
+
+    if (writes.length > 0 && backend.importCells) {
+      // Batch port: ONE transport = ONE adapter transaction record = ONE
+      // UI history entry, so undoing the entry reverts the whole paste and
+      // the two undo stacks stay positionally aligned.
+      const result = await backend.importCells({
+        kind: 'import-cells',
+        sheetId: props.sheetId,
+        cells: writes,
+        range: affectedRange,
+      })
+      const revision =
+        typeof result?.revision === 'number'
+          ? result.revision
+          : Number(result?.revision ?? 0) || 0
+      store.setter(pushHistoryAtom, {
+        transactionId: nextHistoryTransactionId(),
+        kind: 'cells.import',
+        sheetId: props.sheetId,
+        projectionRevision: revision,
+        affectedRange: result?.affectedRange ? { ...result.affectedRange } : affectedRange,
+      })
+    } else if (writes.length > 0) {
+      // Fallback host without the batch port: keep the per-cell transport
+      // but record one UI entry PER acknowledged write (N:N). A single
+      // 'cells.import' entry over N per-cell mutations would leave the
+      // adapter transaction stack N-1 records deeper than the UI stack.
+      for (const write of writes) {
+        const r = await backend.setCellInput({
+          kind: 'set-cell-input',
+          sheetId: props.sheetId,
+          row: write.row,
+          col: write.col,
+          input: write.input,
+        })
+        const rev =
+          typeof r?.revision === 'number'
+            ? r.revision
+            : Number(r?.revision ?? 0) || 0
+        store.setter(pushHistoryAtom, {
+          transactionId: nextHistoryTransactionId(),
+          kind: 'cell.set-input',
+          sheetId: props.sheetId,
+          projectionRevision: rev,
+          affectedRange: r?.affectedRange
+            ? { ...r.affectedRange }
+            : { rowStart: write.row, rowEnd: write.row, colStart: write.col, colEnd: write.col },
+        })
+      }
+    }
 
     store.setter(markClipboardReadyAtom)
     await loadProjection(requestProjection())

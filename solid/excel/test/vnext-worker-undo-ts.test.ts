@@ -425,6 +425,64 @@ describe('worker adapter host-orchestrated undo — TS runtime, real in-process 
     backend.dispose()
   })
 
+  test('undo snapshot over a spill target does not materialize the projection', async () => {
+    const { backend, runtime } = await createBackend()
+    await setInput(backend, 0, 0, '=SEQUENCE(3, 2)')
+    // Hydrate the anchor so the spill projects across A1:B3.
+    const projected = await readCells(backend, { rowStart: 0, rowEnd: 2, colStart: 0, colEnd: 1 })
+    expect(projected.map((cell) => cell.displayValue)).toEqual(['1', '2', '3', '4', '5', '6'])
+
+    // Overwrite the PROJECTED cell B2. The 1x1 undo snapshot overlaps the
+    // spill region; the before-image must stay empty (B2 has no own cell)
+    // instead of capturing the projected '4' as a literal record.
+    await setInput(backend, 1, 1, '99')
+    expect(await displayAt(backend, 1, 1)).toBe('99')
+
+    await backend.undoTransaction!(undoRequest('tx-spill-shadow'))
+    // The projection is live again...
+    expect(await displayAt(backend, 1, 1)).toBe('4')
+    // ...and it is a projection, not a materialized literal: the sheet map
+    // holds ONLY the anchor.
+    const state = runtime.state()
+    const handle = state.workbook.sheet(state.sheets[0].id)!
+    expect([...state.workbook.store.getter(handle.sheetAtom).keys()]).toEqual(['0:0'])
+
+    // Shrinking the spill leaves no stale residue where the array used to be.
+    await setInput(backend, 0, 0, '=SEQUENCE(1, 1)')
+    expect(await displayAt(backend, 1, 1)).toBe('')
+    expect(await displayAt(backend, 0, 1)).toBe('')
+    expect(await displayAt(backend, 0, 0)).toBe('1')
+    backend.dispose()
+  })
+
+  test('range clear across a spill region round-trips through the anchor only', async () => {
+    const { backend, runtime } = await createBackend()
+    await setInput(backend, 0, 0, '=SEQUENCE(3, 2)')
+    const before = await readCells(backend, { rowStart: 0, rowEnd: 2, colStart: 0, colEnd: 1 })
+    expect(before.map((cell) => cell.displayValue)).toEqual(['1', '2', '3', '4', '5', '6'])
+
+    await backend.clearRange!({
+      kind: 'clear-range',
+      sheetId: SHEET,
+      range: { rowStart: 0, rowEnd: 2, colStart: 0, colEnd: 1 },
+      target: 'values',
+    })
+    expect(await readCells(backend, { rowStart: 0, rowEnd: 2, colStart: 0, colEnd: 1 })).toEqual([])
+
+    await backend.undoTransaction!(undoRequest('tx-spill-clear'))
+    const restored = await readCells(backend, { rowStart: 0, rowEnd: 2, colStart: 0, colEnd: 1 })
+    expect(restored.map((cell) => cell.displayValue)).toEqual(['1', '2', '3', '4', '5', '6'])
+    // Only the anchor came back as a real cell; the other five are
+    // projections again.
+    const state = runtime.state()
+    const handle = state.workbook.sheet(state.sheets[0].id)!
+    expect([...state.workbook.store.getter(handle.sheetAtom).keys()]).toEqual(['0:0'])
+
+    await backend.redoTransaction!(redoRequest('tx-spill-clear'))
+    expect(await readCells(backend, { rowStart: 0, rowEnd: 2, colStart: 0, colEnd: 1 })).toEqual([])
+    backend.dispose()
+  })
+
   test('async custom formula: stale settle skips undone cell; redo re-converges', async () => {
     const { backend, runtime } = await createBackend()
     type Latch = { promise: Promise<void>; resolve: () => void }

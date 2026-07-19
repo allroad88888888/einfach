@@ -874,12 +874,12 @@ describeScale('scale parity — one seeded ~75k workload through both worker run
       expect(wasmSnapshot.version).toBe(tsSnapshot.version)
       expect(wasmSnapshot.sheets).toEqual(tsSnapshot.sheets)
       // Cell-record parity keyed by sheet:addr → kind:value. Spill-region
-      // addresses are excluded: the TS runtime deliberately serializes
-      // hydrated spill PROJECTIONS as literal records (worker-runtime-ts
-      // `snapshotRangeSparse` + `readSparseCell`), while the Rust engine's
-      // spill targets are virtual derived atoms that never serialize —
-      // a documented model difference (excel-core-ts PLAN.md §4.6), not a
-      // value divergence (the restored DISPLAYS are asserted equal below).
+      // addresses stay excluded for robustness, though both engines now
+      // omit spill projections from snapshots: the TS runtime's
+      // `snapshotRangeSparse` serializes only real cells (anchor formula
+      // source included) so restore cannot materialize projections, and
+      // the Rust engine's spill targets are virtual derived atoms that
+      // never serialize. Restored DISPLAYS are asserted equal below.
       const spillKeys = new Set(workload.spillRegionRefs.map(refKey))
       const cellMap = (snapshot: PersistenceSnapshot) => {
         const out = new Map<string, string>()

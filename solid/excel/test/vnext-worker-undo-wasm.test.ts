@@ -251,6 +251,52 @@ describe('worker adapter host-orchestrated undo — real WASM engine + real disp
     backend.dispose()
   })
 
+  test('batched import (paste shape) is ONE record: undo reverts all cells, redo restores all', async () => {
+    const backend = await createBackend()
+    await setInput(backend, 0, 0, 'keep')
+    // Paste-shaped batch: one importCells transport = one transaction
+    // record, so a single undo must revert EVERY pasted cell (the
+    // pre-batch grid path issued N setCellInput calls and left the
+    // adapter stack N-1 records deeper than the UI stack).
+    await backend.importCells!({
+      kind: 'import-cells',
+      sheetId: SHEET,
+      cells: [
+        { row: 0, col: 0, input: 'overwritten' },
+        { row: 0, col: 1, input: '2' },
+        { row: 1, col: 0, input: '3' },
+        { row: 1, col: 1, input: '=A2+B1' },
+      ],
+      range: { rowStart: 0, rowEnd: 1, colStart: 0, colEnd: 1 },
+    })
+    expect(await displayAt(backend, 0, 0)).toBe('overwritten')
+    expect(await displayAt(backend, 1, 1)).toBe('5')
+
+    const undoAck = await backend.undoTransaction!(undoRequest('wasm-import-batch'))
+    expect(undoAck.applied).not.toBe(false)
+    expect(await displayAt(backend, 0, 0)).toBe('keep')
+    expect(await displayAt(backend, 0, 1)).toBe('')
+    expect(await displayAt(backend, 1, 0)).toBe('')
+    expect(await displayAt(backend, 1, 1)).toBe('')
+
+    // Stack-alignment proof: the batch was ONE record, not four — the
+    // next undo pops the SEED edit instead of another slice of the batch.
+    const seedUndo = await backend.undoTransaction!(undoRequest('wasm-import-seed'))
+    expect(seedUndo.applied).not.toBe(false)
+    expect(await displayAt(backend, 0, 0)).toBe('')
+
+    await backend.redoTransaction!(redoRequest('wasm-import-seed'))
+    expect(await displayAt(backend, 0, 0)).toBe('keep')
+
+    const redoAck = await backend.redoTransaction!(redoRequest('wasm-import-batch'))
+    expect(redoAck.applied).not.toBe(false)
+    expect(await displayAt(backend, 0, 0)).toBe('overwritten')
+    expect(await displayAt(backend, 0, 1)).toBe('2')
+    expect(await displayAt(backend, 1, 0)).toBe('3')
+    expect(await displayAt(backend, 1, 1)).toBe('5')
+    backend.dispose()
+  })
+
   test('structural undo restores #REF!-rewritten formulas from the full-sheet image', async () => {
     const backend = await createBackend()
     await setInput(backend, 0, 0, '1')
