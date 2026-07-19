@@ -108,6 +108,10 @@ test.describe('Wave 5 toolbar — filter and sort', () => {
     await expect(filterDropdown(page)).toBeVisible()
 
     const equalsValue = '120'
+    // The condition inputs are gated behind the condition-kind select now
+    // (SpreadsheetFilterDropdown renders `filter-equals-input` only when
+    // the draft kind is 'equals'; the default draft kind is 'none').
+    await page.getByTestId('filter-condition-kind').selectOption('equals')
     await filterEqualsInput(page).fill(equalsValue)
     await filterAddEquals(page).click()
 

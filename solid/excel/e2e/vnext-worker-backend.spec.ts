@@ -90,8 +90,10 @@ test.describe('Solid Excel vNext worker backend', () => {
     // gotoRoot preserves the active project's `?backend=` selector
     // (Phase 3b dual-backend audit). Without it, a `--project=ts` run
     // would land on the WASM-default page and the suite would silently
-    // run twice against the same backend.
-    await gotoRoot(page, 'debug=1')
+    // run twice against the same backend. `locale=en` is required because
+    // the app boots locale=zh (commit dede42a) and this spec pins the EN
+    // status-bar string ("<N> cells").
+    await gotoRoot(page, 'debug=1&locale=en')
     await page.getByRole('button', { name: 'vNext Worker', exact: true }).click()
     await expect(page.getByTestId('vnext-worker-grid')).toBeVisible({ timeout: 30_000 })
     await expect(cellDisplay(page, 'C2')).toHaveText('13', { timeout: 30_000 })
@@ -100,6 +102,17 @@ test.describe('Solid Excel vNext worker backend', () => {
   test('renders the Rust worker-backed 3-sheet dependency chain lazily through vNext', async ({
     page,
   }) => {
+    // This test's core evidence chain is the Rust engine's lazy-eval cache
+    // states (Sheet2!C5 stays 'dirty' until first projection read). The TS
+    // worker does not model that dirty-tracking (debugFormulaCacheState
+    // reports 'clean' for a never-read formula). CANONICAL_OWNERSHIP §2/§3
+    // #28: worker-parity closures converge on the WASM single authority; the
+    // TS worker is a fail-closed dev fallback and its lazy-eval divergence is
+    // no longer a parity gap.
+    test.skip(
+      test.info().project.name === 'ts',
+      'Lazy-eval cache-state evidence is WASM-only (CANONICAL_OWNERSHIP §3 #28)',
+    )
     await gotoVNextWorkerDemo(page)
 
     // DOM cell count tracks the live viewport (CSS max-height: 70vh +

@@ -94,7 +94,10 @@ test.describe('Wave 5 toolbar — Name Manager', () => {
 
     await dialogField(dialog, 'name-input').fill('PlaywrightWave5Name')
     await dialogField(dialog, 'name-refers-to').fill('sheet-1!A1:B2')
-    await dialogField(dialog, 'name-scope-select').selectOption('sheet-2')
+    // Sheet-scope option values are namespaced as `sheet:<sheetId>` in
+    // SpreadsheetNameManagerDialog (only `workbook` stays bare) so a sheet
+    // id can never collide with the workbook sentinel.
+    await dialogField(dialog, 'name-scope-select').selectOption('sheet:sheet-2')
 
     await dialogField(dialog, 'name-save-button').click()
     await expect(dialog).toHaveCount(0)
@@ -116,7 +119,8 @@ test.describe('Wave 5 toolbar — Name Manager', () => {
 
     await dialogField(dialog, 'name-input').fill('UnsavedWave5Name')
     await dialogField(dialog, 'name-refers-to').fill('sheet-1!A1:B2')
-    await dialogField(dialog, 'name-scope-select').selectOption('sheet-2')
+    // See above: sheet-scope option values are `sheet:<sheetId>`.
+    await dialogField(dialog, 'name-scope-select').selectOption('sheet:sheet-2')
 
     await dialogField(dialog, 'name-close-button').click()
     await expect(dialog).toHaveCount(0)

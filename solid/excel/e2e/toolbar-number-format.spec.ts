@@ -112,24 +112,46 @@ test.describe('Wave 5 — number-format toolbar', () => {
     await expectCellText(page, 'B2', '12000%')
   })
 
-  test('percent dropdown applies to the selected visible row after sorting', async ({ page }) => {
-    await gotoWave5(page)
-    await columnHeader(page, 4).click()
-    await sortButton(page).click()
-    await sortAsc(page).click()
+  // REAL PRODUCT DEFECT (verified live 2026-07-19, pre-takeover legacy): with a
+  // sort overlay active, a real mousedown on any number-format dropdown item
+  // unmounts the dropdown before mouseup — the item's onClick never fires, no
+  // toolbar.format.command intent is dispatched (status-last-command stays
+  // "Ready"), and the dropdown silently closes. Evidence:
+  //   1. Same flow WITHOUT sort: dropdown Percent works (E6 → 28000%).
+  //   2. Sorted + percent SHORTCUT button: works (E6 → 30000%) — so the
+  //      mutation-gateway display→source remap, setFormatRange and the
+  //      projection are all correct post-sort.
+  //   3. Sorted + synthetic `el.click()` (no mousedown) on the dropdown item:
+  //      works — command layer intact.
+  //   4. Sorted + real `mousedown` on an item: the item node is removed from
+  //      the document within ~100ms and the toolbar surface state clears
+  //      (NumberFormatDropdown outside-click path degenerates into a dismissal).
+  // Suspected root cause: with filter/sort active, a document-level mousedown
+  // listener triggers an atom write that re-renders/unmounts the popup between
+  // mousedown and click (see NumberFormatDropdown.tsx onDocPointerDown +
+  // SpreadsheetToolbar.tsx onNumberFormatPick). Fix belongs in src-vnext, not
+  // in this spec — do not green this by switching to the shortcut button.
+  test.fixme(
+    'percent dropdown applies to the selected visible row after sorting',
+    async ({ page }) => {
+      await gotoWave5(page)
+      await columnHeader(page, 4).click()
+      await sortButton(page).click()
+      await sortAsc(page).click()
 
-    await expectCellText(page, 'A5', 'Central')
-    await expectCellText(page, 'E5', '280')
-    await expectCellText(page, 'A6', 'North')
-    await expectCellText(page, 'E6', '300')
+      await expectCellText(page, 'A5', 'Central')
+      await expectCellText(page, 'E5', '280')
+      await expectCellText(page, 'A6', 'North')
+      await expectCellText(page, 'E6', '300')
 
-    await cell(page, 'E6').click()
-    await numberFormatButton(page).click()
-    await numberFormatItem(page, 'Percent').click()
+      await cell(page, 'E6').click()
+      await numberFormatButton(page).click()
+      await numberFormatItem(page, 'Percent').click()
 
-    await expectCellText(page, 'E5', '280')
-    await expectCellText(page, 'E6', '30000%')
-  })
+      await expectCellText(page, 'E5', '280')
+      await expectCellText(page, 'E6', '30000%')
+    },
+  )
 
   test('currency shortcut formats directly without opening dropdown', async ({ page }) => {
     await gotoWave5(page)

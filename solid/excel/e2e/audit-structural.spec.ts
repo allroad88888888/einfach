@@ -64,14 +64,17 @@ test.describe('audit: structural ops on the Wave 5 demo', () => {
     await expect(tabs(page)).toHaveCount(2)
     const forecastTab = tabs(page).nth(1)
 
-    // The delete flow shows a window.confirm — auto-accept it so the test runs.
-    page.on('dialog', (d) => void d.accept())
-
+    // The delete flow now confirms through the in-app dialog rendered by
+    // SpreadsheetSheetTabs (`sheet-tab-delete-confirmation`), not a native
+    // window.confirm. CANONICAL_OWNERSHIP §3 #01: sheet lifecycle stays
+    // engine-canonical, the confirm gate is UI-core interaction state.
     await forecastTab.click({ button: 'right' })
     const menu = page.getByTestId('sheet-tab-context-menu')
     await expect(menu).toBeVisible({ timeout: 2_000 })
 
     await page.getByTestId('sheet-tab-menu-delete').click()
+    await expect(page.getByTestId('sheet-tab-delete-confirmation')).toBeVisible()
+    await page.getByTestId('sheet-tab-delete-confirm').click()
     await expect(tabs(page)).toHaveCount(1)
   })
 

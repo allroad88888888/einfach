@@ -1,4 +1,5 @@
 import { test, expect, type Page, type BrowserContext } from '@playwright/test'
+import { withEnglishLocale } from './helpers'
 
 /**
  * Audit: clipboard (Ctrl+C / Ctrl+V / Ctrl+X) on the vNext Wave 5 demo.
@@ -36,7 +37,9 @@ async function gotoWave5(page: Page, context: BrowserContext) {
   // read/write would silently fail in headless Chrome otherwise and the
   // spec would assert on stale DOM far downstream.
   await context.grantPermissions(['clipboard-read', 'clipboard-write'])
-  await page.goto('/')
+  // App boots locale=zh (commit dede42a); test 8 pins EN status-bar strings
+  // ("Ready" / "Clipboard paste"), so navigate with `?locale=en`.
+  await page.goto(withEnglishLocale())
   await page.getByTestId('nav-tab-vnext-wave5').click()
   await expect(page.getByTestId('wave5-grid')).toBeVisible({ timeout: 30_000 })
   // Wait one rAF so the initial projection has loaded and B2 shows '120'.

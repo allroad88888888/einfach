@@ -436,7 +436,13 @@ test.describe('Worker-backed workbook RPC', () => {
     expect(result.beforeClear.display).toBe('42')
     expect(result.beforeClearState).toBe('clean')
     expect(result.cleared).toBe(1)
-    expect(result.afterClearState).toBe('dirty')
+    // Sheet1!A1 was already observed (readCells above), so the Store
+    // propagation eagerly re-derives it during clearRange — the engine
+    // pins this in `clear_range_scans_sparse_and_rederives_cross_sheet_dependents`
+    // (rust/excel-core/src/workbook.rs): state 'clean' + one extra eval.
+    // Laziness for never-read formulas is still pinned by the store-undo
+    // scenario below (restoreSparse leaves 'dirty', evalCount 0).
+    expect(result.afterClearState).toBe('clean')
     expect(result.afterNonEmpty).toEqual([
       { sheet: 0, addr: 'A1' },
       { sheet: 1, addr: 'K11' },

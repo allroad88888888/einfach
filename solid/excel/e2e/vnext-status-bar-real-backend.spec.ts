@@ -133,6 +133,14 @@ test.describe('vNext status bar real-backend feasibility gate', () => {
   })
 
   test('formatted numeric display preserves raw aggregate semantics', async ({ page }) => {
+    // The TS worker ships no number-format transport, so the toolbar
+    // mutation surface is fail-closed `blocked` there by design —
+    // CANONICAL_OWNERSHIP §2 (TS worker = fail-closed dev fallback) and
+    // §3 #19/#31 (number-format semantics verified against WASM only).
+    test.skip(
+      test.info().project.name === 'ts',
+      'TS worker has no number-format transport; fail-closed blocked is the product stance (CANONICAL_OWNERSHIP §3 #19/#31)',
+    )
     await gotoWorkerDemo(page)
 
     const sheets = await readSheetList(page)

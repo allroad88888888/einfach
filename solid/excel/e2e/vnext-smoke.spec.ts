@@ -1,9 +1,12 @@
 import { test, expect, type Page } from '@playwright/test'
-import { grantClipboard } from './helpers'
+import { grantClipboard, withEnglishLocale } from './helpers'
 
 test.describe('Solid Excel vNext smoke', () => {
   async function gotoVNextDemo(page: Page) {
-    await page.goto('/')
+    // The app boots locale=zh by default (commit dede42a); this spec pins
+    // the EN status-bar strings ("Ready", "<N> cells"), so navigate with
+    // `?locale=en` like every other legacy spec (see helpers.ts).
+    await page.goto(withEnglishLocale())
     await page.getByRole('button', { name: 'vNext', exact: true }).click()
     await expect(page.getByTestId('vnext-grid')).toBeVisible({ timeout: 30_000 })
   }
@@ -158,11 +161,15 @@ test.describe('Solid Excel vNext smoke', () => {
     const renamed = page.getByRole('tab', { name: 'Report' })
     await expect(renamed).toHaveAttribute('data-active', 'true')
 
-    page.once('dialog', async (dialog) => {
-      await dialog.accept()
-    })
+    // Sheet delete no longer uses a native window.confirm — the delete
+    // command opens the in-app confirmation dialog rendered by
+    // SpreadsheetSheetTabs (`sheet-tab-delete-confirmation`). CANONICAL_OWNERSHIP
+    // §3 #01: sheet lifecycle stays engine-canonical, the confirm gate is
+    // UI-core interaction state.
     await renamed.click({ button: 'right' })
     await page.getByTestId('sheet-tab-menu-delete').click()
+    await expect(page.getByTestId('sheet-tab-delete-confirmation')).toBeVisible()
+    await page.getByTestId('sheet-tab-delete-confirm').click()
     await expect(page.getByRole('tab', { name: 'Report' })).toHaveCount(0)
     await expect(page.getByRole('tab', { name: 'Sheet3' })).toHaveAttribute('data-active', 'true')
     await expect(page.getByTestId('status-visible-cells')).toHaveText(/^\d+ cells$/)
