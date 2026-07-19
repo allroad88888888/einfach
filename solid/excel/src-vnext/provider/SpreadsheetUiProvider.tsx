@@ -66,6 +66,20 @@ export function SpreadsheetUiProvider(props: SpreadsheetUiProviderProps) {
   })
   core.store.setter(spreadsheetBackendAtom, props.backend)
   core.store.setter(capturePasteSpecialCapabilityAtom, props.backend)
+  // Worker backends resolve their fail-closed runtime capability witness
+  // asynchronously (describeCapabilities lands after initWorkbook);
+  // ports sampled synchronously above can be pre-witness. Recapture once
+  // the backend reports ready so capability atoms hold post-witness
+  // truth. Backends without ready() (static, test doubles) skip this.
+  const readyableBackend = props.backend as typeof props.backend & {
+    ready?: () => Promise<unknown>
+  }
+  void readyableBackend.ready
+    ?.call(props.backend)
+    .then(() => {
+      core.store.setter(capturePasteSpecialCapabilityAtom, props.backend)
+    })
+    .catch(() => {})
   const detachNamedRangeFeaturePort = attachNamedRangeFeaturePort(
     core.store,
     props.backend,

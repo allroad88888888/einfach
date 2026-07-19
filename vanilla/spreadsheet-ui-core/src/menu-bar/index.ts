@@ -211,33 +211,43 @@ const EDIT_ITEMS: readonly MenuBarEntry[] = [
 ]
 
 const INSERT_ITEMS: readonly MenuBarEntry[] = [
+  // Structural entries are capability-gated: hosts resolve the keys
+  // against live backend port presence (`backend.insertRows != null`,
+  // `backend.insertColumns != null`) at menu-open time, so backends
+  // that withhold the structural ports (e.g. a worker runtime whose
+  // fail-closed capability witness declares structuralEdits: false)
+  // hide the entries instead of ACK-less no-ops.
   {
     id: 'insert.rowAbove',
     label: 'menuBar.insert.rowAbove',
     accessKey: 'A',
     dispatch: { kind: 'insert-row-above' },
-    isAvailable: 'always',
+    isAvailable: 'capability',
+    capabilityKey: 'insertRows',
   },
   {
     id: 'insert.rowBelow',
     label: 'menuBar.insert.rowBelow',
     accessKey: 'B',
     dispatch: { kind: 'insert-row-below' },
-    isAvailable: 'always',
+    isAvailable: 'capability',
+    capabilityKey: 'insertRows',
   },
   {
     id: 'insert.colLeft',
     label: 'menuBar.insert.colLeft',
     accessKey: 'L',
     dispatch: { kind: 'insert-column-left' },
-    isAvailable: 'always',
+    isAvailable: 'capability',
+    capabilityKey: 'insertColumns',
   },
   {
     id: 'insert.colRight',
     label: 'menuBar.insert.colRight',
     accessKey: 'R',
     dispatch: { kind: 'insert-column-right' },
-    isAvailable: 'always',
+    isAvailable: 'capability',
+    capabilityKey: 'insertColumns',
   },
   { kind: 'separator', id: 'insert.sep-1' },
   {

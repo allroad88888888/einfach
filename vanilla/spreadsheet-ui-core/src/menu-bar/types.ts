@@ -24,6 +24,11 @@ export interface MenuItemDescriptor {
    * - `'pasteSpecial'` → `backend.pasteRange != null`
    * - `'textToColumns'` → `backend.importCellChunks != null`
    * - `'removeRows'` → `backend.removeRows != null` (Remove Duplicates)
+   * - `'insertRows'` → `backend.insertRows != null` (structural row edits;
+   *   read PER menu open — worker backends may withhold the port only
+   *   after their async capability witness resolves)
+   * - `'insertColumns'` → `backend.insertColumns != null` (structural
+   *   column edits; same per-open read)
    *
    * TODO(paste-special review LOW #5): tighten this to a union of the
    * known capability literals so typos in registry entries become

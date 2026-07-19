@@ -39,7 +39,7 @@ import {
   viewportShowFormulaBarAtom,
   viewportShowGridlinesAtom,
   viewportShowHeadingsAtom,
-  viewportFreezeLifecycleAtom,
+  viewportFreezeAtom,
   viewportHiddenAtom,
   viewportHiddenLifecycleAtom,
   workspaceSessionAtom,
@@ -63,10 +63,84 @@ import {
 } from '@einfach/spreadsheet-ui-core'
 import { SpreadsheetUiProvider } from '../src-vnext/provider'
 import { SpreadsheetMenuBar } from '../src-vnext/menu-bar'
+import { createWorkerWorkbookSpreadsheetBackend } from '../src-vnext/adapter'
+import type { WorkerLike } from '../src-vnext/adapter'
+import {
+  installWorkerRuntimeTs,
+  type WorkerContext,
+} from '../src-vnext/adapter/worker-runtime-ts'
 import { setLocale } from '../src/i18n'
 import { seedReadyVisibleProjection } from './projection-test-fixture'
 
 afterEach(cleanup)
+
+/**
+ * Duplex in-process "worker" wired to the real TS runtime (same shape as
+ * vnext-worker-ts-failclosed.test.ts) so the fail-closed capability
+ * handshake runs end to end without spawning a Worker.
+ */
+function createInProcessTsWorker(): WorkerLike {
+  const toWorker: Array<(e: MessageEvent) => void> = []
+  const toClient: Array<(e: MessageEvent) => void> = []
+  const workerCtx: WorkerContext = {
+    postMessage(msg: unknown) {
+      for (const listener of [...toClient]) listener({ data: msg } as MessageEvent)
+    },
+    addEventListener(_type, listener) {
+      toWorker.push(listener)
+    },
+  }
+  installWorkerRuntimeTs(workerCtx)
+  return {
+    postMessage(msg: unknown) {
+      for (const listener of [...toWorker]) listener({ data: msg } as MessageEvent)
+    },
+    addEventListener(_type: 'message', listener: (e: MessageEvent) => void) {
+      toClient.push(listener)
+    },
+    removeEventListener(_type: 'message', listener: (e: MessageEvent) => void) {
+      const index = toClient.indexOf(listener)
+      if (index >= 0) toClient.splice(index, 1)
+    },
+    terminate() {},
+  }
+}
+
+/**
+ * Legacy-shaped protocol worker: answers `describeCapabilities` (and any
+ * other unknown command) with UNKNOWN_COMMAND exactly like the WASM
+ * runtime, so the adapter keeps the full-trust contract.
+ */
+function createLegacyProtocolWorker(): WorkerLike {
+  const listeners: Array<(e: MessageEvent) => void> = []
+  const respond = (payload: unknown) => {
+    queueMicrotask(() => {
+      for (const listener of [...listeners]) listener({ data: payload } as MessageEvent)
+    })
+  }
+  return {
+    postMessage(msg: unknown) {
+      const { id, cmd } = msg as { id: number; cmd: string }
+      if (cmd === 'initWorkbook' || cmd === 'sheetList') {
+        respond({ id, ok: true, result: [{ idx: 0, name: 'Sheet1' }] })
+        return
+      }
+      respond({
+        id,
+        ok: false,
+        error: { code: 'UNKNOWN_COMMAND', message: `unknown command: ${cmd}` },
+      })
+    },
+    addEventListener(_type: 'message', listener: (e: MessageEvent) => void) {
+      listeners.push(listener)
+    },
+    removeEventListener(_type: 'message', listener: (e: MessageEvent) => void) {
+      const index = listeners.indexOf(listener)
+      if (index >= 0) listeners.splice(index, 1)
+    },
+    terminate() {},
+  }
+}
 
 function createBaseBackend(): SpreadsheetBackend {
   return {
@@ -655,6 +729,78 @@ describe('SpreadsheetMenuBar', () => {
     },
   )
 
+  it('Insert > structural entries hide when a worker runtime declares structuralEdits:false and stay for legacy runtimes', async () => {
+    // Real TS worker backend: the fail-closed capability witness
+    // (describeCapabilities → structuralEdits:false) withholds the
+    // structural ports, so post-ready menu opens must hide the entries.
+    const tsBackend = createWorkerWorkbookSpreadsheetBackend({
+      workerFactory: () => createInProcessTsWorker(),
+      sheets: ['Sheet1'],
+    })
+    await tsBackend.ready()
+    const tsRender = render(() => (
+      <SpreadsheetUiProvider backend={tsBackend} store={createStore()}>
+        <SpreadsheetMenuBar />
+      </SpreadsheetUiProvider>
+    ))
+    fireEvent.click(tsRender.container.querySelector('[data-testid="menu-bar-button-insert"]')!)
+    await waitFor(() => {
+      expect(
+        tsRender.container.querySelector('[data-testid="menu-bar-dropdown-insert"]'),
+      ).not.toBeNull()
+    })
+    for (const itemId of [
+      'insert.rowAbove',
+      'insert.rowBelow',
+      'insert.colLeft',
+      'insert.colRight',
+    ]) {
+      expect(
+        tsRender.container.querySelector(`[data-testid="menu-bar-item-${itemId}"]`),
+      ).toBeNull()
+    }
+    // Non-structural entries survive the gate.
+    expect(
+      tsRender.container.querySelector('[data-testid="menu-bar-item-insert.sheet"]'),
+    ).not.toBeNull()
+    tsRender.unmount()
+    tsBackend.dispose()
+
+    // Legacy-shaped worker (answers UNKNOWN_COMMAND to the handshake,
+    // like the WASM runtime): null witness → full trust → the structural
+    // ports stay exposed and the entries stay visible.
+    const legacyBackend = createWorkerWorkbookSpreadsheetBackend({
+      workerFactory: () => createLegacyProtocolWorker(),
+      sheets: ['Sheet1'],
+    })
+    await legacyBackend.ready()
+    const legacyRender = render(() => (
+      <SpreadsheetUiProvider backend={legacyBackend} store={createStore()}>
+        <SpreadsheetMenuBar />
+      </SpreadsheetUiProvider>
+    ))
+    fireEvent.click(
+      legacyRender.container.querySelector('[data-testid="menu-bar-button-insert"]')!,
+    )
+    await waitFor(() => {
+      expect(
+        legacyRender.container.querySelector('[data-testid="menu-bar-dropdown-insert"]'),
+      ).not.toBeNull()
+    })
+    for (const itemId of [
+      'insert.rowAbove',
+      'insert.rowBelow',
+      'insert.colLeft',
+      'insert.colRight',
+    ]) {
+      expect(
+        legacyRender.container.querySelector(`[data-testid="menu-bar-item-${itemId}"]`),
+      ).not.toBeNull()
+    }
+    legacyRender.unmount()
+    legacyBackend.dispose()
+  })
+
   it('Insert > Sheet delegates to the initialized Core sheet-tabs state machine', async () => {
     const store = createStore()
     const initialSheets: SpreadsheetSheetMetadata[] = [{ id: 'sheet-1', name: 'Sheet1', index: 0 }]
@@ -727,7 +873,11 @@ describe('SpreadsheetMenuBar', () => {
     expect(source).toContain('snap.range.rowEnd + 1')
     expect(source).toContain('snap.range.colStart')
     expect(source).toContain('snap.range.colEnd + 1')
-    expect(source).not.toMatch(/backend\s*\.\s*(insertRows|insertColumns|addSheet)\b/)
+    // No direct INVOCATION of the structural backend ports — mutations
+    // must flow through the Core structure-operation lifecycle. Presence
+    // reads (`backend.insertRows != null`) are allowed: they gate entry
+    // VISIBILITY against the fail-closed capability witness per open.
+    expect(source).not.toMatch(/backend\s*\.\s*(insertRows|insertColumns|addSheet)\s*\(/)
     expect(source).not.toContain('pushHistoryAtom')
     expect(source).not.toContain('nextHistoryTransactionId')
     expect(source).not.toContain('createAddSheetOperation')
@@ -1308,66 +1458,87 @@ describe('SpreadsheetMenuBar', () => {
     expect(store.getter(viewportShowFormulaBarAtom)).toBe(false)
   })
 
-  it.each(['read', 'set'] as const)(
-    'View freeze commands are disabled and dispatch nothing when the %s port is missing',
-    (missingPort) => {
-      const store = createStore()
-      let readCalls = 0
-      let setCalls = 0
-      const backend: SpreadsheetBackend = {
-        ...createBaseBackend(),
-        readFreezeConfig:
-          missingPort === 'read'
-            ? undefined
-            : async (request) => {
-                readCalls += 1
-                return {
-                  kind: 'freeze-config',
-                  sheetId: request.sheetId,
-                  requestId: request.requestId,
-                  revision: 0,
-                  freeze: { rows: 0, cols: 0 },
-                }
-              },
-        setFreezeConfig:
-          missingPort === 'set'
-            ? undefined
-            : async (request) => {
-                setCalls += 1
-                return {
-                  sheetId: request.sheetId,
-                  requestId: request.requestId,
-                  revision: 1,
-                }
-              },
-      }
-      store.setter(setWorkspaceActiveSheetAtom, { sheetId: 'sheet-1' })
-      setupSelection(store)
+  it('View freeze commands stay enabled and commit locally without freeze ports', () => {
+    // UI-core canonical flip: freeze is a view fact — a worker backend
+    // without readFreezeConfig / setFreezeConfig still gets full freeze.
+    const store = createStore()
+    const backend: SpreadsheetBackend = {
+      ...createBaseBackend(),
+      readFreezeConfig: undefined,
+      setFreezeConfig: undefined,
+    }
+    store.setter(setWorkspaceActiveSheetAtom, { sheetId: 'sheet-1' })
+    store.setter(selectionAtom, {
+      kind: 'cell',
+      sheetId: 'sheet-1',
+      anchor: { row: 2, col: 1 },
+      focus: { row: 2, col: 1 },
+    })
 
-      const { container } = render(() => (
-        <SpreadsheetUiProvider backend={backend} store={store}>
-          <SpreadsheetMenuBar />
-        </SpreadsheetUiProvider>
-      ))
+    const { container } = render(() => (
+      <SpreadsheetUiProvider backend={backend} store={store}>
+        <SpreadsheetMenuBar />
+      </SpreadsheetUiProvider>
+    ))
 
-      fireEvent.click(container.querySelector('[data-testid="menu-bar-button-view"]')!)
-      const freeze = container.querySelector(
-        '[data-testid="menu-bar-item-view.freeze"]',
-      ) as HTMLButtonElement
-      const unfreeze = container.querySelector(
-        '[data-testid="menu-bar-item-view.unfreeze"]',
-      ) as HTMLButtonElement
-      expect(freeze.disabled).toBe(true)
-      expect(unfreeze.disabled).toBe(true)
-      expect(freeze.title).toContain('unavailable')
+    fireEvent.click(container.querySelector('[data-testid="menu-bar-button-view"]')!)
+    const freeze = container.querySelector(
+      '[data-testid="menu-bar-item-view.freeze"]',
+    ) as HTMLButtonElement
+    const unfreeze = container.querySelector(
+      '[data-testid="menu-bar-item-view.unfreeze"]',
+    ) as HTMLButtonElement
+    expect(freeze.disabled).toBe(false)
+    expect(unfreeze.disabled).toBe(false)
 
-      fireEvent.click(freeze)
-      fireEvent.click(unfreeze)
-      expect(readCalls).toBe(0)
-      expect(setCalls).toBe(0)
-      expect(store.getter(viewportFreezeLifecycleAtom).status).toBe('idle')
-    },
-  )
+    fireEvent.click(freeze)
+    expect(store.getter(viewportFreezeAtom)).toEqual({
+      rowsBySheet: { 'sheet-1': 2 },
+      colsBySheet: { 'sheet-1': 1 },
+    })
+
+    fireEvent.click(container.querySelector('[data-testid="menu-bar-button-view"]')!)
+    fireEvent.click(container.querySelector('[data-testid="menu-bar-item-view.unfreeze"]')!)
+    expect(store.getter(viewportFreezeAtom)).toEqual({
+      rowsBySheet: { 'sheet-1': 0 },
+      colsBySheet: { 'sheet-1': 0 },
+    })
+  })
+
+  it('View freeze mirrors into the persistence hook when the backend exposes one', async () => {
+    const store = createStore()
+    const setRequests: Array<{ sheetId: string; freeze: { rows: number; cols: number } }> = []
+    const backend: SpreadsheetBackend = {
+      ...createBaseBackend(),
+      async setFreezeConfig(request) {
+        setRequests.push({ sheetId: request.sheetId, freeze: { ...request.freeze } })
+        return { sheetId: request.sheetId, requestId: request.requestId }
+      },
+    }
+    store.setter(setWorkspaceActiveSheetAtom, { sheetId: 'sheet-1' })
+    store.setter(selectionAtom, {
+      kind: 'cell',
+      sheetId: 'sheet-1',
+      anchor: { row: 3, col: 2 },
+      focus: { row: 3, col: 2 },
+    })
+
+    const { container } = render(() => (
+      <SpreadsheetUiProvider backend={backend} store={store}>
+        <SpreadsheetMenuBar />
+      </SpreadsheetUiProvider>
+    ))
+
+    fireEvent.click(container.querySelector('[data-testid="menu-bar-button-view"]')!)
+    fireEvent.click(container.querySelector('[data-testid="menu-bar-item-view.freeze"]')!)
+    // Local commit is synchronous; the mirror is fire-and-forget.
+    expect(store.getter(viewportFreezeAtom).rowsBySheet['sheet-1']).toBe(3)
+    await waitFor(() => {
+      expect(setRequests).toEqual([
+        { sheetId: 'sheet-1', freeze: { rows: 3, cols: 2 } },
+      ])
+    })
+  })
 
   it('Help > Keyboard Shortcuts opens the shortcuts overlay', () => {
     const store = createStore()
