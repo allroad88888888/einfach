@@ -1,4 +1,4 @@
-import { For, Show, onCleanup, onMount } from 'solid-js'
+import { For, Show, createEffect, onCleanup } from 'solid-js'
 import { useT } from '../../src/i18n'
 
 /**
@@ -73,14 +73,22 @@ export function BordersDropdown(props: BordersDropdownProps) {
     }
   }
 
-  onMount(() => {
+  // Attach the document-level dismiss listeners only while the dropdown is
+  // open (canonical toolbar popup pattern, see NumberFormatDropdown). A
+  // permanently-attached listener is a landmine: after one open/close cycle
+  // `rootRef` points at a detached node, so every later outside mousedown
+  // (e.g. inside a sibling popup) called `onRequestClose()` and cleared the
+  // shared toolbar surface between mousedown and click — real clicks inside
+  // the sibling popup never landed. Pinned by toolbar-number-format e2e
+  // ("percent dropdown applies to the selected visible row after sorting").
+  createEffect(() => {
+    if (!props.isOpen) return
     document.addEventListener('mousedown', onDocPointerDown, true)
     document.addEventListener('keydown', onDocKeyDown)
-  })
-
-  onCleanup(() => {
-    document.removeEventListener('mousedown', onDocPointerDown, true)
-    document.removeEventListener('keydown', onDocKeyDown)
+    onCleanup(() => {
+      document.removeEventListener('mousedown', onDocPointerDown, true)
+      document.removeEventListener('keydown', onDocKeyDown)
+    })
   })
 
   function isEnabled(descriptor: PresetDescriptor): boolean {

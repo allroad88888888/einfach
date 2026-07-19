@@ -1,4 +1,4 @@
-import { createEffect, createSignal, For, onCleanup, onMount, Show } from 'solid-js'
+import { createEffect, createSignal, For, onCleanup, Show } from 'solid-js'
 import { useAtomValue } from '@einfach/solid'
 import { useT } from '../../src/i18n'
 import {
@@ -314,14 +314,21 @@ function SortDropdown(props: SortDropdownProps) {
     }
   }
 
-  onMount(() => {
+  // Attach the document-level dismiss listeners only while the dropdown is
+  // open (canonical toolbar popup pattern, see NumberFormatDropdown /
+  // BordersDropdown). This exact component was the T14 defect: the listener
+  // used to live for the toolbar's lifetime, so after one sort the stale
+  // detached `rootRef` made every outside mousedown call `onRequestClose()`
+  // — clearing the shared toolbar surface and unmounting whichever sibling
+  // popup (e.g. the number-format dropdown) the user was mid-click inside.
+  createEffect(() => {
+    if (!props.isOpen) return
     document.addEventListener('mousedown', onDocPointerDown, true)
     document.addEventListener('keydown', onDocKeyDown)
-  })
-
-  onCleanup(() => {
-    document.removeEventListener('mousedown', onDocPointerDown, true)
-    document.removeEventListener('keydown', onDocKeyDown)
+    onCleanup(() => {
+      document.removeEventListener('mousedown', onDocPointerDown, true)
+      document.removeEventListener('keydown', onDocKeyDown)
+    })
   })
 
   const options: Array<{ direction: SortDirection; labelKey: string; testId: string }> = [

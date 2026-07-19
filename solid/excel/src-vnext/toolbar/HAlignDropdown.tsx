@@ -1,4 +1,4 @@
-import { For, Show, onCleanup, onMount } from 'solid-js'
+import { For, Show, createEffect, onCleanup } from 'solid-js'
 import { useT } from '../../src/i18n'
 
 /**
@@ -56,14 +56,17 @@ export function HAlignDropdown(props: HAlignDropdownProps) {
     }
   }
 
-  onMount(() => {
+  // Attach the document-level dismiss listeners only while the dropdown is
+  // open — see BordersDropdown for the stale-`rootRef` failure mode this
+  // gating prevents.
+  createEffect(() => {
+    if (!props.isOpen) return
     document.addEventListener('mousedown', onDocPointerDown, true)
     document.addEventListener('keydown', onDocKeyDown)
-  })
-
-  onCleanup(() => {
-    document.removeEventListener('mousedown', onDocPointerDown, true)
-    document.removeEventListener('keydown', onDocKeyDown)
+    onCleanup(() => {
+      document.removeEventListener('mousedown', onDocPointerDown, true)
+      document.removeEventListener('keydown', onDocKeyDown)
+    })
   })
 
   return (

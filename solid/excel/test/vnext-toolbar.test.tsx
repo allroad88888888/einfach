@@ -14,6 +14,7 @@ import type {
 import {
   beginProjectionAtom,
   diagnosticsAtom,
+  filterSortStateAtom,
   findReplaceOpenAtom,
   formatCellsEditorAtom,
   formatPainterStateAtom,
@@ -581,6 +582,121 @@ describe('vNext SpreadsheetToolbar', () => {
     )
     expect(setFormatRangeCalls).toHaveLength(0)
     expect(store.getter(toolbarMutationLifecycleAtom).status).toBe('ready')
+  })
+
+  it('keeps the number-format dropdown clickable through a real mousedown after sorting', async () => {
+    // Regression (T14): the toolbar's inline SortDropdown used to attach its
+    // document-level mousedown dismiss listener in `onMount` for the whole
+    // toolbar lifetime. After the sort dropdown had been opened once, its
+    // `rootRef` pointed at a detached node, so a real mousedown on a
+    // number-format item was judged "outside" and cleared the shared toolbar
+    // surface between mousedown and click — the item unmounted before its
+    // onClick could dispatch. Listeners are now attached only while each
+    // popup is open.
+    const store = createStore()
+    const sortedCells = [
+      {
+        row: 5,
+        col: 4,
+        originalRow: 1,
+        displayValue: '300',
+        valueKind: 'number' as const,
+        format: {},
+      },
+    ]
+    const setFormatRangeCalls: SetFormatRangeRequest[] = []
+    const backend: SpreadsheetBackend = {
+      async readVisibleProjection(request) {
+        return {
+          kind: 'visible-window',
+          sheetId: request.sheetId,
+          requestId: request.requestId,
+          revision: request.revision,
+          window: { ...request.window },
+          cells: sortedCells,
+        }
+      },
+      async readRangeProjection() {
+        throw new Error('not used')
+      },
+      async setCellInput() {
+        throw new Error('not used')
+      },
+      async setFormatRange(request) {
+        setFormatRangeCalls.push(request)
+        return {
+          kind: request.kind,
+          sheetId: request.sheetId,
+          requestId: request.requestId,
+          revision: 2,
+          affectedRange: { ...request.range },
+        }
+      },
+      async setFilterSort(request) {
+        return { sheetId: request.sheetId, requestId: request.requestId, revision: 4 }
+      },
+    }
+
+    store.setter(setWorkspaceActiveSheetAtom, { sheetId: 'sheet-1' })
+    store.setter(selectCellAtom, { sheetId: 'sheet-1', coord: { row: 5, col: 4 } })
+    seedVisibleProjection(store, {
+      kind: 'visible-window',
+      sheetId: 'sheet-1',
+      requestId: 1,
+      window: { rowStart: 0, rowEnd: 8, colStart: 0, colEnd: 5 },
+      cells: sortedCells,
+    })
+
+    const { container } = render(() => (
+      <SpreadsheetUiProvider backend={backend} store={store}>
+        <SpreadsheetToolbar />
+      </SpreadsheetUiProvider>
+    ))
+
+    // Sort via the toolbar dropdown — opening it once is what used to arm the
+    // stale-listener landmine.
+    const sortButton = container.querySelector(
+      '[data-testid="toolbar-btn-sort"]',
+    ) as HTMLButtonElement
+    await waitFor(() => expect(sortButton.disabled).toBe(false))
+    fireEvent.click(sortButton)
+    fireEvent.click(
+      container.querySelector('[data-testid="toolbar-sort-asc"]') as HTMLButtonElement,
+    )
+    await waitFor(() =>
+      expect(store.getter(filterSortStateAtom)['sheet-1']?.directives).toEqual([
+        { colIndex: 4, direction: 'asc' },
+      ]),
+    )
+
+    fireEvent.click(getButtons(container).numberFormat)
+    const percentItem = document.body.querySelector(
+      '[data-testid="number-format-item-Percent"]',
+    ) as HTMLButtonElement | null
+    expect(percentItem).not.toBeNull()
+
+    // A real pointer press hits document-level capture listeners before the
+    // item's own click handler; the dropdown (and the item) must survive it.
+    fireEvent.mouseDown(percentItem!)
+    expect(percentItem!.isConnected).toBe(true)
+    expect(store.getter(toolbarActiveSurfaceAtom)).toEqual({
+      kind: 'dropdown',
+      id: 'number-format',
+    })
+
+    fireEvent.mouseUp(percentItem!)
+    fireEvent.click(percentItem!)
+
+    await waitFor(() => expect(setFormatRangeCalls).toHaveLength(1))
+    // Display row 5 remaps to source row 1 through the mutation gateway.
+    expect(setFormatRangeCalls[0].range).toEqual({
+      rowStart: 1,
+      rowEnd: 1,
+      colStart: 4,
+      colEnd: 4,
+    })
+    expect(setFormatRangeCalls[0].format).toEqual({ numberFormat: { kind: 'percent', digits: 0 } })
+    expect(document.body.querySelector('[data-testid="number-format-dropdown"]')).toBeNull()
   })
 
   it('renders the Custom row in the number-format dropdown without raw i18n keys', async () => {
