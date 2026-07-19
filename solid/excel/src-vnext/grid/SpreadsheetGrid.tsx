@@ -114,7 +114,6 @@ import {
   dispatchUndo,
   notifyDraftTypedChar,
   readActiveFormulaSuggestion,
-  resolveProjectionSourceRange,
   runVisibleProjectionTransport,
   spreadsheetProjectionSnapshotAtom,
   syncFormulaReferenceCaret,
@@ -1852,13 +1851,74 @@ export function SpreadsheetGrid(props: SpreadsheetGridProps) {
       }
     }
 
+    if (writes.length === 0) {
+      return
+    }
+
+    const affectedRange = writes.reduce(
+      (acc, write) => ({
+        rowStart: Math.min(acc.rowStart, write.row),
+        rowEnd: Math.max(acc.rowEnd, write.row),
+        colStart: Math.min(acc.colStart, write.col),
+        colEnd: Math.max(acc.colEnd, write.col),
+      }),
+      {
+        rowStart: writes[0].row,
+        rowEnd: writes[0].row,
+        colStart: writes[0].col,
+        colEnd: writes[0].col,
+      },
+    )
+
+    if (backend.importCells) {
+      // Batch port: ONE transport = ONE adapter transaction record = ONE
+      // UI history entry, so undoing the entry reverts the whole fill and
+      // the two undo stacks stay positionally aligned (same contract as
+      // the batch paste path).
+      const result = await backend.importCells({
+        kind: 'import-cells',
+        sheetId: intent.sheetId,
+        cells: writes,
+        range: affectedRange,
+      })
+      const revision =
+        typeof result?.revision === 'number'
+          ? result.revision
+          : Number(result?.revision ?? 0) || 0
+      store.setter(pushHistoryAtom, {
+        transactionId: nextHistoryTransactionId(),
+        kind: 'range.fill',
+        sheetId: intent.sheetId,
+        projectionRevision: revision,
+        affectedRange: result?.affectedRange ? { ...result.affectedRange } : affectedRange,
+      })
+      return
+    }
+
+    // Fallback host without the batch port: keep the per-cell transport but
+    // record one UI entry PER acknowledged write (N:N). Zero entries over N
+    // per-cell mutations would leave the adapter transaction stack N records
+    // deeper than the UI stack and bind later undos to the wrong snapshots.
     for (const write of writes) {
-      await backend.setCellInput({
+      const result = await backend.setCellInput({
         kind: 'set-cell-input',
         sheetId: intent.sheetId,
         row: write.row,
         col: write.col,
         input: write.input,
+      })
+      const revision =
+        typeof result?.revision === 'number'
+          ? result.revision
+          : Number(result?.revision ?? 0) || 0
+      store.setter(pushHistoryAtom, {
+        transactionId: nextHistoryTransactionId(),
+        kind: 'cell.set-input',
+        sheetId: intent.sheetId,
+        projectionRevision: revision,
+        affectedRange: result?.affectedRange
+          ? { ...result.affectedRange }
+          : { rowStart: write.row, rowEnd: write.row, colStart: write.col, colEnd: write.col },
       })
     }
   }
@@ -2481,28 +2541,44 @@ export function SpreadsheetGrid(props: SpreadsheetGridProps) {
     }
 
     const range = snapshot.range
-    const sourceRange = resolveProjectionSourceRange(store, sheetId, range)
+    // Mutation gateway: display→source row remap (filter/sort) plus the
+    // protection gate — locked cells on a protected sheet cannot be
+    // reformatted. Blocked resolutions launch zero transport (fail-closed);
+    // the gateway already recorded the diagnostic + lastBlock.
+    const resolution = store.setter(resolveContentMutationAtom, {
+      kind: 'set-format-range',
+      sheetId,
+      range,
+    })
+    if (resolution.status === 'blocked') {
+      return
+    }
+    const sourceRanges = resolution.ranges ?? [range]
     const current = activeCellFormat()
     const nextFormat: SpreadsheetCellFormat = { ...current, [field]: !current[field] }
 
-    const result = await backend.setFormatRange({
-      kind: 'set-format-range',
-      sheetId,
-      range: sourceRange,
-      format: nextFormat,
-    })
-
-    const revision =
-      typeof result?.revision === 'number'
-        ? result.revision
-        : Number(result?.revision ?? 0) || 0
-    store.setter(pushHistoryAtom, {
-      transactionId: nextHistoryTransactionId(),
-      kind: 'format.set',
-      sheetId,
-      projectionRevision: revision,
-      affectedRange: { ...(result?.affectedRange ?? sourceRange) },
-    })
+    // One UI history entry per setFormatRange transport (N:N): both
+    // reference adapters record one undo transaction per call, so a single
+    // entry over a split remap would leave the stacks positionally offset.
+    for (const sourceRange of sourceRanges) {
+      const result = await backend.setFormatRange({
+        kind: 'set-format-range',
+        sheetId,
+        range: { ...sourceRange },
+        format: nextFormat,
+      })
+      const revision =
+        typeof result?.revision === 'number'
+          ? result.revision
+          : Number(result?.revision ?? 0) || 0
+      store.setter(pushHistoryAtom, {
+        transactionId: nextHistoryTransactionId(),
+        kind: 'format.set',
+        sheetId,
+        projectionRevision: revision,
+        affectedRange: { ...(result?.affectedRange ?? sourceRange) },
+      })
+    }
 
     await loadProjection(requestProjection())
   }

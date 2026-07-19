@@ -5,6 +5,7 @@ import { createStore, type Store } from '@einfach/core'
 import { cleanup, fireEvent, render, waitFor } from '@solidjs/testing-library'
 import type {
   BackendMutationResult,
+  DisplayCell,
   SetFormatRangeRequest,
   SpreadsheetBackend,
   VisibleProjectionRequest,
@@ -13,6 +14,7 @@ import {
   closeFormatCellsAtom,
   formatCellsEditorAtom,
   openFormatCellsAtom,
+  setSheetProtectionAtom,
 } from '@einfach/spreadsheet-ui-core'
 import { setLocale } from '../src/i18n'
 import { SpreadsheetUiProvider } from '../src-vnext/provider'
@@ -680,6 +682,85 @@ describe('SpreadsheetFormatCellsDialog', () => {
     store.setter(closeFormatCellsAtom)
     await waitFor(() => expect(queryByTestId('format-cells-dialog')).toBeNull())
   })
+
+  it.each<TestDialogKind>(['format-cells', 'number-format'])(
+    '%s save on a protected sheet is blocked by the mutation gateway with zero transport',
+    async (kind) => {
+      const store = createStore()
+      const { backend, setFormatRangeRequests } = createFakeBackend()
+      store.setter(setSheetProtectionAtom, {
+        sheetId: 'sheet-1',
+        state: { mode: 'protected', unlockedRanges: [] },
+      })
+      openTestDialog(store, kind)
+      const { getByTestId } = renderTestDialog(kind, store, backend)
+      const saveTestId = kind === 'format-cells' ? 'format-cells-save' : 'number-format-dialog-save'
+
+      fireEvent.click(getByTestId(saveTestId))
+
+      // The gateway rejects before the save controller's write boundary:
+      // the dialog settles as error-open (retryable) with ZERO transports.
+      await waitFor(() => {
+        const state = readTestDialogState(store, kind)
+        expect(state.status).toBe('open')
+        if (state.status !== 'open') return
+        expect(state.phase).toBe('error-open')
+        expect(state.pending).toBe(false)
+        expect(state.error).toBe('The target cells are locked on a protected sheet.')
+      })
+      expect(setFormatRangeRequests).toHaveLength(0)
+    },
+  )
+
+  it.each<TestDialogKind>(['format-cells', 'number-format'])(
+    '%s save under an active filter writes formats to the mapped source rows, split per run',
+    async (kind) => {
+      const store = createStore()
+      const { backend, setFormatRangeRequests } = createFakeBackend()
+      // Display rows 0..2 backed by source rows 0, 5, 3 (filter/sort permutation).
+      const displayToSourceRow: Record<number, number> = { 0: 0, 1: 5, 2: 3 }
+      const cells: DisplayCell[] = []
+      for (let row = RANGE.rowStart; row <= RANGE.rowEnd; row += 1) {
+        for (let col = RANGE.colStart; col <= RANGE.colEnd; col += 1) {
+          cells.push({
+            row,
+            col,
+            displayValue: `s${displayToSourceRow[row]},${col}`,
+            originalRow: displayToSourceRow[row],
+          })
+        }
+      }
+      seedReadyVisibleProjection(store, {
+        status: 'ready',
+        result: {
+          kind: 'visible-window',
+          sheetId: 'sheet-1',
+          requestId: 1,
+          window: RANGE,
+          cells,
+        },
+      })
+      openTestDialog(store, kind)
+      const { getByTestId } = renderTestDialog(kind, store, backend)
+      const saveTestId = kind === 'format-cells' ? 'format-cells-save' : 'number-format-dialog-save'
+
+      fireEvent.click(getByTestId(saveTestId))
+
+      await waitFor(() => {
+        expect(setFormatRangeRequests).toHaveLength(3)
+      })
+      expect(
+        setFormatRangeRequests.map((request) => (request as SetFormatRangeRequest).range),
+      ).toEqual([
+        { rowStart: 0, rowEnd: 0, colStart: 0, colEnd: 2 },
+        { rowStart: 5, rowEnd: 5, colStart: 0, colEnd: 2 },
+        { rowStart: 3, rowEnd: 3, colStart: 0, colEnd: 2 },
+      ])
+      await waitFor(() => {
+        expect(readTestDialogState(store, kind).status).toBe('closed')
+      })
+    },
+  )
 
   it.each<TestDialogKind>(['format-cells', 'number-format'])(
     '%s blocks with outcome unknown when the captured projection refresh rejects',

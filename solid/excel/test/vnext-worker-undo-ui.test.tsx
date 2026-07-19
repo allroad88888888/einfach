@@ -75,6 +75,21 @@ function gridCellText(container: HTMLElement, addr: string): string {
   )
 }
 
+function dispatchPointerEvent(
+  target: EventTarget,
+  type: 'pointerdown' | 'pointermove' | 'pointerup',
+  coordinates: { clientX?: number; clientY?: number },
+) {
+  target.dispatchEvent(
+    new MouseEvent(type, {
+      bubbles: true,
+      cancelable: true,
+      clientX: coordinates.clientX ?? 0,
+      clientY: coordinates.clientY ?? 0,
+    }),
+  )
+}
+
 async function commitCellEdit(container: HTMLElement, addr: string, value: string) {
   fireEvent.click(
     container.querySelector(`[data-cell-addr="${addr}"] .spreadsheet-grid-cell-button`)!,
@@ -223,6 +238,83 @@ describe('worker path Ctrl+Z semantics (grid + history timeline)', () => {
       expect(gridCellText(container, 'A2')).toBe('3')
       expect(gridCellText(container, 'B2')).toBe('4')
       expect(store.getter(historyStackAtom).cursor).toBe(1)
+    })
+
+    backend.dispose()
+  })
+
+  it('fill-handle drag records ONE range.fill entry; Ctrl+Z reverts the whole fill', async () => {
+    const worker = createInProcessTsWorker()
+    const backend = createWorkerWorkbookSpreadsheetBackend({
+      workerFactory: () => worker,
+      sheets: [{ id: 'sheet-1', name: 'Sheet1' }],
+    })
+    await backend.ready()
+
+    const store = createStore()
+    const { container, getByTestId } = render(() => (
+      <SpreadsheetUiProvider backend={backend} store={store}>
+        <SpreadsheetGrid sheetId="sheet-1" viewport={VIEWPORT} data-testid="grid" />
+      </SpreadsheetUiProvider>
+    ))
+    await waitFor(() => {
+      expect(container.querySelectorAll('td.spreadsheet-grid-cell').length).toBeGreaterThan(0)
+    })
+
+    await commitCellEdit(container, 'A1', 'x')
+    await waitFor(() => {
+      expect(gridCellText(container, 'A1')).toBe('x')
+      expect(store.getter(historyStackAtom).entries).toHaveLength(1)
+    })
+
+    // Drag the A1 fill handle down to A3. The worker adapter exposes no
+    // fillRange/fillSeries port, so the grid takes the gateway-resolved
+    // fallback — which must batch through importCells (one transport = one
+    // adapter transaction = one UI entry), never N silent per-cell writes.
+    fireEvent.click(
+      container.querySelector('[data-cell-addr="A1"] .spreadsheet-grid-cell-button')!,
+    )
+    const targetCell = container.querySelector('[data-cell-addr="A3"]') as HTMLElement
+    const originalElementFromPoint = document.elementFromPoint
+    Object.defineProperty(document, 'elementFromPoint', {
+      configurable: true,
+      value: () => targetCell,
+    })
+    try {
+      dispatchPointerEvent(getByTestId('fill-handle-A1'), 'pointerdown', { clientX: 1, clientY: 1 })
+      dispatchPointerEvent(window, 'pointermove', { clientX: 1, clientY: 3 })
+      dispatchPointerEvent(window, 'pointerup', { clientX: 1, clientY: 3 })
+
+      await waitFor(() => {
+        expect(gridCellText(container, 'A2')).toBe('x')
+        expect(gridCellText(container, 'A3')).toBe('x')
+        expect(store.getter(historyStackAtom).entries).toHaveLength(2)
+      })
+    } finally {
+      Object.defineProperty(document, 'elementFromPoint', {
+        configurable: true,
+        value: originalElementFromPoint,
+      })
+    }
+    expect(store.getter(historyStackAtom).entries[1].kind).toBe('range.fill')
+
+    // ONE Ctrl+Z reverts BOTH filled cells and leaves the source intact.
+    const grid = container.querySelector('[data-testid="grid"]')!
+    fireEvent.keyDown(grid, { key: 'z', ctrlKey: true })
+    await waitFor(() => {
+      expect(gridCellText(container, 'A2')).toBe('')
+      expect(gridCellText(container, 'A3')).toBe('')
+      expect(gridCellText(container, 'A1')).toBe('x')
+      expect(store.getter(historyStackAtom).cursor).toBe(1)
+      expect(store.getter(historyLifecycleAtom).status).toBe('ready')
+    })
+
+    // Ctrl+Y restores the whole fill.
+    fireEvent.keyDown(grid, { key: 'y', ctrlKey: true })
+    await waitFor(() => {
+      expect(gridCellText(container, 'A2')).toBe('x')
+      expect(gridCellText(container, 'A3')).toBe('x')
+      expect(store.getter(historyStackAtom).cursor).toBe(2)
     })
 
     backend.dispose()

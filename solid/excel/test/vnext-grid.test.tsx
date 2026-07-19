@@ -17,6 +17,7 @@ import type {
   RangeTsvExportResult,
   ResolveDataEdgeRequest,
   SetCellInputRequest,
+  SetFormatRangeRequest,
   SpreadsheetBackend,
   VisibleProjectionRequest,
   VisibleProjectionResult,
@@ -50,6 +51,7 @@ import {
   hideColumnsAtom,
   hideRowsAtom,
   viewportHiddenDiagnosticAtom,
+  historyStackAtom,
 } from '@einfach/spreadsheet-ui-core'
 import {
   createWorkerWorkbookSpreadsheetBackend,
@@ -2754,6 +2756,120 @@ describe('vNext SpreadsheetGrid', () => {
     fireEvent.dblClick(container.querySelector('[data-cell-addr="A1"]')!)
 
     expect(store.getter(editingSessionAtom).status).toBe('idle')
+  })
+
+  it('Ctrl+B on a protected sheet is blocked with zero setFormatRange transport', async () => {
+    const store = createStore()
+    const setFormatRangeRequests: SetFormatRangeRequest[] = []
+    const { backend } = createFakeBackend()
+    backend.setFormatRange = async (request) => {
+      setFormatRangeRequests.push(request)
+      return { sheetId: request.sheetId, revision: 31, affectedRange: request.range }
+    }
+
+    store.setter(setSheetProtectionAtom, {
+      sheetId: 'sheet-1',
+      state: { mode: 'protected', unlockedRanges: [] },
+    })
+
+    const viewport = {
+      scrollTop: 0,
+      scrollLeft: 0,
+      viewportHeight: 4,
+      viewportWidth: 4,
+      rowHeight: 1,
+      colWidth: 1,
+      rowCount: 10,
+      colCount: 10,
+      overscanRows: 0,
+      overscanCols: 0,
+    }
+    const { container } = render(() => (
+      <SpreadsheetUiProvider backend={backend} store={store}>
+        <SpreadsheetGrid sheetId="sheet-1" viewport={viewport} data-testid="grid" />
+      </SpreadsheetUiProvider>
+    ))
+    await waitFor(() => {
+      expect(container.querySelectorAll('td.spreadsheet-grid-cell')).toHaveLength(16)
+    })
+
+    fireEvent.click(container.querySelector('[data-cell-addr="A1"] .spreadsheet-grid-cell-button')!)
+    fireEvent.keyDown(container.querySelector('[data-testid="grid"]')!, {
+      key: 'b',
+      ctrlKey: true,
+    })
+
+    await flushMicrotasks()
+    expect(setFormatRangeRequests).toHaveLength(0)
+    expect(store.getter(historyStackAtom).entries).toHaveLength(0)
+  })
+
+  it('Ctrl+B under an active filter writes formats to the mapped source rows, split per run', async () => {
+    const store = createStore()
+    const setFormatRangeRequests: SetFormatRangeRequest[] = []
+    // Display rows 0..3 backed by source rows 0, 5, 3, 7 (filter/sort permutation).
+    const displayToSourceRow: Record<number, number> = { 0: 0, 1: 5, 2: 3, 3: 7 }
+    const { backend } = createFakeBackend({
+      cells: (window) => {
+        const cells: DisplayCell[] = []
+        for (let row = window.rowStart; row <= window.rowEnd; row += 1) {
+          const sourceRow = displayToSourceRow[row]
+          if (sourceRow === undefined) continue
+          for (let col = window.colStart; col <= window.colEnd; col += 1) {
+            cells.push({ row, col, displayValue: `s${sourceRow},${col}`, originalRow: sourceRow })
+          }
+        }
+        return cells
+      },
+    })
+    backend.setFormatRange = async (request) => {
+      setFormatRangeRequests.push(request)
+      return { sheetId: request.sheetId, revision: 32, affectedRange: request.range }
+    }
+
+    const viewport = {
+      scrollTop: 0,
+      scrollLeft: 0,
+      viewportHeight: 4,
+      viewportWidth: 4,
+      rowHeight: 1,
+      colWidth: 1,
+      rowCount: 10,
+      colCount: 10,
+      overscanRows: 0,
+      overscanCols: 0,
+    }
+    const { container } = render(() => (
+      <SpreadsheetUiProvider backend={backend} store={store}>
+        <SpreadsheetGrid sheetId="sheet-1" viewport={viewport} data-testid="grid" />
+      </SpreadsheetUiProvider>
+    ))
+    await waitFor(() => {
+      expect(container.querySelectorAll('td.spreadsheet-grid-cell')).toHaveLength(16)
+    })
+
+    // A2:B3 = display rows 1..2, cols 0..1 → source rows 5 and 3.
+    fireEvent.click(container.querySelector('[data-cell-addr="A2"] .spreadsheet-grid-cell-button')!)
+    fireEvent.click(container.querySelector('[data-cell-addr="B3"] .spreadsheet-grid-cell-button')!, {
+      shiftKey: true,
+    })
+    fireEvent.keyDown(container.querySelector('[data-testid="grid"]')!, {
+      key: 'b',
+      ctrlKey: true,
+    })
+
+    await waitFor(() => {
+      expect(setFormatRangeRequests).toHaveLength(2)
+    })
+    expect(setFormatRangeRequests.map((request) => request.range)).toEqual([
+      { rowStart: 5, rowEnd: 5, colStart: 0, colEnd: 1 },
+      { rowStart: 3, rowEnd: 3, colStart: 0, colEnd: 1 },
+    ])
+    expect(setFormatRangeRequests.every((request) => request.format?.bold === true)).toBe(true)
+    // One UI history entry per transport (N:N with per-mutation adapters).
+    const entries = store.getter(historyStackAtom).entries
+    expect(entries).toHaveLength(2)
+    expect(entries.every((entry) => entry.kind === 'format.set')).toBe(true)
   })
 
   it('Ctrl+F opens find-replace atom', async () => {

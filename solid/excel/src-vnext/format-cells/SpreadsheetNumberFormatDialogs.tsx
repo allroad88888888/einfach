@@ -4,7 +4,7 @@ import { For, Show, createEffect, onCleanup } from 'solid-js'
 import type { JSX } from 'solid-js'
 import { useAtomValue } from '@einfach/solid'
 import { useT } from '../../src/i18n'
-import { resolveProjectionSourceRanges } from '../provider/projection-coordinates'
+import { resolveFormatSaveSourceRanges } from './format-save-source-ranges'
 import { refreshVisibleProjection } from '../provider/projection-refresh'
 import { useSpreadsheetBackend, useSpreadsheetUiStore } from '../provider/hooks'
 import {
@@ -59,7 +59,7 @@ export function SpreadsheetNumberFormatDialogs(
   }) as SpreadsheetBackend
   const savePorts: RunFormatCellsSaveInput = Object.freeze({
     resolveSourceRanges: Object.freeze((sheetId: string, range: CellRange) =>
-      resolveProjectionSourceRanges(store, sheetId, range),
+      resolveFormatSaveSourceRanges(store, sheetId, range),
     ),
     setFormatRange: capabilities.setFormatRange,
     refreshProjection:

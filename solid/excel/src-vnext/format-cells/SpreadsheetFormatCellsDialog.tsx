@@ -23,7 +23,7 @@ import {
   type SpreadsheetVerticalAlignment,
 } from '@einfach/spreadsheet-ui-core'
 import { useT } from '../../src/i18n'
-import { resolveProjectionSourceRanges } from '../provider/projection-coordinates'
+import { resolveFormatSaveSourceRanges } from './format-save-source-ranges'
 import { refreshVisibleProjection } from '../provider/projection-refresh'
 import { useSpreadsheetBackend, useSpreadsheetUiStore } from '../provider/hooks'
 import './format-cells-dialog.css'
@@ -183,7 +183,7 @@ export function SpreadsheetFormatCellsDialog(props: SpreadsheetFormatCellsDialog
   }) as SpreadsheetBackend
   const savePorts: RunFormatCellsSaveInput = Object.freeze({
     resolveSourceRanges: Object.freeze((sheetId: string, range: CellRange) =>
-      resolveProjectionSourceRanges(store, sheetId, range),
+      resolveFormatSaveSourceRanges(store, sheetId, range),
     ),
     setFormatRange: capabilities.setFormatRange,
     refreshProjection:
