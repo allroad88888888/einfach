@@ -111,6 +111,18 @@ export interface PasteRangeResult extends SheetRef {
 /** Minimum backend capability consumed by the framework-neutral Core command. */
 export interface PasteSpecialControllerPort {
   pasteRange?(request: PasteRangeRequest): Promise<PasteRangeResult>
+  /**
+   * Optional fail-closed subdivision of the pasteRange capability. When
+   * declared, only the listed kinds are eligible: Core blocks any other
+   * kind pre-dispatch with a structured reason instead of sending a
+   * request the backend would have to reject (a format-model-less worker
+   * runtime cannot apply the format leg of 'formats' /
+   * 'values-and-formats' / 'all'). Absent → every Core-supported kind is
+   * assumed available (legacy full-trust contract, e.g. the static
+   * backend). Declared kinds outside `SUPPORTED_PASTE_SPECIAL_KINDS`
+   * are ignored.
+   */
+  readonly pasteRangeSupportedKinds?: readonly PasteSpecialKind[]
 }
 
 /** Adapter input for one confirm/retry dispatch. */

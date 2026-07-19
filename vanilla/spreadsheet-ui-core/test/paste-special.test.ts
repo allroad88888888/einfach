@@ -9,6 +9,7 @@ import {
   PASTE_SPECIAL_OUTCOME_UNKNOWN_ERROR,
   PASTE_SPECIAL_REFRESH_ERROR_PREFIX,
   PASTE_SPECIAL_UNSUPPORTED_KIND_ERROR,
+  SUPPORTED_PASTE_SPECIAL_KINDS,
   capturePasteSpecialCapabilityAtom,
   closePasteSpecialAtom,
   confirmPasteSpecialAtom,
@@ -16,6 +17,7 @@ import {
   nextPasteSpecialRequestId,
   nextPasteSpecialSessionId,
   openPasteSpecialAtom,
+  pasteSpecialBackendKindError,
   patchPasteSpecialOptionsAtom,
   pasteSpecialCanCloseAtom,
   pasteSpecialCanConfirmAtom,
@@ -27,6 +29,7 @@ import {
   pasteSpecialRequestIdAtom,
   pasteSpecialSessionAtom,
   pasteSpecialSessionIdAtom,
+  pasteSpecialSupportedKindsAtom,
   type PasteRangeRequest,
   type PasteRangeResult,
   type PasteSpecialControllerPort,
@@ -530,5 +533,92 @@ describe('paste-special Core state machine', () => {
     expect(closePasteSpecialAtom.debugLabel).toBe('spreadsheet.pasteSpecial.closeCommand')
     expect(confirmPasteSpecialAtom.debugLabel).toBe('spreadsheet.pasteSpecial.confirm')
     expect(pasteSpecialCanCloseAtom.debugLabel).toBe('spreadsheet.pasteSpecial.canClose')
+  })
+})
+
+describe('paste-special backend supported-kinds subdivision', () => {
+  test('capture without a declaration keeps the legacy full-trust kind set', () => {
+    const store = createStore()
+    const { port } = createPort()
+    store.setter(capturePasteSpecialCapabilityAtom, port)
+    expect(store.getter(pasteSpecialSupportedKindsAtom)).toEqual(SUPPORTED_PASTE_SPECIAL_KINDS)
+  })
+
+  test('capture intersects a declaration with the Core-supported set', () => {
+    const store = createStore()
+    const { port } = createPort()
+    const declaring: PasteSpecialControllerPort = {
+      ...port,
+      pasteRangeSupportedKinds: ['transpose', 'values', 'column-widths'],
+    }
+    store.setter(capturePasteSpecialCapabilityAtom, declaring)
+    expect(store.getter(pasteSpecialSupportedKindsAtom)).toEqual(['values', 'transpose'])
+  })
+
+  test('open falls back to the first supported kind when the default is excluded', () => {
+    const store = createStore()
+    const { port } = createPort()
+    const declaring: PasteSpecialControllerPort = {
+      ...port,
+      pasteRangeSupportedKinds: ['values', 'transpose'],
+    }
+    seedPasteContext(store)
+    store.setter(capturePasteSpecialCapabilityAtom, declaring)
+    store.setter(openPasteSpecialAtom)
+
+    expect(store.getter(pasteSpecialOptionsAtom).kind).toBe('values')
+    expect(store.getter(pasteSpecialLifecycleAtom).status).toBe('editing')
+    expect(store.getter(pasteSpecialCanConfirmAtom)).toBe(true)
+  })
+
+  test('patching to a backend-excluded kind blocks with the structured reason', () => {
+    const store = createStore()
+    const { pasteRange, port } = createPort()
+    const declaring: PasteSpecialControllerPort = {
+      ...port,
+      pasteRangeSupportedKinds: ['values', 'transpose'],
+    }
+    seedPasteContext(store)
+    store.setter(capturePasteSpecialCapabilityAtom, declaring)
+    store.setter(openPasteSpecialAtom)
+    store.setter(patchPasteSpecialOptionsAtom, { kind: 'values-and-formats' })
+
+    expect(store.getter(pasteSpecialLifecycleAtom).status).toBe('blocked')
+    expect(store.getter(pasteSpecialErrorAtom)).toBe(
+      pasteSpecialBackendKindError('values-and-formats'),
+    )
+    expect(store.getter(pasteSpecialCanConfirmAtom)).toBe(false)
+
+    const sessionId = store.getter(pasteSpecialSessionAtom)!.sessionId
+    void store.setter(confirmPasteSpecialAtom, {
+      source: declaring,
+      sessionId,
+      refreshProjection: async () => {},
+    })
+    expect(pasteRange).not.toHaveBeenCalled()
+  })
+
+  test('recapturing a full-trust backend unblocks a backend-excluded kind', () => {
+    const store = createStore()
+    const { port } = createPort()
+    const declaring: PasteSpecialControllerPort = {
+      ...port,
+      pasteRangeSupportedKinds: ['values', 'transpose'],
+    }
+    seedPasteContext(store)
+    store.setter(capturePasteSpecialCapabilityAtom, declaring)
+    store.setter(openPasteSpecialAtom)
+    store.setter(patchPasteSpecialOptionsAtom, { kind: 'all' })
+    expect(store.getter(pasteSpecialLifecycleAtom).status).toBe('blocked')
+
+    store.setter(capturePasteSpecialCapabilityAtom, port)
+    expect(store.getter(pasteSpecialLifecycleAtom).status).toBe('editing')
+    expect(store.getter(pasteSpecialErrorAtom)).toBe('')
+  })
+
+  test('supported-kinds atom carries the namespace debug label', () => {
+    expect(pasteSpecialSupportedKindsAtom.debugLabel).toBe(
+      'spreadsheet.pasteSpecial.supportedKinds',
+    )
   })
 })

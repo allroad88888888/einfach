@@ -116,6 +116,12 @@ import type {
   StaticSpreadsheetSheetInput,
 } from './types'
 import { evaluateFormula, formatEvalResult, type EvalCellLookup } from './static-formula-eval'
+import {
+  applyPasteArithmetic,
+  isPasteSourceBlank,
+  pasteRangeGeometry,
+  pasteSourceCoord,
+} from './paste-range-plan'
 
 function isObject(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null
@@ -3395,11 +3401,11 @@ export function createStaticSpreadsheetBackend(
     async pasteRange(request: PasteRangeRequest): Promise<PasteRangeResult> {
       // Reference implementation for Wave 7.3 Paste Special. Walks the
       // source range (read straight from this backend's in-memory state),
-      // applies the requested kind/op/transpose/skipBlanks flags, and
-      // writes back via the same maps that `setCellInput` /
-      // `setFormatRange` mutate. Designed to be easy to reason about, not
-      // to handle every Excel edge case — the host's worker backend can
-      // bring its own optimised version.
+      // applies the requested kind/op/transpose/skipBlanks flags via the
+      // shared pure helpers in `paste-range-plan.ts` (one semantic shared
+      // with the worker adapter), and writes back via the same maps that
+      // `setCellInput` / `setFormatRange` mutate. Designed to be easy to
+      // reason about, not to handle every Excel edge case.
       beginUndoableMutation(state)
 
       const sourceSheetCells = getOrCreateSheetCells(state, request.source.sheetId)
@@ -3410,125 +3416,36 @@ export function createStaticSpreadsheetBackend(
 
       const src = request.source.range
       const tgt = request.target
-      const transpose = request.transpose || request.pasteKind === 'transpose'
+      const geometry = pasteRangeGeometry(request)
 
-      const srcRows = src.rowEnd - src.rowStart + 1
-      const srcCols = src.colEnd - src.colStart + 1
-      // Effective height/width of the patch we write at the target,
-      // accounting for transpose. The target is clamped to the source
-      // shape — Excel's classic Paste Special behaviour.
-      const patchRows = transpose ? srcCols : srcRows
-      const patchCols = transpose ? srcRows : srcCols
-
-      const writeValues =
-        request.pasteKind === 'values' ||
-        request.pasteKind === 'values-and-formats' ||
-        request.pasteKind === 'all' ||
-        request.pasteKind === 'transpose'
-
-      const writeFormats =
-        request.pasteKind === 'formats' ||
-        request.pasteKind === 'values-and-formats' ||
-        request.pasteKind === 'all'
-
-      // 'column-widths' and 'comments' are accepted as no-ops by this
-      // reference backend; a future revision can wire them through the
-      // dimension-map / comments stores.
-
-      function numericInput(input: string | undefined): number | null {
-        if (input === undefined) return null
-        const trimmed = input.trim()
-        if (trimmed === '') return null
-        const n = Number(trimmed)
-        return Number.isFinite(n) ? n : null
-      }
-
-      // Excel error literals follow `#NAME!` / `#DIV/0!` / `#VALUE!` /
-      // `#REF!` / `#NUM!` / `#N/A` shapes. Pre-paste arithmetic must
-      // pass an error source/target straight through rather than try to
-      // coerce a `#...` string to a number.
-      function isErrorLiteral(input: string | undefined): boolean {
-        if (input === undefined) return false
-        const trimmed = input.trim()
-        return trimmed.startsWith('#') && trimmed.length > 1
-      }
-
-      /**
-       * Arithmetic coercion for paste-special op != 'none'. Semantics
-       * (documented in `vanilla/spreadsheet-ui-core/src/paste-special/README.md`):
-       *
-       *   - error source OR error target → preserve the existing target
-       *     (returns `null` to signal the caller to skip the write).
-       *   - non-numeric source → preserve the existing target (skip).
-       *   - non-numeric target → treated as 0 (Excel behaviour).
-       *   - divide-by-zero → emit the `#DIV/0!` error literal.
-       *
-       * `null` return = skip the write entirely. A returned string is the
-       * new cell input.
-       */
-      function applyOp(
-        sourceInput: string,
-        targetInput: string | undefined,
-      ): string | null {
-        if (request.op === 'none') return sourceInput
-
-        if (isErrorLiteral(sourceInput) || isErrorLiteral(targetInput)) {
-          // Pass-through: leave the target untouched.
-          return null
-        }
-
-        const b = numericInput(sourceInput)
-        if (b === null) {
-          // Text source — operation undefined for non-numerics; skip
-          // rather than overwrite the target with the literal text.
-          return null
-        }
-        const a = numericInput(targetInput) ?? 0
-
-        switch (request.op) {
-          case 'add':
-            return String(a + b)
-          case 'subtract':
-            return String(a - b)
-          case 'multiply':
-            return String(a * b)
-          case 'divide':
-            if (b === 0) return '#DIV/0!'
-            return String(a / b)
-          default:
-            return sourceInput
-        }
-      }
-
-      for (let dr = 0; dr < patchRows; dr += 1) {
-        for (let dc = 0; dc < patchCols; dc += 1) {
-          // Map (dr, dc) inside the patch back to a source coordinate,
-          // accounting for transpose.
-          const srcRow = transpose ? src.rowStart + dc : src.rowStart + dr
-          const srcCol = transpose ? src.colStart + dr : src.colStart + dc
+      for (let dr = 0; dr < geometry.patchRows; dr += 1) {
+        for (let dc = 0; dc < geometry.patchCols; dc += 1) {
+          const srcCoord = pasteSourceCoord(src, geometry.transpose, dr, dc)
           const tgtRow = tgt.rowStart + dr
           const tgtCol = tgt.colStart + dc
-          const srcKey = keyFor(srcRow, srcCol)
+          const srcKey = keyFor(srcCoord.row, srcCoord.col)
           const tgtKey = keyFor(tgtRow, tgtCol)
           const srcCell = sourceSheetCells.get(srcKey)
           const srcDisplay = srcCell?.displayValue ?? ''
 
           // Skip-blanks: if the source cell is empty, leave the target alone.
-          if (request.skipBlanks && srcDisplay.length === 0 && !srcCell?.formula) {
+          if (request.skipBlanks && isPasteSourceBlank(srcDisplay, srcCell?.formula)) {
             continue
           }
 
-          if (writeValues) {
+          if (geometry.writeValues) {
             const baseInput = srcCell?.formula ?? srcDisplay
             const targetCell = targetSheetCells.get(tgtKey)
-            const finalInput =
-              request.op === 'none'
-                ? baseInput
-                : applyOp(baseInput, targetCell?.displayValue)
-            // `applyOp` returns `null` when arithmetic coercion would be
-            // ill-defined (text/error sides) — preserve the target
-            // verbatim. Otherwise reuse the in-place setCellInput
-            // helper so revision/value-kind invariants stay consistent.
+            const finalInput = applyPasteArithmetic(
+              request.op,
+              baseInput,
+              targetCell?.displayValue,
+            )
+            // `applyPasteArithmetic` returns `null` when arithmetic
+            // coercion would be ill-defined (text/error sides) — preserve
+            // the target verbatim. Otherwise reuse the in-place
+            // setCellInput helper so revision/value-kind invariants stay
+            // consistent.
             if (finalInput !== null) {
               recordCellBefore(state, request.sheetId, tgtKey)
               updateCell(targetSheetCells, {
@@ -3541,11 +3458,11 @@ export function createStaticSpreadsheetBackend(
             }
           }
 
-          if (writeFormats) {
+          if (geometry.writeFormats) {
             recordCellFormatBefore(state, request.sheetId, tgtKey)
             const effectiveFormat = getEffectiveFormat(
-              srcRow,
-              srcCol,
+              srcCoord.row,
+              srcCoord.col,
               sourceCellFormats,
               sourceRangeFormats,
             )
@@ -3564,12 +3481,7 @@ export function createStaticSpreadsheetBackend(
         sheetId: request.sheetId,
         requestId: request.requestId,
         revision: request.revision ?? state.revision,
-        affectedRange: {
-          rowStart: tgt.rowStart,
-          rowEnd: tgt.rowStart + patchRows - 1,
-          colStart: tgt.colStart,
-          colEnd: tgt.colStart + patchCols - 1,
-        },
+        affectedRange: { ...geometry.affectedRange },
       }
     },
     async removeRows(request: RemoveRowsRequest): Promise<RemoveRowsResult> {

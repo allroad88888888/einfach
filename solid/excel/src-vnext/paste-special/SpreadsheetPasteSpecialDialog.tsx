@@ -8,6 +8,7 @@ import {
   closePasteSpecialAtom,
   confirmPasteSpecialAtom,
   isPasteSpecialKindSupported,
+  pasteSpecialBackendKindError,
   patchPasteSpecialOptionsAtom,
   pasteSpecialCanCloseAtom,
   pasteSpecialCanConfirmAtom,
@@ -17,6 +18,7 @@ import {
   pasteSpecialOpenAtom,
   pasteSpecialOptionsAtom,
   pasteSpecialSessionAtom,
+  pasteSpecialSupportedKindsAtom,
   resolveContentMutationAtom,
   type PasteSpecialKind,
   type PasteSpecialOp,
@@ -61,6 +63,7 @@ export function SpreadsheetPasteSpecialDialog(props: SpreadsheetPasteSpecialDial
   const canEdit = useAtomValue(pasteSpecialCanEditAtom)
   const canClose = useAtomValue(pasteSpecialCanCloseAtom)
   const canConfirm = useAtomValue(pasteSpecialCanConfirmAtom)
+  const supportedKinds = useAtomValue(pasteSpecialSupportedKindsAtom)
 
   // Reset-on-open is owned by `openPasteSpecialAtom` (a write-only
   // command atom that flips open + writes defaults in a single setter).
@@ -143,17 +146,28 @@ export function SpreadsheetPasteSpecialDialog(props: SpreadsheetPasteSpecialDial
             <legend class="ps-legend">{t('pasteSpecial.kind.legend')}</legend>
             {PASTE_KINDS.map((kind) => {
               const supportedKind = isPasteSpecialKindSupported(kind)
+              // Backend capability subdivision: a kind the captured
+              // backend excluded (e.g. format-leg kinds on a runtime
+              // with no format model) renders disabled with the same
+              // structured reason Core would block the confirm with.
+              const backendSupported = () => supportedKinds().includes(kind)
               return (
                 <label
                   class="ps-radio"
-                  title={supportedKind ? undefined : PASTE_SPECIAL_UNSUPPORTED_KIND_ERROR}
+                  title={
+                    !supportedKind
+                      ? PASTE_SPECIAL_UNSUPPORTED_KIND_ERROR
+                      : backendSupported()
+                        ? undefined
+                        : pasteSpecialBackendKindError(kind)
+                  }
                 >
                   <input
                     type="radio"
                     name="paste-special-kind"
                     data-testid={`paste-special-kind-${kind}`}
                     checked={options().kind === kind}
-                    disabled={!canEdit() || !supportedKind}
+                    disabled={!canEdit() || !supportedKind || !backendSupported()}
                     onChange={() => store.setter(patchPasteSpecialOptionsAtom, { kind })}
                   />
                   {t(`pasteSpecial.kind.${kind}`)}

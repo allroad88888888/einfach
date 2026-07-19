@@ -43,6 +43,27 @@ export const SUPPORTED_PASTE_SPECIAL_KINDS: readonly PasteSpecialKind[] = Object
   'transpose',
 ])
 
+export const PASTE_SPECIAL_BACKEND_KIND_ERROR_PREFIX =
+  'Paste Special kind is not supported by the current backend: '
+
+/** Structured pre-dispatch reason for a kind the active backend excluded. */
+export function pasteSpecialBackendKindError(kind: PasteSpecialKind): string {
+  return `${PASTE_SPECIAL_BACKEND_KIND_ERROR_PREFIX}${kind}.`
+}
+
+/**
+ * Fail-closed normalization of a backend's `pasteRangeSupportedKinds`
+ * declaration: no declaration keeps the legacy full-trust contract, a
+ * declaration is intersected with the Core-supported set.
+ */
+function normalizeSupportedKinds(declared: unknown): readonly PasteSpecialKind[] {
+  if (!Array.isArray(declared)) return SUPPORTED_PASTE_SPECIAL_KINDS
+  const declaredKinds = declared as readonly unknown[]
+  return Object.freeze(
+    SUPPORTED_PASTE_SPECIAL_KINDS.filter((kind) => declaredKinds.includes(kind)),
+  )
+}
+
 const INITIAL_PASTE_SPECIAL_LIFECYCLE: PasteSpecialLifecycleState = Object.freeze({
   status: 'closed',
   sessionId: 0,
@@ -177,11 +198,15 @@ function sameRange(left: CellRange, right: CellRange): boolean {
 function sessionBlockReason(
   session: PasteSpecialSessionSnapshot | null,
   capability: boolean,
+  supportedKinds: readonly PasteSpecialKind[],
 ): string | null {
   if (session !== null && !isPasteSpecialKindSupported(session.options.kind)) {
     return PASTE_SPECIAL_UNSUPPORTED_KIND_ERROR
   }
   if (!capability) return PASTE_SPECIAL_CAPABILITY_ERROR
+  if (session !== null && !supportedKinds.includes(session.options.kind)) {
+    return pasteSpecialBackendKindError(session.options.kind)
+  }
   if (
     session === null ||
     session.sheetId === null ||
@@ -258,6 +283,9 @@ const pasteSpecialLifecycleBackingAtom = atom<PasteSpecialLifecycleState>(
 )
 const pasteSpecialErrorBackingAtom = atom<string>('')
 const pasteSpecialCapabilityBackingAtom = atom<boolean>(false)
+const pasteSpecialSupportedKindsBackingAtom = atom<readonly PasteSpecialKind[]>(
+  SUPPORTED_PASTE_SPECIAL_KINDS,
+)
 const pasteSpecialSessionIdBackingAtom = atom<number>(0)
 const pasteSpecialRequestIdBackingAtom = atom<number>(0)
 
@@ -290,6 +318,16 @@ export const pasteSpecialCapabilityAtom: Atom<boolean> = atom((get) =>
 )
 pasteSpecialCapabilityAtom.debugLabel = 'spreadsheet.pasteSpecial.capability'
 
+/**
+ * Kinds the captured backend really applies. Defaults to every
+ * Core-supported kind (legacy full-trust) until a backend declaring
+ * `pasteRangeSupportedKinds` is captured.
+ */
+export const pasteSpecialSupportedKindsAtom: Atom<readonly PasteSpecialKind[]> = atom((get) =>
+  get(pasteSpecialSupportedKindsBackingAtom),
+)
+pasteSpecialSupportedKindsAtom.debugLabel = 'spreadsheet.pasteSpecial.supportedKinds'
+
 export const pasteSpecialSessionIdAtom: Atom<number> = atom((get) =>
   get(pasteSpecialSessionIdBackingAtom),
 )
@@ -318,7 +356,11 @@ export const pasteSpecialCanConfirmAtom = atom((get) => {
   return (
     get(pasteSpecialOpenAtom) &&
     get(pasteSpecialCapabilityAtom) &&
-    sessionBlockReason(get(pasteSpecialSessionAtom), true) === null &&
+    sessionBlockReason(
+      get(pasteSpecialSessionAtom),
+      true,
+      get(pasteSpecialSupportedKindsAtom),
+    ) === null &&
     (lifecycle.status === 'editing' || lifecycle.status === 'error')
   )
 })
@@ -374,7 +416,14 @@ export const capturePasteSpecialCapabilityAtom = atom(
     } catch {
       available = false
     }
+    let declaredKinds: unknown
+    try {
+      declaredKinds = available ? source?.pasteRangeSupportedKinds : undefined
+    } catch {
+      declaredKinds = undefined
+    }
     set(pasteSpecialCapabilityBackingAtom, available)
+    set(pasteSpecialSupportedKindsBackingAtom, normalizeSupportedKinds(declaredKinds))
     if (!get(pasteSpecialOpenAtom)) return
 
     const session = get(pasteSpecialSessionAtom)
@@ -388,7 +437,7 @@ export const capturePasteSpecialCapabilityAtom = atom(
     ) {
       return
     }
-    const reason = sessionBlockReason(session, available)
+    const reason = sessionBlockReason(session, available, get(pasteSpecialSupportedKindsAtom))
     if (reason !== null) {
       set(pasteSpecialErrorBackingAtom, reason)
       set(
@@ -444,7 +493,15 @@ export const openPasteSpecialAtom = atom(null, (get, set) => {
     // The blocked session below explains that its frozen context is incomplete.
   }
 
-  const options = snapshotOptions(DEFAULT_PASTE_SPECIAL_OPTIONS)
+  // A backend that subdivides the capability may exclude the default
+  // kind (format-leg kinds on a format-model-less runtime). Open on the
+  // first supported kind instead of opening pre-blocked.
+  const supportedKinds = get(pasteSpecialSupportedKindsAtom)
+  const options = snapshotOptions(
+    supportedKinds.includes(DEFAULT_PASTE_SPECIAL_OPTIONS.kind) || supportedKinds.length === 0
+      ? DEFAULT_PASTE_SPECIAL_OPTIONS
+      : { ...DEFAULT_PASTE_SPECIAL_OPTIONS, kind: supportedKinds[0] },
+  )
   const session: PasteSpecialSessionSnapshot = Object.freeze({
     sessionId,
     sheetId,
@@ -453,7 +510,7 @@ export const openPasteSpecialAtom = atom(null, (get, set) => {
     payload,
     options,
   })
-  const reason = sessionBlockReason(session, get(pasteSpecialCapabilityAtom))
+  const reason = sessionBlockReason(session, get(pasteSpecialCapabilityAtom), supportedKinds)
   set(pasteSpecialSessionIdBackingAtom, sessionId)
   set(activePasteSpecialMutationAtom, null)
   set(pasteSpecialSessionBackingAtom, session)
@@ -494,7 +551,11 @@ export const patchPasteSpecialOptionsAtom = atom(
     const session = get(pasteSpecialSessionAtom)
     if (session === null || !get(pasteSpecialOpenAtom)) return
     const nextSession = Object.freeze({ ...session, options: next })
-    const reason = sessionBlockReason(nextSession, get(pasteSpecialCapabilityAtom))
+    const reason = sessionBlockReason(
+      nextSession,
+      get(pasteSpecialCapabilityAtom),
+      get(pasteSpecialSupportedKindsAtom),
+    )
     set(pasteSpecialSessionBackingAtom, nextSession)
     set(pasteSpecialErrorBackingAtom, reason ?? '')
     set(
@@ -567,7 +628,11 @@ export const confirmPasteSpecialAtom = atom(
       return 'stale'
     }
 
-    const reason = sessionBlockReason(session, get(pasteSpecialCapabilityAtom))
+    const reason = sessionBlockReason(
+      session,
+      get(pasteSpecialCapabilityAtom),
+      get(pasteSpecialSupportedKindsAtom),
+    )
     if (reason !== null || typeof input.refreshProjection !== 'function') {
       set(pasteSpecialErrorBackingAtom, reason ?? PASTE_SPECIAL_CONTEXT_ERROR)
       set(

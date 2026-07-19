@@ -40,7 +40,7 @@ import type {
   SetRangeLockRequest,
   SetSheetProtectionRequest,
 } from '../protection/types'
-import type { PasteRangeRequest, PasteRangeResult } from '../paste-special/types'
+import type { PasteRangeRequest, PasteRangeResult, PasteSpecialKind } from '../paste-special/types'
 
 export type {
   ClearNoteRequest,
@@ -885,6 +885,11 @@ export interface SpreadsheetBackend {
   // omit this method cause the menu entry + dialog to hide via
   // `pasteSpecialSupportedAtom` so the surface degrades cleanly.
   pasteRange?(request: PasteRangeRequest): Promise<PasteRangeResult>
+  // Optional fail-closed subdivision of the pasteRange capability (see
+  // `PasteSpecialControllerPort.pasteRangeSupportedKinds`): a backend
+  // that cannot apply the format leg declares only the value-leg kinds
+  // and Core blocks the rest pre-dispatch. Absent → full trust.
+  readonly pasteRangeSupportedKinds?: readonly PasteSpecialKind[]
   // remove-duplicates — Wave 7.5. Optional capability; host adapters that
   // omit this method cause the Data > Remove Duplicates menu entry to hide
   // via `removeDuplicatesSupportedAtom` so the surface degrades cleanly.

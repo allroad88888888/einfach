@@ -5,9 +5,15 @@ lifecycle, history hand-off, and projection-refresh sequencing. The Solid
 dialog is a projection of this Core state; it does not own or discover the
 capability.
 
-Parity item #11 remains **Partial**. The static backend implements
-`pasteRange`; the Worker and WorkerTS backends do not. The Edit menu and
-Ctrl+Alt+V are capability-gated, while a Context Menu entry is still absent.
+Parity item #11: the static backend AND the worker adapter implement
+`pasteRange` (the worker path composes existing RPCs over the shared
+`solid/excel/src-vnext/adapter/paste-range-plan.ts` helpers). The Edit menu
+and Ctrl+Alt+V are capability-gated. A backend may subdivide the capability
+fail-closed via `pasteRangeSupportedKinds` (projected by
+`pasteSpecialSupportedKindsAtom`): the TS worker runtime declares only the
+value-leg kinds (`values` / `transpose`), so format-leg kinds block
+pre-dispatch with `pasteSpecialBackendKindError(kind)` and
+`openPasteSpecialAtom` falls back to the first supported kind.
 
 ## State Decision Template
 
@@ -18,6 +24,8 @@ Ctrl+Alt+V are capability-gated, while a Context Menu entry is still absent.
     identity, acknowledgement, history, and refresh ordering.
 - Public state atoms:
   - `pasteSpecialCapabilityAtom`: read-only capability projection;
+  - `pasteSpecialSupportedKindsAtom`: read-only projection of the captured
+    backend's kind subdivision (defaults to every Core-supported kind);
   - `pasteSpecialOpenAtom`, `pasteSpecialOptionsAtom`,
     `pasteSpecialSessionAtom`, `pasteSpecialLifecycleAtom`, and
     `pasteSpecialErrorAtom`: Core-owned dialog/session state.
