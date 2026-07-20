@@ -158,6 +158,36 @@ pub struct TableEntry {
 }
 
 impl TableEntry {
+    /// Rebuild an entry from its wire form. The ONLY way to construct a
+    /// `TableEntry` outside this module, and it exists for exactly one
+    /// caller shape: a host that holds a previously-taken
+    /// [`TableRegistrySnapshot`] in serialized form (the wasm
+    /// `snapshotTables` / `restoreTables` pair) and needs to rehydrate it.
+    ///
+    /// Deliberately does NOT validate — the invariants (`columns.len() ==
+    /// range.cols()`, name shape, name mutex, no same-sheet overlap) are
+    /// enforced as a whole-registry batch by
+    /// [`Workbook::restore_tables`], which is the only consumer of the
+    /// entries this builds. Building one by hand and never restoring it is
+    /// inert.
+    pub fn from_parts(
+        canonical_name: impl Into<String>,
+        sheet_name: impl Into<String>,
+        range: CellRange,
+        has_headers: bool,
+        has_totals: bool,
+        columns: Vec<String>,
+    ) -> Self {
+        TableEntry {
+            canonical_name: canonical_name.into(),
+            sheet_name: sheet_name.into(),
+            range: range.normalize(),
+            has_headers,
+            has_totals,
+            columns,
+        }
+    }
+
     /// The Table name in the casing the user supplied.
     pub fn name(&self) -> &str {
         &self.canonical_name
@@ -199,6 +229,66 @@ impl TableEntry {
             has_totals: self.has_totals,
             columns: self.columns.clone(),
         }
+    }
+}
+
+/// A whole-registry snapshot of a workbook's Excel Tables — the undo
+/// primitive for Table *definition* changes (design doc #32 §11/§12, and
+/// CANONICAL_OWNERSHIP §4-3 "注册态重放").
+///
+/// **REPLACE semantics, deliberately.** [`Workbook::restore_tables`] swaps
+/// the entire registry for the snapshot's contents; it is not an additive
+/// merge like the sparse-cell primitive (`snapshot_sparse` /
+/// `restore_sparse`). Three reasons:
+///
+/// 1. The registry is tiny and hard-capped at [`MAX_TABLES`] (256), so a
+///    full copy costs nothing next to the cell grid that forced ADDITIVE
+///    semantics on the sparse primitive.
+/// 2. ADDITIVE cannot express deletion. A Table definition change is just
+///    as often "this table stopped existing" (`delete_table`, a structural
+///    delete that swallowed the header row) as "this table appeared", and
+///    an additive restore would silently resurrect nothing while leaving
+///    the created table behind — the classic half-undo.
+/// 3. Whole-registry equality makes the round-trip assertion exact:
+///    `snapshot → mutate → restore` must leave the registry *identical*,
+///    columns/range/has_totals included. With REPLACE that is one
+///    comparison; with ADDITIVE it is an unbounded diff argument.
+///
+/// A host undo transaction records `snapshot_tables()` as the before-image,
+/// applies the mutation, and calls `restore_tables(before)` to undo. Redo is
+/// symmetric with the after-image. The snapshot holds no sheet indices —
+/// entries anchor by sheet NAME, exactly like the live registry — so it
+/// survives `move_sheet` and sheet-index churn between capture and restore.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct TableRegistrySnapshot {
+    /// Entries in the registry's stable order (alphabetical by uppercased
+    /// name), so two snapshots of equal registries compare equal.
+    entries: Vec<TableEntry>,
+}
+
+impl TableRegistrySnapshot {
+    /// Build a snapshot from entries a host previously serialized. Order is
+    /// irrelevant — [`Workbook::restore_tables`] re-keys into the registry's
+    /// `BTreeMap`, which imposes the canonical order.
+    pub fn from_entries(entries: Vec<TableEntry>) -> Self {
+        TableRegistrySnapshot { entries }
+    }
+
+    /// The captured entries, for serialization by a host (wasm DTO).
+    pub fn entries(&self) -> &[TableEntry] {
+        &self.entries
+    }
+
+    /// Number of Tables captured.
+    pub fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    /// Whether the snapshot captured an empty registry. Restoring an empty
+    /// snapshot CLEARS the registry (that is the whole point of REPLACE) —
+    /// it is not a no-op.
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
     }
 }
 
@@ -256,6 +346,12 @@ pub enum TableError {
     /// registry mid-evaluation. Mirrors every other workbook mutation
     /// entry point's re-entrancy guard.
     MutationDuringCustomCall,
+    /// [`Workbook::restore_tables`] was handed an entry whose shape is
+    /// internally inconsistent — `columns.len()` disagrees with the
+    /// range's column count. Snapshots the engine produced always agree;
+    /// this fires only on a host-corrupted or hand-built payload, and the
+    /// registry is left untouched (restore validates before it swaps).
+    MalformedSnapshot,
 }
 
 impl std::fmt::Display for TableError {
@@ -298,6 +394,10 @@ impl std::fmt::Display for TableError {
             TableError::MutationDuringCustomCall => write!(
                 f,
                 "table registry mutations are forbidden while a custom-formula callback is executing"
+            ),
+            TableError::MalformedSnapshot => write!(
+                f,
+                "table snapshot entry is malformed: column count does not match the range width"
             ),
         }
     }
@@ -2051,6 +2151,132 @@ impl Workbook {
     /// Number of registered Tables. Companion to the `MAX_TABLES` cap.
     pub fn table_count(&self) -> usize {
         self.tables.len()
+    }
+
+    // --- Registry snapshot / restore (design doc #32 §11/§12) ------------
+    //
+    // The undo primitive for Table DEFINITION changes. Everything a Table
+    // op writes into CELLS (the totals row's `SUBTOTAL` formulas, the cell
+    // moves a structural edit performs) is already covered by the host's
+    // sparse-cell and format snapshots; what had no before-image until now
+    // is the registry itself — name, sheet anchor, range, header/totals
+    // flags, column names. These two calls close that gap, and the host
+    // pairs them with the existing cell primitives inside one undo
+    // transaction.
+
+    /// Capture the entire Table registry (see [`TableRegistrySnapshot`] for
+    /// why this is REPLACE rather than additive). Pure read — no epoch bump,
+    /// no reactive traffic.
+    pub fn snapshot_tables(&self) -> TableRegistrySnapshot {
+        TableRegistrySnapshot {
+            entries: self.tables.values().cloned().collect(),
+        }
+    }
+
+    /// Replace the entire Table registry with `snapshot`, returning the
+    /// number of Tables now registered.
+    ///
+    /// **All-or-nothing.** Every entry is validated before anything is
+    /// swapped, so a rejected restore leaves the live registry byte-for-byte
+    /// unchanged (mirroring `restore_persistence_v1`'s reject-without-
+    /// mutating discipline). Validation re-asserts the invariants
+    /// `define_table` enforces, because a snapshot is host-held data that
+    /// may have been serialized, stored, and replayed against a workbook
+    /// that has moved on since capture:
+    ///
+    /// - cap — more than [`MAX_TABLES`] entries → [`TableError::TooManyTables`];
+    /// - name shape — [`TableError::InvalidName`] / [`ReservedName`] /
+    ///   [`NameLikeCellRef`](TableError::NameLikeCellRef);
+    /// - name mutex — duplicates within the snapshot, or a collision with a
+    ///   defined name that exists NOW, → [`TableError::NameConflict`]
+    ///   (the shared workbook namespace of §4.2 survives restore);
+    /// - geometry — two entries overlapping on one sheet →
+    ///   [`TableError::RangeOverlap`]; `columns.len()` disagreeing with the
+    ///   range width → [`TableError::MalformedSnapshot`].
+    ///
+    /// Entries anchored to a sheet that no longer exists are **kept, not
+    /// dropped**: the registry anchors by name and the eval-side resolver
+    /// already degrades a missing anchor to `#NAME?` (never a panic), so a
+    /// host replaying "undo deleteSheet" can restore the registry in either
+    /// order and the references light up once the sheet is back. Silently
+    /// discarding them would make the primitive lossy and the undo
+    /// one-directional.
+    ///
+    /// On a change, bumps the tables epoch — which republishes the Table
+    /// projection to the formula-inner provider AND wakes every formula
+    /// holding a `depend_tables` edge, so `=SUM(Table1[Qty])` re-derives
+    /// against the restored geometry. A restore that reproduces the current
+    /// registry exactly is detected and skips the bump, so undoing a
+    /// non-Table edit inside a transaction that snapshots tables anyway
+    /// costs no spurious recompute.
+    pub fn restore_tables(
+        &mut self,
+        snapshot: TableRegistrySnapshot,
+    ) -> Result<usize, TableError> {
+        if self.is_inside_custom_call() {
+            return Err(TableError::MutationDuringCustomCall);
+        }
+        if snapshot.entries.len() > MAX_TABLES {
+            return Err(TableError::TooManyTables);
+        }
+
+        // Phase 1 — validate into a candidate map. Nothing on `self` is
+        // touched until every entry has passed.
+        let mut next: BTreeMap<String, TableEntry> = BTreeMap::new();
+        for entry in snapshot.entries {
+            let name = entry.canonical_name.as_str();
+            if Self::validate_name(name).is_err() {
+                return Err(TableError::InvalidName);
+            }
+            let key = name.to_ascii_uppercase();
+            if is_builtin_function_name(&key) {
+                return Err(TableError::ReservedName);
+            }
+            if name_is_cell_ref_like(name) {
+                return Err(TableError::NameLikeCellRef);
+            }
+            // Shared namespace, evaluated against the CURRENT defined
+            // names — a name that became a defined name after the snapshot
+            // was taken must not be re-claimed behind its back.
+            if self.named_values.contains_key(&key) {
+                return Err(TableError::NameConflict);
+            }
+            if next.contains_key(&key) {
+                return Err(TableError::NameConflict);
+            }
+
+            let range = entry.range.normalize();
+            if entry.columns.len() as u32 != range.cols() {
+                return Err(TableError::MalformedSnapshot);
+            }
+            if next
+                .values()
+                .any(|t| t.sheet_name == entry.sheet_name && ranges_overlap(t.range, range))
+            {
+                return Err(TableError::RangeOverlap);
+            }
+
+            next.insert(
+                key,
+                TableEntry {
+                    canonical_name: entry.canonical_name,
+                    sheet_name: entry.sheet_name,
+                    range,
+                    has_headers: entry.has_headers,
+                    has_totals: entry.has_totals,
+                    columns: entry.columns,
+                },
+            );
+        }
+
+        // Phase 2 — swap, and broadcast only if the registry really moved.
+        let count = next.len();
+        if next == self.tables {
+            return Ok(count);
+        }
+        self.tables = next;
+        self.bump_tables_epoch();
+        Ok(count)
     }
 
     // --- Totals row (design doc #32 §7 / I5) ----------------------------

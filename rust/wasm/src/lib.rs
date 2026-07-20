@@ -3,8 +3,8 @@ use einfach_excel_core::{
     Align, BorderSpec, BorderStyle, CellAddress, CellBorders, CellFormat, CellRange,
     CellSubscription, CustomFunctionRegistry, DepGraphStats, FormatRangeSnapshot, NumberFormat,
     RangeFormatSnapshotLayer, Rotation, Sheet, SheetError, SortDirection, SortKey, SortRangeError,
-    SortRangeReport, TableEntry, TableError, TotalsFunction, VerticalAlign, Workbook,
-    WorkbookError,
+    SortRangeReport, TableEntry, TableError, TableRegistrySnapshot, TotalsFunction, VerticalAlign,
+    Workbook, WorkbookError,
 };
 use serde::{de, Deserialize, Serialize};
 use std::cell::Cell;
@@ -1133,6 +1133,16 @@ struct WorkbookPersistenceV1JSON {
     formats: Vec<FormatRangeSnapshotJSON>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     sizes: Vec<ViewportSizeSnapshotJSON>,
+    /// Excel Table registry (#32). `default` + `skip_serializing_if` keeps
+    /// the wire backward-compatible in BOTH directions: payloads written
+    /// before this field existed restore as "no Tables" (exactly today's
+    /// behaviour), and a table-less workbook still serializes byte-identical
+    /// to before. Included because `restore_persistence_v1` builds a FRESH
+    /// `Workbook` — without the registry travelling with the payload, every
+    /// restored workbook came back with its Tables silently gone and its
+    /// structured references reading `#NAME?`, i.e. a lossy restore.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    tables: Vec<TableJSON>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -1140,6 +1150,9 @@ struct WorkbookPersistenceRestoreStatsJSON {
     restored_cells: u32,
     restored_formats: u32,
     sheets: u32,
+    /// Excel Tables re-registered (#32). Additive output key — hosts that
+    /// predate it simply ignore it.
+    restored_tables: u32,
 }
 
 // === Engine physical sort (`sortRange`) wire — S2 of
@@ -1263,17 +1276,25 @@ impl SortRangeReportJSON {
 // `getTable`. Mirrors `TableEntry`'s public accessors; the range is emitted
 // as an A1 string (`"A1:C10"`) to match how ranges read elsewhere on the JS
 // side, plus the resolved 0-based `sheetIndex` for adapter convenience.
-#[derive(Clone, Debug, Serialize)]
+//
+// Also the wire element of the `snapshotTables` / `restoreTables` undo
+// primitive, hence `Deserialize`: a host round-trips exactly what
+// `listTables` hands it. On the way back IN, `sheetIndex` is ignored — the
+// engine anchors Tables by sheet NAME (so the snapshot survives `moveSheet`
+// and index churn between capture and restore), which is why the field
+// carries a `default` and the restore path reads `sheet` only.
+#[derive(Clone, Debug, Serialize, Deserialize)]
 struct TableJSON {
     name: String,
     sheet: String,
-    #[serde(rename = "sheetIndex")]
+    #[serde(rename = "sheetIndex", default)]
     sheet_index: u32,
     range: String,
-    #[serde(rename = "hasHeaders")]
+    #[serde(rename = "hasHeaders", default)]
     has_headers: bool,
-    #[serde(rename = "hasTotals")]
+    #[serde(rename = "hasTotals", default)]
     has_totals: bool,
+    #[serde(default)]
     columns: Vec<String>,
 }
 
@@ -1294,13 +1315,54 @@ impl TableJSON {
             columns: entry.columns().to_vec(),
         }
     }
+
+    /// Rehydrate a snapshot entry. The `range` is the same `"A1:C10"` form
+    /// `from_entry` emits; a bare `"A1"` degenerates to a 1x1 range, matching
+    /// `SortRangeWireJSON`. Shape checks beyond parsing (column count vs
+    /// range width, name mutex, cap) belong to `Workbook::restore_tables`,
+    /// which validates the batch atomically.
+    fn into_entry(self) -> Result<TableEntry, String> {
+        let (a, b) = self
+            .range
+            .split_once(':')
+            .unwrap_or((self.range.as_str(), self.range.as_str()));
+        let start = CellAddress::parse(a.trim())
+            .ok_or_else(|| format!("invalid table range cell: {a}"))?;
+        let end = CellAddress::parse(b.trim())
+            .ok_or_else(|| format!("invalid table range cell: {b}"))?;
+        Ok(TableEntry::from_parts(
+            self.name,
+            self.sheet,
+            CellRange::new(start, end),
+            self.has_headers,
+            self.has_totals,
+            self.columns,
+        ))
+    }
+}
+
+/// Envelope for `snapshotTables` / `restoreTables`. Versioned like the
+/// persistence-v1 payload so a stored undo record can be rejected loudly
+/// rather than silently half-applied, and so the shape stays distinguishable
+/// from the bare `TableJSON[]` that `listTables` returns.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct TableRegistrySnapshotJSON {
+    version: u32,
+    tables: Vec<TableJSON>,
 }
 
 /// Map a `TableError` to a stable JS error string (mirrors
 /// `workbook_error_to_js`). Not part of the frozen export surface — no
 /// snapshot regeneration is triggered by adding a variant here.
 fn table_error_to_js(err: TableError) -> JsValue {
-    let msg = match err {
+    JsValue::from_str(table_error_id(err))
+}
+
+/// The stable string id behind `table_error_to_js`, split out so the
+/// natively-testable helpers (`restore_tables_json`) can surface the same
+/// vocabulary without constructing a `JsValue`.
+fn table_error_id(err: TableError) -> &'static str {
+    match err {
         TableError::TooManyTables => "too-many-tables",
         TableError::InvalidName => "invalid-name",
         TableError::ReservedName => "reserved-name",
@@ -1315,8 +1377,8 @@ fn table_error_to_js(err: TableError) -> JsValue {
         TableError::TotalsRowBlocked => "totals-row-blocked",
         TableError::NoTotalsRow => "no-totals-row",
         TableError::MutationDuringCustomCall => "mutation-during-custom-call",
-    };
-    JsValue::from_str(msg)
+        TableError::MalformedSnapshot => "malformed-snapshot",
+    }
 }
 
 /// Initialize the panic hook once per module load. Called automatically from
@@ -2346,16 +2408,7 @@ impl WasmWorkbook {
     /// name (the engine's stable order).
     #[wasm_bindgen(js_name = "listTables")]
     pub fn list_tables(&self) -> Result<JsValue, JsValue> {
-        let tables: Vec<TableJSON> = self
-            .workbook
-            .list_tables()
-            .into_iter()
-            .map(|entry| {
-                let idx = self.sheet_index_by_name(entry.sheet_name()).unwrap_or(0);
-                TableJSON::from_entry(entry, idx)
-            })
-            .collect();
-        serde_wasm_bindgen::to_value(&tables)
+        serde_wasm_bindgen::to_value(&self.tables_json())
             .map_err(|err| JsValue::from_str(&format!("serialize tables: {err}")))
     }
 
@@ -2371,6 +2424,56 @@ impl WasmWorkbook {
             }
             None => Ok(JsValue::null()),
         }
+    }
+
+    /// Capture the whole Excel Table registry as an undo before-image
+    /// (design doc #32 §11/§12). Returns
+    /// `{ version: 1, tables: TableJSON[] }` — the same per-Table shape
+    /// `listTables` emits, wrapped in a versioned envelope.
+    ///
+    /// This is the missing before-image for Table DEFINITION changes:
+    /// everything `createTable` / `renameTable` / `deleteTable` / the totals
+    /// toggle writes into CELLS is already covered by the host's sparse-cell
+    /// and format snapshots, but the registry itself (name, sheet anchor,
+    /// range, header/totals flags, column names) was not. A host records
+    /// this before the mutation and replays it through `restoreTables` to
+    /// undo. Pure read — no epoch bump, no recompute.
+    #[wasm_bindgen(js_name = "snapshotTables")]
+    pub fn snapshot_tables(&self) -> Result<JsValue, JsValue> {
+        serde_wasm_bindgen::to_value(&TableRegistrySnapshotJSON {
+            version: 1,
+            tables: self.tables_json(),
+        })
+            .map_err(|err| JsValue::from_str(&format!("serialize table snapshot: {err}")))
+    }
+
+    /// Replace the whole Table registry with a `snapshotTables` payload,
+    /// returning the number of Tables now registered.
+    ///
+    /// **REPLACE, not additive** (unlike `restoreSparse`): Tables created
+    /// after the snapshot are dropped and Tables deleted since are revived,
+    /// which is what makes a Table-definition undo symmetric. Restoring an
+    /// empty `tables` array therefore CLEARS the registry — it is not a
+    /// no-op.
+    ///
+    /// All-or-nothing: the payload is fully validated (cap 256, name shape,
+    /// the §4.2 name mutex against current defined names, same-sheet range
+    /// overlap, column-count vs range width) before anything is swapped, so a
+    /// rejection leaves the live registry untouched. Errors are the stable
+    /// `table_error_to_js` strings plus `"unsupported-snapshot-version"` and
+    /// parse messages for a malformed envelope. Only cell values/formulas are
+    /// left alone — the registry is a view over them.
+    ///
+    /// A restore that changes the registry bumps the tables epoch, so
+    /// `=SUM(Table1[Qty])` and friends re-derive against the restored
+    /// geometry; a restore that reproduces the current registry exactly
+    /// skips the bump.
+    #[wasm_bindgen(js_name = "restoreTables")]
+    pub fn restore_tables(&mut self, value: JsValue) -> Result<u32, JsValue> {
+        let payload: TableRegistrySnapshotJSON = serde_wasm_bindgen::from_value(value)
+            .map_err(|err| JsValue::from_str(&format!("invalid table snapshot: {err}")))?;
+        self.restore_tables_json(payload)
+            .map_err(|err| JsValue::from_str(&err))
     }
 
     /// Push the host's per-sheet hidden-row set as read-only SUBTOTAL 101-111
@@ -3687,6 +3790,46 @@ impl WasmWorkbook {
             .map(|idx| idx as u32)
     }
 
+    /// Every registered Table as a wire DTO. Shared by `listTables`,
+    /// `snapshotTables`, and the persistence-v1 envelope.
+    fn tables_json(&self) -> Vec<TableJSON> {
+        self.workbook
+            .list_tables()
+            .into_iter()
+            .map(|entry| {
+                let idx = self.sheet_index_by_name(entry.sheet_name()).unwrap_or(0);
+                TableJSON::from_entry(entry, idx)
+            })
+            .collect()
+    }
+
+    /// Parse a wire snapshot into the engine type. Separated from
+    /// `restore_tables_json` so the persistence path can validate the payload
+    /// BEFORE it swaps in a fresh workbook.
+    fn table_snapshot_from_json(
+        tables: Vec<TableJSON>,
+    ) -> Result<TableRegistrySnapshot, String> {
+        let entries = tables
+            .into_iter()
+            .map(TableJSON::into_entry)
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(TableRegistrySnapshot::from_entries(entries))
+    }
+
+    fn restore_tables_json(
+        &mut self,
+        payload: TableRegistrySnapshotJSON,
+    ) -> Result<u32, String> {
+        if payload.version != 1 {
+            return Err("unsupported-snapshot-version".into());
+        }
+        let snapshot = Self::table_snapshot_from_json(payload.tables)?;
+        self.workbook
+            .restore_tables(snapshot)
+            .map(|count| count as u32)
+            .map_err(|err| table_error_id(err).to_string())
+    }
+
     fn snapshot_persistence_v1_json(&self) -> WorkbookPersistenceV1JSON {
         let mut sheets = Vec::with_capacity(self.workbook.sheet_count());
         let mut formats = Vec::with_capacity(self.workbook.sheet_count());
@@ -3728,6 +3871,7 @@ impl WasmWorkbook {
             cells: self.snapshot_sparse_cells(),
             formats,
             sizes,
+            tables: self.tables_json(),
         }
     }
 
@@ -3798,6 +3942,11 @@ impl WasmWorkbook {
             size_snapshots.push((sheet_idx, row_heights, col_widths));
         }
 
+        // Parse the Table registry BEFORE the workbook is swapped, so a
+        // malformed range string joins the other reject-without-mutating
+        // failures rather than stranding a half-restored workbook.
+        let table_snapshot = Self::table_snapshot_from_json(payload.tables)?;
+
         let mut workbook = Workbook::new();
         let first_name = payload.sheets[0].name.clone();
         let first_sheet_already_named = workbook.name(0) == Some(first_name.as_str());
@@ -3853,10 +4002,21 @@ impl WasmWorkbook {
             }
         }
 
+        // Registry last: entries anchor by sheet NAME, so every sheet must
+        // already exist and be named. REPLACE semantics make this exact —
+        // the fresh workbook starts empty, so restore installs precisely the
+        // captured set.
+        let restored_tables = self
+            .workbook
+            .restore_tables(table_snapshot)
+            .map_err(|err| format!("persistence restore tables failed: {}", table_error_id(err)))?
+            as u32;
+
         let stats = WorkbookPersistenceRestoreStatsJSON {
             restored_cells,
             restored_formats,
             sheets: payload.sheets.len() as u32,
+            restored_tables,
         };
         Ok(stats)
     }
@@ -4379,6 +4539,222 @@ mod tests {
             json.columns,
             vec!["Region".to_string(), "Sales".to_string()],
             "column display names read from the header row"
+        );
+    }
+
+    // === Table registry snapshot / restore wire (#32 §11/§12) ===
+
+    /// Build a `WasmWorkbook` holding one Table `Inventory` at A1:C4 on
+    /// Sheet1 (headers Name/Qty/Price + 3 data rows).
+    fn workbook_with_inventory_table() -> WasmWorkbook {
+        let mut wb = WasmWorkbook::new();
+        for (a1, v) in [("A1", "Name"), ("B1", "Qty"), ("C1", "Price")] {
+            wb.workbook.set_cell(0, a1, Value::Text(v.into()));
+        }
+        for (i, qty) in [1.0f64, 2.0, 3.0].iter().enumerate() {
+            let r = i + 2;
+            wb.workbook
+                .set_cell(0, &format!("B{r}"), Value::Number(*qty));
+        }
+        wb.workbook
+            .define_table(
+                Some("Inventory"),
+                0,
+                CellRange::new(CellAddress::new(0, 0), CellAddress::new(3, 2)),
+                true,
+            )
+            .expect("define table");
+        wb
+    }
+
+    fn snapshot_tables_json(wb: &WasmWorkbook) -> TableRegistrySnapshotJSON {
+        TableRegistrySnapshotJSON {
+            version: 1,
+            tables: wb.tables_json(),
+        }
+    }
+
+    #[test]
+    fn wasm_table_snapshot_restore_round_trips_the_registry() {
+        let mut wb = workbook_with_inventory_table();
+        let before = snapshot_tables_json(&wb);
+        assert_eq!(before.version, 1);
+        assert_eq!(before.tables.len(), 1);
+
+        wb.workbook.delete_table("Inventory").expect("delete");
+        wb.workbook
+            .define_table(
+                Some("Other"),
+                0,
+                CellRange::new(CellAddress::new(10, 0), CellAddress::new(11, 0)),
+                true,
+            )
+            .expect("other");
+
+        assert_eq!(wb.restore_tables_json(before), Ok(1));
+        let entry = wb.workbook.get_table("Inventory").expect("revived");
+        assert_eq!(entry.range().end.row, 3);
+        assert_eq!(entry.columns(), ["Name", "Qty", "Price"]);
+        assert!(
+            wb.workbook.get_table("Other").is_none(),
+            "REPLACE drops post-snapshot tables"
+        );
+    }
+
+    #[test]
+    fn wasm_table_restore_preserves_totals_flag_and_grown_range() {
+        let mut wb = workbook_with_inventory_table();
+        wb.workbook
+            .set_table_totals_row("Inventory", true)
+            .expect("totals on");
+        let with_totals = snapshot_tables_json(&wb);
+        assert!(with_totals.tables[0].has_totals);
+        assert_eq!(with_totals.tables[0].range, "A1:C5");
+
+        wb.workbook
+            .set_table_totals_row("Inventory", false)
+            .expect("totals off");
+        assert!(!wb.workbook.get_table("Inventory").unwrap().has_totals());
+
+        assert_eq!(wb.restore_tables_json(with_totals), Ok(1));
+        let entry = wb.workbook.get_table("Inventory").expect("entry");
+        assert!(entry.has_totals(), "flag restored");
+        assert_eq!(entry.range().end.row, 4, "grown range restored");
+    }
+
+    #[test]
+    fn wasm_table_restore_of_an_empty_envelope_clears_the_registry() {
+        let mut wb = workbook_with_inventory_table();
+        let empty = TableRegistrySnapshotJSON {
+            version: 1,
+            tables: vec![],
+        };
+        assert_eq!(wb.restore_tables_json(empty), Ok(0));
+        assert_eq!(wb.workbook.table_count(), 0);
+    }
+
+    #[test]
+    fn wasm_table_restore_rejects_unsupported_version_without_mutating() {
+        let mut wb = workbook_with_inventory_table();
+        let bad = TableRegistrySnapshotJSON {
+            version: 2,
+            tables: vec![],
+        };
+        assert_eq!(
+            wb.restore_tables_json(bad),
+            Err("unsupported-snapshot-version".into())
+        );
+        assert_eq!(wb.workbook.table_count(), 1, "registry untouched");
+    }
+
+    #[test]
+    fn wasm_table_restore_surfaces_engine_error_ids_and_parse_failures() {
+        let mut wb = workbook_with_inventory_table();
+
+        // Engine-side rejection keeps the stable `table_error_to_js` id.
+        let malformed = TableRegistrySnapshotJSON {
+            version: 1,
+            tables: vec![TableJSON {
+                name: "Broken".into(),
+                sheet: "Sheet1".into(),
+                sheet_index: 0,
+                range: "A1:C4".into(),
+                has_headers: true,
+                has_totals: false,
+                columns: vec!["only-one".into()],
+            }],
+        };
+        assert_eq!(
+            wb.restore_tables_json(malformed),
+            Err("malformed-snapshot".into())
+        );
+
+        // Wire-side parse failure is reported before the engine is reached.
+        let unparseable = TableRegistrySnapshotJSON {
+            version: 1,
+            tables: vec![TableJSON {
+                name: "Broken".into(),
+                sheet: "Sheet1".into(),
+                sheet_index: 0,
+                range: "not-a-cell".into(),
+                has_headers: true,
+                has_totals: false,
+                columns: vec!["a".into()],
+            }],
+        };
+        assert!(wb
+            .restore_tables_json(unparseable)
+            .unwrap_err()
+            .contains("invalid table range cell"));
+
+        assert_eq!(wb.workbook.table_count(), 1, "both rejections were inert");
+    }
+
+    #[test]
+    fn wasm_table_json_round_trips_through_into_entry() {
+        let wb = workbook_with_inventory_table();
+        let json = wb.tables_json().into_iter().next().expect("one table");
+        let entry = json.into_entry().expect("parse");
+        assert_eq!(entry.name(), "Inventory");
+        assert_eq!(entry.sheet_name(), "Sheet1");
+        assert_eq!(entry.range().start, CellAddress::new(0, 0));
+        assert_eq!(entry.range().end, CellAddress::new(3, 2));
+        assert!(entry.has_headers());
+        assert_eq!(entry.columns(), ["Name", "Qty", "Price"]);
+    }
+
+    #[test]
+    fn wasm_persistence_v1_carries_the_table_registry_through_a_restore() {
+        let source = workbook_with_inventory_table();
+        let envelope = source.snapshot_persistence_v1_json();
+        assert_eq!(envelope.tables.len(), 1, "registry rides along");
+        assert_eq!(envelope.tables[0].name, "Inventory");
+
+        // A FRESH workbook — this is the shape `restore_persistence_v1`
+        // builds internally, and the case where a missing registry made the
+        // restore lossy.
+        let mut restored = WasmWorkbook::new();
+        let stats = restored.restore_persistence_v1_json(envelope).unwrap();
+        assert_eq!(stats.restored_tables, 1);
+
+        let entry = restored.workbook.get_table("Inventory").expect("entry");
+        assert_eq!(entry.sheet_name(), "Sheet1");
+        assert_eq!(entry.columns(), ["Name", "Qty", "Price"]);
+
+        // The decisive check: a structured reference resolves after restore.
+        restored
+            .workbook
+            .set_formula(0, "E1", "=SUM(Inventory[Qty])");
+        assert_eq!(restored.workbook.get_cell("Sheet1", "E1"), Value::Number(6.0));
+    }
+
+    #[test]
+    fn wasm_persistence_v1_payload_without_tables_field_still_restores() {
+        // Backward compatibility: payloads written before the field existed
+        // deserialize with an empty registry rather than failing.
+        let json = r#"{"version":1,"sheets":[{"idx":0,"name":"Sheet1"}],"cells":[]}"#;
+        let payload: WorkbookPersistenceV1JSON =
+            serde_json::from_str(json).expect("legacy payload parses");
+        assert!(payload.tables.is_empty());
+
+        let mut wb = workbook_with_inventory_table();
+        let stats = wb.restore_persistence_v1_json(payload).unwrap();
+        assert_eq!(stats.restored_tables, 0);
+        assert_eq!(
+            wb.workbook.table_count(),
+            0,
+            "fresh workbook + empty registry"
+        );
+    }
+
+    #[test]
+    fn wasm_persistence_v1_omits_the_tables_key_for_a_table_less_workbook() {
+        let wb = WasmWorkbook::new();
+        let envelope = wb.snapshot_persistence_v1_json();
+        let json = serde_json::to_string(&envelope).expect("serialize");
+        assert!(
+            !json.contains("\"tables\""),
+            "wire stays byte-identical for table-less workbooks: {json}"
         );
     }
 
@@ -4957,6 +5333,7 @@ mod tests {
                 }],
                 col_widths: vec![],
             }],
+            tables: vec![],
         };
 
         assert!(wb.restore_persistence_v1_json(payload).is_err());
@@ -4978,6 +5355,7 @@ mod tests {
             cells: vec![],
             formats: vec![],
             sizes: vec![],
+            tables: vec![],
         };
         assert!(wb.restore_persistence_v1_json(payload).is_err());
     }
@@ -5005,6 +5383,7 @@ mod tests {
             }],
             formats: vec![],
             sizes: vec![],
+            tables: vec![],
         };
 
         let stats = wb.restore_persistence_v1_json(payload).unwrap();
@@ -5045,6 +5424,7 @@ mod tests {
                 range_formats: vec![],
             }],
             sizes: vec![],
+            tables: vec![],
         };
 
         assert!(wb.restore_persistence_v1_json(payload).is_err());
@@ -5068,6 +5448,7 @@ mod tests {
             cells: vec![],
             formats: vec![],
             sizes: vec![],
+            tables: vec![],
         };
 
         let stats = wb.restore_persistence_v1_json(payload).unwrap();
@@ -5110,6 +5491,7 @@ mod tests {
             cells,
             formats: vec![],
             sizes: vec![],
+            tables: vec![],
         }
     }
 
