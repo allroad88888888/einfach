@@ -5,7 +5,9 @@ import { createStore } from '@einfach/core'
 import { cleanup, fireEvent, render, waitFor } from '@solidjs/testing-library'
 import type {
   FilterSortMutationResult,
+  ResolveDataEdgeRequest,
   SetFilterSortRequest,
+  SortRangeRequest,
   SpreadsheetBackend,
 } from '@einfach/spreadsheet-ui-core'
 import {
@@ -18,6 +20,7 @@ import {
   filterSortLifecycleAtom,
   filterSortStateAtom,
   openFilterDropdownAtom,
+  selectionAtom,
   setFilterSortAtom,
   setWorkspaceActiveSheetAtom,
 } from '@einfach/spreadsheet-ui-core'
@@ -567,5 +570,151 @@ describe('vNext SpreadsheetFilterDropdown', () => {
     expect(store.getter(filterDropdownAtom).status).toBe('closed')
     expect(store.getter(filterSortLifecycleAtom).status).toBe('closed')
     expect(container.querySelector('[data-testid="filter-dropdown"]')).toBeNull()
+  })
+})
+
+describe('vNext SpreadsheetFilterDropdown — physical sort (design-engine-sort S6)', () => {
+  function createPhysicalBackend(
+    sortRequests: SortRangeRequest[],
+    filterRequests: SetFilterSortRequest[],
+    lastRow = 5,
+    lastCol = 3,
+  ): SpreadsheetBackend {
+    return createFakeBackend({
+      async setFilterSort(req) {
+        filterRequests.push(req)
+        return { sheetId: req.sheetId, requestId: req.requestId, revision: 1 }
+      },
+      async resolveDataEdge(req: ResolveDataEdgeRequest) {
+        return {
+          sheetId: req.sheetId,
+          requestId: req.requestId,
+          target:
+            req.direction === 'down'
+              ? { row: lastRow, col: 0 }
+              : { row: 0, col: lastCol },
+        }
+      },
+      async sortRange(req: SortRangeRequest) {
+        sortRequests.push(req)
+        return {
+          kind: 'sort-range',
+          sheetId: req.sheetId,
+          applied: true,
+          movedRows: 3,
+          movedCells: 12,
+          affectedRange: req.range,
+          requestId: req.requestId,
+          revision: 2,
+        }
+      },
+    })
+  }
+
+  it('dispatches a physical sort keyed by the dropdown column and closes the dropdown', async () => {
+    const store = createStore()
+    const sortRequests: SortRangeRequest[] = []
+    const filterRequests: SetFilterSortRequest[] = []
+    // Selection sits on column 0; the dropdown targets column 2. The physical
+    // sort must key on the dropdown's column, not the selection's.
+    store.setter(setWorkspaceActiveSheetAtom, { sheetId: 'sheet-1' })
+    store.setter(selectionAtom, {
+      kind: 'cell',
+      sheetId: 'sheet-1',
+      anchor: { row: 2, col: 0 },
+      focus: { row: 2, col: 0 },
+    })
+    store.setter(openFilterDropdownAtom, { sheetId: 'sheet-1', colIndex: 2 })
+    const backend = createPhysicalBackend(sortRequests, filterRequests)
+    const { container } = renderDropdown(store, backend)
+    await waitForEditing(store)
+
+    fireEvent.click(button(container, 'filter-sort-desc'))
+
+    await waitFor(() => expect(sortRequests).toHaveLength(1))
+    expect(sortRequests[0]).toMatchObject({
+      kind: 'sort-range',
+      sheetId: 'sheet-1',
+      keys: [{ col: 2, direction: 'desc' }],
+      range: { rowStart: 1, rowEnd: 5, colStart: 0, colEnd: 3 },
+    })
+    // No display directive is written on the physical path.
+    expect(filterRequests).toHaveLength(0)
+    expect(store.getter(filterSortStateAtom)['sheet-1']?.directives ?? []).toEqual([])
+    // Excel closes the AutoFilter menu once a sort applies.
+    await waitFor(() => expect(store.getter(filterDropdownAtom).status).toBe('closed'))
+  })
+
+  it('carries filter-hidden rows in excludedRows, derived from the projection', async () => {
+    const store = createStore()
+    const sortRequests: SortRangeRequest[] = []
+    const filterRequests: SetFilterSortRequest[] = []
+    const window = { rowStart: 0, rowEnd: 5, colStart: 0, colEnd: 3 }
+    // Filter is active on column 0; the projection compresses source rows 2
+    // and 4 away (display rows carry originalRow 0,1,3,5).
+    store.setter(setFilterSortAtom, {
+      sheetId: 'sheet-1',
+      state: { rules: [{ kind: 'equals', colIndex: 0, value: 'x' }], directives: [] },
+    })
+    seedReadyVisibleProjection(store, {
+      status: 'ready',
+      request: createVisibleProjectionRequest({
+        sheetId: 'sheet-1',
+        requestId: 1,
+        reason: 'viewport',
+        window,
+      }),
+      result: {
+        kind: 'visible-window',
+        sheetId: 'sheet-1',
+        requestId: 1,
+        revision: 1,
+        window,
+        cells: [
+          { row: 0, col: 0, displayValue: 'head', originalRow: 0 },
+          { row: 1, col: 0, displayValue: 'x', originalRow: 1 },
+          { row: 2, col: 0, displayValue: 'x', originalRow: 3 },
+          { row: 3, col: 0, displayValue: 'x', originalRow: 5 },
+        ],
+      },
+      error: undefined,
+    })
+    store.setter(setWorkspaceActiveSheetAtom, { sheetId: 'sheet-1' })
+    store.setter(openFilterDropdownAtom, { sheetId: 'sheet-1', colIndex: 1 })
+    const backend = createPhysicalBackend(sortRequests, filterRequests)
+    const { container } = renderDropdown(store, backend)
+    await waitForEditing(store)
+
+    fireEvent.click(button(container, 'filter-sort-asc'))
+
+    await waitFor(() => expect(sortRequests).toHaveLength(1))
+    expect(sortRequests[0].keys).toEqual([{ col: 1, direction: 'asc' }])
+    expect(sortRequests[0].excludedRows).toEqual([2, 4])
+  })
+
+  it('keeps the display-permutation directive when the host has no sortRange port', async () => {
+    const store = createStore()
+    const filterRequests: SetFilterSortRequest[] = []
+    // No sortRange port → fallback to the existing dropdown display directive.
+    const backend = createFakeBackend({
+      async setFilterSort(req) {
+        filterRequests.push(req)
+        return { sheetId: req.sheetId, requestId: req.requestId, revision: 1 }
+      },
+    })
+    openDropdown(store, 3)
+    const { container } = renderDropdown(store, backend)
+    await waitForEditing(store)
+
+    fireEvent.click(button(container, 'filter-sort-asc'))
+
+    await waitFor(() =>
+      expect(store.getter(filterSortStateAtom)['sheet-1']?.directives).toEqual([
+        { colIndex: 3, direction: 'asc' },
+      ]),
+    )
+    expect(filterRequests).toHaveLength(1)
+    // Fallback keeps the dropdown open (display directive), unlike the physical path.
+    expect(store.getter(filterDropdownAtom).status).toBe('open')
   })
 })

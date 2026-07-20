@@ -207,6 +207,14 @@ export interface RunPhysicalSortInput {
    * which routes the command to the display-permutation fallback.
    */
   readonly range: CellRange | null
+  /**
+   * Explicit sort target. The toolbar / menu omit it so the command derives
+   * the key column from the active selection; the filter dropdown supplies
+   * its own `{ sheetId, colIndex }` because clicking the header chevron does
+   * not move the selection onto that column. Ignored by the display fallback
+   * (that path stays selection-authoritative).
+   */
+  readonly target?: FilterSortEntrypointTarget
   readonly refreshProjection: (sheetId: string) => Promise<void>
 }
 

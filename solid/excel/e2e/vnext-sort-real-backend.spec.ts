@@ -114,6 +114,39 @@ async function sortAscendingFromColumnE(page: Page) {
 const sortHistoryEntry = (page: Page) =>
   page.locator('.history-timeline-entry[data-kind="range.sort"]')
 
+const workerFilterDropdown = (page: Page) => page.getByTestId('vnext-worker-filter-dropdown')
+
+/**
+ * Seed a clean filter+sort scenario on Sheet1 (design-engine-sort S6, #29):
+ *   - column A made contiguous A2..A5 so the down-edge from A1 spans the full
+ *     data region regardless of the active cell / filter compression;
+ *   - column D = filter key ('keep' except D3='drop', a MIDDLE data row);
+ *   - column E = sort key (3/1/2/4 out of order).
+ */
+async function seedFilterSortScenario(page: Page) {
+  await typeIntoCell(page, 'A3', 'r3')
+  await typeIntoCell(page, 'A5', 'r5')
+  await typeIntoCell(page, 'D2', 'keep')
+  await typeIntoCell(page, 'D3', 'drop')
+  await typeIntoCell(page, 'D4', 'keep')
+  await typeIntoCell(page, 'D5', 'keep')
+  await typeIntoCell(page, 'E2', '3')
+  await typeIntoCell(page, 'E3', '1')
+  await typeIntoCell(page, 'E4', '2')
+  await typeIntoCell(page, 'E5', '4')
+}
+
+async function applyEqualsFilterOnColumn(page: Page, col: number, value: string) {
+  await page.locator(`th.spreadsheet-grid-col-header[data-col="${col}"]`).click()
+  const filterButton = page.getByTestId('toolbar-btn-filter')
+  await expect(filterButton).toBeEnabled()
+  await filterButton.click()
+  await expect(workerFilterDropdown(page)).toBeVisible()
+  await page.getByTestId('filter-condition-kind').selectOption('equals')
+  await page.getByTestId('filter-equals-input').fill(value)
+  await page.getByTestId('filter-add-equals').click()
+}
+
 test.describe('vNext engine physical sort real-backend evidence', () => {
   test.afterEach(async ({ page }) => {
     await expectNoConsoleErrors(page)
@@ -166,6 +199,90 @@ test.describe('vNext engine physical sort real-backend evidence', () => {
     await expect(cellDisplay(page, 'E3')).toHaveText('2')
     await expect(cellDisplay(page, 'E4')).toHaveText('3')
     await expect(sortHistoryEntry(page)).toHaveAttribute('data-applied', 'true')
+  })
+
+  test('WASM worker: a filter-active toolbar sort reorders the visible rows and leaves the filtered row in place', async ({
+    page,
+  }) => {
+    test.skip(!activeProjectIsWasm(), 'physical engine sort is the WASM backend contract')
+    await gotoWorkerDemo(page)
+    await seedFilterSortScenario(page)
+
+    // Filter column D to 'keep' → the MIDDLE data row (D3='drop') compresses
+    // out of the display. Close the dropdown to free the toolbar sort lane.
+    await applyEqualsFilterOnColumn(page, 3, 'keep')
+    await page.getByTestId('filter-close').click()
+    await expect(workerFilterDropdown(page)).toBeHidden()
+
+    // Filtered display shows the visible rows in SOURCE order: E = 3, 2, 4.
+    await expect(cellDisplay(page, 'E2')).toHaveText('3')
+    await expect(cellDisplay(page, 'E3')).toHaveText('2')
+    await expect(cellDisplay(page, 'E4')).toHaveText('4')
+
+    // Sort ascending by column E. The sheet has an active filter — previously
+    // this routed to the display permutation; now it sorts PHYSICALLY with the
+    // filtered-out row carried in excludedRows (design-engine-sort S6 / #29).
+    await selectGridCell(page, 'E2')
+    const sortButton = page.getByTestId('toolbar-btn-sort')
+    await expect(sortButton).toBeEnabled()
+    await sortButton.click()
+    await expect(page.getByTestId('toolbar-sort-dropdown')).toBeVisible()
+    await page.getByTestId('toolbar-sort-asc').click()
+
+    // Visible rows reordered ascending inside the compressed display.
+    await expect(cellDisplay(page, 'E2')).toHaveText('2')
+    await expect(cellDisplay(page, 'E3')).toHaveText('3')
+    await expect(cellDisplay(page, 'E4')).toHaveText('4')
+    // DISCRIMINATOR: a physical sort records exactly one range.sort entry.
+    await expect(sortHistoryEntry(page)).toHaveCount(1)
+
+    // Clear the filter through the column-D chevron. The filtered row stayed at
+    // its source position (E3=1, D3='drop'); the visible rows physically moved
+    // around it — E now reads 2, 1, 3, 4 down source rows 2..5.
+    await page.getByTestId('filter-chevron-3').click()
+    await expect(workerFilterDropdown(page)).toBeVisible()
+    await page.getByTestId('filter-clear-filter').click()
+    await page.getByTestId('filter-close').click()
+    await expect(workerFilterDropdown(page)).toBeHidden()
+
+    await expect(cellDisplay(page, 'E2')).toHaveText('2')
+    await expect(cellDisplay(page, 'E3')).toHaveText('1')
+    await expect(cellDisplay(page, 'E4')).toHaveText('3')
+    await expect(cellDisplay(page, 'E5')).toHaveText('4')
+    await expect(cellDisplay(page, 'D3')).toHaveText('drop')
+  })
+
+  test('WASM worker: the filter dropdown sort dispatches a physical engine sort and closes the menu', async ({
+    page,
+  }) => {
+    test.skip(!activeProjectIsWasm(), 'physical engine sort is the WASM backend contract')
+    await gotoWorkerDemo(page)
+    // Contiguous column A so the dropdown's data-region resolution (which
+    // carries no bottom-row hint) spans source rows 2..5.
+    await typeIntoCell(page, 'A3', 'r3')
+    await typeIntoCell(page, 'A5', 'r5')
+    await seedCleanSortColumn(page)
+    await typeIntoCell(page, 'E5', '4')
+
+    // Open the dropdown on column E via the toolbar filter button (no
+    // pre-existing rule needed — it opens on the active column), then sort.
+    await selectGridCell(page, 'E2')
+    const filterButton = page.getByTestId('toolbar-btn-filter')
+    await expect(filterButton).toBeEnabled()
+    await filterButton.click()
+    await expect(workerFilterDropdown(page)).toBeVisible()
+
+    await page.getByTestId('filter-sort-asc').click()
+
+    // Excel closes the AutoFilter menu on sort; the engine physically reorders
+    // and records one range.sort history entry (a display directive records
+    // none — see the TS fail-closed test above).
+    await expect(workerFilterDropdown(page)).toBeHidden()
+    await expect(cellDisplay(page, 'E2')).toHaveText('1')
+    await expect(cellDisplay(page, 'E3')).toHaveText('2')
+    await expect(cellDisplay(page, 'E4')).toHaveText('3')
+    await expect(cellDisplay(page, 'E5')).toHaveText('4')
+    await expect(sortHistoryEntry(page)).toHaveCount(1)
   })
 
   test('TS worker fail-closes to the display permutation — the view reorders with NO range.sort data mutation', async ({

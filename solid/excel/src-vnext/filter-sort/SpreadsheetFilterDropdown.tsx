@@ -13,6 +13,7 @@ import {
   filterSortStateAtom,
   getColumnLabel,
   runFilterSortMutationAtom,
+  runPhysicalSortAtom,
   retryFilterSortRefreshAtom,
   updateFilterSortAvailableValuesAtom,
   updateFilterSortDraftAtom,
@@ -21,10 +22,12 @@ import {
   type FilterSortDraftPatch,
   type FilterSortMutationIntent,
   type FilterSortState,
+  type SortDirection,
 } from '@einfach/spreadsheet-ui-core'
 
 import {
   refreshVisibleProjection,
+  resolveSortRange,
   spreadsheetProjectionSnapshotAtom,
   useSpreadsheetBackend,
   useSpreadsheetUiStore,
@@ -168,6 +171,36 @@ export function SpreadsheetFilterDropdown(props: SpreadsheetFilterDropdownProps)
     })
   }
 
+  // Sort now dispatches the SAME physical-sort command as the toolbar / menu
+  // (design-engine-sort S6 / #29). When the host exposes `sortRange` and a data
+  // region resolves, the dropdown closes (Excel closes its AutoFilter menu on
+  // sort) and the engine reorders data by THIS dropdown's column — supplied as
+  // an explicit target because the header chevron never moved the selection.
+  // Without a `sortRange` port (or a resolvable region) the command keeps the
+  // existing display-permutation directive on the dropdown's column.
+  async function runSort(direction: SortDirection) {
+    const currentSheetId = sheetId()
+    const currentCol = colIndex()
+    if (!currentSheetId || currentCol < 0) return
+    const range =
+      typeof backend.sortRange === 'function'
+        ? await resolveSortRange(store, backend, currentSheetId, { row: 0, col: currentCol })
+        : null
+    if (range === null) {
+      run({ kind: 'sort', direction })
+      return
+    }
+    store.setter(closeFilterDropdownAtom)
+    void store.setter(runPhysicalSortAtom, {
+      source: backend,
+      entrypoint: 'toolbar',
+      direction,
+      range,
+      target: { sheetId: currentSheetId, colIndex: currentCol },
+      refreshProjection: (targetSheetId) => refreshVisibleProjection(store, backend, targetSheetId),
+    })
+  }
+
   function toggleValue(value: string, checked: boolean) {
     const selected = new Set(draft().selectedValues)
     if (checked) selected.add(value)
@@ -262,7 +295,7 @@ export function SpreadsheetFilterDropdown(props: SpreadsheetFilterDropdownProps)
               class="filter-btn"
               data-testid="filter-sort-asc"
               disabled={mutationDisabled()}
-              onClick={() => run({ kind: 'sort', direction: 'asc' })}
+              onClick={() => void runSort('asc')}
             >
               {t('filterSort.sortAsc')}
             </button>
@@ -271,7 +304,7 @@ export function SpreadsheetFilterDropdown(props: SpreadsheetFilterDropdownProps)
               class="filter-btn"
               data-testid="filter-sort-desc"
               disabled={mutationDisabled()}
-              onClick={() => run({ kind: 'sort', direction: 'desc' })}
+              onClick={() => void runSort('desc')}
             >
               {t('filterSort.sortDesc')}
             </button>

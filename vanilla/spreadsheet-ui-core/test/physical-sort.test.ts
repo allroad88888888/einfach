@@ -2,6 +2,7 @@ import { describe, expect, test } from '@jest/globals'
 import { createStore } from '@einfach/core'
 import {
   PHYSICAL_SORT_REJECTION_MESSAGES,
+  beginProjectionAtom,
   captureSortRangeCapabilityAtom,
   clearPhysicalSortDiagnosticAtom,
   filterSortEntrypointStateAtom,
@@ -10,6 +11,7 @@ import {
   historyStackAtom,
   physicalSortDiagnosticAtom,
   physicalSortRejectionMessage,
+  resolveProjectionAtom,
   runPhysicalSortAtom,
   selectionAtom,
   setFilterSortAtom,
@@ -18,11 +20,13 @@ import {
 } from '../src'
 import type {
   CellRange,
+  DisplayCell,
   PhysicalSortControllerPort,
   SetFilterSortRequest,
   SortRangeRejectionCode,
   SortRangeRequest,
   SortRangeResult,
+  VisibleProjectionResult,
 } from '../src'
 
 function makeStore() {
@@ -45,6 +49,31 @@ function setActiveCell(
 }
 
 const RANGE: CellRange = { rowStart: 1, rowEnd: 5, colStart: 0, colEnd: 3 }
+
+/**
+ * Seed the visible projection UI core consumes so `buildSortExcludedRows` can
+ * derive filter-hidden rows from `DisplayCell.originalRow` gaps. Window covers
+ * display rows 0..(cells max row); source rows a filter compresses away simply
+ * have no cell here.
+ */
+function publishProjection(
+  store: ReturnType<typeof makeStore>,
+  cells: DisplayCell[],
+  sheetId = 'sheet-1',
+  window: CellRange = { rowStart: 0, rowEnd: 5, colStart: 0, colEnd: 3 },
+) {
+  const outcome = store.setter(beginProjectionAtom, { kind: 'visible-window', sheetId, window })
+  if (outcome.status !== 'started') throw new Error(`projection begin: ${outcome.status}`)
+  const result: VisibleProjectionResult = {
+    kind: 'visible-window',
+    sheetId,
+    requestId: outcome.request.requestId,
+    window: { ...window },
+    cells,
+  }
+  const resolved = store.setter(resolveProjectionAtom, { request: outcome.request, result })
+  if (resolved.status !== 'accepted') throw new Error(`projection resolve: ${resolved.status}`)
+}
 
 function appliedResult(request: SortRangeRequest, movedRows: number): SortRangeResult {
   return {
@@ -171,7 +200,106 @@ describe('runPhysicalSortAtom — capability split', () => {
     ])
   })
 
-  test('an active column filter routes to display permutation, not sortRange', async () => {
+  test('an active column filter now sorts physically with filtered-out rows excluded', async () => {
+    const store = makeStore()
+    setActiveCell(store, 'sheet-1', 2, 1)
+    store.setter(setFilterSortAtom, {
+      sheetId: 'sheet-1',
+      state: { rules: [{ kind: 'equals', colIndex: 0, value: 'x' }], directives: [] },
+    })
+    // Filter compresses source rows 2 and 4 away: display rows carry
+    // originalRow 0 (header), 1, 3, 5. The gaps inside the observed span are
+    // the filtered-out rows.
+    publishProjection(store, [
+      { row: 0, col: 0, displayValue: 'head', originalRow: 0 },
+      { row: 1, col: 0, displayValue: 'x', originalRow: 1 },
+      { row: 2, col: 0, displayValue: 'x', originalRow: 3 },
+      { row: 3, col: 0, displayValue: 'x', originalRow: 5 },
+    ])
+    const { source, sortRequests } = makePhysicalSource()
+
+    await store.setter(runPhysicalSortAtom, {
+      source,
+      entrypoint: 'toolbar',
+      direction: 'asc',
+      range: RANGE,
+      refreshProjection: noRefresh,
+    })
+
+    // Filter-active sheets sort physically (flip step 3): filtered-out rows ride
+    // in excludedRows so the engine leaves them in place; no display directive.
+    expect(sortRequests).toHaveLength(1)
+    expect(sortRequests[0].excludedRows).toEqual([2, 4])
+    expect(sortRequests[0].keys).toEqual([{ col: 1, direction: 'asc' }])
+    expect(store.getter(filterSortStateAtom)['sheet-1']?.directives ?? []).toEqual([])
+  })
+})
+
+describe('runPhysicalSortAtom — filter-hidden excluded rows', () => {
+  test('unions manual hidden rows with filter-derived filtered-out rows', async () => {
+    const store = makeStore()
+    setActiveCell(store, 'sheet-1', 2, 1)
+    store.setter(setFilterSortAtom, {
+      sheetId: 'sheet-1',
+      state: { rules: [{ kind: 'equals', colIndex: 0, value: 'x' }], directives: [] },
+    })
+    // Manually hide row 5 (inside the range); filter compresses row 3 away.
+    store.setter(hideRowsAtom, { sheetId: 'sheet-1', indices: [5] })
+    publishProjection(store, [
+      { row: 0, col: 0, displayValue: 'head', originalRow: 0 },
+      { row: 1, col: 0, displayValue: 'x', originalRow: 1 },
+      { row: 2, col: 0, displayValue: 'x', originalRow: 2 },
+      { row: 3, col: 0, displayValue: 'x', originalRow: 4 },
+      { row: 4, col: 0, displayValue: 'x', originalRow: 5 },
+    ])
+    const { source, sortRequests } = makePhysicalSource()
+
+    await store.setter(runPhysicalSortAtom, {
+      source,
+      entrypoint: 'toolbar',
+      direction: 'asc',
+      range: RANGE,
+      refreshProjection: noRefresh,
+    })
+
+    // Observed span 1..5 (row 5 present but also manually hidden); gap 3 is
+    // filtered out; union with hidden row 5, sorted ascending.
+    expect(sortRequests[0].excludedRows).toEqual([3, 5])
+  })
+
+  test('reasons only inside the observed span (bounded projection window)', async () => {
+    const store = makeStore()
+    setActiveCell(store, 'sheet-1', 2, 1)
+    store.setter(setFilterSortAtom, {
+      sheetId: 'sheet-1',
+      state: { rules: [{ kind: 'equals', colIndex: 0, value: 'x' }], directives: [] },
+    })
+    // Projection window only observes source rows 2 and 4 (scrolled). Row 3 is
+    // a gap inside [2..4] → excluded; rows 1 and 5 are outside the observed
+    // span → left in the reorder set (bounded-window semantics).
+    publishProjection(
+      store,
+      [
+        { row: 0, col: 0, displayValue: 'x', originalRow: 2 },
+        { row: 1, col: 0, displayValue: 'x', originalRow: 4 },
+      ],
+      'sheet-1',
+      { rowStart: 0, rowEnd: 1, colStart: 0, colEnd: 3 },
+    )
+    const { source, sortRequests } = makePhysicalSource()
+
+    await store.setter(runPhysicalSortAtom, {
+      source,
+      entrypoint: 'toolbar',
+      direction: 'asc',
+      range: RANGE,
+      refreshProjection: noRefresh,
+    })
+
+    expect(sortRequests[0].excludedRows).toEqual([3])
+  })
+
+  test('a filter with no consumed projection excludes nothing derived', async () => {
     const store = makeStore()
     setActiveCell(store, 'sheet-1', 2, 1)
     store.setter(setFilterSortAtom, {
@@ -188,12 +316,57 @@ describe('runPhysicalSortAtom — capability split', () => {
       refreshProjection: noRefresh,
     })
 
-    // Physical sort cannot yet exclude filtered-out rows (flip step 3), so the
-    // combined filter+sort keeps flowing through the display permutation.
-    expect(sortRequests).toHaveLength(0)
-    expect(store.getter(filterSortStateAtom)['sheet-1']?.directives).toEqual([
-      { colIndex: 1, direction: 'asc' },
-    ])
+    // Still physical (no directives), but with no projection to read the
+    // filtered-out rows cannot be derived — excludedRows is empty.
+    expect(sortRequests).toHaveLength(1)
+    expect(sortRequests[0].excludedRows).toEqual([])
+  })
+
+  test('ignores a projection published for a different sheet', async () => {
+    const store = makeStore()
+    setActiveCell(store, 'sheet-1', 2, 1)
+    store.setter(setFilterSortAtom, {
+      sheetId: 'sheet-1',
+      state: { rules: [{ kind: 'equals', colIndex: 0, value: 'x' }], directives: [] },
+    })
+    publishProjection(
+      store,
+      [
+        { row: 0, col: 0, displayValue: 'x', originalRow: 1 },
+        { row: 1, col: 0, displayValue: 'x', originalRow: 4 },
+      ],
+      'other-sheet',
+    )
+    const { source, sortRequests } = makePhysicalSource()
+
+    await store.setter(runPhysicalSortAtom, {
+      source,
+      entrypoint: 'toolbar',
+      direction: 'asc',
+      range: RANGE,
+      refreshProjection: noRefresh,
+    })
+
+    expect(sortRequests[0].excludedRows).toEqual([])
+  })
+
+  test('explicit target sorts the given column, not the selection (dropdown path)', async () => {
+    const store = makeStore()
+    // Selection is on column 1, but the dropdown targets column 2.
+    setActiveCell(store, 'sheet-1', 2, 1)
+    const { source, sortRequests } = makePhysicalSource()
+
+    await store.setter(runPhysicalSortAtom, {
+      source,
+      entrypoint: 'toolbar',
+      direction: 'desc',
+      range: RANGE,
+      target: { sheetId: 'sheet-1', colIndex: 2 },
+      refreshProjection: noRefresh,
+    })
+
+    expect(sortRequests).toHaveLength(1)
+    expect(sortRequests[0].keys).toEqual([{ col: 2, direction: 'desc' }])
   })
 })
 

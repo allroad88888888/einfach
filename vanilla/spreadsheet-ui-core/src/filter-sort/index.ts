@@ -8,6 +8,7 @@ import type {
 } from '../backend/types'
 import type { CellRange } from '../shared'
 import { pushHistoryAtom } from '../history'
+import { projectionSnapshotAtom } from '../projection'
 import { getHiddenRowsForSheet, viewportHiddenAtom } from '../viewport/hidden'
 import {
   selectionAuthorityWitnessAtom,
@@ -1630,6 +1631,14 @@ function normalizeSortRange(range: CellRange): CellRange {
   }
 }
 
+function sanitizeExplicitSortTarget(
+  target: FilterSortEntrypointTarget | undefined,
+): FilterSortEntrypointTarget | null {
+  if (!target || typeof target.sheetId !== 'string' || target.sheetId.length === 0) return null
+  if (!Number.isSafeInteger(target.colIndex) || target.colIndex < 0) return null
+  return Object.freeze({ sheetId: target.sheetId, colIndex: target.colIndex })
+}
+
 function isValidSortRange(range: CellRange): boolean {
   return (
     Number.isSafeInteger(range.rowStart) &&
@@ -1643,27 +1652,70 @@ function isValidSortRange(range: CellRange): boolean {
   )
 }
 
-/**
- * Excluded rows (0-based SOURCE space) the host hands the engine so they stay
- * in place while the visible rows reorder. v1 assembles the ONE canonical
- * source available in UI core — hidden rows (`viewportHiddenAtom`, flip step
- * 2) clipped to the sort range. Filtered-out rows depend on flip step 3 and
- * are handled by routing an active-filter sheet to the display fallback
- * instead (see `runPhysicalSortAtom`); summary-row pinning needs cell reads
- * UI core does not own and is a known v1 gap (design §6.1).
- */
-export function buildSortExcludedRows(get: Getter, sheetId: string, range: CellRange): number[] {
-  const hidden = getHiddenRowsForSheet(get(viewportHiddenAtom), sheetId)
-  const result: number[] = []
-  for (const row of hidden) {
-    if (row >= range.rowStart && row <= range.rowEnd) result.push(row)
-  }
-  return result
-}
-
 function sheetHasActiveFilterRules(get: Getter, sheetId: string): boolean {
   const state = get(filterSortStateAtom)[sheetId]
   return state !== undefined && state.rules.length > 0
+}
+
+/**
+ * Filtered-out SOURCE rows the physical sort must leave in place, derived from
+ * the visible projection UI core ALREADY consumes — no adapter port, no engine
+ * hidden model (design §6.1, mirrors the SUBTOTAL "host feeds visibility as an
+ * input" rule). Each `DisplayCell` carries `originalRow` (its source row) when
+ * filter is active; a row a column filter compresses away has NO display slot,
+ * so its `originalRow` never appears among the projected cells. We can only
+ * judge the rows the current projection window actually covers, so we reason
+ * strictly inside the observed source-row span `[minObserved..maxObserved]`:
+ * a source row in that span (and in the sort range) that no projected cell
+ * reports is filtered out. Rows beyond the observed span sit outside the
+ * bounded projection window and are left in the reorder set — a documented v1
+ * gap when the data region exceeds the viewport (design §2.2 / §6.1). Whole-row
+ * physical moves keep each row's filter-column value co-located, so the VISIBLE
+ * post-sort result is correct regardless; only the resting position of an
+ * unobserved filtered row can differ from Excel.
+ */
+function deriveFilterHiddenRows(get: Getter, sheetId: string, range: CellRange): number[] {
+  if (!sheetHasActiveFilterRules(get, sheetId)) return []
+  const result = get(projectionSnapshotAtom).result
+  if (result === undefined || result.sheetId !== sheetId) return []
+
+  const observed = new Set<number>()
+  let minObserved = Number.POSITIVE_INFINITY
+  let maxObserved = Number.NEGATIVE_INFINITY
+  for (const cell of result.cells) {
+    const source = cell.originalRow ?? cell.row
+    if (!Number.isSafeInteger(source) || source < range.rowStart || source > range.rowEnd) continue
+    observed.add(source)
+    if (source < minObserved) minObserved = source
+    if (source > maxObserved) maxObserved = source
+  }
+  if (maxObserved < minObserved) return []
+
+  const filteredOut: number[] = []
+  for (let row = minObserved; row <= maxObserved; row += 1) {
+    if (!observed.has(row)) filteredOut.push(row)
+  }
+  return filteredOut
+}
+
+/**
+ * Excluded rows (0-based SOURCE space) the host hands the engine so they stay
+ * in place while the visible rows reorder. The set is the union of two
+ * UI-core canonical facts, both clipped to the sort range:
+ *   1. manually hidden rows (`viewportHiddenAtom`, flip step 2);
+ *   2. filter-hidden rows derived from the consumed visible projection
+ *      (`deriveFilterHiddenRows`, flip step 3).
+ * Summary-row pinning needs cell reads UI core does not own and is a known v1
+ * gap (design §6.1).
+ */
+export function buildSortExcludedRows(get: Getter, sheetId: string, range: CellRange): number[] {
+  const excluded = new Set<number>()
+  const hidden = getHiddenRowsForSheet(get(viewportHiddenAtom), sheetId)
+  for (const row of hidden) {
+    if (row >= range.rowStart && row <= range.rowEnd) excluded.add(row)
+  }
+  for (const row of deriveFilterHiddenRows(get, sheetId, range)) excluded.add(row)
+  return [...excluded].sort((a, b) => a - b)
 }
 
 export const runPhysicalSortAtom = atom(
@@ -1679,7 +1731,10 @@ export const runPhysicalSortAtom = atom(
     const port = readSortRangePort(input.source)
     set(sortRangeCapabilityBackingAtom, port !== undefined)
 
-    const target = resolveFilterSortEntrypointTarget(get)
+    // The dropdown supplies its own target (its column, not the selection's);
+    // the toolbar / menu omit it and stay selection-authoritative.
+    const target =
+      sanitizeExplicitSortTarget(input.target) ?? resolveFilterSortEntrypointTarget(get)
     const range = input.range === null ? null : normalizeSortRange(input.range)
     const rangeIsValid = range !== null && isValidSortRange(range)
     const columnInRange =
@@ -1688,17 +1743,14 @@ export const runPhysicalSortAtom = atom(
       target.colIndex >= range!.colStart &&
       target.colIndex <= range!.colEnd
 
-    // Capability-driven split: physical only when the port and a valid region
-    // are present, the key column sits inside the region, and no active column
-    // filter stands in the way (filtered-out exclusion is flip step 3 —
-    // design §2.2). Everything else falls back to the display permutation so
-    // static hosts and filter+sort combinations keep working.
+    // Capability-driven split: physical whenever the port and a valid region
+    // are present and the key column sits inside the region. Filter-active
+    // sheets now sort physically too — the filtered-out rows ride in
+    // `excludedRows` (flip step 3, design §2.2 / §6.1) so they stay in place.
+    // Everything else falls back to the display permutation so hosts without
+    // a `sortRange` port keep working.
     const physicalApplicable =
-      port !== undefined &&
-      target !== null &&
-      rangeIsValid &&
-      columnInRange &&
-      !sheetHasActiveFilterRules(get, target.sheetId)
+      port !== undefined && target !== null && rangeIsValid && columnInRange
 
     if (!physicalApplicable || target === null || range === null) {
       set(physicalSortDiagnosticBackingAtom, null)
