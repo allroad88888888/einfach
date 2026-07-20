@@ -1,6 +1,14 @@
 import { atom } from '@einfach/core'
 import type { Atom, Getter } from '@einfach/core'
-import type { ProjectionRequestId } from '../backend/types'
+import type {
+  ProjectionRequestId,
+  SortRangeRejectionCode,
+  SortRangeRequest,
+  SortRangeResult,
+} from '../backend/types'
+import type { CellRange } from '../shared'
+import { pushHistoryAtom } from '../history'
+import { getHiddenRowsForSheet, viewportHiddenAtom } from '../viewport/hidden'
 import {
   selectionAuthorityWitnessAtom,
   selectionSnapshotAtom,
@@ -24,8 +32,11 @@ import type {
   FilterSortLifecycleState,
   FilterSortState,
   FilterSortStateBySheet,
+  PhysicalSortControllerPort,
+  PhysicalSortDiagnostic,
   RunFilterSortEntrypointInput,
   RunFilterSortMutationInput,
+  RunPhysicalSortInput,
   RetryFilterSortRefreshInput,
   SortDirection,
   SortDirective,
@@ -1534,3 +1545,297 @@ export const notifyActiveSheetChangedAtom = atom(
   },
 )
 notifyActiveSheetChangedAtom.debugLabel = 'spreadsheet.filterSort.notifyActiveSheet'
+
+// ===========================================================================
+// Engine physical sort (design-engine-sort S5)
+//
+// `runPhysicalSortAtom` is the single command the toolbar / menu sort
+// entrypoints dispatch. It routes by capability: when the host backend
+// exposes `sortRange` (and a physical sort is applicable) it reorders engine
+// DATA through that port with host-orchestrated undo; otherwise it delegates
+// to `runFilterSortEntrypointAtom` so the existing display permutation keeps
+// working. Both paths share the single backend lane (`activeFilterSort*`).
+// ===========================================================================
+
+/** Structured-reject code → user-readable prompt (design §3/§5). */
+export const PHYSICAL_SORT_REJECTION_MESSAGES: Readonly<Record<SortRangeRejectionCode, string>> =
+  Object.freeze({
+    'invalid-range': 'Sort could not run: the sort range is invalid.',
+    'empty-keys': 'Sort could not run: no sort column was provided.',
+    'key-out-of-range': 'Sort could not run: the sort column is outside the sorted range.',
+    'spill-in-range':
+      'Sort could not run: the range overlaps a spilled array. Move or clear the array first.',
+    'invalid-payload': 'Sort could not run: the sort request was malformed.',
+    'source-too-large': 'Sort could not run: the range is too large to sort.',
+    'merge-in-range':
+      'Sort could not run: the range contains merged cells. Unmerge them before sorting.',
+  })
+
+export function physicalSortRejectionMessage(
+  code: SortRangeRejectionCode,
+  fallback?: string,
+): string {
+  return PHYSICAL_SORT_REJECTION_MESSAGES[code] ?? fallback ?? 'Sort could not run.'
+}
+
+const sortRangeCapabilityBackingAtom = atom<boolean>(false)
+sortRangeCapabilityBackingAtom.debugLabel = 'spreadsheet.sort.capabilityBacking'
+
+/** Read-only witness of the physical-sort `sortRange` port (captured on dispatch). */
+export const sortRangeSupportedAtom: Atom<boolean> = atom((get) =>
+  get(sortRangeCapabilityBackingAtom),
+)
+sortRangeSupportedAtom.debugLabel = 'spreadsheet.sort.supported'
+
+function readSortRangePort(
+  source: PhysicalSortControllerPort,
+): PhysicalSortControllerPort['sortRange'] {
+  try {
+    const port = source?.sortRange
+    return typeof port === 'function' ? port : undefined
+  } catch {
+    return undefined
+  }
+}
+
+/** Captures the `sortRange` capability witness without dispatching. */
+export const captureSortRangeCapabilityAtom = atom(
+  null,
+  (_get, set, source: PhysicalSortControllerPort) => {
+    set(sortRangeCapabilityBackingAtom, readSortRangePort(source) !== undefined)
+  },
+)
+captureSortRangeCapabilityAtom.debugLabel = 'spreadsheet.sort.captureCapability'
+
+const physicalSortDiagnosticBackingAtom = atom<PhysicalSortDiagnostic | null>(null)
+physicalSortDiagnosticBackingAtom.debugLabel = 'spreadsheet.sort.diagnosticBacking'
+
+/** Read-only last physical-sort rejection, user-readable. Cleared on the next dispatch. */
+export const physicalSortDiagnosticAtom: Atom<PhysicalSortDiagnostic | null> = atom((get) =>
+  get(physicalSortDiagnosticBackingAtom),
+)
+physicalSortDiagnosticAtom.debugLabel = 'spreadsheet.sort.diagnostic'
+
+export const clearPhysicalSortDiagnosticAtom = atom(null, (_get, set) => {
+  set(physicalSortDiagnosticBackingAtom, null)
+})
+clearPhysicalSortDiagnosticAtom.debugLabel = 'spreadsheet.sort.clearDiagnostic'
+
+function normalizeSortRange(range: CellRange): CellRange {
+  return {
+    rowStart: Math.min(range.rowStart, range.rowEnd),
+    rowEnd: Math.max(range.rowStart, range.rowEnd),
+    colStart: Math.min(range.colStart, range.colEnd),
+    colEnd: Math.max(range.colStart, range.colEnd),
+  }
+}
+
+function isValidSortRange(range: CellRange): boolean {
+  return (
+    Number.isSafeInteger(range.rowStart) &&
+    Number.isSafeInteger(range.rowEnd) &&
+    Number.isSafeInteger(range.colStart) &&
+    Number.isSafeInteger(range.colEnd) &&
+    range.rowStart >= 0 &&
+    range.colStart >= 0 &&
+    range.rowEnd >= range.rowStart &&
+    range.colEnd >= range.colStart
+  )
+}
+
+/**
+ * Excluded rows (0-based SOURCE space) the host hands the engine so they stay
+ * in place while the visible rows reorder. v1 assembles the ONE canonical
+ * source available in UI core — hidden rows (`viewportHiddenAtom`, flip step
+ * 2) clipped to the sort range. Filtered-out rows depend on flip step 3 and
+ * are handled by routing an active-filter sheet to the display fallback
+ * instead (see `runPhysicalSortAtom`); summary-row pinning needs cell reads
+ * UI core does not own and is a known v1 gap (design §6.1).
+ */
+export function buildSortExcludedRows(get: Getter, sheetId: string, range: CellRange): number[] {
+  const hidden = getHiddenRowsForSheet(get(viewportHiddenAtom), sheetId)
+  const result: number[] = []
+  for (const row of hidden) {
+    if (row >= range.rowStart && row <= range.rowEnd) result.push(row)
+  }
+  return result
+}
+
+function sheetHasActiveFilterRules(get: Getter, sheetId: string): boolean {
+  const state = get(filterSortStateAtom)[sheetId]
+  return state !== undefined && state.rules.length > 0
+}
+
+export const runPhysicalSortAtom = atom(
+  null,
+  async (get, set, input: RunPhysicalSortInput): Promise<void> => {
+    // Single backend lane: a display mutation, a display entrypoint, and a
+    // physical sort must never overlap on the same sheet transport.
+    if (get(activeFilterSortEntrypointAtom) !== null) return
+    if (get(activeFilterSortMutationAtom) !== null) return
+    // A live dropdown draft owns the same lane; stay inert until it closes.
+    if (get(filterDropdownAtom).status === 'open') return
+
+    const port = readSortRangePort(input.source)
+    set(sortRangeCapabilityBackingAtom, port !== undefined)
+
+    const target = resolveFilterSortEntrypointTarget(get)
+    const range = input.range === null ? null : normalizeSortRange(input.range)
+    const rangeIsValid = range !== null && isValidSortRange(range)
+    const columnInRange =
+      rangeIsValid &&
+      target !== null &&
+      target.colIndex >= range!.colStart &&
+      target.colIndex <= range!.colEnd
+
+    // Capability-driven split: physical only when the port and a valid region
+    // are present, the key column sits inside the region, and no active column
+    // filter stands in the way (filtered-out exclusion is flip step 3 —
+    // design §2.2). Everything else falls back to the display permutation so
+    // static hosts and filter+sort combinations keep working.
+    const physicalApplicable =
+      port !== undefined &&
+      target !== null &&
+      rangeIsValid &&
+      columnInRange &&
+      !sheetHasActiveFilterRules(get, target.sheetId)
+
+    if (!physicalApplicable || target === null || range === null) {
+      set(physicalSortDiagnosticBackingAtom, null)
+      await set(runFilterSortEntrypointAtom, {
+        source: input.source,
+        entrypoint: input.entrypoint,
+        direction: input.direction,
+        refreshProjection: input.refreshProjection,
+      })
+      return
+    }
+
+    const operationId = nextFilterSortOperationId(get(filterSortEntrypointOperationIdStateAtom))
+    const requestId = nextFilterSortRequestId(get(filterSortSyncTicketAtom))
+    if (operationId === null || requestId === null) {
+      set(
+        filterSortEntrypointStateBackingAtom,
+        entrypointStateFor('blocked', {
+          entrypoint: input.entrypoint,
+          target,
+          direction: input.direction,
+          attempt: 1,
+          error: 'Filter and sort command identity space is exhausted.',
+        }),
+      )
+      return
+    }
+
+    const previous = get(filterSortEntrypointStateBackingAtom)
+    const currentState = get(filterSortStateAtom)[target.sheetId] ?? EMPTY_FILTER_SORT_STATE
+    const ticket: FilterSortEntrypointTicket = Object.freeze({
+      operationId,
+      requestId,
+      entrypoint: input.entrypoint,
+      target,
+      direction: input.direction,
+      attempt: nextEntrypointAttempt(previous, input.entrypoint, target, input.direction),
+      // Identity — the physical path never commits sort directives; the field
+      // only exists so the shared entrypoint ticket type is satisfied.
+      next: normalizeState(currentState),
+      selectionWitness: get(selectionAuthorityWitnessAtom),
+      workspaceWitness: get(workspaceActiveSheetAuthorityWitnessAtom),
+    })
+    set(filterSortEntrypointOperationIdStateAtom, operationId)
+    set(filterSortSyncTicketBackingAtom, requestId)
+    set(activeFilterSortEntrypointAtom, ticket)
+    set(physicalSortDiagnosticBackingAtom, null)
+    set(filterSortEntrypointStateBackingAtom, entrypointStateForTicket('pending', ticket))
+
+    const ownsTicket = (): boolean => get(activeFilterSortEntrypointAtom) === ticket
+
+    // Publish the reservation before transport launch so same-tick re-entry
+    // is inert; re-set the owned pending value to flush it (see the display
+    // entrypoint for the same Einfach deferral note).
+    await Promise.resolve()
+    if (!ownsTicket()) return
+    set(filterSortEntrypointStateBackingAtom, get(filterSortEntrypointStateBackingAtom))
+
+    const request: SortRangeRequest = {
+      kind: 'sort-range',
+      sheetId: target.sheetId,
+      range,
+      keys: [{ col: target.colIndex, direction: input.direction }],
+      excludedRows: buildSortExcludedRows(get, target.sheetId, range),
+      requestId,
+    }
+
+    let result: SortRangeResult
+    try {
+      result = await port.call(input.source, request)
+    } catch (error) {
+      if (!ownsTicket()) return
+      set(activeFilterSortEntrypointAtom, null)
+      set(
+        filterSortEntrypointStateBackingAtom,
+        entrypointStateForTicket(
+          'outcome-unknown',
+          ticket,
+          outcomeUnknownError(errorMessage(error)),
+        ),
+      )
+      return
+    }
+
+    if (!ownsTicket()) return
+
+    // Structured rejection (a gated request resolves, it does NOT reject the
+    // promise): nothing was written, no undo entry recorded, no history push.
+    if (!result || result.applied === false) {
+      const code: SortRangeRejectionCode = result ? result.code : 'invalid-payload'
+      const message = physicalSortRejectionMessage(code, result?.message)
+      set(activeFilterSortEntrypointAtom, null)
+      set(
+        physicalSortDiagnosticBackingAtom,
+        Object.freeze({
+          code,
+          message,
+          ...(result && result.anchor !== undefined ? { anchor: result.anchor } : {}),
+        }),
+      )
+      set(filterSortEntrypointStateBackingAtom, entrypointStateForTicket('error', ticket, message))
+      return
+    }
+
+    // Applied. A no-op (movedRows === 0) resolves successfully but records NO
+    // history entry — an identity sort is not an undo step (design §7).
+    if (result.movedRows > 0) {
+      set(pushHistoryAtom, {
+        transactionId: `range-sort-${target.sheetId}-${requestId}`,
+        kind: 'range.sort',
+        sheetId: target.sheetId,
+        projectionRevision: result.revision ?? requestId,
+        affectedRange: result.affectedRange ?? range,
+      })
+    }
+    set(physicalSortDiagnosticBackingAtom, null)
+    set(
+      filterSortEntrypointStateBackingAtom,
+      entrypointStateForTicket('local-acknowledged', ticket),
+    )
+
+    await Promise.resolve()
+    if (!ownsTicket()) return
+    set(filterSortEntrypointStateBackingAtom, entrypointStateForTicket('refreshing', ticket))
+    try {
+      await input.refreshProjection(target.sheetId)
+    } catch (error) {
+      if (!ownsTicket()) return
+      set(
+        filterSortEntrypointStateBackingAtom,
+        entrypointStateForTicket('refresh-failed', ticket, refreshFailureError(error)),
+      )
+      return
+    }
+    if (!ownsTicket()) return
+    set(activeFilterSortEntrypointAtom, null)
+    set(filterSortEntrypointStateBackingAtom, entrypointStateForTicket('idle', ticket))
+  },
+)
+runPhysicalSortAtom.debugLabel = 'spreadsheet.sort.runPhysical'

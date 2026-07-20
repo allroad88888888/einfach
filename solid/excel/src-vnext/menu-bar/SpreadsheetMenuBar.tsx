@@ -40,7 +40,7 @@ import {
   reportCopyAsStatusAtom,
   retryFilterSortRefreshAtom,
   removeDuplicatesCapabilityAtom,
-  runFilterSortEntrypointAtom,
+  runPhysicalSortAtom,
   runStructureOperationAtom,
   unhideViewportSelectionAtom,
   runTextToColumnsEntrypointAtom,
@@ -72,6 +72,7 @@ import {
   dispatchRedo,
   dispatchUndo,
   refreshVisibleProjection,
+  resolveSortRange,
   textToColumnsSupportedAtom,
   useSpreadsheetBackend,
   useSpreadsheetUiStore,
@@ -533,12 +534,24 @@ export function SpreadsheetMenuBar(props: SpreadsheetMenuBarProps) {
       case 'sort-asc':
       case 'sort-desc': {
         const direction = dispatch.kind === 'sort-asc' ? 'asc' : 'desc'
-        void store.setter(runFilterSortEntrypointAtom, {
-          source: backend,
-          entrypoint: 'menu-bar',
-          direction,
-          refreshProjection: (sheetId) => refreshVisibleProjection(store, backend, sheetId),
-        })
+        // One physical-sort command; the capability split (engine sortRange vs
+        // display permutation) is resolved inside `runPhysicalSortAtom`.
+        void (async () => {
+          const snap = store.getter(selectionSnapshotAtom)
+          const sheetId = snap.activeCell.sheetId || getActiveSheetId()
+          if (!sheetId) return
+          const range =
+            typeof backend.sortRange === 'function'
+              ? await resolveSortRange(store, backend, sheetId, snap.activeCell)
+              : null
+          void store.setter(runPhysicalSortAtom, {
+            source: backend,
+            entrypoint: 'menu-bar',
+            direction,
+            range,
+            refreshProjection: (target) => refreshVisibleProjection(store, backend, target),
+          })
+        })()
         return
       }
       case 'toggle-formula-bar':

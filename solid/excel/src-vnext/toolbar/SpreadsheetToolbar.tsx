@@ -23,10 +23,11 @@ import {
   openToolbarDropdownAtom,
   openToolbarPaletteAtom,
   openValidationRuleEditorAtom,
+  physicalSortDiagnosticAtom,
   resolveContentMutationAtom,
   retryFilterSortRefreshAtom,
   retryToolbarMutationRefreshAtom,
-  runFilterSortEntrypointAtom,
+  runPhysicalSortAtom,
   runToolbarMutationAtom,
   selectionSnapshotAtom,
   toolbarActiveSurfaceAtom,
@@ -52,6 +53,7 @@ import {
 import {
   isVisibleProjectionResult,
   refreshVisibleProjection,
+  resolveSortRange,
   spreadsheetProjectionSnapshotAtom,
   useSpreadsheetBackend,
   useSpreadsheetUiStore,
@@ -391,6 +393,7 @@ export function SpreadsheetToolbar(props: SpreadsheetToolbarProps) {
   const t = useT()
   const availability = useAtomValue(toolbarCommandAvailabilityAtom)
   const filterSortEntrypoint = useAtomValue(filterSortEntrypointProjectionAtom)
+  const physicalSortDiagnostic = useAtomValue(physicalSortDiagnosticAtom)
   const findReplaceCapability = useAtomValue(findReplaceCapabilityProjectionAtom)
   const activeToolbarSurface = useAtomValue(toolbarActiveSurfaceAtom)
   const toolbarMutationLifecycle = useAtomValue(toolbarMutationLifecycleAtom)
@@ -1082,13 +1085,25 @@ export function SpreadsheetToolbar(props: SpreadsheetToolbarProps) {
     })
   }
 
-  function handleSortSelect(direction: SortDirection) {
+  // Sort now dispatches ONE physical-sort command. When the backend exposes
+  // `sortRange` (worker host) the region is resolved and the engine reorders
+  // data physically; otherwise (static host) the command delegates to the
+  // display permutation. The capability split is transparent to this handler.
+  async function handleSortSelect(direction: SortDirection) {
     closeToolbarSurface()
-    void store.setter(runFilterSortEntrypointAtom, {
+    const snap = store.getter(selectionSnapshotAtom)
+    const sheetId = snap.activeCell.sheetId || availability().sheetId
+    if (!sheetId) return
+    const range =
+      typeof backend.sortRange === 'function'
+        ? await resolveSortRange(store, backend, sheetId, snap.activeCell)
+        : null
+    void store.setter(runPhysicalSortAtom, {
       source: backend,
       entrypoint: 'toolbar',
       direction,
-      refreshProjection: (sheetId) => refreshVisibleProjection(store, backend, sheetId),
+      range,
+      refreshProjection: (target) => refreshVisibleProjection(store, backend, target),
     })
   }
 
@@ -1740,9 +1755,13 @@ export function SpreadsheetToolbar(props: SpreadsheetToolbarProps) {
             sortDropdownOpen() ? 'fmt-btn-active' : ''
           }`.trim()}
           data-testid="toolbar-btn-sort"
-          data-tooltip={filterSortEntrypoint().disabledReason ?? t('toolbar.sort.title')}
+          data-tooltip={
+            physicalSortDiagnostic()?.message ??
+            filterSortEntrypoint().disabledReason ??
+            t('toolbar.sort.title')
+          }
           aria-label={t('toolbar.sort.title')}
-          title={filterSortEntrypoint().disabledReason ?? ''}
+          title={physicalSortDiagnostic()?.message ?? filterSortEntrypoint().disabledReason ?? ''}
           aria-haspopup="menu"
           aria-expanded={sortDropdownOpen()}
           disabled={filterSortEntrypoint().disabled}
