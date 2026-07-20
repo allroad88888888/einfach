@@ -21,6 +21,8 @@ import type {
   SortRangeRejectWire,
   SortRangeReportWire,
   SparseCellWire,
+  TableJSONWire,
+  TableRejectCode,
   SparseRangeWire,
   WorkbookImportStatsWire,
   WorkbookSheetMeta,
@@ -140,6 +142,28 @@ type WasmWorkbookRuntime = {
    * guards the call at dispatch time.
    */
   sortRange?: (sheetIdx: number, payload: unknown) => unknown
+  /**
+   * Excel Table CRUD (#32). `createTable` returns the engine-assigned
+   * canonical name; rename / rename-column / delete return `void`.
+   * Structured engine rejections THROW a `TableError` string
+   * (`"range-overlap"`, `"name-conflict"`, …) — the dispatcher maps the
+   * known set to a `TABLE_REJECTED` RPC error. Optional so pre-#32
+   * wasm-pkg builds and test mocks keep compiling; `assertMethod` guards
+   * the call at dispatch time.
+   */
+  createTable?: (
+    sheetIdx: number,
+    startRow: number,
+    startCol: number,
+    endRow: number,
+    endCol: number,
+    name?: string,
+  ) => string
+  renameTable?: (name: string, newName: string) => void
+  renameTableColumn?: (name: string, oldColumn: string, newColumn: string) => void
+  deleteTable?: (name: string) => void
+  listTables?: () => TableJSONWire[]
+  getTable?: (name: string) => TableJSONWire | null
   snapshot_persistence_v1?: () => WorkbookPersistenceSnapshotWire
   restore_persistence_v1?: (
     snapshot: WorkbookPersistenceSnapshotWire,
@@ -1240,6 +1264,52 @@ function toRpcError(err: unknown): RpcErrorWire {
   return { code: 'WORKER_ERROR', message: String(err) }
 }
 
+// Excel Table CRUD (#32). The WASM `create_table` / `rename_table` / …
+// bindings map every `TableError` to `JsValue::from_str(<code>)`, which
+// wasm-bindgen throws as a bare JS string. Recognize the known set and
+// surface it as a structured `TABLE_REJECTED` RPC error (detail.code =
+// the engine reason) so the host adapter converts it into a not-applied
+// result instead of a generic WORKER_ERROR — mirrors `SORT_REJECTED`.
+const TABLE_REJECTION_CODES = new Set<TableRejectCode>([
+  'too-many-tables',
+  'invalid-name',
+  'reserved-name',
+  'name-like-cell-ref',
+  'name-conflict',
+  'range-overlap',
+  'sheet-not-found',
+  'not-found',
+  'column-not-found',
+  'duplicate-column',
+  'invalid-column-name',
+  'mutation-during-custom-call',
+])
+
+function tableRejectionCode(err: unknown): TableRejectCode | null {
+  const message = typeof err === 'string' ? err : err instanceof Error ? err.message : ''
+  return TABLE_REJECTION_CODES.has(message as TableRejectCode) ? (message as TableRejectCode) : null
+}
+
+/**
+ * Run a table binding and post its response, converting a recognized
+ * `TableError` throw into a structured `TABLE_REJECTED` error. Non-table
+ * throws (invalid sheet, missing method, serialize failure) rethrow to
+ * the outer dispatcher, which posts a single generic error — no
+ * double-post because this path posted nothing.
+ */
+function dispatchTable(id: number, run: () => unknown): void {
+  let result: unknown
+  try {
+    result = run()
+  } catch (err) {
+    const code = tableRejectionCode(err)
+    if (code === null) throw err
+    postError(id, { code: 'TABLE_REJECTED', message: code, detail: { code } })
+    return
+  }
+  postResponse(id, result)
+}
+
 let workerRuntimeInstalled = false
 
 export function installWorkerRuntime() {
@@ -1411,6 +1481,75 @@ export function installWorkerRuntime() {
                 rowPermutation: report.rowPermutation,
               })
             }
+          }
+          break
+        case 'createTable':
+          {
+            const sheet = Number(msg.sheet)
+            assertSheet(wb, sheet)
+            const bounds = (msg.bounds ?? {}) as {
+              startRow: number
+              startCol: number
+              endRow: number
+              endCol: number
+            }
+            const createTable = assertMethod(wb, 'createTable')
+            const name = typeof msg.name === 'string' ? msg.name : undefined
+            dispatchTable(msg.id, () =>
+              createTable.call(
+                wb,
+                sheet,
+                Number(bounds.startRow),
+                Number(bounds.startCol),
+                Number(bounds.endRow),
+                Number(bounds.endCol),
+                name,
+              ),
+            )
+          }
+          break
+        case 'renameTable':
+          {
+            const renameTable = assertMethod(wb, 'renameTable')
+            dispatchTable(msg.id, () => {
+              renameTable.call(wb, String(msg.name), String(msg.newName))
+              return true
+            })
+          }
+          break
+        case 'renameTableColumn':
+          {
+            const renameTableColumn = assertMethod(wb, 'renameTableColumn')
+            dispatchTable(msg.id, () => {
+              renameTableColumn.call(
+                wb,
+                String(msg.name),
+                String(msg.oldColumn),
+                String(msg.newColumn),
+              )
+              return true
+            })
+          }
+          break
+        case 'deleteTable':
+          {
+            const deleteTable = assertMethod(wb, 'deleteTable')
+            dispatchTable(msg.id, () => {
+              deleteTable.call(wb, String(msg.name))
+              return true
+            })
+          }
+          break
+        case 'listTables':
+          {
+            const listTables = assertMethod(wb, 'listTables')
+            dispatchTable(msg.id, () => listTables.call(wb))
+          }
+          break
+        case 'getTable':
+          {
+            const getTable = assertMethod(wb, 'getTable')
+            dispatchTable(msg.id, () => getTable.call(wb, String(msg.name)))
           }
           break
         case 'setFormatRange':

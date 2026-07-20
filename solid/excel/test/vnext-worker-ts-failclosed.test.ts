@@ -146,9 +146,34 @@ describe('TS worker runtime — structured UNSUPPORTED instead of success-shaped
       tsvChunkExport: false,
       persistenceFormats: false,
       sortRange: false,
+      structuredTables: false,
     }
     expect(expectOk(await raw({ cmd: 'describeCapabilities' }))).toEqual(witness)
     expect({ ...TS_WORKER_RUNTIME_CAPABILITIES }).toEqual(witness)
+  })
+
+  test('table CRUD commands refuse with UNSUPPORTED (no fake registry ACKs)', async () => {
+    const { raw } = makeRpc()
+    await raw({ cmd: 'initWorkbook', sheets: ['Sheet1'] })
+
+    // An empty `listTables` / null `getTable` would read as "workbook has
+    // no tables" — a lie. The TS core models no Table registry, so every
+    // command refuses honestly.
+    expectUnsupported(
+      await raw({
+        cmd: 'createTable',
+        sheet: 0,
+        bounds: { startRow: 0, startCol: 0, endRow: 3, endCol: 2 },
+        name: 'Table1',
+      }),
+    )
+    expectUnsupported(await raw({ cmd: 'renameTable', name: 'Table1', newName: 'Sales' }))
+    expectUnsupported(
+      await raw({ cmd: 'renameTableColumn', name: 'Table1', oldColumn: 'A', newColumn: 'B' }),
+    )
+    expectUnsupported(await raw({ cmd: 'deleteTable', name: 'Table1' }))
+    expectUnsupported(await raw({ cmd: 'listTables' }))
+    expectUnsupported(await raw({ cmd: 'getTable', name: 'Table1' }))
   })
 
   test('sortRange refuses with UNSUPPORTED and moves no data', async () => {
@@ -333,6 +358,14 @@ describe('TS worker backend — the capability handshake withholds unimplemented
     // Engine physical sort: the TS runtime declares `sortRange: false`, so
     // the port is withheld and UI-core hides the physical-sort entry.
     expect(backend.sortRange).toBeUndefined()
+    // Excel Table CRUD: the TS runtime declares `structuredTables: false`,
+    // so all six ports are withheld and UI-core hides the Table entries.
+    expect(backend.createTable).toBeUndefined()
+    expect(backend.renameTable).toBeUndefined()
+    expect(backend.renameTableColumn).toBeUndefined()
+    expect(backend.deleteTable).toBeUndefined()
+    expect(backend.listTables).toBeUndefined()
+    expect(backend.getTable).toBeUndefined()
 
     backend.dispose()
   })
@@ -438,6 +471,13 @@ describe('legacy runtimes without the handshake keep the full-trust contract (WA
     expect(typeof backend.setFormatRange).toBe('function')
     // Full-trust null witness keeps the engine physical-sort port exposed.
     expect(typeof backend.sortRange).toBe('function')
+    // Full-trust null witness keeps the Table CRUD ports exposed too.
+    expect(typeof backend.createTable).toBe('function')
+    expect(typeof backend.renameTable).toBe('function')
+    expect(typeof backend.renameTableColumn).toBe('function')
+    expect(typeof backend.deleteTable).toBe('function')
+    expect(typeof backend.listTables).toBe('function')
+    expect(typeof backend.getTable).toBe('function')
 
     backend.dispose()
   })

@@ -117,6 +117,11 @@ export const TS_WORKER_RUNTIME_CAPABILITIES: WorkerRuntimeCapabilitiesWire = Obj
   // relocate + verbatim carry + spill gate). Declaring `false` withholds
   // the host sort port; a real implementation is the optional S7 slice.
   sortRange: false,
+  // The TS core (`@einfach/excel-core-ts`) has no Excel Table registry —
+  // no structured-reference parser, no table geometry. Declaring `false`
+  // withholds the six table CRUD ports (fail-closed); WASM is the only
+  // real Table path (design-excel-table.md §1/§10).
+  structuredTables: false,
 })
 
 const CUSTOM_FORMULA_ERROR_CODES: readonly ErrorCode[] = [
@@ -1495,6 +1500,18 @@ export function createWorkerRuntimeTs(events?: WorkerRuntimeTsEvents): ExcelCore
         // refusal is structured and honest (never a success-shaped reply
         // that would leave the host believing data moved).
         return unsupported('sortRange (engine physical sort)')
+      case 'createTable':
+      case 'renameTable':
+      case 'renameTableColumn':
+      case 'deleteTable':
+      case 'listTables':
+      case 'getTable':
+        // Fail-closed: the TS core models no Excel Table registry. The
+        // `structuredTables: false` witness withholds the host ports, so a
+        // compliant adapter never sends these; if one does, refuse
+        // honestly rather than fake an ACK (an empty `listTables` would
+        // read as "workbook has no tables" — a lie).
+        return unsupported(`${String(msg.cmd)} (structured tables)`)
       case 'setFormatRange':
         // Fail-closed: was "succeed with 0 cells affected".
         return unsupported('setFormatRange (formats)')

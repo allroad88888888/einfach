@@ -41,6 +41,32 @@ import type {
   SetSheetProtectionRequest,
 } from '../protection/types'
 import type { PasteRangeRequest, PasteRangeResult, PasteSpecialKind } from '../paste-special/types'
+import type {
+  CreateTableRequest,
+  CreateTableResult,
+  DeleteTableRequest,
+  GetTableRequest,
+  GetTableResult,
+  ListTablesRequest,
+  ListTablesResult,
+  RenameTableColumnRequest,
+  RenameTableRequest,
+  TableMutationResult,
+} from '../tables/types'
+
+// --- tables (Excel Table CRUD — parity #32) ---
+export type {
+  CreateTableRequest,
+  CreateTableResult,
+  DeleteTableRequest,
+  GetTableRequest,
+  GetTableResult,
+  ListTablesRequest,
+  ListTablesResult,
+  RenameTableColumnRequest,
+  RenameTableRequest,
+  TableMutationResult,
+}
 
 export type {
   ClearNoteRequest,
@@ -1002,6 +1028,26 @@ export interface SpreadsheetBackend {
     options?: { isAsync?: boolean },
   ): Promise<void>
   unregisterCustomFormula?(name: string): Promise<void>
+  // tables — Excel Table CRUD (parity #32, design-excel-table.md §10).
+  // Optional capability family: host adapters whose engine has no Table
+  // model omit these ports (the TS worker declares `structuredTables:
+  // false`, the static backend implements none), which hides every Table
+  // entry through the standard method-presence degradation contract. The
+  // engine registry is canonical (CANONICAL_OWNERSHIP §3 #32) — these are
+  // the only path UI core reads a table's geometry; it stores no second
+  // copy. `createTable` resolves the engine-assigned canonical name OR a
+  // structured `TableMutationRejectedResult` (name conflict / range
+  // overlap / cap 256 / …) rather than rejecting the promise; rename and
+  // delete follow the same applied-or-structured-reject convention.
+  // Table-definition undo is NOT wired in this slice (design §11/§12
+  // known gap — persistence and the snapshot primitive do not carry the
+  // table registry).
+  createTable?(request: CreateTableRequest): Promise<CreateTableResult>
+  renameTable?(request: RenameTableRequest): Promise<TableMutationResult>
+  renameTableColumn?(request: RenameTableColumnRequest): Promise<TableMutationResult>
+  deleteTable?(request: DeleteTableRequest): Promise<TableMutationResult>
+  listTables?(request: ListTablesRequest): Promise<ListTablesResult>
+  getTable?(request: GetTableRequest): Promise<GetTableResult>
   // content-change push — Wave 8.2. Optional capability: backends whose
   // engine can change cell content OUTSIDE a UI-initiated mutation
   // (async custom-formula settles, collaborative edits) invoke the

@@ -246,6 +246,50 @@ export interface SortRangeRejectWire {
   message?: string
 }
 
+// === Excel Table registry wire (#32) — CRUD DTO ===
+
+/**
+ * Serialized `TableEntry` as emitted by the WASM `listTables` / `getTable`
+ * bindings (`rust/wasm/src/lib.rs` `TableJSON`). `range` is an A1 string
+ * (`"A1:C10"`) spanning header + data (+ totals when present); `sheetIndex`
+ * is the resolved 0-based engine sheet index and `sheet` its display name.
+ */
+export interface TableJSONWire {
+  name: string
+  sheet: string
+  sheetIndex: number
+  range: string
+  hasHeaders: boolean
+  hasTotals: boolean
+  columns: string[]
+}
+
+/**
+ * Structured reject reasons the engine returns for a table mutation. They
+ * ride on the `TABLE_REJECTED` RPC error's `detail` (see
+ * `RpcErrorWire.detail`) — `detail.code` is the raw engine `TableError`
+ * string, mirroring the `SORT_REJECTED` convention so the host adapter can
+ * map it to a structured not-applied result instead of a bare throw.
+ */
+export type TableRejectCode =
+  | 'too-many-tables'
+  | 'invalid-name'
+  | 'reserved-name'
+  | 'name-like-cell-ref'
+  | 'name-conflict'
+  | 'range-overlap'
+  | 'sheet-not-found'
+  | 'not-found'
+  | 'column-not-found'
+  | 'duplicate-column'
+  | 'invalid-column-name'
+  | 'mutation-during-custom-call'
+
+export interface TableRejectWire {
+  code: TableRejectCode
+  message?: string
+}
+
 export interface WorkbookPersistenceSheetWire {
   idx: number
   name: string
@@ -298,6 +342,14 @@ export interface WorkerRuntimeCapabilitiesWire {
   persistenceFormats: boolean
   /** sortRange physically reorders workbook data (engine physical sort). */
   sortRange: boolean
+  /**
+   * createTable / renameTable / renameTableColumn / deleteTable /
+   * listTables / getTable are backed by a real engine Table registry
+   * (Excel Table CRUD — #32). The TS runtime has no Table model and
+   * declares this `false`; the WASM runtime's null witness keeps the
+   * family trusted.
+   */
+  structuredTables: boolean
 }
 
 export interface WorkerWorkbookSheetDebugCountersWire {
@@ -374,6 +426,21 @@ export interface WorkerWorkbookClient {
    * handshake, so a compliant caller never reaches this on that runtime.
    */
   sortRange(sheet: number, payload: SortRangePayloadWire): Promise<SortRangeReportWire>
+  /**
+   * Excel Table CRUD (#32, design-excel-table.md §10). Optional so
+   * hand-rolled client doubles (tests) keep compiling; the WASM runtime
+   * always implements them and the host adapter guards presence before
+   * use. `createTable` resolves the engine-assigned canonical name;
+   * rename / rename-column / delete resolve `void`. A structured engine
+   * reject surfaces as an Error whose `code` is `TABLE_REJECTED` and whose
+   * `detail` is a `TableRejectWire` (mirrors the `sortRange` convention).
+   */
+  createTable?(sheet: number, bounds: SortRangeBoundsWire, name?: string): Promise<string>
+  renameTable?(name: string, newName: string): Promise<void>
+  renameTableColumn?(name: string, oldColumn: string, newColumn: string): Promise<void>
+  deleteTable?(name: string): Promise<void>
+  listTables?(): Promise<TableJSONWire[]>
+  getTable?(name: string): Promise<TableJSONWire | null>
   beginImport(
     sessionIdOrOptions?: number | BeginImportOptionsWire,
     options?: BeginImportOptionsWire,
@@ -672,6 +739,28 @@ export function createWorkerWorkbook(opts: WorkerWorkbookOptions): WorkerWorkboo
     },
     sortRange(sheet, payload) {
       return request<SortRangeReportWire>('sortRange', { sheet, payload })
+    },
+    createTable(sheet, bounds, name) {
+      return request<string>('createTable', {
+        sheet,
+        bounds,
+        ...(name === undefined ? {} : { name }),
+      })
+    },
+    renameTable(name, newName) {
+      return request<void>('renameTable', { name, newName })
+    },
+    renameTableColumn(name, oldColumn, newColumn) {
+      return request<void>('renameTableColumn', { name, oldColumn, newColumn })
+    },
+    deleteTable(name) {
+      return request<void>('deleteTable', { name })
+    },
+    listTables() {
+      return request<TableJSONWire[]>('listTables')
+    },
+    getTable(name) {
+      return request<TableJSONWire | null>('getTable', { name })
     },
     beginImport(sessionIdOrOptions, options) {
       const sessionId =

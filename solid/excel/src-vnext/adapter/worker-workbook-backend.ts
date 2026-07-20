@@ -55,6 +55,19 @@ import type {
   SortRangeRejectionCode,
   SortRangeRequest,
   SortRangeResult,
+  CreateTableRequest,
+  CreateTableResult,
+  DeleteTableRequest,
+  GetTableRequest,
+  GetTableResult,
+  ListTablesRequest,
+  ListTablesResult,
+  RenameTableColumnRequest,
+  RenameTableRequest,
+  SpreadsheetTableDescriptor,
+  TableMutationRejectedResult,
+  TableMutationRejectionCode,
+  TableMutationResult,
   SpreadsheetBackend,
   RedoTransactionRequest,
   UndoTransactionRequest,
@@ -115,6 +128,7 @@ import {
   type SortRangePayloadWire,
   type SortRangeReportWire,
   type SparseCellWire,
+  type TableJSONWire,
   type SparseRangeWire,
   type WorkerLike,
   type WorkerRuntimeCapabilitiesWire,
@@ -2827,6 +2841,205 @@ export function createWorkerWorkbookSpreadsheetBackend(
     }
   }
 
+  // --- Excel Table CRUD (design-excel-table.md §10, parity #32) ---------
+  //
+  // The engine registry is canonical (CANONICAL_OWNERSHIP §3 #32): these
+  // ports are the only path UI core reads a table's geometry, and the
+  // adapter keeps no second copy. Capability-gated by `structuredTables`.
+  //
+  // TODO(#32 undo, design §11/§12): table-definition mutations are NOT
+  // wrapped in a host-orchestrated undo transaction. The snapshot
+  // primitive and persistence v1 do not carry the table registry, so a
+  // Ctrl+Z cannot replay a create/rename/delete of the table itself.
+  // The cell-level fallout of a totals-row toggle (formula writes) is
+  // still covered by the existing recordCellMutation cell snapshots; the
+  // registry entry is not. Wire this once the registry replay protocol
+  // lands (§4-3). Create / rename / delete bump the revision so the next
+  // projection read reflects any referencing-formula recalc (engine epoch
+  // handles the recompute; worker cellsDirty pushes drive reprojection).
+
+  const TABLE_REJECTION_CODES = new Set<TableMutationRejectionCode>([
+    'too-many-tables',
+    'invalid-name',
+    'reserved-name',
+    'name-like-cell-ref',
+    'name-conflict',
+    'range-overlap',
+    'sheet-not-found',
+    'not-found',
+    'column-not-found',
+    'duplicate-column',
+    'invalid-column-name',
+    'mutation-during-custom-call',
+  ])
+
+  function normalizeTableRejectionCode(code: unknown): TableMutationRejectionCode {
+    return typeof code === 'string' && TABLE_REJECTION_CODES.has(code as TableMutationRejectionCode)
+      ? (code as TableMutationRejectionCode)
+      : 'invalid-payload'
+  }
+
+  type TableClientMethod =
+    | 'createTable'
+    | 'renameTable'
+    | 'renameTableColumn'
+    | 'deleteTable'
+    | 'listTables'
+    | 'getTable'
+
+  function requireTableClient<K extends TableClientMethod>(
+    method: K,
+  ): NonNullable<WorkerWorkbookClient[K]> {
+    const fn = client[method]
+    if (typeof fn !== 'function') {
+      throw createBackendError('UNSUPPORTED', `worker runtime does not implement ${method}`)
+    }
+    return fn.bind(client) as NonNullable<WorkerWorkbookClient[K]>
+  }
+
+  function toTableDescriptor(wire: TableJSONWire): SpreadsheetTableDescriptor {
+    const sheet = lookup.sheets.find((entry) => entry.idx === wire.sheetIndex)
+    return {
+      name: wire.name,
+      sheetId: sheet?.id ?? '',
+      sheetName: wire.sheet,
+      sheetIndex: wire.sheetIndex,
+      range: wire.range,
+      hasHeaders: wire.hasHeaders,
+      hasTotals: wire.hasTotals,
+      columns: wire.columns,
+    }
+  }
+
+  function tableRejectionFromError(
+    request: { requestId?: number; revision?: number | string },
+    error: unknown,
+  ): TableMutationRejectedResult | null {
+    const err = error as Error & { code?: string; detail?: unknown }
+    if (err?.code !== 'TABLE_REJECTED') return null
+    const detail = (err.detail ?? {}) as { code?: unknown; message?: unknown }
+    return {
+      kind: 'table-mutation-not-applied',
+      applied: false,
+      code: normalizeTableRejectionCode(detail.code),
+      message: typeof detail.message === 'string' ? detail.message : err.message,
+      requestId: request.requestId,
+      // A rejected mutation never bumps: echo the current (un-bumped) witness.
+      revision: request.revision ?? revision,
+    }
+  }
+
+  async function createTableThroughWorker(request: CreateTableRequest): Promise<CreateTableResult> {
+    const sheet = await resolveSheet(request.sheetId)
+    const range = normalizeRange(request.range)
+    try {
+      const name = await requireTableClient('createTable')(
+        sheet.idx,
+        toSortRangeBounds(range),
+        request.name,
+      )
+      const nextRevision = bumpRevision()
+      return {
+        kind: 'create-table',
+        applied: true,
+        name,
+        requestId: request.requestId,
+        revision: request.revision ?? nextRevision,
+      }
+    } catch (error) {
+      const rejection = tableRejectionFromError(request, error)
+      if (rejection !== null) return rejection
+      throw error
+    }
+  }
+
+  async function renameTableThroughWorker(
+    request: RenameTableRequest,
+  ): Promise<TableMutationResult> {
+    await readyPromise
+    try {
+      await requireTableClient('renameTable')(request.name, request.newName)
+      const nextRevision = bumpRevision()
+      return {
+        kind: 'table-mutation',
+        applied: true,
+        name: request.newName,
+        requestId: request.requestId,
+        revision: request.revision ?? nextRevision,
+      }
+    } catch (error) {
+      const rejection = tableRejectionFromError(request, error)
+      if (rejection !== null) return rejection
+      throw error
+    }
+  }
+
+  async function renameTableColumnThroughWorker(
+    request: RenameTableColumnRequest,
+  ): Promise<TableMutationResult> {
+    await readyPromise
+    try {
+      await requireTableClient('renameTableColumn')(
+        request.name,
+        request.oldColumn,
+        request.newColumn,
+      )
+      const nextRevision = bumpRevision()
+      return {
+        kind: 'table-mutation',
+        applied: true,
+        name: request.name,
+        requestId: request.requestId,
+        revision: request.revision ?? nextRevision,
+      }
+    } catch (error) {
+      const rejection = tableRejectionFromError(request, error)
+      if (rejection !== null) return rejection
+      throw error
+    }
+  }
+
+  async function deleteTableThroughWorker(
+    request: DeleteTableRequest,
+  ): Promise<TableMutationResult> {
+    await readyPromise
+    try {
+      await requireTableClient('deleteTable')(request.name)
+      const nextRevision = bumpRevision()
+      return {
+        kind: 'table-mutation',
+        applied: true,
+        name: request.name,
+        requestId: request.requestId,
+        revision: request.revision ?? nextRevision,
+      }
+    } catch (error) {
+      const rejection = tableRejectionFromError(request, error)
+      if (rejection !== null) return rejection
+      throw error
+    }
+  }
+
+  async function listTablesThroughWorker(request: ListTablesRequest): Promise<ListTablesResult> {
+    await readyPromise
+    const wires = await requireTableClient('listTables')()
+    return {
+      requestId: request.requestId,
+      revision,
+      tables: wires.map(toTableDescriptor),
+    }
+  }
+
+  async function getTableThroughWorker(request: GetTableRequest): Promise<GetTableResult> {
+    await readyPromise
+    const wire = await requireTableClient('getTable')(request.name)
+    return {
+      requestId: request.requestId,
+      revision,
+      table: wire ? toTableDescriptor(wire) : null,
+    }
+  }
+
   return {
     async listSheets() {
       await refreshSheetLookup()
@@ -3506,6 +3719,33 @@ export function createWorkerWorkbookSpreadsheetBackend(
      */
     get sortRange() {
       return runtimeSupports('sortRange') ? sortRangeThroughWorker : undefined
+    },
+
+    /**
+     * Excel Table CRUD (design-excel-table.md §10, parity #32).
+     * Capability-gated by `structuredTables`: the TS worker declares it
+     * `false` so every port reads `undefined` and UI-core hides the Table
+     * entries; the WASM runtime's null witness keeps them exposed (full
+     * trust). See the `*ThroughWorker` functions above for the reject
+     * mapping and the (deferred) undo note.
+     */
+    get createTable() {
+      return runtimeSupports('structuredTables') ? createTableThroughWorker : undefined
+    },
+    get renameTable() {
+      return runtimeSupports('structuredTables') ? renameTableThroughWorker : undefined
+    },
+    get renameTableColumn() {
+      return runtimeSupports('structuredTables') ? renameTableColumnThroughWorker : undefined
+    },
+    get deleteTable() {
+      return runtimeSupports('structuredTables') ? deleteTableThroughWorker : undefined
+    },
+    get listTables() {
+      return runtimeSupports('structuredTables') ? listTablesThroughWorker : undefined
+    },
+    get getTable() {
+      return runtimeSupports('structuredTables') ? getTableThroughWorker : undefined
     },
 
     /**
