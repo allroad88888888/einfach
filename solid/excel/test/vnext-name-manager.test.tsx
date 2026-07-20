@@ -6,6 +6,7 @@ import { afterEach, beforeEach, describe, expect, it, jest } from '@jest/globals
 import { createStore, type Store } from '@einfach/core'
 import { cleanup, fireEvent, render, waitFor } from '@solidjs/testing-library'
 import {
+  allTablesAtom,
   deleteNameManagerEntryAtom,
   nameManagerDraftGenerationAtom,
   nameManagerEditorAtom,
@@ -22,6 +23,8 @@ import {
   setSheetTabsSheetsAtom,
   type DeleteNamedRangeRequest,
   type ListNamedRangesRequest,
+  type ListTablesRequest,
+  type ListTablesResult,
   type NamedRange,
   type NamedRangeBackendCapabilities,
   type NamedRangeControllerPort,
@@ -29,6 +32,7 @@ import {
   type NamedRangeMutationResult,
   type SetNamedRangeRequest,
   type SpreadsheetBackend,
+  type SpreadsheetTableDescriptor,
 } from '@einfach/spreadsheet-ui-core'
 import { SpreadsheetNameManagerDialog } from '../src-vnext/named-ranges'
 import { SpreadsheetUiProvider, type NamedRangeCapabilityPort } from '../src-vnext/provider'
@@ -582,5 +586,129 @@ describe('SpreadsheetNameManagerDialog core adapter', () => {
     expect(source).toContain('deleteNameManagerEntryAtom')
     expect(source).toContain('namedRangeRegistryStateAtom')
     expect(source).toContain('namedRangeMutationStateAtom')
+  })
+})
+
+const SALES_TABLE: SpreadsheetTableDescriptor = Object.freeze({
+  name: 'SalesTable',
+  sheetId: 'sheet-1',
+  sheetName: 'Sheet 1',
+  sheetIndex: 0,
+  range: 'A1:C10',
+  hasHeaders: true,
+  hasTotals: true,
+  columns: Object.freeze(['Region', 'Q1', 'Q2']),
+})
+
+const COSTS_TABLE: SpreadsheetTableDescriptor = Object.freeze({
+  name: 'CostsTable',
+  sheetId: 'sheet-2',
+  sheetName: 'Sheet 2',
+  sheetIndex: 1,
+  range: 'B2:D8',
+  hasHeaders: true,
+  hasTotals: false,
+  columns: Object.freeze(['Item', 'Budget', 'Actual']),
+})
+
+describe('SpreadsheetNameManagerDialog tables region', () => {
+  it('refreshes the catalog on open and lists every workbook table', async () => {
+    const store = createStore()
+    const listTables = jest.fn(
+      async (request: ListTablesRequest): Promise<ListTablesResult> => ({
+        requestId: request.requestId,
+        revision: 1,
+        tables: [SALES_TABLE, COSTS_TABLE],
+      }),
+    )
+    const backend = makeBackend({ listTables })
+    seedSheets(store)
+    store.setter(openNameManagerAtom, { status: 'editing-new' })
+
+    const view = renderManager(store, backend)
+    await waitUntilReady(store)
+    await waitFor(() => expect(listTables).toHaveBeenCalledTimes(1))
+    await waitFor(() => expect(store.getter(allTablesAtom).length).toBe(2))
+
+    expect(view.getByTestId('name-manager-tables')).not.toBeNull()
+    const list = view.getByTestId('name-manager-tables-list')
+    expect(list.querySelectorAll('li').length).toBe(2)
+
+    const text = list.textContent ?? ''
+    expect(text).toContain('SalesTable')
+    expect(text).toContain('Sheet 1')
+    expect(text).toContain('A1:C10')
+    expect(text).toContain('Region, Q1, Q2')
+    expect(text).toContain('CostsTable')
+    expect(text).toContain('B2:D8')
+
+    // Totals badge only on the table that carries a totals row.
+    const totals = list.querySelectorAll('[data-testid="name-manager-table-totals"]')
+    expect(totals.length).toBe(1)
+    const salesRow = list.querySelector('[data-table-name="SalesTable"]') as HTMLElement
+    expect(salesRow.textContent).toContain('Totals row')
+    const costsRow = list.querySelector('[data-table-name="CostsTable"]') as HTMLElement
+    expect(costsRow.querySelector('[data-testid="name-manager-table-totals"]')).toBeNull()
+  })
+
+  it('does not read the table catalog until the dialog opens', async () => {
+    const store = createStore()
+    const listTables = jest.fn(
+      async (request: ListTablesRequest): Promise<ListTablesResult> => ({
+        requestId: request.requestId,
+        revision: 1,
+        tables: [SALES_TABLE],
+      }),
+    )
+    const backend = makeBackend({ listTables })
+    seedSheets(store)
+
+    const view = renderManager(store, backend)
+    await Promise.resolve()
+    expect(listTables).not.toHaveBeenCalled()
+    expect(view.queryByTestId('name-manager-tables')).toBeNull()
+
+    store.setter(openNameManagerAtom, { status: 'editing-new' })
+    await waitUntilReady(store)
+    await waitFor(() => expect(listTables).toHaveBeenCalledTimes(1))
+    await waitFor(() =>
+      expect(view.getByTestId('name-manager-tables-list').querySelectorAll('li').length).toBe(1),
+    )
+  })
+
+  it('shows the empty state when the workbook has no tables', async () => {
+    const store = createStore()
+    const listTables = jest.fn(
+      async (request: ListTablesRequest): Promise<ListTablesResult> => ({
+        requestId: request.requestId,
+        revision: 1,
+        tables: [],
+      }),
+    )
+    const backend = makeBackend({ listTables })
+    seedSheets(store)
+    store.setter(openNameManagerAtom, { status: 'editing-new' })
+
+    const view = renderManager(store, backend)
+    await waitUntilReady(store)
+    await waitFor(() => expect(listTables).toHaveBeenCalledTimes(1))
+
+    expect(view.getByTestId('name-manager-tables')).not.toBeNull()
+    await waitFor(() => expect(view.getByTestId('name-manager-tables-empty')).not.toBeNull())
+    expect(view.queryByTestId('name-manager-tables-list')).toBeNull()
+  })
+
+  it('hides the tables region when the backend omits listTables', async () => {
+    const store = createStore()
+    const backend = makeBackend()
+    seedSheets(store)
+    store.setter(openNameManagerAtom, { status: 'editing-new' })
+
+    const view = renderManager(store, backend)
+    await waitUntilReady(store)
+
+    expect(view.queryByTestId('name-manager-tables')).toBeNull()
+    expect(view.queryByTestId('name-manager-tables-list')).toBeNull()
+    expect(view.queryByTestId('name-manager-tables-empty')).toBeNull()
   })
 })

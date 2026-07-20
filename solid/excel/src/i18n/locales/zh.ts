@@ -591,6 +591,11 @@ export const messages: Record<string, string> = {
   'nameManager.kind.lambda': 'Lambda',
   'nameManager.params': '参数',
   'nameManager.lambdaBody': '函数体公式',
+  'nameManager.tables.title': '表格',
+  'nameManager.tables.empty': '当前工作簿没有表格。',
+  'nameManager.tables.location': '{sheet} · {range}',
+  'nameManager.tables.columns': '列：{columns}',
+  'nameManager.tables.hasTotals': '汇总行',
 
   'status.aggregate.sum': '求和',
   'status.aggregate.average': '平均',

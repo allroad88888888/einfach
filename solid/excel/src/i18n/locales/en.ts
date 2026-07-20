@@ -614,6 +614,11 @@ export const messages: Record<string, string> = {
   'nameManager.kind.lambda': 'Lambda',
   'nameManager.params': 'Params',
   'nameManager.lambdaBody': 'Body formula',
+  'nameManager.tables.title': 'Tables',
+  'nameManager.tables.empty': 'No tables in this workbook.',
+  'nameManager.tables.location': '{sheet} · {range}',
+  'nameManager.tables.columns': 'Columns: {columns}',
+  'nameManager.tables.hasTotals': 'Totals row',
 
   // Status bar
   'status.aggregate.sum': 'Sum',

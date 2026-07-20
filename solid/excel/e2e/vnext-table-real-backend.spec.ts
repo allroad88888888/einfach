@@ -136,4 +136,34 @@ test.describe('vNext Excel Table structured references — real WASM backend', (
     // The overlap reject never assigned a second name (still Table1).
     await expect(cell(page, 'E1')).toBeVisible()
   })
+
+  test('the Name Manager tables region lists a table created through the engine', async ({
+    page,
+  }) => {
+    test.skip(
+      !activeProjectIsWasm(),
+      'Excel Table CRUD is WASM-only (TS worker declares structuredTables:false)',
+    )
+    await gotoWorkerDemo(page)
+    await seedTableRegion(page)
+    await selectRange(page, 'E1:F4')
+
+    await page.getByTestId('menu-bar-button-data').click()
+    await page.getByTestId('menu-bar-item-data.createTable').click()
+    await expect(page.getByTestId('menu-bar-create-table-status')).toHaveText('Table1')
+
+    // Opening the Name Manager refreshes the read-only table catalog from the
+    // canonical engine registry — the created table appears in its own region.
+    await page.getByTestId('toolbar-btn-name-manager').click()
+    const dialog = page.getByTestId('vnext-worker-name-manager')
+    await expect(dialog).toBeVisible()
+
+    const region = dialog.getByTestId('name-manager-tables')
+    await expect(region).toBeVisible()
+    const list = dialog.getByTestId('name-manager-tables-list')
+    await expect(list).toContainText('Table1')
+    await expect(list).toContainText('E1:F4')
+    await expect(list).toContainText('Item, Qty')
+    await expect(list.locator('[data-table-name="Table1"]')).toHaveCount(1)
+  })
 })

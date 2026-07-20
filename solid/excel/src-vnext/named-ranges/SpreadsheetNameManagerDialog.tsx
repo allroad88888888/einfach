@@ -4,6 +4,7 @@ import { For, Show, createEffect, onCleanup } from 'solid-js'
 import { useAtomValue } from '@einfach/solid'
 import { locale, useT } from '../../src/i18n'
 import {
+  allTablesAtom,
   closeNameManagerAtom,
   deleteNameManagerEntryAtom,
   nameManagerEditorAtom,
@@ -19,6 +20,7 @@ import {
   namedRangeMutationStateAtom,
   namedRangeRegistryStateAtom,
   openNameManagerAtom,
+  refreshTableCatalogAtom,
   saveNameManagerAtom,
   sheetTabsSheetsAtom,
   workspaceSessionAtom,
@@ -108,8 +110,14 @@ export function SpreadsheetNameManagerDialog(props: SpreadsheetNameManagerDialog
   const refersTo = useAtomValue(nameManagerRefersToDraftAtom)
   const kind = useAtomValue(nameManagerKindDraftAtom)
   const params = useAtomValue(nameManagerParamsDraftAtom)
+  const allTables = useAtomValue(allTablesAtom)
 
   const isOpen = () => editor().status !== 'closed'
+  // Read-only Excel Table catalog. The engine registry is canonical; the
+  // dialog only lists the last `listTables` projection. Degrades by port
+  // presence — a backend whose engine has no Table model omits `listTables`
+  // and the whole region is hidden.
+  const tablesSupported = () => typeof backend.listTables === 'function'
   const interactionLocked = () =>
     mutation().status === 'pending' || registry().status === 'refreshing'
 
@@ -164,6 +172,16 @@ export function SpreadsheetNameManagerDialog(props: SpreadsheetNameManagerDialog
     if (registry().status === 'refreshing') return copy.refreshing
     return null
   }
+
+  // Refresh the read-only table catalog on the closed → open edge so the
+  // list reflects the canonical engine registry each time the dialog opens.
+  createEffect<boolean>((wasOpen) => {
+    const open = isOpen()
+    if (open && !wasOpen && tablesSupported()) {
+      store.setter(refreshTableCatalogAtom, backend)
+    }
+    return open
+  }, false)
 
   createEffect(() => {
     if (!isOpen()) return
@@ -339,6 +357,46 @@ export function SpreadsheetNameManagerDialog(props: SpreadsheetNameManagerDialog
             {t('nameManager.close')}
           </button>
         </div>
+
+        <Show when={tablesSupported()}>
+          <section class="nm-tables" data-testid="name-manager-tables">
+            <h3 class="nm-tables-title">{t('nameManager.tables.title')}</h3>
+            <Show
+              when={allTables().length > 0}
+              fallback={
+                <p class="nm-tables-empty" data-testid="name-manager-tables-empty">
+                  {t('nameManager.tables.empty')}
+                </p>
+              }
+            >
+              <ul class="nm-tables-list" data-testid="name-manager-tables-list">
+                <For each={allTables()}>
+                  {(table) => (
+                    <li class="nm-table-row" data-table-name={table.name}>
+                      <span class="nm-table-name">{table.name}</span>
+                      <span class="nm-table-location">
+                        {t('nameManager.tables.location', {
+                          sheet: table.sheetName,
+                          range: table.range,
+                        })}
+                      </span>
+                      <span class="nm-table-columns">
+                        {t('nameManager.tables.columns', {
+                          columns: table.columns.join(', '),
+                        })}
+                      </span>
+                      <Show when={table.hasTotals}>
+                        <span class="nm-table-totals" data-testid="name-manager-table-totals">
+                          {t('nameManager.tables.hasTotals')}
+                        </span>
+                      </Show>
+                    </li>
+                  )}
+                </For>
+              </ul>
+            </Show>
+          </section>
+        </Show>
       </div>
     </Show>
   )
