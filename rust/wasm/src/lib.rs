@@ -2,7 +2,8 @@ use einfach_core::{CellListener, Value, ValueError};
 use einfach_excel_core::{
     Align, BorderSpec, BorderStyle, CellAddress, CellBorders, CellFormat, CellRange,
     CellSubscription, CustomFunctionRegistry, DepGraphStats, FormatRangeSnapshot, NumberFormat,
-    RangeFormatSnapshotLayer, Rotation, Sheet, SheetError, VerticalAlign, Workbook, WorkbookError,
+    RangeFormatSnapshotLayer, Rotation, Sheet, SheetError, SortDirection, SortKey, SortRangeError,
+    SortRangeReport, VerticalAlign, Workbook, WorkbookError,
 };
 use serde::{de, Deserialize, Serialize};
 use std::cell::Cell;
@@ -1138,6 +1139,123 @@ struct WorkbookPersistenceRestoreStatsJSON {
     restored_cells: u32,
     restored_formats: u32,
     sheets: u32,
+}
+
+// === Engine physical sort (`sortRange`) wire — S2 of
+// `solid/excel/docs/online-excel-parity/design-engine-sort.md` ===
+//
+// Payload `{ range, keys: [{ col, direction, caseSensitive }], excludedRows }`.
+// `range` is either an A1 string (`"A1:B3"`, or `"A1"` for a single cell) or a
+// zero-based `{ startRow, startCol, endRow, endCol }` bounds object. Success
+// serializes `SortRangeReportJSON` (`{ ok: true, movedRows, movedCells,
+// rowPermutation }`); every rejection (engine gate OR payload parse) returns a
+// structured `{ ok: false, code, anchor?, message? }` object in the Ok arm,
+// matching the `trySetCell*` convention (`sheet_error_to_js`).
+
+/// Range wire: an A1 string or a zero-based bounds object.
+#[derive(Clone, Debug, Deserialize)]
+#[serde(untagged)]
+enum SortRangeWireJSON {
+    A1(String),
+    Bounds {
+        #[serde(rename = "startRow")]
+        start_row: u32,
+        #[serde(rename = "startCol")]
+        start_col: u32,
+        #[serde(rename = "endRow")]
+        end_row: u32,
+        #[serde(rename = "endCol")]
+        end_col: u32,
+    },
+}
+
+impl SortRangeWireJSON {
+    fn into_range(self) -> Result<CellRange, String> {
+        match self {
+            SortRangeWireJSON::A1(s) => {
+                let (a, b) = s.split_once(':').unwrap_or((s.as_str(), s.as_str()));
+                let start = CellAddress::parse(a.trim())
+                    .ok_or_else(|| format!("invalid range cell: {a}"))?;
+                let end = CellAddress::parse(b.trim())
+                    .ok_or_else(|| format!("invalid range cell: {b}"))?;
+                Ok(CellRange::new(start, end))
+            }
+            SortRangeWireJSON::Bounds {
+                start_row,
+                start_col,
+                end_row,
+                end_col,
+            } => Ok(CellRange::new(
+                CellAddress::new(start_row, start_col),
+                CellAddress::new(end_row, end_col),
+            )),
+        }
+    }
+}
+
+/// One sort key. `direction` accepts `"asc"`/`"desc"` (the UI-core
+/// `SortDirection` vocabulary) plus the long `"ascending"`/`"descending"`
+/// spellings; anything else — including a missing field — defaults to
+/// ascending. `caseSensitive` defaults to `false` (Excel default).
+#[derive(Clone, Debug, Deserialize)]
+struct SortKeyWireJSON {
+    col: u32,
+    #[serde(default)]
+    direction: Option<String>,
+    #[serde(rename = "caseSensitive", default)]
+    case_sensitive: bool,
+}
+
+impl SortKeyWireJSON {
+    fn into_key(self) -> SortKey {
+        let direction = match self.direction.as_deref() {
+            Some("desc") | Some("descending") => SortDirection::Descending,
+            _ => SortDirection::Ascending,
+        };
+        SortKey {
+            col: self.col,
+            direction,
+            case_sensitive: self.case_sensitive,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Deserialize)]
+struct SortRangePayloadJSON {
+    range: SortRangeWireJSON,
+    #[serde(default)]
+    keys: Vec<SortKeyWireJSON>,
+    #[serde(rename = "excludedRows", default)]
+    excluded_rows: Vec<u32>,
+}
+
+/// Success witness. `rowPermutation` is the changed-slot permutation as
+/// `[[slotRow, sourceRow], …]` pairs (compact for the up-to-50k moved-row
+/// witness; reserved for overlay remap / parity, v1 consumers may ignore).
+#[derive(Clone, Debug, Serialize)]
+struct SortRangeReportJSON {
+    ok: bool,
+    #[serde(rename = "movedRows")]
+    moved_rows: u32,
+    #[serde(rename = "movedCells")]
+    moved_cells: u32,
+    #[serde(rename = "rowPermutation")]
+    row_permutation: Vec<[u32; 2]>,
+}
+
+impl SortRangeReportJSON {
+    fn from_report(report: &SortRangeReport) -> Self {
+        SortRangeReportJSON {
+            ok: true,
+            moved_rows: report.moved_rows,
+            moved_cells: report.moved_cells,
+            row_permutation: report
+                .row_permutation
+                .iter()
+                .map(|&(slot, source)| [slot, source])
+                .collect(),
+        }
+    }
 }
 
 /// Initialize the panic hook once per module load. Called automatically from
@@ -3318,6 +3436,41 @@ impl WasmWorkbook {
             JsValue::from_str(&format!("serialize persistence restore stats: {err}"))
         })
     }
+
+    /// Physically sort a range (design-engine-sort S2). Payload:
+    /// `{ range, keys: [{ col, direction, caseSensitive }], excludedRows }`
+    /// where `range` is an A1 string or a zero-based bounds object. Returns
+    /// the `SortRangeReport` witness on success and a structured
+    /// `{ ok: false, code, anchor?, message? }` object for every rejection —
+    /// engine gates (`invalid-range`, `empty-keys`, `key-out-of-range`,
+    /// `spill-in-range`) and payload-parse failures (`invalid-payload`).
+    /// The `Err` arm is reserved for a catastrophic report serialization.
+    #[wasm_bindgen(js_name = "sortRange")]
+    pub fn sort_range(&mut self, sheet_idx: u32, payload: JsValue) -> Result<JsValue, JsValue> {
+        let payload: SortRangePayloadJSON = match serde_wasm_bindgen::from_value(payload) {
+            Ok(payload) => payload,
+            Err(err) => {
+                return Ok(sort_error_to_js("invalid-payload", None, Some(&err.to_string())))
+            }
+        };
+        let range = match payload.range.into_range() {
+            Ok(range) => range,
+            Err(msg) => return Ok(sort_error_to_js("invalid-payload", None, Some(&msg))),
+        };
+        let keys: Vec<SortKey> = payload
+            .keys
+            .into_iter()
+            .map(SortKeyWireJSON::into_key)
+            .collect();
+        match self
+            .workbook
+            .sort_range(sheet_idx as usize, range, &keys, &payload.excluded_rows)
+        {
+            Ok(report) => serde_wasm_bindgen::to_value(&SortRangeReportJSON::from_report(&report))
+                .map_err(|err| JsValue::from_str(&format!("serialize sort report: {err}"))),
+            Err(err) => Ok(sort_range_error_to_js(err)),
+        }
+    }
 }
 
 impl Default for WasmWorkbook {
@@ -3801,8 +3954,48 @@ fn workbook_error_to_js(err: WorkbookError) -> JsValue {
         WorkbookError::ParseFailed => "parse-failed".to_string(),
         WorkbookError::EvalFailed(e) => format!("eval-failed: {}", e),
         WorkbookError::MutationDuringCustomCall => "mutation-during-custom-call".to_string(),
+        // #32 Excel Table T1: defined-name/Table shared-namespace conflict.
+        // Non-export compile-fix for the new `WorkbookError` variant — this
+        // internal error-formatting helper is not part of the wasm export
+        // surface, so no snapshot regeneration is needed.
+        WorkbookError::NameConflict => "name-conflict".to_string(),
     };
     JsValue::from_str(&msg)
+}
+
+/// Build the `{ ok: false, code, anchor?, message? }` rejection object for
+/// `sortRange`. Mirrors `sheet_error_to_js` so the JS side matches on `code`
+/// rather than parsing a message string.
+fn sort_error_to_js(code: &str, anchor: Option<&str>, message: Option<&str>) -> JsValue {
+    let obj = js_sys::Object::new();
+    js_sys::Reflect::set(&obj, &JsValue::from_str("ok"), &JsValue::FALSE).ok();
+    js_sys::Reflect::set(&obj, &JsValue::from_str("code"), &JsValue::from_str(code)).ok();
+    if let Some(anchor) = anchor {
+        js_sys::Reflect::set(&obj, &JsValue::from_str("anchor"), &JsValue::from_str(anchor)).ok();
+    }
+    if let Some(message) = message {
+        js_sys::Reflect::set(
+            &obj,
+            &JsValue::from_str("message"),
+            &JsValue::from_str(message),
+        )
+        .ok();
+    }
+    obj.into()
+}
+
+/// Map a `SortRangeError` to the structured `sortRange` rejection object.
+/// Codes are kebab-case, matching the `sheet_error_to_js` family; the
+/// spill rejection carries its anchor address.
+fn sort_range_error_to_js(err: SortRangeError) -> JsValue {
+    match err {
+        SortRangeError::InvalidRange => sort_error_to_js("invalid-range", None, None),
+        SortRangeError::EmptyKeys => sort_error_to_js("empty-keys", None, None),
+        SortRangeError::KeyOutOfRange => sort_error_to_js("key-out-of-range", None, None),
+        SortRangeError::SpillIntersectsRange { anchor } => {
+            sort_error_to_js("spill-in-range", Some(&anchor.to_string()), None)
+        }
+    }
 }
 
 /// Collapse a spill-anchor `Value::Array` to its top-left scalar before
@@ -3946,6 +4139,95 @@ mod tests {
             demote_busy_for_custom_return(ValueError::Spill),
             ValueError::Spill
         );
+    }
+
+    // === sortRange wire helpers (S2) ===
+
+    #[test]
+    fn sort_range_wire_parses_a1_string() {
+        let range = SortRangeWireJSON::A1("A1:B3".into())
+            .into_range()
+            .unwrap()
+            .normalize();
+        assert_eq!(range.start, CellAddress::new(0, 0));
+        assert_eq!(range.end, CellAddress::new(2, 1));
+    }
+
+    #[test]
+    fn sort_range_wire_single_cell_a1_is_one_by_one() {
+        let range = SortRangeWireJSON::A1("C5".into()).into_range().unwrap();
+        assert_eq!(range.start, CellAddress::new(4, 2));
+        assert_eq!(range.end, CellAddress::new(4, 2));
+    }
+
+    #[test]
+    fn sort_range_wire_parses_bounds_object() {
+        let range = SortRangeWireJSON::Bounds {
+            start_row: 1,
+            start_col: 2,
+            end_row: 4,
+            end_col: 3,
+        }
+        .into_range()
+        .unwrap();
+        assert_eq!(range.start, CellAddress::new(1, 2));
+        assert_eq!(range.end, CellAddress::new(4, 3));
+    }
+
+    #[test]
+    fn sort_range_wire_rejects_garbage_a1() {
+        assert!(SortRangeWireJSON::A1("not-a-cell".into())
+            .into_range()
+            .is_err());
+    }
+
+    #[test]
+    fn sort_key_wire_direction_and_case_defaults() {
+        // Missing direction → ascending; caseSensitive default false.
+        let k = SortKeyWireJSON {
+            col: 3,
+            direction: None,
+            case_sensitive: false,
+        }
+        .into_key();
+        assert_eq!(k.col, 3);
+        assert_eq!(k.direction, SortDirection::Ascending);
+        assert!(!k.case_sensitive);
+
+        // Both short and long descending spellings map to Descending.
+        for spelling in ["desc", "descending"] {
+            let k = SortKeyWireJSON {
+                col: 0,
+                direction: Some(spelling.into()),
+                case_sensitive: true,
+            }
+            .into_key();
+            assert_eq!(k.direction, SortDirection::Descending, "{spelling}");
+            assert!(k.case_sensitive);
+        }
+
+        // Unknown spelling falls back to ascending (never panics).
+        let k = SortKeyWireJSON {
+            col: 0,
+            direction: Some("sideways".into()),
+            case_sensitive: false,
+        }
+        .into_key();
+        assert_eq!(k.direction, SortDirection::Ascending);
+    }
+
+    #[test]
+    fn sort_range_report_json_maps_permutation_to_pairs() {
+        let report = SortRangeReport {
+            moved_rows: 2,
+            moved_cells: 3,
+            row_permutation: vec![(0, 1), (1, 0)],
+        };
+        let json = SortRangeReportJSON::from_report(&report);
+        assert!(json.ok);
+        assert_eq!(json.moved_rows, 2);
+        assert_eq!(json.moved_cells, 3);
+        assert_eq!(json.row_permutation, vec![[0, 1], [1, 0]]);
     }
 
     #[test]
