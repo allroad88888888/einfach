@@ -72,6 +72,13 @@ pub enum WorkbookError {
     /// it until after the callback returns.
     /// See `CUSTOM_FORMULAS.md` § "No mutations during callback".
     MutationDuringCustomCall,
+    /// The proposed defined-name collides (case-insensitively) with an
+    /// existing Excel Table name. Table names and defined names share one
+    /// workbook namespace (Excel parity — see the design doc's #32 §4.2),
+    /// so `define_name`/`define_name_value` reject a name already claimed
+    /// by a Table. The mirror rejection (a Table refusing an existing
+    /// defined name) lives on `TableError::NameConflict`.
+    NameConflict,
 }
 
 impl std::fmt::Display for WorkbookError {
@@ -90,11 +97,165 @@ impl std::fmt::Display for WorkbookError {
                 f,
                 "workbook mutations are forbidden while a custom-formula callback is executing"
             ),
+            WorkbookError::NameConflict => {
+                write!(f, "name collides with an existing Excel Table name")
+            }
         }
     }
 }
 
 impl std::error::Error for WorkbookError {}
+
+/// Maximum number of Excel Tables registered in one workbook. A bounded,
+/// engine-enforced cap (design doc #32 §4.1) — `define_table` rejects the
+/// 257th table with `TableError::TooManyTables`. Mirrors the UI-core
+/// `tableCatalogAtom` cache cap so the two layers agree on the ceiling.
+const MAX_TABLES: usize = 256;
+
+/// Excel's grid bounds (0-based): 16384 columns (`A`..`XFD` → 0..=16383)
+/// and 1048576 rows (1..=1048576 → 0..=1048575). Used by the Table
+/// name guard: a name is only "cell-reference-like" (and thus rejected)
+/// when it parses to an address INSIDE this grid. `CellAddress::parse`
+/// itself is unbounded, so `"Table1"` parses to column `TABLE` (far past
+/// `XFD`) and is correctly NOT treated as a cell reference — otherwise the
+/// default auto-generated `Table1`..`TableN` names would be unusable.
+const GRID_MAX_COL: u32 = 16_383;
+const GRID_MAX_ROW: u32 = 1_048_575;
+
+/// One Excel Table registered in a workbook (design doc #32 §4.1). The
+/// registry is workbook-level (name uniqueness is a workbook-scoped,
+/// cross-sheet concern in Excel); each entry is anchored to a sheet by
+/// NAME so `move_sheet` is naturally immune and `rename_sheet` /
+/// `remove_sheet` maintain the anchor (§4.4).
+///
+/// Fields are private; read them through the accessors so the invariant
+/// "`columns.len() == range.cols()` and `range` is normalized" stays
+/// owned by this module.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TableEntry {
+    /// Name as the user typed it (display casing). The registry key is the
+    /// uppercased form, mirroring `NamedEntry::canonical_name`.
+    canonical_name: String,
+    /// The sheet this Table lives on, by name (the stable anchor — see
+    /// the struct doc and §4.4).
+    sheet_name: String,
+    /// Normalized rectangle covering the header row + data rows (+ totals
+    /// row when `has_totals`). Structural edits follow this per §4.3.
+    range: CellRange,
+    /// MVP invariant: always `true` (a Table's first row is its header).
+    /// Kept as a field so the totals/header machinery in later slices has
+    /// a real flag to read rather than a hard-coded assumption.
+    has_headers: bool,
+    /// Whether a totals row is currently shown. T1 stores the flag as a
+    /// placeholder (default `false`); the toggle logic that grows the
+    /// range and writes `SUBTOTAL` formulas is T5 (§7) and does not land
+    /// here.
+    has_totals: bool,
+    /// Column display names, left→right (index 0 == `range.start.col`).
+    /// Matching is case-insensitive but the display casing is preserved.
+    columns: Vec<String>,
+}
+
+impl TableEntry {
+    /// The Table name in the casing the user supplied.
+    pub fn name(&self) -> &str {
+        &self.canonical_name
+    }
+
+    /// Name of the sheet this Table is anchored to.
+    pub fn sheet_name(&self) -> &str {
+        &self.sheet_name
+    }
+
+    /// The normalized rectangle the Table currently occupies.
+    pub fn range(&self) -> CellRange {
+        self.range
+    }
+
+    /// MVP: always `true`.
+    pub fn has_headers(&self) -> bool {
+        self.has_headers
+    }
+
+    /// Whether a totals row is currently shown (T1: always `false`).
+    pub fn has_totals(&self) -> bool {
+        self.has_totals
+    }
+
+    /// Column display names, left→right.
+    pub fn columns(&self) -> &[String] {
+        &self.columns
+    }
+}
+
+/// Failure modes for the workbook Table registry (design doc #32 §4.1).
+/// Distinct from `WorkbookError` (defined-name registry) and `SheetError`
+/// (per-cell writes) because Table lifecycle failures are a separate axis.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum TableError {
+    /// The workbook already holds `MAX_TABLES` (256) tables.
+    TooManyTables,
+    /// The proposed name violates the identifier grammar (same rule as
+    /// `WorkbookError::InvalidName`: `[A-Za-z_][A-Za-z0-9_]*`, 1..=255).
+    InvalidName,
+    /// The proposed name collides (case-insensitively) with a built-in
+    /// function name (`SUM`, `IF`, …).
+    ReservedName,
+    /// The proposed name parses as an in-grid A1 cell reference (`AB12`).
+    /// Such names are unreachable as bare Table references — the parser's
+    /// cell-ref branch claims them first — so they are refused at
+    /// definition time (§4.2 cond. 3). Grid-bounded on purpose: `Table1`
+    /// (column `TABLE`, far past `XFD`) is NOT cell-reference-like and is
+    /// allowed.
+    NameLikeCellRef,
+    /// The proposed name collides (case-insensitively) with another Table
+    /// or with a defined name — the two share one workbook namespace.
+    NameConflict,
+    /// The proposed range overlaps an existing Table on the same sheet.
+    RangeOverlap,
+    /// `define_table` was given a sheet index outside the workbook.
+    SheetNotFound,
+    /// No Table is registered under the supplied name (rename/delete/get).
+    NotFound,
+    /// A host custom-formula JS callback tried to mutate the Table
+    /// registry mid-evaluation. Mirrors every other workbook mutation
+    /// entry point's re-entrancy guard.
+    MutationDuringCustomCall,
+}
+
+impl std::fmt::Display for TableError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            TableError::TooManyTables => {
+                write!(f, "workbook already holds the maximum of {MAX_TABLES} tables")
+            }
+            TableError::InvalidName => write!(
+                f,
+                "table name must match [A-Za-z_][A-Za-z0-9_]* and be 1..=255 chars"
+            ),
+            TableError::ReservedName => {
+                write!(f, "table name collides with a built-in function name")
+            }
+            TableError::NameLikeCellRef => {
+                write!(f, "table name parses as a cell reference")
+            }
+            TableError::NameConflict => {
+                write!(f, "table name collides with an existing table or defined name")
+            }
+            TableError::RangeOverlap => {
+                write!(f, "table range overlaps an existing table on the same sheet")
+            }
+            TableError::SheetNotFound => write!(f, "sheet index is outside the workbook"),
+            TableError::NotFound => write!(f, "no table registered under that name"),
+            TableError::MutationDuringCustomCall => write!(
+                f,
+                "table registry mutations are forbidden while a custom-formula callback is executing"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for TableError {}
 
 /// A workbook is an ordered collection of named sheets. Every formula derives
 /// through facade/formula-inner atoms in the workbook's shared Store.
@@ -166,6 +327,22 @@ pub struct Workbook {
     /// changed, re-read everything". Single-cell mutators do NOT bump it
     /// (they have precise per-cell subscriber fanout already).
     content_revision: u64,
+    /// Excel Table registry (design doc #32 §4.1). Keyed by the uppercased
+    /// Table name so lookup and the shared name-uniqueness check are
+    /// case-insensitive; `TableEntry::canonical_name` keeps the display
+    /// casing. `BTreeMap` (not `HashMap`) for a stable, alphabetical
+    /// iteration order in `list_tables` — the same rationale as
+    /// `named_values`. Bounded to `MAX_TABLES` by `define_table`.
+    tables: BTreeMap<String, TableEntry>,
+    /// Monotonic counter bumped on every Table registry mutation
+    /// (create/rename/delete/structural-follow/sheet-hook). T1 broadcast
+    /// hook for Table geometry/name invalidation (design doc #32 §8): a
+    /// structured-reference formula's dependency on "the tables changed"
+    /// is a tracked read of a per-sheet `tables_epoch` Store atom in T3;
+    /// until that atom lands in `sheet.rs`, this workbook-level counter is
+    /// the observable broadcast seam (tests assert it advances). See
+    /// `bump_tables_epoch`.
+    tables_epoch: u64,
 }
 
 /// STORAGE_PRIMARY Phase 6.1: result stats from one
@@ -260,6 +437,8 @@ impl Workbook {
             custom_functions: None,
             custom_call_depth,
             content_revision: 0,
+            tables: BTreeMap::new(),
+            tables_epoch: 0,
         };
         // Default sheet so users can `wb.active_mut()` without first calling
         // add_sheet — matches the Excel "blank file already has Sheet1" UX.
@@ -364,6 +543,13 @@ impl Workbook {
         let key = name.to_ascii_uppercase();
         if is_builtin_function_name(&key) {
             return Err(WorkbookError::ReservedName);
+        }
+        // Shared namespace with the Table registry (design doc #32 §4.2,
+        // reverse direction): a defined name may not shadow an existing
+        // Table name. The forward direction — a Table refusing an existing
+        // defined name — is enforced in `validate_table_name`.
+        if self.tables.contains_key(&key) {
+            return Err(WorkbookError::NameConflict);
         }
         self.named_values.insert(
             key,
@@ -604,6 +790,19 @@ impl Workbook {
         self.by_name.remove(&old);
         self.names[idx] = new_name.to_string();
         self.by_name.insert(new_name.to_string(), idx);
+        // Table anchor maintenance (design doc #32 §4.4): entries are
+        // anchored by sheet NAME, so re-point every Table on the renamed
+        // sheet. Bump the epoch only if at least one Table moved.
+        let mut table_moved = false;
+        for entry in self.tables.values_mut() {
+            if entry.sheet_name == old {
+                entry.sheet_name = new_name.to_string();
+                table_moved = true;
+            }
+        }
+        if table_moved {
+            self.bump_tables_epoch();
+        }
         self.sync_atom_topology();
         true
     }
@@ -1298,6 +1497,16 @@ impl Workbook {
         sheet.detach_workbook_context();
         let name = self.names.remove(idx);
         self.by_name.remove(&name);
+        // Table anchor maintenance (design doc #32 §4.4): drop every Table
+        // anchored to the removed sheet. Formulas on OTHER sheets that
+        // referenced those Tables surface `#NAME?` at eval time (T3);
+        // recovering the Tables on a deleteSheet-undo is a host-replay
+        // concern (§12), out of this slice.
+        let before = self.tables.len();
+        self.tables.retain(|_, t| t.sheet_name != name);
+        if self.tables.len() != before {
+            self.bump_tables_epoch();
+        }
         self.rebuild_name_lookup();
         self.sync_atom_topology();
         Some(sheet)
@@ -1438,6 +1647,559 @@ impl Workbook {
         let result = f(&mut loader);
         loader.flush();
         result
+    }
+
+    // ===================================================================
+    // Excel Table registry (design doc #32 T1: §4.1 / §4.2 / §4.3 / §4.4 /
+    // §8 broadcast seam). Pure registry data + CRUD + name mutex +
+    // structural follow. Structured-reference PARSING (T2) and EVALUATION
+    // (T3/T4) are out of this slice — nothing here touches formula.rs /
+    // eval.rs / sheet.rs internals.
+    // ===================================================================
+
+    /// Register a new Excel Table (design doc #32 §4.1).
+    ///
+    /// - `name`: `Some(n)` uses `n` (validated below); `None` auto-generates
+    ///   the first free `Table1`, `Table2`, … .
+    /// - `sheet_index`: the anchoring sheet; `TableError::SheetNotFound`
+    ///   when out of range.
+    /// - `range`: normalized here; row 0 of the range is the header row.
+    ///   Rejected with `TableError::RangeOverlap` if it intersects an
+    ///   existing Table on the same sheet.
+    /// - `has_headers`: MVP callers pass `true` (the flag is stored as-is
+    ///   so later slices can relax it).
+    ///
+    /// Column names are read from the header row's cells; blank or
+    /// duplicate headers are disambiguated to `Column1`, `Column2`, ….
+    /// Returns the final (canonical-cased) Table name on success.
+    ///
+    /// Only registry metadata is created — cell values, formulas, and
+    /// formats are untouched (a Table is a *view* over existing cells).
+    pub fn define_table(
+        &mut self,
+        name: Option<&str>,
+        sheet_index: usize,
+        range: CellRange,
+        has_headers: bool,
+    ) -> Result<String, TableError> {
+        if self.is_inside_custom_call() {
+            return Err(TableError::MutationDuringCustomCall);
+        }
+        if sheet_index >= self.sheets.len() {
+            return Err(TableError::SheetNotFound);
+        }
+        let range = range.normalize();
+        let sheet_name = self.names[sheet_index].clone();
+
+        // Overlap check against existing tables on the SAME sheet.
+        if self
+            .tables
+            .values()
+            .any(|t| t.sheet_name == sheet_name && ranges_overlap(t.range, range))
+        {
+            return Err(TableError::RangeOverlap);
+        }
+
+        // Cap check happens before name resolution so a rejected 257th
+        // table never perturbs the auto-name counter.
+        if self.tables.len() >= MAX_TABLES {
+            return Err(TableError::TooManyTables);
+        }
+
+        let canonical_name = match name {
+            Some(n) => {
+                self.validate_table_name(n, None)?;
+                n.to_string()
+            }
+            None => self.next_auto_table_name(),
+        };
+        let key = canonical_name.to_ascii_uppercase();
+
+        let columns = self.derive_column_names(&sheet_name, range);
+
+        self.tables.insert(
+            key,
+            TableEntry {
+                canonical_name: canonical_name.clone(),
+                sheet_name,
+                range,
+                has_headers,
+                has_totals: false,
+                columns,
+            },
+        );
+        self.bump_tables_epoch();
+        Ok(canonical_name)
+    }
+
+    /// Remove a Table's registry entry ("convert to range" — design doc
+    /// §4.1). Cell values, formulas, and formats are left in place; only
+    /// the Table semantics are dropped. `TableError::NotFound` when the
+    /// name is unknown.
+    pub fn delete_table(&mut self, name: &str) -> Result<(), TableError> {
+        if self.is_inside_custom_call() {
+            return Err(TableError::MutationDuringCustomCall);
+        }
+        let key = name.to_ascii_uppercase();
+        if self.tables.remove(&key).is_none() {
+            return Err(TableError::NotFound);
+        }
+        self.bump_tables_epoch();
+        Ok(())
+    }
+
+    /// Rename a Table (design doc §4.1). Re-validates `new_name` against
+    /// the full name mutex (grammar / built-in / cell-ref-form / conflict),
+    /// excluding the Table's own current key so a case-only rename works.
+    ///
+    /// NOTE (T1 boundary): this updates only the registry key + display
+    /// name. Rewriting the TEXT of formulas that reference the old name
+    /// (`retarget_formula_refs`-style walker over `Expr::TableRef`) is T3
+    /// (§4.3) — it depends on the structured-reference AST that T2 adds.
+    pub fn rename_table(&mut self, name: &str, new_name: &str) -> Result<(), TableError> {
+        if self.is_inside_custom_call() {
+            return Err(TableError::MutationDuringCustomCall);
+        }
+        let old_key = name.to_ascii_uppercase();
+        if !self.tables.contains_key(&old_key) {
+            return Err(TableError::NotFound);
+        }
+        self.validate_table_name(new_name, Some(&old_key))?;
+        let new_key = new_name.to_ascii_uppercase();
+        // Remove-then-reinsert (the key changes unless it's a case-only
+        // rename, which `validate_table_name`'s self-exclusion permits).
+        let mut entry = self.tables.remove(&old_key).expect("existence checked above");
+        entry.canonical_name = new_name.to_string();
+        self.tables.insert(new_key, entry);
+        self.bump_tables_epoch();
+        Ok(())
+    }
+
+    /// Case-insensitive Table lookup. `None` when no Table is registered
+    /// under `name`.
+    pub fn get_table(&self, name: &str) -> Option<&TableEntry> {
+        self.tables.get(&name.to_ascii_uppercase())
+    }
+
+    /// Every registered Table, in stable (alphabetical-by-uppercased-name)
+    /// order.
+    pub fn list_tables(&self) -> Vec<&TableEntry> {
+        self.tables.values().collect()
+    }
+
+    /// Number of registered Tables. Companion to the `MAX_TABLES` cap.
+    pub fn table_count(&self) -> usize {
+        self.tables.len()
+    }
+
+    /// Current value of the Table invalidation broadcast counter (design
+    /// doc §8 seam). Bumped by every registry mutation. T3 additionally
+    /// pushes each bump into the per-sheet `tables_epoch` Store atom so
+    /// structured-reference formulas re-derive; T1 exposes the counter so
+    /// callers/tests can observe that a mutation broadcast happened.
+    pub fn tables_epoch(&self) -> u64 {
+        self.tables_epoch
+    }
+
+    // --- Structural-follow wrappers (design doc §4.3) --------------------
+    //
+    // These delegate to the existing per-sheet structural ops (which do the
+    // full cell/formula/spill/format/dimension retarget) and then remap
+    // every Table anchored to that sheet. The wasm binding still calls
+    // `Sheet::insert_row` directly today; rewiring it to route through
+    // these wrappers is T6 (§10) — deliberately NOT done here so T1 leaves
+    // the wasm export surface untouched.
+
+    /// Insert `count` rows at `at` on `sheet_index`, then follow Tables.
+    pub fn insert_rows(&mut self, sheet_index: usize, at: u32, count: u32) {
+        self.apply_structural_shift_with_table_follow(
+            sheet_index,
+            crate::shift::ShiftEdit::RowInsert { at, count },
+        );
+    }
+
+    /// Delete `count` rows at `at` on `sheet_index`, then follow Tables.
+    pub fn delete_rows(&mut self, sheet_index: usize, at: u32, count: u32) {
+        self.apply_structural_shift_with_table_follow(
+            sheet_index,
+            crate::shift::ShiftEdit::RowDelete { at, count },
+        );
+    }
+
+    /// Insert `count` columns at `at` on `sheet_index`, then follow Tables.
+    pub fn insert_columns(&mut self, sheet_index: usize, at: u32, count: u32) {
+        self.apply_structural_shift_with_table_follow(
+            sheet_index,
+            crate::shift::ShiftEdit::ColInsert { at, count },
+        );
+    }
+
+    /// Delete `count` columns at `at` on `sheet_index`, then follow Tables.
+    pub fn delete_columns(&mut self, sheet_index: usize, at: u32, count: u32) {
+        self.apply_structural_shift_with_table_follow(
+            sheet_index,
+            crate::shift::ShiftEdit::ColDelete { at, count },
+        );
+    }
+
+    fn apply_structural_shift_with_table_follow(
+        &mut self,
+        sheet_index: usize,
+        edit: crate::shift::ShiftEdit,
+    ) {
+        if self.is_inside_custom_call() {
+            return; // re-entrancy guard, mirrors the cell mutators
+        }
+        if sheet_index >= self.sheets.len() {
+            return;
+        }
+        // Delegate to the existing sheet-level structural op — same path
+        // the wasm binding uses today, so cells/formulas/spills/formats
+        // all follow exactly as before.
+        match edit {
+            crate::shift::ShiftEdit::RowInsert { at, count } => {
+                self.sheets[sheet_index].insert_row(at, count)
+            }
+            crate::shift::ShiftEdit::RowDelete { at, count } => {
+                self.sheets[sheet_index].delete_row(at, count)
+            }
+            crate::shift::ShiftEdit::ColInsert { at, count } => {
+                self.sheets[sheet_index].insert_col(at, count)
+            }
+            crate::shift::ShiftEdit::ColDelete { at, count } => {
+                self.sheets[sheet_index].delete_col(at, count)
+            }
+        }
+        self.remap_tables_after_shift(sheet_index, edit);
+    }
+
+    /// Follow every Table anchored to `sheet_index` through a structural
+    /// `edit` (design doc §4.3 matrix). Reuses `ShiftEdit`'s coordinate
+    /// math for the shift/grow cases and clamps the delete cases so a
+    /// partially-covered Table shrinks (rather than surfacing a `#REF!`
+    /// corner as A1 range-formats do). Deletes that swallow the header row
+    /// (rows) or every column (cols) drop the Table. Bumps the epoch iff a
+    /// Table actually changed.
+    ///
+    /// `pub(crate)`: the public entry points are the structural wrappers
+    /// above. `ShiftEdit` is deliberately not re-exported (T1 leaves the
+    /// `shift` surface unchanged), so external callers reach this only
+    /// through the wrappers.
+    pub(crate) fn remap_tables_after_shift(
+        &mut self,
+        sheet_index: usize,
+        edit: crate::shift::ShiftEdit,
+    ) {
+        let Some(sheet_name) = self.names.get(sheet_index).cloned() else {
+            return;
+        };
+        let keys: Vec<String> = self
+            .tables
+            .iter()
+            .filter(|(_, t)| t.sheet_name == sheet_name)
+            .map(|(k, _)| k.clone())
+            .collect();
+
+        let mut changed = false;
+        for key in keys {
+            let (range, columns) = {
+                let entry = self.tables.get(&key).expect("key just collected");
+                (entry.range, entry.columns.clone())
+            };
+            match remap_table_geometry(range, &columns, edit) {
+                TableRemap::Keep => {}
+                TableRemap::Resize { range, columns } => {
+                    let e = self.tables.get_mut(&key).expect("key just collected");
+                    e.range = range;
+                    e.columns = columns;
+                    changed = true;
+                }
+                TableRemap::Delete => {
+                    self.tables.remove(&key);
+                    changed = true;
+                }
+            }
+        }
+        if changed {
+            self.bump_tables_epoch();
+        }
+    }
+
+    // --- internal helpers ----------------------------------------------
+
+    /// Bump the Table invalidation broadcast counter (design doc §8). The
+    /// T3 seam: this is where the per-sheet `tables_epoch` Store atoms will
+    /// also be `store.set(+1)` so structured-reference formulas that did a
+    /// tracked read of them re-derive. T1 keeps only the workbook counter.
+    fn bump_tables_epoch(&mut self) {
+        self.tables_epoch = self.tables_epoch.wrapping_add(1);
+    }
+
+    /// Full Table name mutex (design doc §4.2). `exclude_key` is the
+    /// uppercased key of the Table being renamed (so a case-only rename
+    /// doesn't collide with itself); `None` for a fresh `define_table`.
+    fn validate_table_name(&self, name: &str, exclude_key: Option<&str>) -> Result<(), TableError> {
+        if Self::validate_name(name).is_err() {
+            return Err(TableError::InvalidName);
+        }
+        let key = name.to_ascii_uppercase();
+        if is_builtin_function_name(&key) {
+            return Err(TableError::ReservedName);
+        }
+        if name_is_cell_ref_like(name) {
+            return Err(TableError::NameLikeCellRef);
+        }
+        // Shared namespace: reject collisions with other Tables …
+        let collides_table = match exclude_key {
+            Some(self_key) => key != self_key && self.tables.contains_key(&key),
+            None => self.tables.contains_key(&key),
+        };
+        if collides_table {
+            return Err(TableError::NameConflict);
+        }
+        // … and with defined names (forward direction of §4.2's mutex).
+        if self.named_values.contains_key(&key) {
+            return Err(TableError::NameConflict);
+        }
+        Ok(())
+    }
+
+    /// First free `Table1`, `Table2`, … not already used by a Table or a
+    /// defined name (shared namespace). `TableN` is never cell-ref-like
+    /// (column `TABLE` is past `XFD`) nor a built-in, so those checks are
+    /// unnecessary here.
+    fn next_auto_table_name(&self) -> String {
+        let mut n: usize = 1;
+        loop {
+            let candidate = format!("Table{n}");
+            let key = candidate.to_ascii_uppercase();
+            if !self.tables.contains_key(&key) && !self.named_values.contains_key(&key) {
+                return candidate;
+            }
+            n += 1;
+        }
+    }
+
+    /// Read the header row's cell text into column names, disambiguating
+    /// blanks/duplicates to `Column1`, `Column2`, … (design doc §4.1). Runs
+    /// before the registry mutation so it only needs `&self`.
+    fn derive_column_names(&self, sheet_name: &str, range: CellRange) -> Vec<String> {
+        let width = range.cols();
+        let header_row = range.start.row;
+        let mut names: Vec<String> = Vec::with_capacity(width as usize);
+        let mut used: HashSet<String> = HashSet::new();
+        for i in 0..width {
+            let addr = CellAddress::new(header_row, range.start.col + i);
+            let raw = self.header_text(sheet_name, addr);
+            let trimmed = raw.trim();
+            let name = if trimmed.is_empty() || used.contains(&trimmed.to_ascii_uppercase()) {
+                next_auto_column_name(&used)
+            } else {
+                trimmed.to_string()
+            };
+            used.insert(name.to_ascii_uppercase());
+            names.push(name);
+        }
+        names
+    }
+
+    /// Best-effort display text of a header cell, for column naming. Reads
+    /// through the normal evaluation path (header cells are usually plain
+    /// text/number literals). Non-scalar/error values yield an empty
+    /// string so the caller auto-names that column.
+    fn header_text(&self, sheet_name: &str, addr: CellAddress) -> String {
+        match self.get_cell(sheet_name, &addr.to_string_repr()) {
+            Value::Text(s) => s,
+            Value::Number(n) => format!("{n}"),
+            Value::Boolean(b) => {
+                if b {
+                    "TRUE".to_string()
+                } else {
+                    "FALSE".to_string()
+                }
+            }
+            _ => String::new(),
+        }
+    }
+}
+
+/// Outcome of following one Table through a structural edit.
+enum TableRemap {
+    /// The edit didn't touch this Table.
+    Keep,
+    /// New geometry (and possibly a new column list after an in-table
+    /// column insert/delete).
+    Resize { range: CellRange, columns: Vec<String> },
+    /// The edit destroyed the Table (header row deleted / all columns
+    /// deleted). The registry entry is dropped.
+    Delete,
+}
+
+/// Do two normalized ranges intersect? (Inclusive rectangles.)
+fn ranges_overlap(a: CellRange, b: CellRange) -> bool {
+    let a = a.normalize();
+    let b = b.normalize();
+    a.start.row <= b.end.row
+        && b.start.row <= a.end.row
+        && a.start.col <= b.end.col
+        && b.start.col <= a.end.col
+}
+
+/// Is `name` an in-grid A1 cell reference (`AB12`)? Grid-bounded so
+/// out-of-grid pseudo-refs like `Table1` (column `TABLE` past `XFD`) are
+/// NOT treated as cell references. See `GRID_MAX_COL` / `GRID_MAX_ROW`.
+fn name_is_cell_ref_like(name: &str) -> bool {
+    match CellAddress::parse(name) {
+        Some(addr) => addr.col <= GRID_MAX_COL && addr.row <= GRID_MAX_ROW,
+        None => false,
+    }
+}
+
+/// Next `ColumnN` not already present in `used` (uppercased keys), for
+/// blank/duplicate header disambiguation and in-table column inserts.
+fn next_auto_column_name(used: &HashSet<String>) -> String {
+    let mut n: usize = 1;
+    loop {
+        let candidate = format!("Column{n}");
+        if !used.contains(&candidate.to_ascii_uppercase()) {
+            return candidate;
+        }
+        n += 1;
+    }
+}
+
+/// Shrink the closed interval `[lo, hi]` by the deletion of `[d0, d1]`
+/// (all on one axis). Returns `None` when `[lo, hi]` is fully inside the
+/// deleted band (nothing survives). Otherwise returns the reindexed
+/// `(new_lo, new_hi)`:
+///   - band entirely below (`hi < d0`): unchanged;
+///   - band entirely above (`lo > d1`): both shift up by the band width;
+///   - partial overlap: the surviving cells close the gap.
+fn shrink_interval(lo: u32, hi: u32, d0: u32, d1: u32) -> Option<(u32, u32)> {
+    if d0 <= lo && hi <= d1 {
+        return None;
+    }
+    let count = d1 - d0 + 1;
+    let new_lo = if lo < d0 {
+        lo
+    } else if lo > d1 {
+        lo - count
+    } else {
+        d0
+    };
+    let ov_lo = d0.max(lo);
+    let ov_hi = d1.min(hi);
+    let deleted = if ov_hi >= ov_lo { ov_hi - ov_lo + 1 } else { 0 };
+    let len = (hi - lo + 1) - deleted;
+    Some((new_lo, new_lo + len - 1))
+}
+
+/// Core of the design doc §4.3 follow matrix for a single Table. Pure: it
+/// takes the current geometry and returns the outcome, so it's unit-tested
+/// directly and reused by `Workbook::remap_tables_after_shift`.
+fn remap_table_geometry(
+    range: CellRange,
+    columns: &[String],
+    edit: crate::shift::ShiftEdit,
+) -> TableRemap {
+    use crate::shift::ShiftEdit;
+    let range = range.normalize();
+    let (s_r, e_r) = (range.start.row, range.end.row);
+    let (s_c, e_c) = (range.start.col, range.end.col);
+
+    match edit {
+        ShiftEdit::RowInsert { at, count } => {
+            let ns_r = if s_r >= at { s_r + count } else { s_r };
+            let ne_r = if e_r >= at { e_r + count } else { e_r };
+            if ns_r == s_r && ne_r == e_r {
+                return TableRemap::Keep;
+            }
+            TableRemap::Resize {
+                range: CellRange::new(
+                    CellAddress::new(ns_r, s_c),
+                    CellAddress::new(ne_r, e_c),
+                ),
+                columns: columns.to_vec(),
+            }
+        }
+        ShiftEdit::ColInsert { at, count } => {
+            let ns_c = if s_c >= at { s_c + count } else { s_c };
+            let ne_c = if e_c >= at { e_c + count } else { e_c };
+            let mut cols = columns.to_vec();
+            // Widening (insert strictly inside the column span): splice in
+            // `count` auto-named columns at the insertion index.
+            if s_c < at && at <= e_c {
+                let idx = (at - s_c) as usize;
+                let mut used: HashSet<String> =
+                    cols.iter().map(|c| c.to_ascii_uppercase()).collect();
+                for offset in 0..count as usize {
+                    let name = next_auto_column_name(&used);
+                    used.insert(name.to_ascii_uppercase());
+                    cols.insert(idx + offset, name);
+                }
+            }
+            if ns_c == s_c && ne_c == e_c && cols.len() == columns.len() {
+                return TableRemap::Keep;
+            }
+            TableRemap::Resize {
+                range: CellRange::new(
+                    CellAddress::new(s_r, ns_c),
+                    CellAddress::new(e_r, ne_c),
+                ),
+                columns: cols,
+            }
+        }
+        ShiftEdit::RowDelete { at, count } => {
+            let d0 = at;
+            let d1 = at + count - 1;
+            // Header row (row 0 of the range) swallowed → drop the Table.
+            if d0 <= s_r && s_r <= d1 {
+                return TableRemap::Delete;
+            }
+            match shrink_interval(s_r, e_r, d0, d1) {
+                None => TableRemap::Delete, // unreachable (header survives)
+                Some((ns_r, ne_r)) => {
+                    if ns_r == s_r && ne_r == e_r {
+                        return TableRemap::Keep;
+                    }
+                    TableRemap::Resize {
+                        range: CellRange::new(
+                            CellAddress::new(ns_r, s_c),
+                            CellAddress::new(ne_r, e_c),
+                        ),
+                        columns: columns.to_vec(),
+                    }
+                }
+            }
+        }
+        ShiftEdit::ColDelete { at, count } => {
+            let d0 = at;
+            let d1 = at + count - 1;
+            match shrink_interval(s_c, e_c, d0, d1) {
+                None => TableRemap::Delete, // every column deleted
+                Some((ns_c, ne_c)) => {
+                    // Drop the column names covered by the deleted band.
+                    let mut cols = columns.to_vec();
+                    let ov_lo = d0.max(s_c);
+                    let ov_hi = d1.min(e_c);
+                    if ov_hi >= ov_lo {
+                        let del_start = (ov_lo - s_c) as usize;
+                        let del_end = (ov_hi - s_c) as usize;
+                        cols.drain(del_start..=del_end);
+                    }
+                    if ns_c == s_c && ne_c == e_c && cols.len() == columns.len() {
+                        return TableRemap::Keep;
+                    }
+                    TableRemap::Resize {
+                        range: CellRange::new(
+                            CellAddress::new(s_r, ns_c),
+                            CellAddress::new(e_r, ne_c),
+                        ),
+                        columns: cols,
+                    }
+                }
+            }
+        }
     }
 }
 
