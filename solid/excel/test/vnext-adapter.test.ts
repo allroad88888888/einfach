@@ -546,6 +546,9 @@ function createFakeWorkerWorkbookClient(): FakeWorkerWorkbookClient {
     async restoreFormatSnapshot() {
       throw new Error('not used')
     },
+    async sortRange() {
+      throw new Error('not used')
+    },
     async snapshotViewportSizes(range) {
       calls.snapshotViewportSizes.push({ ...range })
       return {

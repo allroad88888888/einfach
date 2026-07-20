@@ -170,9 +170,81 @@ export interface WorkbookSheetMeta {
 export interface RpcErrorWire {
   code: string
   message: string
+  /**
+   * Optional structured, command-specific rejection detail carried past
+   * the flat `code`/`message` pair. `sortRange` uses it to forward the
+   * engine's `{ code, anchor?, message? }` reject payload (`SortRangeRejectWire`)
+   * — the RPC `code` is `SORT_REJECTED`, `detail.code` is the engine
+   * reason. Absent for every other command.
+   */
+  detail?: unknown
 }
 
 export type FormulaMutationResultWire = FormulaMutationResult
+
+// === Engine physical sort (`sortRange`) wire — design-engine-sort S2/S3 ===
+
+/**
+ * One sort key. `col` is a 0-based ABSOLUTE column index that must fall
+ * inside the sort range's column span. `direction` defaults to `'asc'`
+ * and `caseSensitive` to `false` (Excel defaults) engine-side when
+ * omitted.
+ */
+export interface SortKeyWire {
+  col: number
+  direction?: 'asc' | 'desc'
+  caseSensitive?: boolean
+}
+
+/** Zero-based bounds; the object alternative to an A1 range string. */
+export interface SortRangeBoundsWire {
+  startRow: number
+  startCol: number
+  endRow: number
+  endCol: number
+}
+
+/**
+ * `sortRange` request payload (forwarded verbatim to the engine binding).
+ * `range` is an A1 string (`"A1:B9"` or `"A1"`) or a zero-based bounds
+ * object; `excludedRows` are 0-based SOURCE rows the host holds in place
+ * (hidden ∪ filtered-out ∪ summary), assembled by the caller.
+ */
+export interface SortRangePayloadWire {
+  range: string | SortRangeBoundsWire
+  keys: SortKeyWire[]
+  excludedRows?: number[]
+}
+
+/**
+ * Success witness. `rowPermutation` is `[[slotRow, sourceRow], …]` over
+ * the CHANGED slots only — reserved for overlay remap / parity; v1
+ * consumers may ignore it.
+ */
+export interface SortRangeReportWire {
+  movedRows: number
+  movedCells: number
+  rowPermutation: Array<[number, number]>
+}
+
+/**
+ * Structured reject reasons the engine returns. They ride on the
+ * `SORT_REJECTED` RPC error's `detail` (see `RpcErrorWire.detail`) rather
+ * than the flat `code`/`message` pair, so `anchor` survives.
+ */
+export type SortRangeRejectCode =
+  | 'invalid-range'
+  | 'empty-keys'
+  | 'key-out-of-range'
+  | 'spill-in-range'
+  | 'invalid-payload'
+
+export interface SortRangeRejectWire {
+  code: SortRangeRejectCode
+  /** Present only for `spill-in-range` — the intersecting anchor (A1). */
+  anchor?: string
+  message?: string
+}
 
 export interface WorkbookPersistenceSheetWire {
   idx: number
@@ -224,6 +296,8 @@ export interface WorkerRuntimeCapabilitiesWire {
   tsvChunkExport: boolean
   /** persistence v1 snapshots round-trip the `formats` block. */
   persistenceFormats: boolean
+  /** sortRange physically reorders workbook data (engine physical sort). */
+  sortRange: boolean
 }
 
 export interface WorkerWorkbookSheetDebugCountersWire {
@@ -287,6 +361,19 @@ export interface WorkerWorkbookClient {
   setFormatRange(range: SparseRangeWire, fmt: CellFormatJSON | null | undefined): Promise<number>
   snapshotFormatRange(range: SparseRangeWire): Promise<FormatRangeSnapshot>
   restoreFormatSnapshot(snapshot: FormatRangeSnapshot): Promise<number>
+  /**
+   * Engine physical sort (design-engine-sort S2/S3). Reorders `payload.range`'s
+   * data rows in place by `payload.keys`, holding `payload.excludedRows`
+   * fixed. Resolves a `SortRangeReportWire` on success. Rejects with an
+   * Error whose `code` is `SORT_REJECTED` and whose `detail` is a
+   * `SortRangeRejectWire` for every engine/payload gate (invalid-range,
+   * empty-keys, key-out-of-range, spill-in-range, invalid-payload). A
+   * runtime that declares `sortRange: false` (the TS runtime, which has
+   * no physical sort) rejects with `UNSUPPORTED` instead — the host
+   * adapter withholds the sort port entirely through the capability
+   * handshake, so a compliant caller never reaches this on that runtime.
+   */
+  sortRange(sheet: number, payload: SortRangePayloadWire): Promise<SortRangeReportWire>
   beginImport(
     sessionIdOrOptions?: number | BeginImportOptionsWire,
     options?: BeginImportOptionsWire,
@@ -405,7 +492,10 @@ function cellKey(ref: CellRefWire): string {
 
 function toError(error: RpcErrorWire): Error {
   const err = new Error(error.message)
-  return Object.assign(err, { code: error.code })
+  return Object.assign(err, {
+    code: error.code,
+    ...(error.detail === undefined ? {} : { detail: error.detail }),
+  })
 }
 
 export function createWorkerWorkbook(opts: WorkerWorkbookOptions): WorkerWorkbookClient {
@@ -579,6 +669,9 @@ export function createWorkerWorkbook(opts: WorkerWorkbookOptions): WorkerWorkboo
     },
     restoreFormatSnapshot(snapshot) {
       return request<number>('restoreFormatSnapshot', { snapshot })
+    },
+    sortRange(sheet, payload) {
+      return request<SortRangeReportWire>('sortRange', { sheet, payload })
     },
     beginImport(sessionIdOrOptions, options) {
       const sessionId =

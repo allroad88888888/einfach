@@ -145,9 +145,41 @@ describe('TS worker runtime — structured UNSUPPORTED instead of success-shaped
       formatSnapshots: false,
       tsvChunkExport: false,
       persistenceFormats: false,
+      sortRange: false,
     }
     expect(expectOk(await raw({ cmd: 'describeCapabilities' }))).toEqual(witness)
     expect({ ...TS_WORKER_RUNTIME_CAPABILITIES }).toEqual(witness)
+  })
+
+  test('sortRange refuses with UNSUPPORTED and moves no data', async () => {
+    const { raw } = makeRpc()
+    await raw({ cmd: 'initWorkbook', sheets: ['Sheet1'] })
+    await raw({ cmd: 'setCell', sheet: 0, addr: 'A1', value: { type: 'number', value: 3 } })
+    await raw({ cmd: 'setCell', sheet: 0, addr: 'A2', value: { type: 'number', value: 1 } })
+
+    // The TS core has no physical sort — never a success-shaped fake ACK
+    // that would leave the host believing rows reordered.
+    expectUnsupported(
+      await raw({
+        cmd: 'sortRange',
+        sheet: 0,
+        payload: {
+          range: { startRow: 0, startCol: 0, endRow: 1, endCol: 0 },
+          keys: [{ col: 0, direction: 'asc' }],
+        },
+      }),
+    )
+
+    const cells = expectOk(
+      await raw({
+        cmd: 'readCells',
+        cells: [
+          { sheet: 0, addr: 'A1' },
+          { sheet: 0, addr: 'A2' },
+        ],
+      }),
+    ) as Array<{ display: string }>
+    expect(cells.map((c) => c.display)).toEqual(['3', '1'])
   })
 
   test('structural commands refuse with UNSUPPORTED and leave the workbook untouched', async () => {

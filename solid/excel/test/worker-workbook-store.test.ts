@@ -335,6 +335,9 @@ function makeFakeWorkerWorkbookClient(
       calls.restoreFormatSnapshot.push(snapshot)
       return 1
     },
+    async sortRange() {
+      throw new Error('not used')
+    },
     async snapshotViewportSizes(range) {
       calls.snapshotViewportSizes.push({
         sheet: range.sheet,

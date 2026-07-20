@@ -18,6 +18,8 @@ import type {
   ViewportSizeSnapshotWire,
   RpcErrorWire,
   RpcResponseWire,
+  SortRangeRejectWire,
+  SortRangeReportWire,
   SparseCellWire,
   SparseRangeWire,
   WorkbookImportStatsWire,
@@ -128,6 +130,16 @@ type WasmWorkbookRuntime = {
   ) => ViewportSizeSnapshotWire
   set_row_height?: (sheetIdx: number, rowIndex: number, heightPx: number) => boolean
   set_col_width?: (sheetIdx: number, colIndex: number, widthPx: number) => boolean
+  /**
+   * Engine physical sort (design-engine-sort S2). Reorders the range's
+   * data rows in place and returns EITHER the success report
+   * `{ ok: true, movedRows, movedCells, rowPermutation }` OR a structured
+   * reject `{ ok: false, code, anchor?, message? }` — both in the Ok arm;
+   * only a catastrophic report-serialization failure throws. Optional so
+   * pre-S2 wasm-pkg builds and test mocks keep compiling; `assertMethod`
+   * guards the call at dispatch time.
+   */
+  sortRange?: (sheetIdx: number, payload: unknown) => unknown
   snapshot_persistence_v1?: () => WorkbookPersistenceSnapshotWire
   restore_persistence_v1?: (
     snapshot: WorkbookPersistenceSnapshotWire,
@@ -1361,6 +1373,44 @@ export function installWorkerRuntime() {
             assertSheet(wb, sheet)
             assertMethod(wb, 'delete_col').call(wb, sheet, colIndex, count)
             postResponse(msg.id, true)
+          }
+          break
+        case 'sortRange':
+          {
+            const sheet = Number(msg.sheet)
+            assertSheet(wb, sheet)
+            const sortRange = assertMethod(wb, 'sortRange')
+            // Payload ({ range, keys, excludedRows }) is the engine's
+            // authority — forward it verbatim. The binding returns the
+            // success report or a structured reject, both in its Ok arm;
+            // only a catastrophic serialization failure throws (caught by
+            // the outer try → toRpcError).
+            const outcome = sortRange.call(wb, sheet, msg.payload) as
+              | ({ ok?: true } & SortRangeReportWire)
+              | ({ ok: false } & SortRangeRejectWire)
+            if (outcome && (outcome as { ok?: unknown }).ok === false) {
+              const reject = outcome as SortRangeRejectWire
+              // Fail-closed: a structured engine reject surfaces as an RPC
+              // error so the host's recordCellMutation wrapper (S4)
+              // short-circuits before recording undo or bumping revision.
+              // anchor/message ride on `detail` (SortRangeRejectWire).
+              postError(msg.id, {
+                code: 'SORT_REJECTED',
+                message: reject.message ?? reject.code,
+                detail: {
+                  code: reject.code,
+                  ...(reject.anchor === undefined ? {} : { anchor: reject.anchor }),
+                  ...(reject.message === undefined ? {} : { message: reject.message }),
+                },
+              })
+            } else {
+              const report = outcome as SortRangeReportWire
+              postResponse(msg.id, {
+                movedRows: report.movedRows,
+                movedCells: report.movedCells,
+                rowPermutation: report.rowPermutation,
+              })
+            }
           }
           break
         case 'setFormatRange':

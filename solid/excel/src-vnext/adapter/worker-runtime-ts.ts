@@ -113,6 +113,10 @@ export const TS_WORKER_RUNTIME_CAPABILITIES: WorkerRuntimeCapabilitiesWire = Obj
   formatSnapshots: false,
   tsvChunkExport: false,
   persistenceFormats: false,
+  // The TS core has no physical-sort primitive (no arbitrary-permutation
+  // relocate + verbatim carry + spill gate). Declaring `false` withholds
+  // the host sort port; a real implementation is the optional S7 slice.
+  sortRange: false,
 })
 
 const CUSTOM_FORMULA_ERROR_CODES: readonly ErrorCode[] = [
@@ -1484,6 +1488,13 @@ export function createWorkerRuntimeTs(events?: WorkerRuntimeTsEvents): ExcelCore
         // `structuralEdits: false`, so a compliant adapter never sends
         // these; if one does, the refusal is structured and honest.
         return unsupported(`${String(msg.cmd)} (structural edits)`)
+      case 'sortRange':
+        // Fail-closed: the TS core has no physical sort. Never fake an
+        // ACK — the `sortRange: false` witness already withholds the host
+        // port, so a compliant adapter never sends this; if one does, the
+        // refusal is structured and honest (never a success-shaped reply
+        // that would leave the host believing data moved).
+        return unsupported('sortRange (engine physical sort)')
       case 'setFormatRange':
         // Fail-closed: was "succeed with 0 cells affected".
         return unsupported('setFormatRange (formats)')
