@@ -231,6 +231,16 @@ pub enum TableError {
     SheetNotFound,
     /// No Table is registered under the supplied name (rename/delete/get).
     NotFound,
+    /// `rename_table_column` was given an `old_column` that no column of the
+    /// Table matches (case-insensitively).
+    ColumnNotFound,
+    /// `rename_table_column`'s `new_column` collides (case-insensitively)
+    /// with a DIFFERENT existing column of the same Table.
+    DuplicateColumn,
+    /// `rename_table_column`'s `new_column` is empty (would render an
+    /// unparseable `Table[]` reference — the empty-column form is deferred,
+    /// design §3.2).
+    InvalidColumnName,
     /// A host custom-formula JS callback tried to mutate the Table
     /// registry mid-evaluation. Mirrors every other workbook mutation
     /// entry point's re-entrancy guard.
@@ -261,6 +271,13 @@ impl std::fmt::Display for TableError {
             }
             TableError::SheetNotFound => write!(f, "sheet index is outside the workbook"),
             TableError::NotFound => write!(f, "no table registered under that name"),
+            TableError::ColumnNotFound => {
+                write!(f, "no column of that table matches the supplied name")
+            }
+            TableError::DuplicateColumn => {
+                write!(f, "the new column name collides with another column of the table")
+            }
+            TableError::InvalidColumnName => write!(f, "column name must not be empty"),
             TableError::MutationDuringCustomCall => write!(
                 f,
                 "table registry mutations are forbidden while a custom-formula callback is executing"
@@ -349,12 +366,11 @@ pub struct Workbook {
     /// `named_values`. Bounded to `MAX_TABLES` by `define_table`.
     tables: BTreeMap<String, TableEntry>,
     /// Monotonic counter bumped on every Table registry mutation
-    /// (create/rename/delete/structural-follow/sheet-hook). T1 broadcast
-    /// hook for Table geometry/name invalidation (design doc #32 §8): a
-    /// structured-reference formula's dependency on "the tables changed"
-    /// is a tracked read of a per-sheet `tables_epoch` Store atom in T3;
-    /// until that atom lands in `sheet.rs`, this workbook-level counter is
-    /// the observable broadcast seam (tests assert it advances). See
+    /// (create/rename/delete/structural-follow/sheet-hook) — the observable
+    /// witness that a broadcast happened (tests assert it advances). The
+    /// REACTIVE half of the broadcast (design doc #32 §8) is the shared
+    /// `tables_epoch` Store atom in `WorkbookAtomContext`, which a
+    /// structured-reference formula reads through `depend_tables`; see
     /// `bump_tables_epoch`.
     tables_epoch: u64,
 }
@@ -1791,14 +1807,11 @@ impl Workbook {
         Ok(())
     }
 
-    /// Rename a Table (design doc §4.1). Re-validates `new_name` against
-    /// the full name mutex (grammar / built-in / cell-ref-form / conflict),
-    /// excluding the Table's own current key so a case-only rename works.
-    ///
-    /// NOTE (T1 boundary): this updates only the registry key + display
-    /// name. Rewriting the TEXT of formulas that reference the old name
-    /// (`retarget_formula_refs`-style walker over `Expr::TableRef`) is T3
-    /// (§4.3) — it depends on the structured-reference AST that T2 adds.
+    /// Rename a Table (design doc §4.1 / §4.3). Re-validates `new_name`
+    /// against the full name mutex (grammar / built-in / cell-ref-form /
+    /// conflict), excluding the Table's own current key so a case-only
+    /// rename works, then rewrites the TEXT of every formula that references
+    /// the old name (`OldName[…]` → `NewName[…]`) across all sheets.
     pub fn rename_table(&mut self, name: &str, new_name: &str) -> Result<(), TableError> {
         if self.is_inside_custom_call() {
             return Err(TableError::MutationDuringCustomCall);
@@ -1814,8 +1827,107 @@ impl Workbook {
         let mut entry = self.tables.remove(&old_key).expect("existence checked above");
         entry.canonical_name = new_name.to_string();
         self.tables.insert(new_key, entry);
+        // Sync the projection to the new name BEFORE rewriting referencing
+        // formulas so their re-install resolves the renamed Table.
+        self.sync_atom_tables();
+        let spec = crate::shift::TableRefEditSpec::RenameTable {
+            from: old_key,
+            to: new_name.to_string(),
+        };
+        self.rewrite_table_refs_across_sheets(&spec, None);
         self.bump_tables_epoch();
         Ok(())
+    }
+
+    /// Rename one column of a Table (design doc §4.1 / §4.3; the engine half
+    /// of the I3 header-edit → column-rename story). Updates the registry
+    /// column name — the source of truth for `Table[Col]` resolution — and
+    /// rewrites the TEXT of every referencing formula (`Table[Old]` →
+    /// `Table[New]`, plus table-less `[Old]` inside the Table's own cells).
+    ///
+    /// The visible HEADER CELL text is left untouched: the canonical trigger
+    /// (§I3) is a header-cell edit, which already carries the new text, and
+    /// resolution reads the registry, not the header cell. A direct call
+    /// (e.g. a Name Manager rename) thus lags the header display until the
+    /// host writes it — a documented MVP boundary.
+    pub fn rename_table_column(
+        &mut self,
+        table_name: &str,
+        old_column: &str,
+        new_column: &str,
+    ) -> Result<(), TableError> {
+        if self.is_inside_custom_call() {
+            return Err(TableError::MutationDuringCustomCall);
+        }
+        if new_column.trim().is_empty() {
+            return Err(TableError::InvalidColumnName);
+        }
+        let key = table_name.to_ascii_uppercase();
+        let Some(entry) = self.tables.get(&key) else {
+            return Err(TableError::NotFound);
+        };
+        let col_idx = entry
+            .columns
+            .iter()
+            .position(|c| c.eq_ignore_ascii_case(old_column))
+            .ok_or(TableError::ColumnNotFound)?;
+        // Collision with a DIFFERENT column is rejected; a case-only rename
+        // of the same column is allowed.
+        if entry
+            .columns
+            .iter()
+            .enumerate()
+            .any(|(i, c)| i != col_idx && c.eq_ignore_ascii_case(new_column))
+        {
+            return Err(TableError::DuplicateColumn);
+        }
+        let anchor_sheet = entry.sheet_name.clone();
+        let table_range = entry.range;
+        self.tables
+            .get_mut(&key)
+            .expect("existence checked above")
+            .columns[col_idx] = new_column.to_string();
+        self.sync_atom_tables();
+        let spec = crate::shift::TableRefEditSpec::RenameColumn {
+            table_upper: key,
+            from: old_column.to_string(),
+            to: new_column.to_string(),
+        };
+        self.rewrite_table_refs_across_sheets(&spec, Some((&anchor_sheet, table_range)));
+        self.bump_tables_epoch();
+        Ok(())
+    }
+
+    /// Rewrite structured-reference formula text across every sheet per
+    /// `spec` (design doc §4.3). `anchor` is `Some((sheet_name, range))` for
+    /// a column rename, so table-less `[Col]` references inside the Table's
+    /// own cells on its anchor sheet are rewritten too; `None` for a table
+    /// rename (bare references carry no table name and never match).
+    ///
+    /// Collect (immutable sheet reads) then apply (`set_formula`) in two
+    /// passes: the borrow checker forbids holding a sheet borrow across the
+    /// mutable re-install, and the apply pass reuses the proven formula-edit
+    /// path (parking, cycle check, subscriber notification).
+    fn rewrite_table_refs_across_sheets(
+        &mut self,
+        spec: &crate::shift::TableRefEditSpec,
+        anchor: Option<(&str, CellRange)>,
+    ) {
+        let mut rewrites: Vec<(usize, CellAddress, String)> = Vec::new();
+        for idx in 0..self.sheets.len() {
+            let bare_range = match anchor {
+                Some((sheet_name, range)) if self.names[idx].as_str() == sheet_name => Some(range),
+                _ => None,
+            };
+            let bare_for = |addr: CellAddress| bare_range.is_some_and(|r| r.contains(addr));
+            for (addr, text) in self.sheets[idx].collect_table_ref_rewrites(spec, &bare_for) {
+                rewrites.push((idx, addr, text));
+            }
+        }
+        for (idx, addr, text) in rewrites {
+            let a1 = addr.to_string_repr();
+            self.set_formula(idx, &a1, &text);
+        }
     }
 
     /// Case-insensitive Table lookup. `None` when no Table is registered
@@ -1970,17 +2082,19 @@ impl Workbook {
 
     // --- internal helpers ----------------------------------------------
 
-    /// Bump the Table invalidation broadcast counter (design doc §8). The
-    /// T3 seam: this is where the per-sheet `tables_epoch` Store atoms will
-    /// also be `store.set(+1)` so structured-reference formulas that did a
-    /// tracked read of them re-derive. T1 keeps only the workbook counter.
+    /// Bump the Table invalidation broadcast counter (design doc §8) and
+    /// publish the change reactively. Two effects, in order:
+    ///   1. `sync_atom_tables` refreshes the formula-inner provider's Table
+    ///      projection so structured references resolve against current
+    ///      geometry.
+    ///   2. `atom_context.bump_tables_epoch` `store.set(+1)`s the shared
+    ///      `tables_epoch` atom, waking exactly the formulas that resolved a
+    ///      Table (they hold a `depend_tables` edge) — cross-sheet included,
+    ///      since the whole workbook shares one Store.
     fn bump_tables_epoch(&mut self) {
         self.tables_epoch = self.tables_epoch.wrapping_add(1);
-        // T2: refresh the formula-inner provider's Table projection so
-        // structured references resolve against current geometry. The
-        // reactive `store.set(per-sheet tables_epoch, +1)` that re-derives
-        // formulas holding a TableRef edge is the T3 seam (§8).
         self.sync_atom_tables();
+        self.atom_context.bump_tables_epoch();
     }
 
     /// Full Table name mutex (design doc §4.2). `exclude_key` is the

@@ -3,7 +3,7 @@ use einfach_excel_core::{
     Align, BorderSpec, BorderStyle, CellAddress, CellBorders, CellFormat, CellRange,
     CellSubscription, CustomFunctionRegistry, DepGraphStats, FormatRangeSnapshot, NumberFormat,
     RangeFormatSnapshotLayer, Rotation, Sheet, SheetError, SortDirection, SortKey, SortRangeError,
-    SortRangeReport, VerticalAlign, Workbook, WorkbookError,
+    SortRangeReport, TableEntry, TableError, VerticalAlign, Workbook, WorkbookError,
 };
 use serde::{de, Deserialize, Serialize};
 use std::cell::Cell;
@@ -1258,6 +1258,64 @@ impl SortRangeReportJSON {
     }
 }
 
+// === Excel Table registry wire (#32) — CRUD DTO for `listTables` /
+// `getTable`. Mirrors `TableEntry`'s public accessors; the range is emitted
+// as an A1 string (`"A1:C10"`) to match how ranges read elsewhere on the JS
+// side, plus the resolved 0-based `sheetIndex` for adapter convenience.
+#[derive(Clone, Debug, Serialize)]
+struct TableJSON {
+    name: String,
+    sheet: String,
+    #[serde(rename = "sheetIndex")]
+    sheet_index: u32,
+    range: String,
+    #[serde(rename = "hasHeaders")]
+    has_headers: bool,
+    #[serde(rename = "hasTotals")]
+    has_totals: bool,
+    columns: Vec<String>,
+}
+
+impl TableJSON {
+    fn from_entry(entry: &TableEntry, sheet_index: u32) -> Self {
+        let range = entry.range();
+        TableJSON {
+            name: entry.name().to_string(),
+            sheet: entry.sheet_name().to_string(),
+            sheet_index,
+            range: format!(
+                "{}:{}",
+                range.start.to_string_repr(),
+                range.end.to_string_repr()
+            ),
+            has_headers: entry.has_headers(),
+            has_totals: entry.has_totals(),
+            columns: entry.columns().to_vec(),
+        }
+    }
+}
+
+/// Map a `TableError` to a stable JS error string (mirrors
+/// `workbook_error_to_js`). Not part of the frozen export surface — no
+/// snapshot regeneration is triggered by adding a variant here.
+fn table_error_to_js(err: TableError) -> JsValue {
+    let msg = match err {
+        TableError::TooManyTables => "too-many-tables",
+        TableError::InvalidName => "invalid-name",
+        TableError::ReservedName => "reserved-name",
+        TableError::NameLikeCellRef => "name-like-cell-ref",
+        TableError::NameConflict => "name-conflict",
+        TableError::RangeOverlap => "range-overlap",
+        TableError::SheetNotFound => "sheet-not-found",
+        TableError::NotFound => "not-found",
+        TableError::ColumnNotFound => "column-not-found",
+        TableError::DuplicateColumn => "duplicate-column",
+        TableError::InvalidColumnName => "invalid-column-name",
+        TableError::MutationDuringCustomCall => "mutation-during-custom-call",
+    };
+    JsValue::from_str(msg)
+}
+
 /// Initialize the panic hook once per module load. Called automatically from
 /// every `WasmSheet::new()`; idempotent thanks to `set_once`. C.10.
 fn install_panic_hook() {
@@ -2223,32 +2281,118 @@ impl WasmWorkbook {
         self.workbook.named_names().map(|s| s.to_string()).collect()
     }
 
+    // === Excel Table registry (#32) — CRUD over the workbook-level Table
+    // registry. `has_headers` is hard-`true` (MVP); the range is passed as
+    // 0-based inclusive bounds (matching `clear_range`). Errors surface as
+    // the stable strings from `table_error_to_js`.
+
+    /// Define a Table over `[start..=end]` on `sheet_idx`. `name` is
+    /// `Some` to use an explicit (validated) name, or `None`/`undefined`
+    /// to auto-generate `Table1`, `Table2`, …. Returns the final
+    /// (canonical-cased) Table name.
+    #[wasm_bindgen(js_name = "createTable")]
+    pub fn create_table(
+        &mut self,
+        sheet_idx: u32,
+        start_row: u32,
+        start_col: u32,
+        end_row: u32,
+        end_col: u32,
+        name: Option<String>,
+    ) -> Result<String, JsValue> {
+        let range = CellRange::new(
+            CellAddress::new(start_row, start_col),
+            CellAddress::new(end_row, end_col),
+        );
+        self.workbook
+            .define_table(name.as_deref(), sheet_idx as usize, range, true)
+            .map_err(table_error_to_js)
+    }
+
+    /// Rename a Table, rewriting every referencing formula's text.
+    #[wasm_bindgen(js_name = "renameTable")]
+    pub fn rename_table(&mut self, name: &str, new_name: &str) -> Result<(), JsValue> {
+        self.workbook
+            .rename_table(name, new_name)
+            .map_err(table_error_to_js)
+    }
+
+    /// Rename one column of a Table, rewriting every referencing formula.
+    #[wasm_bindgen(js_name = "renameTableColumn")]
+    pub fn rename_table_column(
+        &mut self,
+        name: &str,
+        old_column: &str,
+        new_column: &str,
+    ) -> Result<(), JsValue> {
+        self.workbook
+            .rename_table_column(name, old_column, new_column)
+            .map_err(table_error_to_js)
+    }
+
+    /// Remove a Table's registry entry (convert to range — values, formulas,
+    /// and formats are untouched).
+    #[wasm_bindgen(js_name = "deleteTable")]
+    pub fn delete_table(&mut self, name: &str) -> Result<(), JsValue> {
+        self.workbook
+            .delete_table(name)
+            .map_err(table_error_to_js)
+    }
+
+    /// Every registered Table as `TableJSON[]`, alphabetical by uppercased
+    /// name (the engine's stable order).
+    #[wasm_bindgen(js_name = "listTables")]
+    pub fn list_tables(&self) -> Result<JsValue, JsValue> {
+        let tables: Vec<TableJSON> = self
+            .workbook
+            .list_tables()
+            .into_iter()
+            .map(|entry| {
+                let idx = self.sheet_index_by_name(entry.sheet_name()).unwrap_or(0);
+                TableJSON::from_entry(entry, idx)
+            })
+            .collect();
+        serde_wasm_bindgen::to_value(&tables)
+            .map_err(|err| JsValue::from_str(&format!("serialize tables: {err}")))
+    }
+
+    /// One Table as `TableJSON`, or `null` when no Table is registered under
+    /// `name` (case-insensitive).
+    #[wasm_bindgen(js_name = "getTable")]
+    pub fn get_table(&self, name: &str) -> Result<JsValue, JsValue> {
+        match self.workbook.get_table(name) {
+            Some(entry) => {
+                let idx = self.sheet_index_by_name(entry.sheet_name()).unwrap_or(0);
+                serde_wasm_bindgen::to_value(&TableJSON::from_entry(entry, idx))
+                    .map_err(|err| JsValue::from_str(&format!("serialize table: {err}")))
+            }
+            None => Ok(JsValue::null()),
+        }
+    }
+
     pub fn clear_cell(&mut self, sheet_idx: u32, addr: &str) {
         self.workbook.clear_cell(sheet_idx as usize, addr);
     }
 
+    // Structural ops route through the WORKBOOK wrappers (not
+    // `sheet_mut(..).insert_row`) so registered Excel Tables anchored to the
+    // sheet follow the edit and their `tables_epoch` fires (design doc #32
+    // §4.3 item c). For a table-less workbook these wrappers are behaviorally
+    // identical to the old direct-sheet path.
     pub fn insert_row(&mut self, sheet_idx: u32, at: u32, count: u32) {
-        if let Some(sheet) = self.workbook.sheet_mut(sheet_idx as usize) {
-            sheet.insert_row(at, count);
-        }
+        self.workbook.insert_rows(sheet_idx as usize, at, count);
     }
 
     pub fn delete_row(&mut self, sheet_idx: u32, at: u32, count: u32) {
-        if let Some(sheet) = self.workbook.sheet_mut(sheet_idx as usize) {
-            sheet.delete_row(at, count);
-        }
+        self.workbook.delete_rows(sheet_idx as usize, at, count);
     }
 
     pub fn insert_col(&mut self, sheet_idx: u32, at: u32, count: u32) {
-        if let Some(sheet) = self.workbook.sheet_mut(sheet_idx as usize) {
-            sheet.insert_col(at, count);
-        }
+        self.workbook.insert_columns(sheet_idx as usize, at, count);
     }
 
     pub fn delete_col(&mut self, sheet_idx: u32, at: u32, count: u32) {
-        if let Some(sheet) = self.workbook.sheet_mut(sheet_idx as usize) {
-            sheet.delete_col(at, count);
-        }
+        self.workbook.delete_columns(sheet_idx as usize, at, count);
     }
 
     pub fn get_display(&self, sheet_idx: u32, addr: &str) -> String {
@@ -3487,6 +3631,14 @@ impl WasmWorkbook {
         self.workbook.get_cell(name, addr)
     }
 
+    /// Resolve a sheet name to its 0-based index for the Table DTO. Used only
+    /// by `listTables` / `getTable`, where the Table anchors by sheet name.
+    fn sheet_index_by_name(&self, name: &str) -> Option<u32> {
+        (0..self.workbook.sheet_count())
+            .find(|&idx| self.workbook.name(idx) == Some(name))
+            .map(|idx| idx as u32)
+    }
+
     fn snapshot_persistence_v1_json(&self) -> WorkbookPersistenceV1JSON {
         let mut sheets = Vec::with_capacity(self.workbook.sheet_count());
         let mut formats = Vec::with_capacity(self.workbook.sheet_count());
@@ -4138,6 +4290,47 @@ mod tests {
         assert_eq!(
             demote_busy_for_custom_return(ValueError::Spill),
             ValueError::Spill
+        );
+    }
+
+    // === Excel Table registry wire (#32 T3) ===
+    //
+    // The `#[wasm_bindgen]`-exported CRUD methods touch `JsValue` in their
+    // signatures, so they can only be exercised through a JS runtime — the
+    // full create → formula → rename → delete round-trip lives in the WASM
+    // e2e (T8) and the engine round-trip in `excel-core/tests/table_shift.rs`.
+    // What is unit-testable natively is the wire mapping this crate owns:
+    // `TableJSON::from_entry` (range → A1 string, columns, flags, sheet
+    // index passthrough).
+
+    #[test]
+    fn table_json_from_entry_maps_fields() {
+        let mut wb = Workbook::new();
+        wb.add_sheet("Data");
+        let sd = wb.index_of("Data").unwrap();
+        wb.set_cell(sd, "A1", Value::Text("Region".into()));
+        wb.set_cell(sd, "B1", Value::Text("Sales".into()));
+        wb.define_table(
+            Some("Revenue"),
+            sd,
+            CellRange::new(CellAddress::new(0, 0), CellAddress::new(2, 1)),
+            true,
+        )
+        .expect("define table");
+
+        // Case-insensitive lookup returns the canonical-cased entry.
+        let entry = wb.get_table("revenue").expect("entry");
+        let json = TableJSON::from_entry(entry, sd as u32);
+        assert_eq!(json.name, "Revenue");
+        assert_eq!(json.sheet, "Data");
+        assert_eq!(json.sheet_index, sd as u32);
+        assert_eq!(json.range, "A1:B3", "range emitted as an A1 span");
+        assert!(json.has_headers);
+        assert!(!json.has_totals);
+        assert_eq!(
+            json.columns,
+            vec!["Region".to_string(), "Sales".to_string()],
+            "column display names read from the header row"
         );
     }
 

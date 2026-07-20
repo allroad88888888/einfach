@@ -36,16 +36,22 @@ impl WasmSheet :: [] :: pub fn unsubscribe(&mut self, token: u32)
 impl WasmWorkbook :: [#[wasm_bindgen(constructor)]] :: pub fn new() -> Self
 impl WasmWorkbook :: [#[wasm_bindgen(js_name = "bulkImportCellsInstrumented")]] :: pub fn bulk_import_cells_instrumented(&mut self, cells: JsValue) -> Result<JsValue, JsValue>
 impl WasmWorkbook :: [#[wasm_bindgen(js_name = "clearCellAt")]] :: pub fn clear_cell_at(&mut self, sheet_idx: usize, addr: &str)
+impl WasmWorkbook :: [#[wasm_bindgen(js_name = "createTable")]] :: pub fn create_table( &mut self, sheet_idx: u32, start_row: u32, start_col: u32, end_row: u32, end_col: u32, name: Option<String>, ) -> Result<String, JsValue>
 impl WasmWorkbook :: [#[wasm_bindgen(js_name = "customFormulaCount")]] :: pub fn custom_formula_count(&self) -> u32
 impl WasmWorkbook :: [#[wasm_bindgen(js_name = "customFormulaNames")]] :: pub fn custom_formula_names(&self) -> JsValue
 impl WasmWorkbook :: [#[wasm_bindgen(js_name = "debugDepGraphStats")]] :: pub fn debug_dep_graph_stats(&self) -> Result<JsValue, JsValue>
 impl WasmWorkbook :: [#[wasm_bindgen(js_name = "debugLastBulkImportPhaseMs")]] :: pub fn debug_last_bulk_import_phase_ms(&self) -> Vec<f64>
 impl WasmWorkbook :: [#[wasm_bindgen(js_name = "defineName")]] :: pub fn define_name(&mut self, name: &str, formula: &str) -> Result<(), JsValue>
 impl WasmWorkbook :: [#[wasm_bindgen(js_name = "definedNames")]] :: pub fn defined_names(&self) -> Vec<String>
+impl WasmWorkbook :: [#[wasm_bindgen(js_name = "deleteTable")]] :: pub fn delete_table(&mut self, name: &str) -> Result<(), JsValue>
 impl WasmWorkbook :: [#[wasm_bindgen(js_name = "drainAsyncCustomRequests")]] :: pub fn drain_async_custom_requests(&mut self) -> JsValue
 impl WasmWorkbook :: [#[wasm_bindgen(js_name = "getCellDisplay")]] :: pub fn get_cell_display(&mut self, sheet_idx: usize, addr: &str) -> String
+impl WasmWorkbook :: [#[wasm_bindgen(js_name = "getTable")]] :: pub fn get_table(&self, name: &str) -> Result<JsValue, JsValue>
+impl WasmWorkbook :: [#[wasm_bindgen(js_name = "listTables")]] :: pub fn list_tables(&self) -> Result<JsValue, JsValue>
 impl WasmWorkbook :: [#[wasm_bindgen(js_name = "registerCustomFormula")]] :: pub fn register_custom_formula(&mut self, name: String, callback: js_sys::Function)
 impl WasmWorkbook :: [#[wasm_bindgen(js_name = "registerCustomFormulaAsync")]] :: pub fn register_custom_formula_async(&mut self, name: String)
+impl WasmWorkbook :: [#[wasm_bindgen(js_name = "renameTable")]] :: pub fn rename_table(&mut self, name: &str, new_name: &str) -> Result<(), JsValue>
+impl WasmWorkbook :: [#[wasm_bindgen(js_name = "renameTableColumn")]] :: pub fn rename_table_column( &mut self, name: &str, old_column: &str, new_column: &str, ) -> Result<(), JsValue>
 impl WasmWorkbook :: [#[wasm_bindgen(js_name = "resolveAsyncCustomCall")]] :: pub fn resolve_async_custom_call(&mut self, call_id: f64, value: JsValue) -> bool
 impl WasmWorkbook :: [#[wasm_bindgen(js_name = "setFormulaAt")]] :: pub fn set_formula_at(&mut self, sheet_idx: usize, addr: &str, src: &str) -> bool
 impl WasmWorkbook :: [#[wasm_bindgen(js_name = "snapshotCell")]] :: pub fn snapshot_cell(&self, sheet_idx: u32, addr: &str) -> Result<JsValue, JsValue>

@@ -912,9 +912,24 @@ pub(crate) struct WorkbookAtomContext {
     names_epoch: RefCell<Option<AtomId>>,
     names_revision: Cell<u64>,
     /// Structured-reference Table projection, keyed by uppercased name
-    /// (design doc #32 §5.3). T2 seam: a `tables_epoch` Store atom for
-    /// reactive geometry-change invalidation lands in T3 — see `sync_tables`.
+    /// (design doc #32 §5.3). Reactive geometry/name-change invalidation is
+    /// carried by the `tables_epoch` atom below.
     tables: RefCell<HashMap<String, ProjectedTable>>,
+    /// Reactive invalidation seam for Table geometry / name changes (design
+    /// doc #32 §8). A structured-reference formula's `lookup_table` does a
+    /// tracked read of this epoch atom (`depend_tables`); every Table
+    /// registry mutation `store.set(+1)`s it (`bump_tables_epoch`), so only
+    /// the formulas that actually resolved a Table re-derive — cell-CONTENT
+    /// edges are already carried by the resolved range's facade reads.
+    ///
+    /// One shared atom (not per-sheet): every sheet in a workbook shares one
+    /// Store (`Workbook::store`), so this single edge invalidates cross-sheet
+    /// structured references for free — exactly as `topology_epoch` /
+    /// `names_epoch` already do. (Design §8 sketched a per-sheet atom + O(n)
+    /// broadcast under a stale "one Store per sheet" model; the shared-Store
+    /// reality makes a single atom both simpler and sufficient.)
+    tables_epoch: RefCell<Option<AtomId>>,
+    tables_revision: Cell<u64>,
     custom_functions: RefCell<Option<Arc<dyn CustomFunctionRegistry>>>,
     custom_epoch: RefCell<Option<AtomId>>,
     custom_revision: Cell<u64>,
@@ -937,6 +952,8 @@ impl WorkbookAtomContext {
             names_epoch: RefCell::new(None),
             names_revision: Cell::new(0),
             tables: RefCell::new(HashMap::new()),
+            tables_epoch: RefCell::new(None),
+            tables_revision: Cell::new(0),
             custom_functions: RefCell::new(None),
             custom_epoch: RefCell::new(None),
             custom_revision: Cell::new(0),
@@ -976,6 +993,22 @@ impl WorkbookAtomContext {
         let _ = args.get(id);
     }
 
+    /// Tracked read of the Table-invalidation epoch (design doc #32 §8).
+    /// Consulted by both `lookup_table_*` paths — including their MISS
+    /// branches — so a formula that references a not-yet-defined Table
+    /// re-derives once that Table is created.
+    fn depend_tables(&self, args: &ReadArgs) {
+        let id = self.epoch_atom(&self.tables_epoch, self.tables_revision.get());
+        let _ = args.get(id);
+    }
+
+    /// Publish a Table geometry / name change so every structured-reference
+    /// formula holding a `depend_tables` edge re-derives (design doc #32 §8).
+    /// Driven by `Workbook::bump_tables_epoch` after each registry mutation.
+    pub(crate) fn bump_tables_epoch(&self) {
+        self.bump_epoch(&self.tables_epoch, &self.tables_revision);
+    }
+
     fn bump_epoch(&self, slot: &RefCell<Option<AtomId>>, revision: &Cell<u64>) {
         let next = revision.get().wrapping_add(1);
         revision.set(next);
@@ -1003,10 +1036,11 @@ impl WorkbookAtomContext {
     /// Refresh the structured-reference Table projection (design doc #32
     /// §5.3). Called by `Workbook` after every Table registry mutation.
     ///
-    /// T2 seam: this only replaces the projection. Reactive re-derive on a
-    /// Table geometry/name change (`store.set(tables_epoch, +1)`) lands in
-    /// T3; structured references already re-derive on cell-CONTENT changes
-    /// because their resolved range reads through the tracked facades.
+    /// Only replaces the projection snapshot; the paired reactive
+    /// `store.set(tables_epoch, +1)` that re-derives dependent formulas is
+    /// `bump_tables_epoch`, kept separate so `Workbook` can sync the
+    /// projection BEFORE it rewrites referencing formulas (rename) and fire
+    /// the epoch AFTER.
     pub(crate) fn sync_tables(&self, tables: HashMap<String, ProjectedTable>) {
         *self.tables.borrow_mut() = tables;
     }
@@ -1014,6 +1048,9 @@ impl WorkbookAtomContext {
     /// Resolve a named structured reference (`Table1[...]`). `None` when no
     /// Table is registered under `name`, or its anchor sheet is gone.
     fn lookup_table_named(&self, name: &str, args: &ReadArgs) -> Option<ResolvedTable> {
+        // Register the geometry/name epoch edge BEFORE the registry probe so
+        // even a miss (`#NAME?`) re-derives once the Table is later created.
+        self.depend_tables(args);
         let table = self.tables.borrow().get(&name.to_ascii_uppercase()).cloned()?;
         // Tracked topology read: cross-sheet resolution depends on the
         // sheet-name → index map, so re-derive if a sheet is added/removed.
@@ -1031,6 +1068,9 @@ impl WorkbookAtomContext {
         addr: CellAddress,
         args: &ReadArgs,
     ) -> Option<ResolvedTable> {
+        // See `lookup_table_named`: register the epoch edge before the probe
+        // so a table-less `[Col]` re-derives once a Table wraps its cell.
+        self.depend_tables(args);
         self.depend_topology(args);
         let sheet_name = self
             .topology
@@ -5694,6 +5734,59 @@ impl Sheet {
             // the cell facade.
             self.write_error(addr, ValueError::InvalidRef);
         }
+    }
+
+    /// Collect the `(address, rewritten formula text)` pairs for every
+    /// formula on this sheet whose structured (Table) references change under
+    /// `spec` (design doc #32 §4.3 table/column rename). Read-only: the
+    /// caller re-installs each rewrite through the normal `set_formula` path,
+    /// so parking, dependency install, cycle checks, and subscriber
+    /// notification are unchanged — the same "two-channel" reach as
+    /// `retarget_formula_refs` + `retarget_parked_sources`, but keyed on the
+    /// Table registry rather than on shifted A1 coordinates.
+    ///
+    /// Hydrated ASTs (`formula_exprs`) are rewritten in place; parked
+    /// sources (`formula_source`) are parsed, rewritten, and rendered —
+    /// rename is a low-frequency dialog op, and a cheap `[` pre-filter skips
+    /// the lazy formulas that provably hold no structured reference.
+    ///
+    /// `bare_for(addr)` decides whether a table-less `[Col]` at `addr`
+    /// targets the renamed Table (column rename on the Table's anchor
+    /// sheet); it is always `false` for a table rename.
+    pub(crate) fn collect_table_ref_rewrites(
+        &self,
+        spec: &crate::shift::TableRefEditSpec,
+        bare_for: &dyn Fn(CellAddress) -> bool,
+    ) -> Vec<(CellAddress, String)> {
+        let mut out: Vec<(CellAddress, String)> = Vec::new();
+        {
+            let exprs = self.interior.formula_exprs.borrow();
+            for (addr, expr) in exprs.iter() {
+                if let Some(new_expr) =
+                    crate::shift::rewrite_table_refs(expr, spec, bare_for(*addr))
+                {
+                    out.push((*addr, crate::shift::render_formula(&new_expr)));
+                }
+            }
+        }
+        let hydrated: HashSet<CellAddress> = out.iter().map(|(a, _)| *a).collect();
+        let sources = self.interior.formula_source.borrow();
+        for (addr, src) in sources.iter() {
+            if hydrated.contains(&addr) {
+                continue;
+            }
+            let text = src.source.as_ref();
+            if !text.contains('[') {
+                continue;
+            }
+            let Some(expr) = crate::formula::parse_formula(text) else {
+                continue;
+            };
+            if let Some(new_expr) = crate::shift::rewrite_table_refs(&expr, spec, bare_for(addr)) {
+                out.push((addr, crate::shift::render_formula(&new_expr)));
+            }
+        }
+        out
     }
 
     /// Set multiple cells at once, with a single propagation pass.
