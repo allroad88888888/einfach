@@ -7,6 +7,7 @@ pub mod formula;
 pub mod range;
 pub mod sheet;
 pub mod shift;
+pub mod sort;
 pub mod undo;
 pub mod workbook;
 
@@ -24,5 +25,6 @@ pub use sheet::{
     RangeFormatSnapshotLayer, Sheet, SheetError,
 };
 pub use shift::{render_formula, shift_refs};
+pub use sort::{sort_cmp, sort_cmp_with_direction, SortDirection, SortKey, SortRangeError, SortRangeReport};
 pub use undo::{CellSnapshot, Edit, UndoStack};
 pub use workbook::{BulkInstallStats, InstallError, Workbook, WorkbookError};

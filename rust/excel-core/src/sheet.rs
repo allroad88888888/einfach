@@ -15,8 +15,8 @@ use crate::format::{apply_rules, CellFormat, ConditionalRule};
 use crate::formula::{parse_formula, Expr, RangeBounds};
 use crate::range::CellRange;
 
-const EXCEL_MAX_ROWS: u32 = 1_048_576;
-const EXCEL_MAX_COLS: u32 = 16_384;
+pub(crate) const EXCEL_MAX_ROWS: u32 = 1_048_576;
+pub(crate) const EXCEL_MAX_COLS: u32 = 16_384;
 const RANGE_TIER_A_CELL_LIMIT: u64 = 256;
 const RANGE_BAND_ROWS: u32 = 256;
 const RANGE_BAND_DEP_LIMIT: u64 = 4_096;
@@ -392,9 +392,9 @@ fn normalize_formula_cell_result(value: Value) -> Value {
 }
 
 #[derive(Clone, Debug)]
-struct RangeFormat {
-    range: CellRange,
-    fmt: CellFormat,
+pub(crate) struct RangeFormat {
+    pub(crate) range: CellRange,
+    pub(crate) fmt: CellFormat,
 }
 
 #[derive(Clone, Debug)]
@@ -643,11 +643,13 @@ pub struct Sheet {
     next_cell_sub_id: u64,
     /// Per-cell formatting (Phase 6). Independent of the dep graph; format
     /// changes never trigger formula recompute. Entry absent → default.
-    formats: HashMap<CellAddress, CellFormat>,
+    /// `pub(crate)` so the sort module's layer materialize+cut preprocessing
+    /// (`sort.rs`) can rewrite entries in place.
+    pub(crate) formats: HashMap<CellAddress, CellFormat>,
     /// Ordered range-format layers. Later entries win. The format lookup order
     /// is reversed so overlapping ranges resolve to the most recently added
-    /// matching layer.
-    range_formats: Vec<RangeFormat>,
+    /// matching layer. `pub(crate)` for the sort module (see `formats`).
+    pub(crate) range_formats: Vec<RangeFormat>,
     /// Sheet-wide conditional formatting rules. Applied in order on top of
     /// each cell's base format at display time (first match wins).
     conditional_rules: Vec<ConditionalRule>,
@@ -740,7 +742,9 @@ pub struct Sheet {
     /// probe instead of a reverse scan over all of `cells` per anchor.
     /// `spill_target_anchor` alone can't serve this lookup: anchors
     /// with zero targets (1×1 / empty arrays) have no entry there.
-    spill_anchor_addr: HashMap<AtomId, CellAddress>,
+    /// `pub(crate)` so the sort module's spill-intersection gate can walk
+    /// the anchor set in O(anchors) without a parallel index.
+    pub(crate) spill_anchor_addr: HashMap<AtomId, CellAddress>,
 }
 
 /// Shared facade/formula-inner context: the minimal handles needed to mint and
@@ -2000,7 +2004,7 @@ impl Sheet {
     /// Structural edits can leave old address keys behind after storage has
     /// moved. Peel obsolete formula components until no further Store-safe
     /// family eviction is possible (chains may require more than one pass).
-    fn prune_obsolete_formula_atoms(&self) {
+    pub(crate) fn prune_obsolete_formula_atoms(&self) {
         loop {
             let keys: Vec<CellAddress> = self
                 .formula_inner_family
@@ -4915,7 +4919,7 @@ impl Sheet {
 
     // === Phase 6: cell formatting ===
 
-    fn base_format_at(&self, addr: CellAddress) -> CellFormat {
+    pub(crate) fn base_format_at(&self, addr: CellAddress) -> CellFormat {
         if let Some(fmt) = self.formats.get(&addr) {
             return fmt.clone();
         }
@@ -5241,7 +5245,7 @@ impl Sheet {
     /// that address actually changed. Detaches every fanout for the duration
     /// of the edit so internal `store.set` calls don't fan out partial
     /// intermediate states; reattaches at the end.
-    fn with_structural_edit(&mut self, f: impl FnOnce(&mut Self)) {
+    pub(crate) fn with_structural_edit(&mut self, f: impl FnOnce(&mut Self)) {
         let addrs: Vec<CellAddress> = self.cell_subscriptions.keys().copied().collect();
         let mut pre: Vec<(CellAddress, Value)> = Vec::with_capacity(addrs.len());
         for addr in &addrs {
@@ -5318,7 +5322,7 @@ impl Sheet {
     }
 
     /// Move every (still-present) cell entry to its new address per `f`.
-    fn relocate_cells(&mut self, f: impl Fn(CellAddress) -> CellAddress) {
+    pub(crate) fn relocate_cells(&mut self, f: impl Fn(CellAddress) -> CellAddress) {
         // Phase A: rebuild each map under new keys. We materialize Vecs first
         // because mutating a BTreeMap while iterating its keys would panic.
         // `drain_into_vec` empties `interior.cells` / `interior.formula_cells`
