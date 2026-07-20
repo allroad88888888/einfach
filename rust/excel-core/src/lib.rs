@@ -28,5 +28,6 @@ pub use shift::{render_formula, shift_refs};
 pub use sort::{sort_cmp, sort_cmp_with_direction, SortDirection, SortKey, SortRangeError, SortRangeReport};
 pub use undo::{CellSnapshot, Edit, UndoStack};
 pub use workbook::{
-    BulkInstallStats, InstallError, TableEntry, TableError, Workbook, WorkbookError,
+    BulkInstallStats, InstallError, TableEntry, TableError, TotalsFunction, Workbook,
+    WorkbookError,
 };

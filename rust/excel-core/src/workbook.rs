@@ -10,7 +10,7 @@ use crate::eval::{
     eval_expr_with_provider, is_builtin_function_name, CustomFunctionRegistry, EvalProvider,
     ExcelLambda, ResolvedTable,
 };
-use crate::formula::{parse_formula, Expr, RangeBounds};
+use crate::formula::{parse_formula, Expr, RangeBounds, TableArea};
 use crate::range::CellRange;
 use crate::sheet::{
     BulkInstallCleanup, PendingAsyncCustomCall, ProjectedTable, Sheet, SheetError,
@@ -241,6 +241,17 @@ pub enum TableError {
     /// unparseable `Table[]` reference — the empty-column form is deferred,
     /// design §3.2).
     InvalidColumnName,
+    /// `set_table_totals_row(name, true)` found the row immediately below the
+    /// Table (within its column span) already occupied by a non-empty cell.
+    /// The engine refuses to silently push existing content down (design
+    /// doc #32 §7 — "被占则显式拒绝，不做隐式插行"); the host surfaces this
+    /// so the user can clear the row first. Named `TotalsRowBlocked` per the
+    /// design doc.
+    TotalsRowBlocked,
+    /// `set_table_total_function` was called on a Table whose totals row is
+    /// not currently shown (`has_totals == false`). Enable it first via
+    /// `set_table_totals_row(name, true)`.
+    NoTotalsRow,
     /// A host custom-formula JS callback tried to mutate the Table
     /// registry mid-evaluation. Mirrors every other workbook mutation
     /// entry point's re-entrancy guard.
@@ -278,6 +289,12 @@ impl std::fmt::Display for TableError {
                 write!(f, "the new column name collides with another column of the table")
             }
             TableError::InvalidColumnName => write!(f, "column name must not be empty"),
+            TableError::TotalsRowBlocked => {
+                write!(f, "the row below the table is occupied; clear it before adding a totals row")
+            }
+            TableError::NoTotalsRow => {
+                write!(f, "the table has no totals row; enable it first")
+            }
             TableError::MutationDuringCustomCall => write!(
                 f,
                 "table registry mutations are forbidden while a custom-formula callback is executing"
@@ -287,6 +304,95 @@ impl std::fmt::Display for TableError {
 }
 
 impl std::error::Error for TableError {}
+
+/// Per-column aggregation for a Table totals-row cell (design doc #32 §7 /
+/// I5). Each variant (except `None`) maps to a SUBTOTAL function number in
+/// the **101-111** band so the generated totals formula excludes host-pushed
+/// hidden rows exactly like every other 101-111 call (T4 / §6) — a filtered
+/// or manually-hidden data row drops out of the total, matching Excel's
+/// totals-row behaviour. `None` means "no aggregate": the totals cell is
+/// cleared.
+///
+/// The nine choices mirror the UI dropdown vocabulary (§9). Note the
+/// deliberate split between `Count` (COUNTA — counts non-empty cells,
+/// SUBTOTAL 103) and `CountNums` (COUNT — counts numbers only, SUBTOTAL
+/// 102), matching Excel's "Count" vs "Count Numbers" menu entries.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TotalsFunction {
+    /// Clear the totals cell (no aggregate).
+    None,
+    /// AVERAGE → SUBTOTAL 101.
+    Average,
+    /// COUNTA (non-empty) → SUBTOTAL 103.
+    Count,
+    /// COUNT (numbers only) → SUBTOTAL 102.
+    CountNums,
+    /// MAX → SUBTOTAL 104.
+    Max,
+    /// MIN → SUBTOTAL 105.
+    Min,
+    /// SUM → SUBTOTAL 109 (the default applied to the last column when the
+    /// totals row is first turned on — Excel parity).
+    Sum,
+    /// STDEV (sample) → SUBTOTAL 107.
+    StdDev,
+    /// VAR (sample) → SUBTOTAL 110.
+    Var,
+}
+
+impl TotalsFunction {
+    /// The SUBTOTAL function number this aggregate generates, or `None` for
+    /// [`TotalsFunction::None`] (which clears the cell instead of writing a
+    /// formula). Always in the 101-111 hidden-excluding band (§7).
+    pub fn subtotal_code(self) -> Option<u32> {
+        match self {
+            TotalsFunction::None => Option::None,
+            TotalsFunction::Average => Some(101),
+            TotalsFunction::CountNums => Some(102),
+            TotalsFunction::Count => Some(103),
+            TotalsFunction::Max => Some(104),
+            TotalsFunction::Min => Some(105),
+            TotalsFunction::StdDev => Some(107),
+            TotalsFunction::Sum => Some(109),
+            TotalsFunction::Var => Some(110),
+        }
+    }
+
+    /// Stable lower-camel id used across the WASM / adapter / UI boundary
+    /// (matches the design §9 dropdown vocabulary). Companion to
+    /// [`TotalsFunction::from_id`].
+    pub fn id(self) -> &'static str {
+        match self {
+            TotalsFunction::None => "none",
+            TotalsFunction::Average => "average",
+            TotalsFunction::Count => "count",
+            TotalsFunction::CountNums => "countNums",
+            TotalsFunction::Max => "max",
+            TotalsFunction::Min => "min",
+            TotalsFunction::Sum => "sum",
+            TotalsFunction::StdDev => "stdDev",
+            TotalsFunction::Var => "var",
+        }
+    }
+
+    /// Parse a [`TotalsFunction::id`] string back into the enum. Returns
+    /// `None` for an unknown id so the WASM boundary can reject it. The
+    /// match is case-sensitive on the canonical camelCase ids.
+    pub fn from_id(id: &str) -> Option<Self> {
+        Some(match id {
+            "none" => TotalsFunction::None,
+            "average" => TotalsFunction::Average,
+            "count" => TotalsFunction::Count,
+            "countNums" => TotalsFunction::CountNums,
+            "max" => TotalsFunction::Max,
+            "min" => TotalsFunction::Min,
+            "sum" => TotalsFunction::Sum,
+            "stdDev" => TotalsFunction::StdDev,
+            "var" => TotalsFunction::Var,
+            _ => return Option::None,
+        })
+    }
+}
 
 /// A workbook is an ordered collection of named sheets. Every formula derives
 /// through facade/formula-inner atoms in the workbook's shared Store.
@@ -1947,6 +2053,181 @@ impl Workbook {
         self.tables.len()
     }
 
+    // --- Totals row (design doc #32 §7 / I5) ----------------------------
+    //
+    // The totals row is a Table-internal behaviour, NOT a sheet structural
+    // op: toggling it grows/shrinks the Table's own range by one row and
+    // writes/clears `=SUBTOTAL(1xx, Table[Col])` formulas through the normal
+    // `set_formula` / `clear_cell` paths, so the totals cells participate in
+    // the recompute graph and the host's cell-level undo snapshots with no
+    // second source of truth (the cell formula *is* the fact — §7).
+
+    /// Toggle a Table's totals row (design doc #32 §7).
+    ///
+    /// `enabled == true`: the row immediately below the Table (within its
+    /// column span) must be entirely empty; if occupied the call fails with
+    /// [`TableError::TotalsRowBlocked`] and nothing changes — the engine
+    /// never silently pushes existing content down. On success the Table's
+    /// `range` grows one row, `has_totals` becomes true, and the **last
+    /// column** gets a default `=SUBTOTAL(109, Table[Col])` (SUM) — Excel's
+    /// default. Every other totals cell is left blank; a host sets those via
+    /// [`Workbook::set_table_total_function`].
+    ///
+    /// `enabled == false`: every totals-row cell in the Table's column span
+    /// is cleared (including any the user hand-edited), the `range` shrinks
+    /// one row, and `has_totals` becomes false.
+    ///
+    /// Idempotent: enabling an already-totalled Table (or disabling one
+    /// without a totals row) is a successful no-op. `TableError::NotFound`
+    /// for an unknown name; guarded against re-entrant custom-formula calls.
+    pub fn set_table_totals_row(&mut self, name: &str, enabled: bool) -> Result<(), TableError> {
+        if self.is_inside_custom_call() {
+            return Err(TableError::MutationDuringCustomCall);
+        }
+        let key = name.to_ascii_uppercase();
+        let Some(entry) = self.tables.get(&key) else {
+            return Err(TableError::NotFound);
+        };
+        if entry.has_totals == enabled {
+            return Ok(()); // idempotent no-op
+        }
+        let sheet_name = entry.sheet_name.clone();
+        let range = entry.range.normalize();
+        let sheet_index = match self.index_of(&sheet_name) {
+            Some(i) => i,
+            // A Table anchored to a missing sheet shouldn't happen (the
+            // sheet-lifecycle hooks keep the anchor valid), but fail closed
+            // rather than panic.
+            None => return Err(TableError::NotFound),
+        };
+
+        if enabled {
+            let totals_row = range.end.row + 1;
+            // Occupancy guard: the row below the Table, across its columns.
+            if self.range_has_content(
+                sheet_index,
+                CellRange::new(
+                    CellAddress::new(totals_row, range.start.col),
+                    CellAddress::new(totals_row, range.end.col),
+                ),
+            ) {
+                return Err(TableError::TotalsRowBlocked);
+            }
+            // Grow the range + flip the flag, then publish the new geometry
+            // BEFORE writing the SUBTOTAL formula so its `Table[Col]` (= the
+            // #Data band, which now correctly EXCLUDES the totals row)
+            // resolves against current geometry on first evaluation.
+            let (canonical, last_col_name, last_col_idx) = {
+                let e = self.tables.get_mut(&key).expect("existence checked above");
+                e.range = CellRange::new(
+                    e.range.start,
+                    CellAddress::new(totals_row, range.end.col),
+                );
+                e.has_totals = true;
+                let last_idx = e.columns.len().saturating_sub(1);
+                (
+                    e.canonical_name.clone(),
+                    e.columns.last().cloned(),
+                    last_idx,
+                )
+            };
+            self.bump_tables_epoch();
+            // Excel default: SUM (109) in the LAST column only.
+            if let Some(col_name) = last_col_name {
+                let addr = CellAddress::new(totals_row, range.start.col + last_col_idx as u32);
+                let text = totals_subtotal_formula(&canonical, &col_name, 109);
+                self.set_formula(sheet_index, &addr.to_string_repr(), &text);
+            }
+        } else {
+            // Toggle off: clear the totals-row cells (current last row of the
+            // range), then shrink and flip the flag.
+            let totals_row = range.end.row;
+            for i in 0..range.cols() {
+                let addr = CellAddress::new(totals_row, range.start.col + i);
+                self.clear_cell(sheet_index, &addr.to_string_repr());
+            }
+            {
+                let e = self.tables.get_mut(&key).expect("existence checked above");
+                let new_end_row = e.range.end.row.saturating_sub(1);
+                e.range = CellRange::new(
+                    e.range.start,
+                    CellAddress::new(new_end_row, e.range.end.col),
+                );
+                e.has_totals = false;
+            }
+            self.bump_tables_epoch();
+        }
+        Ok(())
+    }
+
+    /// Set (or clear) the aggregate function of one totals-row column
+    /// (design doc #32 §7). The Table must already have a totals row
+    /// ([`TableError::NoTotalsRow`] otherwise). `func == TotalsFunction::None`
+    /// clears the cell; any other variant writes `=SUBTOTAL(1xx, Table[Col])`
+    /// with the 101-111 hidden-excluding code (§6 / §7). The written formula
+    /// is the single source of truth — the registry stores no per-column
+    /// selection, so a UI reconstructs the dropdown state by reading the
+    /// cell's formula back.
+    ///
+    /// `TableError::NotFound` for an unknown Table, `ColumnNotFound` for an
+    /// unknown column; guarded against re-entrant custom-formula calls.
+    pub fn set_table_total_function(
+        &mut self,
+        name: &str,
+        column: &str,
+        func: TotalsFunction,
+    ) -> Result<(), TableError> {
+        if self.is_inside_custom_call() {
+            return Err(TableError::MutationDuringCustomCall);
+        }
+        let key = name.to_ascii_uppercase();
+        let Some(entry) = self.tables.get(&key) else {
+            return Err(TableError::NotFound);
+        };
+        if !entry.has_totals {
+            return Err(TableError::NoTotalsRow);
+        }
+        let col_idx = entry
+            .columns
+            .iter()
+            .position(|c| c.eq_ignore_ascii_case(column))
+            .ok_or(TableError::ColumnNotFound)?;
+        let range = entry.range.normalize();
+        let sheet_name = entry.sheet_name.clone();
+        let canonical = entry.canonical_name.clone();
+        // Use the registry's canonical column casing in the generated
+        // formula (not the caller's), so re-reads are stable and the rename
+        // walker matches it.
+        let col_name = entry.columns[col_idx].clone();
+        let sheet_index = match self.index_of(&sheet_name) {
+            Some(i) => i,
+            None => return Err(TableError::NotFound),
+        };
+        let totals_row = range.end.row;
+        let addr = CellAddress::new(totals_row, range.start.col + col_idx as u32);
+        match func.subtotal_code() {
+            None => self.clear_cell(sheet_index, &addr.to_string_repr()),
+            Some(code) => {
+                let text = totals_subtotal_formula(&canonical, &col_name, code);
+                self.set_formula(sheet_index, &addr.to_string_repr(), &text);
+            }
+        }
+        Ok(())
+    }
+
+    /// True iff any cell inside `range` on `sheet_index` holds a non-empty
+    /// primitive or a formula. Used by the totals-row occupancy guard.
+    fn range_has_content(&self, sheet_index: usize, range: CellRange) -> bool {
+        let Some(sheet) = self.sheets.get(sheet_index) else {
+            return false;
+        };
+        let mut occupied = false;
+        sheet.for_each_non_empty_in_range(range, |_| {
+            occupied = true;
+        });
+        occupied
+    }
+
     /// Push the host's per-sheet hidden-row set as read-only evaluation input
     /// for SUBTOTAL 101-111 (design doc #32 §6, CANONICAL_OWNERSHIP §7-1).
     ///
@@ -2218,6 +2499,27 @@ enum TableRemap {
     /// The edit destroyed the Table (header row deleted / all columns
     /// deleted). The registry entry is dropped.
     Delete,
+}
+
+/// Build the canonical `=SUBTOTAL(code, Table[Col])` text for a totals-row
+/// cell (design doc #32 §7). The formula is assembled as an `Expr` and run
+/// through the shared `render_formula`, so the emitted text is guaranteed to
+/// re-parse (the T2 round-trip invariant) AND the resulting cell carries a
+/// real `Expr::TableRef` node — which is exactly what the table/column rename
+/// walkers (§4.3) rewrite, so totals formulas follow renames for free.
+fn totals_subtotal_formula(table: &str, column: &str, code: u32) -> String {
+    let expr = Expr::FuncCall {
+        name: "SUBTOTAL".to_string(),
+        args: vec![
+            Expr::Number(code as f64),
+            Expr::TableRef {
+                table: Some(table.to_string()),
+                area: TableArea::Data,
+                columns: Some((column.to_string(), column.to_string())),
+            },
+        ],
+    };
+    crate::shift::render_formula(&expr)
 }
 
 /// Do two normalized ranges intersect? (Inclusive rectangles.)

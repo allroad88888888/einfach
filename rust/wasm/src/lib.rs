@@ -3,7 +3,8 @@ use einfach_excel_core::{
     Align, BorderSpec, BorderStyle, CellAddress, CellBorders, CellFormat, CellRange,
     CellSubscription, CustomFunctionRegistry, DepGraphStats, FormatRangeSnapshot, NumberFormat,
     RangeFormatSnapshotLayer, Rotation, Sheet, SheetError, SortDirection, SortKey, SortRangeError,
-    SortRangeReport, TableEntry, TableError, VerticalAlign, Workbook, WorkbookError,
+    SortRangeReport, TableEntry, TableError, TotalsFunction, VerticalAlign, Workbook,
+    WorkbookError,
 };
 use serde::{de, Deserialize, Serialize};
 use std::cell::Cell;
@@ -1311,6 +1312,8 @@ fn table_error_to_js(err: TableError) -> JsValue {
         TableError::ColumnNotFound => "column-not-found",
         TableError::DuplicateColumn => "duplicate-column",
         TableError::InvalidColumnName => "invalid-column-name",
+        TableError::TotalsRowBlocked => "totals-row-blocked",
+        TableError::NoTotalsRow => "no-totals-row",
         TableError::MutationDuringCustomCall => "mutation-during-custom-call",
     };
     JsValue::from_str(msg)
@@ -2380,6 +2383,39 @@ impl WasmWorkbook {
     pub fn set_eval_hidden_rows(&mut self, sheet_idx: u32, rows: Vec<u32>) {
         self.workbook
             .set_eval_hidden_rows(sheet_idx as usize, &rows);
+    }
+
+    /// Toggle a Table's totals row (design doc #32 §7). `enabled == true`
+    /// grows the Table by one row and writes a default `=SUBTOTAL(109, …)`
+    /// (SUM) in the last column — unless the row below is occupied, which
+    /// rejects with `"totals-row-blocked"`. `enabled == false` clears the
+    /// totals cells and shrinks the Table. Idempotent per state.
+    #[wasm_bindgen(js_name = "setTableTotalsRow")]
+    pub fn set_table_totals_row(&mut self, name: &str, enabled: bool) -> Result<(), JsValue> {
+        self.workbook
+            .set_table_totals_row(name, enabled)
+            .map_err(table_error_to_js)
+    }
+
+    /// Set one totals-row column's aggregate (design doc #32 §7). `func` is a
+    /// camelCase id: `"none"` (clears the cell) / `"average"` / `"count"`
+    /// (COUNTA) / `"countNums"` (COUNT) / `"max"` / `"min"` / `"sum"` /
+    /// `"stdDev"` / `"var"`. Non-`none` ids write `=SUBTOTAL(1xx, Table[Col])`
+    /// with the 101-111 hidden-excluding code. Requires the totals row to be
+    /// enabled first (`"no-totals-row"` otherwise); unknown `func` yields
+    /// `"invalid-totals-function"`.
+    #[wasm_bindgen(js_name = "setTableTotalFunction")]
+    pub fn set_table_total_function(
+        &mut self,
+        name: &str,
+        column: &str,
+        func: &str,
+    ) -> Result<(), JsValue> {
+        let parsed = TotalsFunction::from_id(func)
+            .ok_or_else(|| JsValue::from_str("invalid-totals-function"))?;
+        self.workbook
+            .set_table_total_function(name, column, parsed)
+            .map_err(table_error_to_js)
     }
 
     pub fn clear_cell(&mut self, sheet_idx: u32, addr: &str) {
