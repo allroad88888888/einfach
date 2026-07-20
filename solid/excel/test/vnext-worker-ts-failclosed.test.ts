@@ -330,6 +330,9 @@ describe('TS worker backend — the capability handshake withholds unimplemented
     expect(backend.removeRows).toBeUndefined()
     expect(backend.removeRowsExact).toBeUndefined()
     expect(backend.setFormatRange).toBeUndefined()
+    // Engine physical sort: the TS runtime declares `sortRange: false`, so
+    // the port is withheld and UI-core hides the physical-sort entry.
+    expect(backend.sortRange).toBeUndefined()
 
     backend.dispose()
   })
@@ -433,6 +436,8 @@ describe('legacy runtimes without the handshake keep the full-trust contract (WA
     expect(typeof backend.removeRows).toBe('function')
     expect(typeof backend.removeRowsExact).toBe('function')
     expect(typeof backend.setFormatRange).toBe('function')
+    // Full-trust null witness keeps the engine physical-sort port exposed.
+    expect(typeof backend.sortRange).toBe('function')
 
     backend.dispose()
   })

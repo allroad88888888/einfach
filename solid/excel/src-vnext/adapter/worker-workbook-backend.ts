@@ -51,6 +51,10 @@ import type {
   SetRowHeightRequest,
   SetValidationRuleRequest,
   SheetMutationResult,
+  SortRangeRejectedResult,
+  SortRangeRejectionCode,
+  SortRangeRequest,
+  SortRangeResult,
   SpreadsheetBackend,
   RedoTransactionRequest,
   UndoTransactionRequest,
@@ -107,6 +111,9 @@ import {
   type CellWire,
   type FormatRangeSnapshot,
   type ImportCellWire,
+  type SortRangeBoundsWire,
+  type SortRangePayloadWire,
+  type SortRangeReportWire,
   type SparseCellWire,
   type SparseRangeWire,
   type WorkerLike,
@@ -182,6 +189,21 @@ const MAX_IMPORT_CELLS_PER_CHUNK = 10_000
  */
 export const MAX_FILTER_SORT_PREDICATE_CELLS = 50_000
 export const FILTER_SORT_SOURCE_TOO_LARGE = 'FILTER_SORT_SOURCE_TOO_LARGE'
+
+/**
+ * Fail-closed source-size cap for engine physical sort (design-engine-sort
+ * §7). The range AREA (rows × cols) upper-bounds the undo before/after
+ * snapshot, so a sort whose range spans more than this many cells is
+ * rejected BEFORE any read, RPC, undo record, or revision bump — silently
+ * dropping undo on a high-frequency reversible op is worse than refusing
+ * (contrast the structural mutation's not-undoable degradation, where the
+ * op still runs). Computed geometrically from the request range so the
+ * gate costs no RPC, matching the pre-dispatch geometry convention of
+ * `pasteRange` and the 50k budget of `MAX_FILTER_SORT_PREDICATE_CELLS`.
+ * The area is a conservative upper bound on the doc's non-empty measure:
+ * it may refuse a large-but-sparse range, never admit one over budget.
+ */
+export const MAX_SORT_SOURCE_CELLS = 50_000
 
 /**
  * Parity #11 paste-special fail-closed lane (defense in depth). UI-core
@@ -407,6 +429,33 @@ function toSparseRange(sheet: number, range: CellRange): SparseRangeWire {
     endRow: range.rowEnd,
     endCol: range.colEnd,
   }
+}
+
+/** CellRange → the 0-based bounds object the `sortRange` payload accepts. */
+function toSortRangeBounds(range: CellRange): SortRangeBoundsWire {
+  return {
+    startRow: range.rowStart,
+    startCol: range.colStart,
+    endRow: range.rowEnd,
+    endCol: range.colEnd,
+  }
+}
+
+const SORT_REJECTION_CODES: readonly SortRangeRejectionCode[] = [
+  'invalid-range',
+  'empty-keys',
+  'key-out-of-range',
+  'spill-in-range',
+  'invalid-payload',
+  'source-too-large',
+  'merge-in-range',
+]
+
+/** Guard an engine `detail.code` back onto the port's reject union. */
+function normalizeSortRejectionCode(code: unknown): SortRangeRejectionCode {
+  return typeof code === 'string' && (SORT_REJECTION_CODES as readonly string[]).includes(code)
+    ? (code as SortRangeRejectionCode)
+    : 'invalid-payload'
 }
 
 function structuralMutationResult(
@@ -2642,6 +2691,126 @@ export function createWorkerWorkbookSpreadsheetBackend(
     })
   }
 
+  /**
+   * Engine physical sort (design-engine-sort S4, parity #29). The engine
+   * owns the reorder (`client.sortRange`); the adapter contributes the two
+   * authority gates the engine cannot enforce, wraps the RPC in ONE
+   * host-orchestrated undo transaction, and converts a structured engine
+   * reject into a not-applied result instead of rejecting the promise.
+   *
+   * Flow:
+   *  1. Source-size cap (fail-closed, NO RPC): reject before any read /
+   *     RPC / undo record / revision bump if the range area exceeds
+   *     `MAX_SORT_SOURCE_CELLS`.
+   *  2. Merge authority gate (design §5.2): the engine has no merge model,
+   *     so the adapter — sole holder of the registry — rejects a sort
+   *     intersecting any merged range before dispatch.
+   *  3. `recordCellMutation('range.sort')` wraps the RPC: range sparse +
+   *     format before-image → `client.sortRange` → after-image for redo,
+   *     ONE record. `bumpRevision` runs only after a successful sort.
+   *  4. A `SORT_REJECTED` throws inside `execute`, so `recordCellMutation`
+   *     pushes NO record and never bumps; the throw is caught here and the
+   *     engine's `detail` becomes the structured not-applied result.
+   */
+  function sortRejectedResult(
+    request: SortRangeRequest,
+    code: SortRangeRejectionCode,
+    message: string,
+    anchor?: string,
+  ): SortRangeRejectedResult {
+    return {
+      kind: 'sort-range-not-applied',
+      sheetId: request.sheetId,
+      applied: false,
+      code,
+      ...(anchor === undefined ? {} : { anchor }),
+      message,
+      requestId: request.requestId,
+      // A rejected sort never bumps: echo the current (un-bumped) witness.
+      revision: request.revision ?? revision,
+    }
+  }
+
+  function sortRejectionFromError(
+    request: SortRangeRequest,
+    error: unknown,
+  ): SortRangeRejectedResult | null {
+    const err = error as Error & { code?: string; detail?: unknown }
+    if (err?.code !== 'SORT_REJECTED') return null
+    const detail = (err.detail ?? {}) as { code?: unknown; anchor?: unknown; message?: unknown }
+    return sortRejectedResult(
+      request,
+      normalizeSortRejectionCode(detail.code),
+      typeof detail.message === 'string' ? detail.message : err.message,
+      typeof detail.anchor === 'string' ? detail.anchor : undefined,
+    )
+  }
+
+  async function sortRangeThroughWorker(request: SortRangeRequest): Promise<SortRangeResult> {
+    const sheet = await resolveSheet(request.sheetId)
+    const range = normalizeRange(request.range)
+
+    const rangeArea =
+      (range.rowEnd - range.rowStart + 1) * (range.colEnd - range.colStart + 1)
+    if (rangeArea > MAX_SORT_SOURCE_CELLS) {
+      return sortRejectedResult(
+        request,
+        'source-too-large',
+        `sort range spans ${rangeArea} cells but the cap is ${MAX_SORT_SOURCE_CELLS}`,
+      )
+    }
+
+    const merges = mergeRangesBySheetId.get(request.sheetId) ?? []
+    if (merges.some((merge) => rangesIntersect(merge, range))) {
+      return sortRejectedResult(
+        request,
+        'merge-in-range',
+        'the sort range intersects a merged range; unmerge before sorting',
+      )
+    }
+
+    const payload: SortRangePayloadWire = {
+      range: toSortRangeBounds(range),
+      keys: request.keys.map((key) => ({
+        col: key.col,
+        ...(key.direction === undefined ? {} : { direction: key.direction }),
+        ...(key.caseSensitive === undefined ? {} : { caseSensitive: key.caseSensitive }),
+      })),
+      ...(request.excludedRows === undefined ? {} : { excludedRows: [...request.excludedRows] }),
+    }
+
+    let appliedRevision: ProjectionRevision = revision
+    try {
+      const report = await recordCellMutation<SortRangeReportWire>({
+        kind: 'range.sort',
+        sheet,
+        range,
+        captureValues: true,
+        captureFormats: true,
+        execute: async () => {
+          const result = await client.sortRange(sheet.idx, payload)
+          appliedRevision = bumpRevision()
+          return result
+        },
+      })
+      return {
+        kind: 'sort-range',
+        sheetId: request.sheetId,
+        applied: true,
+        movedRows: report.movedRows,
+        movedCells: report.movedCells,
+        affectedRange: { ...range },
+        rowPermutation: report.rowPermutation,
+        requestId: request.requestId,
+        revision: request.revision ?? appliedRevision,
+      }
+    } catch (error) {
+      const rejection = sortRejectionFromError(request, error)
+      if (rejection !== null) return rejection
+      throw error
+    }
+  }
+
   return {
     async listSheets() {
       await refreshSheetLookup()
@@ -3309,6 +3478,18 @@ export function createWorkerWorkbookSpreadsheetBackend(
 
     get pasteRangeSupportedKinds() {
       return workerPasteRangeSupportedKinds()
+    },
+
+    /**
+     * Engine physical sort (design-engine-sort S4). Capability-gated: a
+     * runtime that declares `sortRange: false` (the TS worker, which has
+     * no physical sort) makes this port read `undefined` so UI-core hides
+     * the physical-sort entry; the WASM runtime's null witness keeps it
+     * exposed (full trust). See `sortRangeThroughWorker` for the cap +
+     * merge gates and the host-orchestrated undo wrapping.
+     */
+    get sortRange() {
+      return runtimeSupports('sortRange') ? sortRangeThroughWorker : undefined
     },
 
     /**

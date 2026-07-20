@@ -10,6 +10,7 @@ export type HistoryEntryKind =
   | 'range.fill'
   | 'range.merge'
   | 'range.unmerge'
+  | 'range.sort'
   | 'row.insert'
   | 'row.delete'
   | 'column.insert'
