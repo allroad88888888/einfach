@@ -10,7 +10,7 @@ use einfach_core::{
 };
 
 use crate::cell::CellAddress;
-use crate::eval::{eval_expr_with_provider, CustomFunctionRegistry, EvalProvider};
+use crate::eval::{eval_expr_with_provider, CustomFunctionRegistry, EvalProvider, ResolvedTable};
 use crate::format::{apply_rules, CellFormat, ConditionalRule};
 use crate::formula::{parse_formula, Expr, RangeBounds};
 use crate::range::CellRange;
@@ -876,6 +876,33 @@ fn canonical_custom_call_key(name: &str, args: &[Value]) -> String {
 /// atoms are ordinary Store primitives: formulas depend on them only when they
 /// read topology, names, or custom functions. Cell/range dependencies still
 /// point directly at target facades in the same shared Store.
+/// Read-only projection of one workbook Table into the atom context
+/// (design doc #32 §5.3). The formula-inner provider resolves structured
+/// references against this snapshot without a back-reference to `Workbook`,
+/// mirroring how defined names project through `WorkbookAtomContext::names`.
+/// Refreshed wholesale by `sync_tables` on every registry mutation.
+#[derive(Clone)]
+pub(crate) struct ProjectedTable {
+    pub(crate) sheet_name: String,
+    pub(crate) range: CellRange,
+    pub(crate) has_headers: bool,
+    pub(crate) has_totals: bool,
+    pub(crate) columns: Vec<String>,
+}
+
+impl ProjectedTable {
+    fn to_resolved(&self, sheet_index: usize) -> ResolvedTable {
+        ResolvedTable {
+            sheet_name: self.sheet_name.clone(),
+            sheet_index,
+            range: self.range,
+            has_headers: self.has_headers,
+            has_totals: self.has_totals,
+            columns: self.columns.clone(),
+        }
+    }
+}
+
 pub(crate) struct WorkbookAtomContext {
     store: Store,
     topology: RefCell<WorkbookAtomTopology>,
@@ -884,6 +911,10 @@ pub(crate) struct WorkbookAtomContext {
     names: RefCell<HashMap<String, Value>>,
     names_epoch: RefCell<Option<AtomId>>,
     names_revision: Cell<u64>,
+    /// Structured-reference Table projection, keyed by uppercased name
+    /// (design doc #32 §5.3). T2 seam: a `tables_epoch` Store atom for
+    /// reactive geometry-change invalidation lands in T3 — see `sync_tables`.
+    tables: RefCell<HashMap<String, ProjectedTable>>,
     custom_functions: RefCell<Option<Arc<dyn CustomFunctionRegistry>>>,
     custom_epoch: RefCell<Option<AtomId>>,
     custom_revision: Cell<u64>,
@@ -905,6 +936,7 @@ impl WorkbookAtomContext {
             names: RefCell::new(HashMap::new()),
             names_epoch: RefCell::new(None),
             names_revision: Cell::new(0),
+            tables: RefCell::new(HashMap::new()),
             custom_functions: RefCell::new(None),
             custom_epoch: RefCell::new(None),
             custom_revision: Cell::new(0),
@@ -966,6 +998,51 @@ impl WorkbookAtomContext {
     pub(crate) fn sync_names(&self, names: HashMap<String, Value>) {
         *self.names.borrow_mut() = names;
         self.bump_epoch(&self.names_epoch, &self.names_revision);
+    }
+
+    /// Refresh the structured-reference Table projection (design doc #32
+    /// §5.3). Called by `Workbook` after every Table registry mutation.
+    ///
+    /// T2 seam: this only replaces the projection. Reactive re-derive on a
+    /// Table geometry/name change (`store.set(tables_epoch, +1)`) lands in
+    /// T3; structured references already re-derive on cell-CONTENT changes
+    /// because their resolved range reads through the tracked facades.
+    pub(crate) fn sync_tables(&self, tables: HashMap<String, ProjectedTable>) {
+        *self.tables.borrow_mut() = tables;
+    }
+
+    /// Resolve a named structured reference (`Table1[...]`). `None` when no
+    /// Table is registered under `name`, or its anchor sheet is gone.
+    fn lookup_table_named(&self, name: &str, args: &ReadArgs) -> Option<ResolvedTable> {
+        let table = self.tables.borrow().get(&name.to_ascii_uppercase()).cloned()?;
+        // Tracked topology read: cross-sheet resolution depends on the
+        // sheet-name → index map, so re-derive if a sheet is added/removed.
+        self.depend_topology(args);
+        let sheet_index = self.topology.borrow().by_name.get(&table.sheet_name).copied()?;
+        Some(table.to_resolved(sheet_index))
+    }
+
+    /// Resolve a table-less structured reference (`[Col]` / `[@Col]`): the
+    /// Table on `sheet_index` whose range contains `addr`. `None` when the
+    /// cell is inside no Table.
+    fn lookup_table_containing(
+        &self,
+        sheet_index: usize,
+        addr: CellAddress,
+        args: &ReadArgs,
+    ) -> Option<ResolvedTable> {
+        self.depend_topology(args);
+        let sheet_name = self
+            .topology
+            .borrow()
+            .sheets
+            .get(sheet_index)
+            .map(|(name, _)| name.clone())?;
+        let tables = self.tables.borrow();
+        tables
+            .values()
+            .find(|t| t.sheet_name == sheet_name && t.range.contains(addr))
+            .map(|t| t.to_resolved(sheet_index))
     }
 
     pub(crate) fn set_custom_functions(
@@ -1660,6 +1737,20 @@ impl<'a, 'r> EvalProvider for AtomFormulaProvider<'a, 'r> {
 
     fn lookup_named(&self, name: &str) -> Option<Value> {
         self.workbook_context()?.lookup_named(name, self.args)
+    }
+
+    fn lookup_table(&self, name: Option<&str>) -> Option<ResolvedTable> {
+        let context = self.workbook_context()?;
+        match name {
+            Some(n) => context.lookup_table_named(n, self.args),
+            None => {
+                // Table-less `[Col]` / `[@Col]`: locate the Table that
+                // contains the currently-evaluating cell on its own sheet.
+                let addr = self.current_cell()?;
+                let (_, sheet_idx) = self.ctx.workbook_scope()?;
+                context.lookup_table_containing(sheet_idx, addr, self.args)
+            }
+        }
     }
 
     fn current_sheet_index(&self) -> Option<usize> {
@@ -3972,7 +4063,9 @@ impl Sheet {
             | Expr::Bool(_)
             | Expr::Error(_)
             | Expr::Name(_)
-            | Expr::ArrayLit { .. } => {}
+            | Expr::ArrayLit { .. }
+            // Structured reference carries no static A1 ref (design §5.2).
+            | Expr::TableRef { .. } => {}
         }
         false
     }
@@ -4036,7 +4129,9 @@ impl Sheet {
             | Expr::Bool(_)
             | Expr::Error(_)
             | Expr::Name(_)
-            | Expr::ArrayLit { .. } => false,
+            | Expr::ArrayLit { .. }
+            // Structured reference carries no static A1 ref (design §5.2).
+            | Expr::TableRef { .. } => false,
         }
     }
 
@@ -6261,6 +6356,11 @@ fn collect_range_refs_into(expr: &Expr, out: &mut HashSet<CellRange>) {
                 collect_range_refs_into(p, out);
             }
         }
+        // Structured (Table) reference contributes NO static range (design
+        // doc §5.2): it resolves dynamically, and its reactive edges come
+        // from the facade reads its resolved range performs at eval time —
+        // same as `SpillRef` / `DynamicRange` / `OFFSET`.
+        Expr::TableRef { .. } => {}
     }
 }
 
@@ -6334,6 +6434,9 @@ fn collect_refs(expr: &Expr, out: &mut Vec<CellAddress>) {
                 collect_refs(p, out);
             }
         }
+        // Structured (Table) reference has no static A1 addresses (design
+        // doc §5.2); it can't participate in static cycle detection.
+        Expr::TableRef { .. } => {}
     }
 }
 
@@ -6421,6 +6524,10 @@ fn expr_may_produce_array(expr: &Expr) -> bool {
         // path just like a SEQUENCE / UNIQUE call would.
         Expr::ArrayLit { .. } => true,
         Expr::SpillRef(_) | Expr::DynamicRange { .. } => true,
+        // A structured (Table) reference materializes its resolved region
+        // as a `Value::Array` in value context, so a bare `=Table1[Col]`
+        // must take the eager spill re-eval path (design doc §5.3).
+        Expr::TableRef { .. } => true,
         // Multi-area evaluates to `#VALUE!` (error scalar) anywhere
         // other than as an `AREAS` argument — it never produces a
         // spillable `Value::Array`.

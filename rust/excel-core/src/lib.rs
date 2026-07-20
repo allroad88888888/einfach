@@ -18,7 +18,7 @@ pub use format::{
     apply_rules, Align, BorderSpec, BorderStyle, CellBorders, CellFormat, Condition,
     ConditionalRule, NumberFormat, Rotation, StyleOverrides, VerticalAlign,
 };
-pub use formula::{parse_formula, BinOperator, Expr};
+pub use formula::{parse_formula, BinOperator, Expr, TableArea};
 pub use range::CellRange;
 pub use sheet::{
     CellSubscription, DepGraphStats, FormatRangeSnapshot, PendingAsyncCustomCall,

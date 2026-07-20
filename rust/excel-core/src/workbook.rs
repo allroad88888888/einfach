@@ -8,12 +8,13 @@ use einfach_core::{Store, Value, ValueError};
 use crate::cell::CellAddress;
 use crate::eval::{
     eval_expr_with_provider, is_builtin_function_name, CustomFunctionRegistry, EvalProvider,
-    ExcelLambda,
+    ExcelLambda, ResolvedTable,
 };
 use crate::formula::{parse_formula, Expr, RangeBounds};
 use crate::range::CellRange;
 use crate::sheet::{
-    BulkInstallCleanup, PendingAsyncCustomCall, Sheet, SheetError, WorkbookAtomContext,
+    BulkInstallCleanup, PendingAsyncCustomCall, ProjectedTable, Sheet, SheetError,
+    WorkbookAtomContext,
 };
 
 /// One entry in `Workbook::named_values`. Stores the user-supplied
@@ -185,6 +186,19 @@ impl TableEntry {
     /// Column display names, left→right.
     pub fn columns(&self) -> &[String] {
         &self.columns
+    }
+
+    /// Snapshot this entry as an eval-time `ResolvedTable` anchored at the
+    /// given 0-based sheet index (design doc #32 §5.3).
+    pub(crate) fn to_resolved(&self, sheet_index: usize) -> crate::eval::ResolvedTable {
+        crate::eval::ResolvedTable {
+            sheet_name: self.sheet_name.clone(),
+            sheet_index,
+            range: self.range,
+            has_headers: self.has_headers,
+            has_totals: self.has_totals,
+            columns: self.columns.clone(),
+        }
     }
 }
 
@@ -466,6 +480,30 @@ impl Workbook {
             .map(|(key, entry)| (key.clone(), entry.value.clone()))
             .collect();
         self.atom_context.sync_names(names);
+    }
+
+    /// Push the current Table registry into the atom context so the
+    /// formula-inner provider can resolve structured references (design doc
+    /// #32 §5.3). Called from `bump_tables_epoch`, i.e. after every registry
+    /// mutation.
+    fn sync_atom_tables(&self) {
+        let tables = self
+            .tables
+            .iter()
+            .map(|(key, entry)| {
+                (
+                    key.clone(),
+                    ProjectedTable {
+                        sheet_name: entry.sheet_name.clone(),
+                        range: entry.range,
+                        has_headers: entry.has_headers,
+                        has_totals: entry.has_totals,
+                        columns: entry.columns.clone(),
+                    },
+                )
+            })
+            .collect();
+        self.atom_context.sync_tables(tables);
     }
 
     // === Workbook-level defined-name registry ===
@@ -1386,6 +1424,11 @@ impl Workbook {
                 }
             }
             Expr::Number(_) | Expr::Text(_) | Expr::Bool(_) | Expr::Error(_) => {}
+            // Structured (Table) reference: no static A1 ref to follow for
+            // cross-sheet cycle detection (design doc §5.2). It resolves
+            // dynamically; a Table-mediated cycle surfaces at eval time as
+            // `#CYCLE!` via the runtime in-flight guard (§5.3 point 5).
+            Expr::TableRef { .. } => {}
         }
         false
     }
@@ -1933,6 +1976,11 @@ impl Workbook {
     /// tracked read of them re-derive. T1 keeps only the workbook counter.
     fn bump_tables_epoch(&mut self) {
         self.tables_epoch = self.tables_epoch.wrapping_add(1);
+        // T2: refresh the formula-inner provider's Table projection so
+        // structured references resolve against current geometry. The
+        // reactive `store.set(per-sheet tables_epoch, +1)` that re-derives
+        // formulas holding a TableRef edge is the T3 seam (§8).
+        self.sync_atom_tables();
     }
 
     /// Full Table name mutex (design doc §4.2). `exclude_key` is the
@@ -2550,6 +2598,30 @@ impl<'a> EvalProvider for WorkbookEvalProvider<'a> {
         // a clone of the stored value (cheap for `Value::Lambda`, which
         // wraps an `Arc<dyn LambdaValue>`; constant-time for scalars).
         self.wb.get_named(name)
+    }
+
+    fn lookup_table(&self, name: Option<&str>) -> Option<ResolvedTable> {
+        // Eager workbook provider (get_cell of a non-formula cell,
+        // define_name evaluation): read the registry directly (design doc
+        // #32 §5.3). The live formula-inner path goes through
+        // `AtomFormulaProvider::lookup_table` instead.
+        match name {
+            Some(n) => {
+                let entry = self.wb.tables.get(&n.to_ascii_uppercase())?;
+                let sheet_index = self.wb.by_name.get(&entry.sheet_name).copied()?;
+                Some(entry.to_resolved(sheet_index))
+            }
+            None => {
+                let addr = self.current_cell.get()?;
+                let sheet_index = self.current.get();
+                let sheet_name = self.wb.names.get(sheet_index)?;
+                self.wb
+                    .tables
+                    .values()
+                    .find(|t| &t.sheet_name == sheet_name && t.range.contains(addr))
+                    .map(|t| t.to_resolved(sheet_index))
+            }
+        }
     }
 
     fn cell_has_formula(&self, addr: CellAddress) -> bool {

@@ -1,5 +1,5 @@
 use crate::cell::CellAddress;
-use crate::formula::{BinOperator, Expr, RangeBounds};
+use crate::formula::{BinOperator, Expr, RangeBounds, TableArea};
 
 /// What to do with a CellRef whose target was deleted by a structural edit.
 ///
@@ -561,6 +561,11 @@ pub fn map_addrs(expr: &Expr, f: &dyn Fn(CellAddress) -> CellAddress) -> Expr {
         Expr::ArrayLit { .. } => expr.clone(),
         // Multi-area: every part is a reference subject to retargeting.
         Expr::MultiArea(parts) => Expr::MultiArea(parts.iter().map(|p| map_addrs(p, f)).collect()),
+        // Structured (Table) reference: carries no A1 coordinates — it is
+        // resolved against the registry at eval time, and structural edits
+        // follow the Table via the registry (design doc §5.2 / §4.3), not by
+        // rewriting this node. Transparent.
+        Expr::TableRef { .. } => expr.clone(),
     }
 }
 
@@ -686,6 +691,9 @@ pub fn shift_refs(expr: &Expr, drow: i32, dcol: i32) -> Result<Expr, ()> {
                 .map(|p| shift_refs(p, drow, dcol))
                 .collect::<Result<Vec<_>, _>>()?,
         ),
+        // Structured (Table) reference: no A1 coordinates to shift on
+        // copy/paste — it re-resolves by name at the paste target. Clone.
+        Expr::TableRef { .. } => expr.clone(),
     })
 }
 
@@ -970,7 +978,52 @@ fn render_into(expr: &Expr, out: &mut String) {
             }
             out.push(')');
         }
+        // Structured (Table) reference. Column names in a parsed TableRef
+        // can never contain `[ ] # @` (both the bare and bracketed colref
+        // lexers stop at those), so single columns render bare and only
+        // multi-column segments need inner brackets — the round-trip
+        // (`parse(render(parse(s))) == parse(s)`) holds at the AST level.
+        Expr::TableRef {
+            table,
+            area,
+            columns,
+        } => {
+            if let Some(name) = table {
+                out.push_str(name);
+            }
+            out.push('[');
+            match area {
+                TableArea::All => out.push_str("#All"),
+                TableArea::Headers => out.push_str("#Headers"),
+                TableArea::Totals => out.push_str("#Totals"),
+                TableArea::Data => match columns {
+                    None => out.push_str("#Data"),
+                    Some((a, b)) if a == b => out.push_str(a),
+                    Some((a, b)) => render_table_segment(a, b, out),
+                },
+                TableArea::ThisRow => {
+                    out.push('@');
+                    match columns {
+                        None => {}
+                        Some((a, b)) if a == b => out.push_str(a),
+                        Some((a, b)) => render_table_segment(a, b, out),
+                    }
+                }
+            }
+            out.push(']');
+        }
     }
+}
+
+/// Render a multi-column structured-reference segment `[a]:[b]` (design
+/// doc §5.1). Both endpoints are bracketed so the `:` reads as the segment
+/// separator on re-parse rather than as part of a bare column name.
+fn render_table_segment(a: &str, b: &str, out: &mut String) {
+    out.push('[');
+    out.push_str(a);
+    out.push_str("]:[");
+    out.push_str(b);
+    out.push(']');
 }
 
 #[cfg(test)]

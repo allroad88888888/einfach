@@ -5,7 +5,7 @@ use std::sync::Arc;
 use einfach_core::{ArrayData, AtomId, LambdaValue, Value, ValueError};
 
 use crate::cell::CellAddress;
-use crate::formula::{BinOperator, Expr};
+use crate::formula::{BinOperator, Expr, TableArea};
 use crate::range::CellRange;
 use crate::shift::{REF_INVALID_COL, REF_INVALID_ROW};
 
@@ -743,6 +743,29 @@ pub trait CustomFunctionRegistry: Send + Sync + std::fmt::Debug {
 /// any `SheetRef` as `#REF!` — it's a single-sheet shim used only by the
 /// in-file eval tests + `eval_expr` callers that don't carry workbook
 /// context.
+/// A Table resolved from the workbook registry for a structured reference
+/// (design doc #32 §5.3). Carries the full occupied rectangle (header +
+/// data + optional totals) plus the metadata the area/column band math
+/// needs; the resolver (`resolve_table_ref`) turns this into a concrete
+/// runtime range that flows through the same machinery as a typed
+/// `A1:A10` / `Sheet2!A1:A10`.
+#[derive(Clone, Debug)]
+pub struct ResolvedTable {
+    /// Name of the sheet the Table is anchored to.
+    pub sheet_name: String,
+    /// 0-based index of that sheet (used to decide same-sheet vs
+    /// cross-sheet resolution).
+    pub sheet_index: usize,
+    /// Normalized rectangle covering header + data (+ totals when shown).
+    pub range: CellRange,
+    /// Whether the first row of `range` is a header row (MVP: always true).
+    pub has_headers: bool,
+    /// Whether the last row of `range` is a totals row.
+    pub has_totals: bool,
+    /// Column display names left→right; index 0 maps to `range.start.col`.
+    pub columns: Vec<String>,
+}
+
 pub trait EvalProvider {
     fn cell(&self, addr: CellAddress) -> Value;
     fn sheet_cell(&self, sheet: &str, addr: CellAddress) -> Value;
@@ -912,6 +935,26 @@ pub trait EvalProvider {
         None
     }
 
+    /// Resolve a structured-reference Table (design doc #32 §5.3). `name`
+    /// is `Some` for `Table1[...]` and `None` for a table-less `[Col]` /
+    /// `[@Col]`, where the provider returns the Table that CONTAINS the
+    /// current cell. Returns `None` when no such Table exists — the
+    /// structured-reference resolver then surfaces `#NAME?` (named form) or
+    /// `#VALUE!` (table-less form).
+    ///
+    /// Default `None`: providers without a workbook Table registry (the
+    /// single-sheet shim, standalone sheets) never resolve structured
+    /// references, so `=Table1[Col]` degrades to `#NAME?` exactly as an
+    /// unbound name would.
+    ///
+    /// T2 seam: this reads the registry only. The reactive re-derive on a
+    /// Table geometry/name change (the `tables_epoch` tracked read) lands
+    /// in T3 — cell-CONTENT edges already register through the facade reads
+    /// the resolved range performs, so ordinary recalculation is unaffected.
+    fn lookup_table(&self, _name: Option<&str>) -> Option<ResolvedTable> {
+        None
+    }
+
     // ===== EVAL_PROVIDER TRAIT METHODS: ADD NEW METHODS BEFORE THIS LINE =====
     // Sentinel for parallel-agent merges — when a new feature needs a new
     // EvalProvider hook, add it BEFORE this marker (with a sensible default)
@@ -998,7 +1041,11 @@ pub fn eval_expr_with_provider(expr: &Expr, provider: &dyn EvalProvider) -> Valu
             Value::Error(ValueError::InvalidValue)
         }
 
-        Expr::SpillRef(_) | Expr::DynamicRange { .. } => {
+        Expr::SpillRef(_) | Expr::DynamicRange { .. } | Expr::TableRef { .. } => {
+            // A structured reference in value context materializes its
+            // resolved region as a `Value::Array` (spilling like `A1#` /
+            // `A1:INDEX(...)`), or collapses to the scalar for a 1×1 region
+            // (design doc §5.3 value-context arm).
             match runtime_ref_from_expr(expr, provider) {
                 Ok(r) => runtime_ref_to_value(&r, provider),
                 Err(e) => Value::Error(e),
@@ -1593,8 +1640,123 @@ fn runtime_ref_from_expr(
             runtime_ref_from_indirect(args, provider)
         }
         Expr::FuncCall { name, args } if name == "INDEX" => runtime_ref_from_index(args, provider),
+        Expr::TableRef {
+            table,
+            area,
+            columns,
+        } => resolve_table_ref(table.as_deref(), *area, columns.as_ref(), provider),
         _ => Err(ValueError::InvalidValue),
     }
+}
+
+/// Resolve an `Expr::TableRef` to a concrete runtime range (design doc #32
+/// §5.3, "delayed resolution + delegate"). The single funnel every
+/// consumer routes through — value context (`runtime_ref_to_value`),
+/// aggregate streaming (`for_each_arg_value`), 2-D collection
+/// (`collect_range_2d_for_arg`), and binop broadcast
+/// (`eval_operand_for_binop`) all reach a structured reference via
+/// `runtime_ref_from_expr`, so no parallel read path exists. Dependency
+/// edges register through the provider's facade reads exactly as for a
+/// typed range.
+fn resolve_table_ref(
+    table: Option<&str>,
+    area: TableArea,
+    columns: Option<&(String, String)>,
+    provider: &dyn EvalProvider,
+) -> Result<RuntimeRef, ValueError> {
+    let Some(resolved) = provider.lookup_table(table) else {
+        // Named table not in the registry → `#NAME?` (unknown name, Excel
+        // parity). A table-less `[Col]` / `[@Col]` whose current cell is
+        // not inside any Table → `#VALUE!`.
+        return Err(match table {
+            Some(_) => ValueError::InvalidName,
+            None => ValueError::InvalidValue,
+        });
+    };
+
+    let full = resolved.range.normalize();
+    let header_rows: u32 = if resolved.has_headers { 1 } else { 0 };
+    let totals_rows: u32 = if resolved.has_totals { 1 } else { 0 };
+    let data_start = full.start.row + header_rows;
+    let data_end = full
+        .end
+        .row
+        .checked_sub(totals_rows)
+        .unwrap_or(full.start.row);
+
+    let (row_start, row_end) = match area {
+        TableArea::All => (full.start.row, full.end.row),
+        TableArea::Headers => {
+            if !resolved.has_headers {
+                return Err(ValueError::InvalidRef);
+            }
+            (full.start.row, full.start.row)
+        }
+        TableArea::Totals => {
+            if !resolved.has_totals {
+                return Err(ValueError::InvalidRef);
+            }
+            (full.end.row, full.end.row)
+        }
+        TableArea::Data => {
+            if data_end < data_start {
+                // Zero data rows → `#REF!` (design §4.1 known divergence
+                // from Excel's "keep one empty data row").
+                return Err(ValueError::InvalidRef);
+            }
+            (data_start, data_end)
+        }
+        TableArea::ThisRow => {
+            let cur = provider.current_cell().ok_or(ValueError::InvalidValue)?;
+            if data_end < data_start || cur.row < data_start || cur.row > data_end {
+                // Current row outside the data area (or no current cell) →
+                // `#VALUE!` (design §5.3 point 2, Excel parity).
+                return Err(ValueError::InvalidValue);
+            }
+            (cur.row, cur.row)
+        }
+    };
+
+    let (col_start, col_end) = match columns {
+        None => (full.start.col, full.end.col),
+        Some((a, b)) => {
+            let ia = find_table_column(&resolved.columns, a).ok_or(ValueError::InvalidRef)?;
+            let ib = find_table_column(&resolved.columns, b).ok_or(ValueError::InvalidRef)?;
+            let ca = full.start.col + ia;
+            let cb = full.start.col + ib;
+            (ca.min(cb), ca.max(cb))
+        }
+    };
+
+    let range = CellRange::new(
+        CellAddress::new(row_start, col_start),
+        CellAddress::new(row_end, col_end),
+    );
+
+    // Same-sheet Tables resolve as a bare (`sheet: None`) range so the
+    // dependency edges are byte-for-byte identical to a typed `A1:A10`;
+    // cross-sheet Tables carry the anchor sheet name so reads route through
+    // the cross-sheet facade path (design §5.3 point 4).
+    let sheet = if provider.current_sheet_index() == Some(resolved.sheet_index) {
+        None
+    } else {
+        Some(resolved.sheet_name)
+    };
+
+    Ok(RuntimeRef {
+        sheet,
+        range,
+        materialized: None,
+    })
+}
+
+/// Case-insensitive column-name lookup → 0-based offset within a Table's
+/// column list. `None` when the name isn't a column (→ `#REF!`).
+fn find_table_column(columns: &[String], name: &str) -> Option<u32> {
+    columns
+        .iter()
+        .position(|c| c.eq_ignore_ascii_case(name))
+        .map(|i| i as u32)
 }
 
 fn top_left_runtime_ref(mut r: RuntimeRef) -> RuntimeRef {
