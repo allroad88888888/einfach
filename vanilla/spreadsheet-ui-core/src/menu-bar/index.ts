@@ -398,19 +398,25 @@ const FORMAT_ITEMS: readonly MenuBarEntry[] = [
 ]
 
 const DATA_ITEMS: readonly MenuBarEntry[] = [
+  // Sort is a physical engine DATA mutation (parity #29): it hides when the
+  // host backend exposes no `sortRange` port. The display-permutation
+  // fallback was retired with #24, so a host without the port (the
+  // fail-closed TS worker) has no sort at all rather than a fake one.
   {
     id: 'data.sortAsc',
     label: 'menuBar.data.sortAsc',
     accessKey: 'A',
     dispatch: { kind: 'sort-asc' },
-    isAvailable: 'always',
+    isAvailable: 'capability',
+    capabilityKey: 'sortRange',
   },
   {
     id: 'data.sortDesc',
     label: 'menuBar.data.sortDesc',
     accessKey: 'D',
     dispatch: { kind: 'sort-desc' },
-    isAvailable: 'always',
+    isAvailable: 'capability',
+    capabilityKey: 'sortRange',
   },
   {
     id: 'data.filter',

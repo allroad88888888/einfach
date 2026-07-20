@@ -170,6 +170,9 @@ export function SpreadsheetMenuBar(props: SpreadsheetMenuBarProps) {
    *   - `'textToColumns'` → host backend implements `importCellChunks`
    *   - `'removeRows'`    → Core reports exact range-read and row-removal
    *                         capabilities (Data → Remove Duplicates)
+   *   - `'sortRange'`     → host backend exposes the physical-sort port
+   *                         (Data → Sort asc/desc). No port → no sort at
+   *                         all (#24 retired the display permutation).
    *   - `'insertRows'` / `'insertColumns'` → host backend exposes the
    *     structural port. Read directly off the backend PER dropdown
    *     render (the dropdown remounts on every open), NOT captured at
@@ -196,6 +199,8 @@ export function SpreadsheetMenuBar(props: SpreadsheetMenuBarProps) {
         return backend.insertRows != null
       case 'insertColumns':
         return backend.insertColumns != null
+      case 'sortRange':
+        return backend.sortRange != null
       default:
         return false
     }
@@ -585,16 +590,15 @@ export function SpreadsheetMenuBar(props: SpreadsheetMenuBarProps) {
       case 'sort-asc':
       case 'sort-desc': {
         const direction = dispatch.kind === 'sort-asc' ? 'asc' : 'desc'
-        // One physical-sort command; the capability split (engine sortRange vs
-        // display permutation) is resolved inside `runPhysicalSortAtom`.
+        // One physical-sort command through the engine `sortRange` port. The
+        // entries are capability-gated on that port (#24), so reaching here
+        // without it is impossible from the menu — guarded anyway.
         void (async () => {
           const snap = store.getter(selectionSnapshotAtom)
           const sheetId = snap.activeCell.sheetId || getActiveSheetId()
           if (!sheetId) return
-          const range =
-            typeof backend.sortRange === 'function'
-              ? await resolveSortRange(store, backend, sheetId, snap.activeCell)
-              : null
+          if (typeof backend.sortRange !== 'function') return
+          const range = await resolveSortRange(store, backend, sheetId, snap.activeCell)
           void store.setter(runPhysicalSortAtom, {
             source: backend,
             entrypoint: 'menu-bar',
@@ -701,11 +705,7 @@ export function SpreadsheetMenuBar(props: SpreadsheetMenuBarProps) {
       </Show>
       <Show when={lastCreatedTableName()}>
         {(name) => (
-          <span
-            role="status"
-            data-testid="menu-bar-create-table-status"
-            data-table-name={name()}
-          >
+          <span role="status" data-testid="menu-bar-create-table-status" data-table-name={name()}>
             {name()}
           </span>
         )}

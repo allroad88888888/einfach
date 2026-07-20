@@ -67,6 +67,7 @@ import {
   type SetSheetProtectionRequest,
   type SetTableTotalsRowRequest,
   type TableMutationResult,
+  type SortRangeRequest,
   type SpreadsheetBackend,
   type SpreadsheetSheetMetadata,
   type UnhideColumnsRequest,
@@ -77,10 +78,7 @@ import { SpreadsheetUiProvider } from '../src-vnext/provider'
 import { SpreadsheetMenuBar } from '../src-vnext/menu-bar'
 import { createWorkerWorkbookSpreadsheetBackend } from '../src-vnext/adapter'
 import type { WorkerLike } from '../src-vnext/adapter'
-import {
-  installWorkerRuntimeTs,
-  type WorkerContext,
-} from '../src-vnext/adapter/worker-runtime-ts'
+import { installWorkerRuntimeTs, type WorkerContext } from '../src-vnext/adapter/worker-runtime-ts'
 import { setLocale } from '../src/i18n'
 import { seedReadyVisibleProjection } from './projection-test-fixture'
 
@@ -767,9 +765,7 @@ describe('SpreadsheetMenuBar', () => {
       'insert.colLeft',
       'insert.colRight',
     ]) {
-      expect(
-        tsRender.container.querySelector(`[data-testid="menu-bar-item-${itemId}"]`),
-      ).toBeNull()
+      expect(tsRender.container.querySelector(`[data-testid="menu-bar-item-${itemId}"]`)).toBeNull()
     }
     // Non-structural entries survive the gate.
     expect(
@@ -791,9 +787,7 @@ describe('SpreadsheetMenuBar', () => {
         <SpreadsheetMenuBar />
       </SpreadsheetUiProvider>
     ))
-    fireEvent.click(
-      legacyRender.container.querySelector('[data-testid="menu-bar-button-insert"]')!,
-    )
+    fireEvent.click(legacyRender.container.querySelector('[data-testid="menu-bar-button-insert"]')!)
     await waitFor(() => {
       expect(
         legacyRender.container.querySelector('[data-testid="menu-bar-dropdown-insert"]'),
@@ -1246,14 +1240,44 @@ describe('SpreadsheetMenuBar', () => {
     expect(store.getter(validationRuleEditorAtom).status).toBe('editing')
   })
 
-  it('Data > Sort Asc writes a sort directive on the active column', async () => {
-    const store = createStore()
-    const backend: SpreadsheetBackend = {
+  /**
+   * Sort is a physical engine mutation (#29) and the display permutation is
+   * retired (#24), so the Data > Sort entries are capability-gated on the
+   * backend `sortRange` port and dispatch a `sort-range` request.
+   */
+  function createSortingBackend(sortRequests: SortRangeRequest[]): SpreadsheetBackend {
+    return {
       ...createBaseBackend(),
       async setFilterSort({ sheetId, requestId }) {
         return { sheetId, requestId, revision: 1 }
       },
+      async resolveDataEdge(request) {
+        return {
+          kind: 'resolve-data-edge',
+          sheetId: request.sheetId,
+          target: request.direction === 'down' ? { row: 6, col: 0 } : { row: 0, col: 4 },
+        }
+      },
+      async sortRange(request) {
+        sortRequests.push(request)
+        return {
+          kind: 'sort-range',
+          sheetId: request.sheetId,
+          applied: true,
+          movedRows: 2,
+          movedCells: 8,
+          affectedRange: request.range,
+          requestId: request.requestId,
+          revision: 2,
+        }
+      },
     }
+  }
+
+  it('Data > Sort Asc physically sorts the active column through sortRange', async () => {
+    const store = createStore()
+    const sortRequests: SortRangeRequest[] = []
+    const backend = createSortingBackend(sortRequests)
     store.setter(setWorkspaceActiveSheetAtom, { sheetId: 'sheet-1' })
     store.setter(selectionAtom, {
       kind: 'cell',
@@ -1275,21 +1299,16 @@ describe('SpreadsheetMenuBar', () => {
     await waitFor(() => expect(sortAsc.disabled).toBe(false))
     fireEvent.click(sortAsc)
 
-    await waitFor(() => {
-      const state = store.getter(filterSortStateAtom)['sheet-1']
-      expect(state).toBeDefined()
-      expect(state!.directives).toEqual([{ colIndex: 3, direction: 'asc' }])
-    })
+    await waitFor(() => expect(sortRequests).toHaveLength(1))
+    expect(sortRequests[0]!.keys).toEqual([{ col: 3, direction: 'asc' }])
+    // No display permutation is ever written any more.
+    expect(store.getter(filterSortStateAtom)['sheet-1']).toBeUndefined()
   })
 
-  it('Data > Sort Desc writes a descending sort directive', async () => {
+  it('Data > Sort Desc dispatches a descending physical sort', async () => {
     const store = createStore()
-    const backend: SpreadsheetBackend = {
-      ...createBaseBackend(),
-      async setFilterSort({ sheetId, requestId }) {
-        return { sheetId, requestId, revision: 1 }
-      },
-    }
+    const sortRequests: SortRangeRequest[] = []
+    const backend = createSortingBackend(sortRequests)
     store.setter(setWorkspaceActiveSheetAtom, { sheetId: 'sheet-1' })
     store.setter(selectionAtom, {
       kind: 'cell',
@@ -1311,11 +1330,34 @@ describe('SpreadsheetMenuBar', () => {
     await waitFor(() => expect(sortDesc.disabled).toBe(false))
     fireEvent.click(sortDesc)
 
+    await waitFor(() => expect(sortRequests).toHaveLength(1))
+    expect(sortRequests[0]!.keys).toEqual([{ col: 1, direction: 'desc' }])
+    expect(store.getter(filterSortStateAtom)['sheet-1']).toBeUndefined()
+  })
+
+  it('hides both Data > Sort entries when the backend exposes no sortRange port', async () => {
+    const store = createStore()
+    const backend: SpreadsheetBackend = {
+      ...createBaseBackend(),
+      async setFilterSort({ sheetId, requestId }) {
+        return { sheetId, requestId, revision: 1 }
+      },
+    }
+    store.setter(setWorkspaceActiveSheetAtom, { sheetId: 'sheet-1' })
+    setupSelection(store)
+
+    const { container } = render(() => (
+      <SpreadsheetUiProvider backend={backend} store={store}>
+        <SpreadsheetMenuBar />
+      </SpreadsheetUiProvider>
+    ))
+
+    fireEvent.click(container.querySelector('[data-testid="menu-bar-button-data"]')!)
     await waitFor(() => {
-      const state = store.getter(filterSortStateAtom)['sheet-1']
-      expect(state).toBeDefined()
-      expect(state!.directives).toEqual([{ colIndex: 1, direction: 'desc' }])
+      expect(container.querySelector('[data-testid="menu-bar-item-data.filter"]')).not.toBeNull()
     })
+    expect(container.querySelector('[data-testid="menu-bar-item-data.sortAsc"]')).toBeNull()
+    expect(container.querySelector('[data-testid="menu-bar-item-data.sortDesc"]')).toBeNull()
   })
 
   function tableDescriptor(name: string): SpreadsheetTableDescriptor {
@@ -1747,9 +1789,7 @@ describe('SpreadsheetMenuBar', () => {
     // Local commit is synchronous; the mirror is fire-and-forget.
     expect(store.getter(viewportFreezeAtom).rowsBySheet['sheet-1']).toBe(3)
     await waitFor(() => {
-      expect(setRequests).toEqual([
-        { sheetId: 'sheet-1', freeze: { rows: 3, cols: 2 } },
-      ])
+      expect(setRequests).toEqual([{ sheetId: 'sheet-1', freeze: { rows: 3, cols: 2 } }])
     })
   })
 

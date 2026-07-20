@@ -86,6 +86,25 @@ async function waitForEditing(store: ReturnType<typeof createStore>) {
   await waitFor(() => expect(store.getter(filterSortLifecycleAtom).status).toBe('editing'))
 }
 
+/**
+ * Drive one filter mutation through the dropdown. Sort is no longer a
+ * `setFilterSort` payload (#24 retired the display permutation), so the filter
+ * lifecycle tests use an equals draft as their transport vehicle.
+ */
+function applyEqualsDraft(container: HTMLElement, value: string) {
+  const condition = container.querySelector(
+    '[data-testid="filter-condition-kind"]',
+  ) as HTMLSelectElement
+  fireEvent.change(condition, { target: { value: 'equals' } })
+  fireEvent.input(container.querySelector('[data-testid="filter-equals-input"]')!, {
+    target: { value },
+  })
+  fireEvent.click(button(container, 'filter-add-equals'))
+}
+
+const equalsRule = (colIndex: number, value: string) =>
+  ({ kind: 'equals', colIndex, value }) as const
+
 describe('vNext SpreadsheetFilterDropdown', () => {
   it('does not render when dropdown is closed', () => {
     const { container } = renderDropdown(createStore(), createFakeBackend())
@@ -109,7 +128,9 @@ describe('vNext SpreadsheetFilterDropdown', () => {
     expect(dropdown?.getAttribute('data-filter-sort-status')).toBe('editing')
     expect(condition.value).toBe('none')
     expect(container.querySelector('[data-testid="filter-equals-input"]')).toBeNull()
-    expect(button(container, 'filter-sort-asc')).not.toBeNull()
+    // The fake backend exposes no `sortRange` port, so the sort section is
+    // withheld entirely (#24) — only the filter controls render.
+    expect(container.querySelector('[data-testid="filter-sort-section"]')).toBeNull()
     expect(button(container, 'filter-clear')).not.toBeNull()
   })
 
@@ -122,17 +143,17 @@ describe('vNext SpreadsheetFilterDropdown', () => {
 
     await waitFor(() => {
       expect(store.getter(filterSortLifecycleAtom).status).toBe('blocked')
-      expect(button(container, 'filter-sort-asc').disabled).toBe(true)
+      expect(button(container, 'filter-add-equals').disabled).toBe(true)
     })
     expect(container.querySelector('[data-testid="filter-error-text"]')?.textContent).toBe(
       FILTER_SORT_CAPABILITY_ERROR,
     )
     expect(button(container, 'filter-close').disabled).toBe(false)
-    fireEvent.click(button(container, 'filter-sort-asc'))
+    fireEvent.click(button(container, 'filter-add-equals'))
     expect(store.getter(filterSortStateAtom)['sheet-1']).toBeUndefined()
   })
 
-  it('commits a sort only after a strict matching acknowledgement', async () => {
+  it('commits a filter only after a strict matching acknowledgement', async () => {
     const store = createStore()
     const calls: SetFilterSortRequest[] = []
     const ack = deferred<FilterSortMutationResult>()
@@ -146,11 +167,11 @@ describe('vNext SpreadsheetFilterDropdown', () => {
     const { container } = renderDropdown(store, backend)
     await waitForEditing(store)
 
-    fireEvent.click(button(container, 'filter-sort-asc'))
+    applyEqualsDraft(container, 'alpha')
 
     await waitFor(() => {
       expect(calls).toHaveLength(1)
-      expect(button(container, 'filter-sort-asc').disabled).toBe(true)
+      expect(button(container, 'filter-add-equals').disabled).toBe(true)
     })
     expect(store.getter(filterSortStateAtom)['sheet-1']).toBeUndefined()
 
@@ -160,9 +181,7 @@ describe('vNext SpreadsheetFilterDropdown', () => {
       revision: 1,
     })
     await waitFor(() => {
-      expect(store.getter(filterSortStateAtom)['sheet-1']?.directives).toEqual([
-        { colIndex: 0, direction: 'asc' },
-      ])
+      expect(store.getter(filterSortStateAtom)['sheet-1']?.rules).toEqual([equalsRule(0, 'alpha')])
       expect(store.getter(filterSortLifecycleAtom).status).toBe('editing')
     })
   })
@@ -181,9 +200,8 @@ describe('vNext SpreadsheetFilterDropdown', () => {
     const { container } = renderDropdown(store, backend)
     await waitForEditing(store)
 
-    const asc = button(container, 'filter-sort-asc')
-    fireEvent.click(asc)
-    fireEvent.click(asc)
+    applyEqualsDraft(container, 'alpha')
+    fireEvent.click(button(container, 'filter-add-equals'))
 
     await waitFor(() => expect(calls).toHaveLength(1))
     expect(store.getter(filterSortLifecycleAtom).status).toBe('pending')
@@ -204,14 +222,13 @@ describe('vNext SpreadsheetFilterDropdown', () => {
     })
     store.setter(setFilterSortAtom, {
       sheetId: 'sheet-1',
-      state: { rules: [], directives: [{ colIndex: 3, direction: 'desc' }] },
+      state: { rules: [equalsRule(3, 'seed')] },
     })
     openDropdown(store)
     const { container } = renderDropdown(store, backend)
     await waitForEditing(store)
-    const draftBefore = store.getter(filterSortDraftAtom)
 
-    fireEvent.click(button(container, 'filter-sort-asc'))
+    applyEqualsDraft(container, 'alpha')
 
     await waitFor(() => {
       const text = container.querySelector('[data-testid="filter-error-text"]')?.textContent
@@ -219,13 +236,10 @@ describe('vNext SpreadsheetFilterDropdown', () => {
       expect(text).toContain(FILTER_SORT_ACKNOWLEDGEMENT_ERROR)
       expect(store.getter(filterSortLifecycleAtom).status).toBe('outcome-unknown')
     })
-    fireEvent.click(button(container, 'filter-sort-asc'))
+    fireEvent.click(button(container, 'filter-add-equals'))
     expect(calls).toBe(1)
     expect(button(container, 'filter-close').disabled).toBe(true)
-    expect(store.getter(filterSortStateAtom)['sheet-1']?.directives).toEqual([
-      { colIndex: 3, direction: 'desc' },
-    ])
-    expect(store.getter(filterSortDraftAtom)).toEqual(draftBefore)
+    expect(store.getter(filterSortStateAtom)['sheet-1']?.rules).toEqual([equalsRule(3, 'seed')])
   })
 
   it('keeps close and reopen inert until the active request settles', async () => {
@@ -242,7 +256,7 @@ describe('vNext SpreadsheetFilterDropdown', () => {
     const { container } = renderDropdown(store, backend)
     await waitForEditing(store)
 
-    fireEvent.click(button(container, 'filter-sort-asc'))
+    applyEqualsDraft(container, 'alpha')
     await waitFor(() => expect(calls).toHaveLength(1))
     const sessionId = store.getter(filterSortDraftAtom).sessionId
     expect(button(container, 'filter-close').disabled).toBe(true)
@@ -258,9 +272,7 @@ describe('vNext SpreadsheetFilterDropdown', () => {
     firstAck.resolve({ sheetId: 'sheet-1', requestId: calls[0]!.requestId, revision: 1 })
     await waitForEditing(store)
 
-    expect(store.getter(filterSortStateAtom)['sheet-1']?.directives).toEqual([
-      { colIndex: 0, direction: 'asc' },
-    ])
+    expect(store.getter(filterSortStateAtom)['sheet-1']?.rules).toEqual([equalsRule(0, 'alpha')])
     expect(store.getter(filterDropdownAtom)).toMatchObject({
       status: 'open',
       sheetId: 'sheet-1',
@@ -277,60 +289,20 @@ describe('vNext SpreadsheetFilterDropdown', () => {
     })
     store.setter(setFilterSortAtom, {
       sheetId: 'sheet-1',
-      state: { rules: [], directives: [{ colIndex: 4, direction: 'desc' }] },
+      state: { rules: [equalsRule(4, 'seed')] },
     })
     openDropdown(store)
     const { container } = renderDropdown(store, backend)
     await waitForEditing(store)
-    const draftBefore = store.getter(filterSortDraftAtom)
 
-    fireEvent.click(button(container, 'filter-sort-asc'))
+    applyEqualsDraft(container, 'alpha')
 
     await waitFor(() => {
       const text = container.querySelector('[data-testid="filter-error-text"]')?.textContent
       expect(text).toContain(FILTER_SORT_OUTCOME_UNKNOWN_ERROR)
       expect(text).toContain('backend exploded')
     })
-    expect(store.getter(filterSortStateAtom)['sheet-1']?.directives).toEqual([
-      { colIndex: 4, direction: 'desc' },
-    ])
-    expect(store.getter(filterSortDraftAtom)).toEqual(draftBefore)
-  })
-
-  it('makes the selected column primary while preserving sort tie-breakers', async () => {
-    const store = createStore()
-    const calls: SetFilterSortRequest[] = []
-    const backend = createFakeBackend({
-      async setFilterSort(req) {
-        calls.push(req)
-        return { sheetId: req.sheetId, requestId: req.requestId, revision: 1 }
-      },
-    })
-    store.setter(setFilterSortAtom, {
-      sheetId: 'sheet-1',
-      state: {
-        rules: [{ kind: 'equals', colIndex: 4, value: 'open' }],
-        directives: [
-          { colIndex: 0, direction: 'desc' },
-          { colIndex: 2, direction: 'asc' },
-        ],
-      },
-    })
-    openDropdown(store, 1)
-    const { container } = renderDropdown(store, backend)
-    await waitForEditing(store)
-
-    fireEvent.click(button(container, 'filter-sort-asc'))
-
-    const expected = [
-      { colIndex: 1, direction: 'asc' },
-      { colIndex: 0, direction: 'desc' },
-      { colIndex: 2, direction: 'asc' },
-    ]
-    await waitFor(() =>
-      expect(store.getter(filterSortStateAtom)['sheet-1']?.directives).toEqual(expected),
-    )
-    expect(calls[0]!.directives).toEqual(expected)
+    expect(store.getter(filterSortStateAtom)['sheet-1']?.rules).toEqual([equalsRule(4, 'seed')])
   })
 
   it('applies projected value-list selection only after Apply', async () => {
@@ -430,20 +402,11 @@ describe('vNext SpreadsheetFilterDropdown', () => {
     )
   })
 
-  it('clears filter and sort independently, then clears the whole column', async () => {
+  it('clears the column filter, then clears the whole column', async () => {
     const store = createStore()
     store.setter(setFilterSortAtom, {
       sheetId: 'sheet-1',
-      state: {
-        rules: [
-          { kind: 'equals', colIndex: 1, value: 'x' },
-          { kind: 'equals', colIndex: 2, value: 'y' },
-        ],
-        directives: [
-          { colIndex: 1, direction: 'asc' },
-          { colIndex: 2, direction: 'desc' },
-        ],
-      },
+      state: { rules: [equalsRule(1, 'x'), equalsRule(2, 'y')] },
     })
     openDropdown(store, 1)
     const { container } = renderDropdown(store, createFakeBackend())
@@ -452,28 +415,17 @@ describe('vNext SpreadsheetFilterDropdown', () => {
     fireEvent.click(button(container, 'filter-clear-filter'))
     await waitFor(() =>
       expect(store.getter(filterSortStateAtom)['sheet-1']).toEqual({
-        rules: [{ kind: 'equals', colIndex: 2, value: 'y' }],
-        directives: [
-          { colIndex: 1, direction: 'asc' },
-          { colIndex: 2, direction: 'desc' },
-        ],
+        rules: [equalsRule(2, 'y')],
       }),
     )
     await waitForEditing(store)
 
-    fireEvent.click(button(container, 'filter-clear-sort'))
-    await waitFor(() =>
-      expect(store.getter(filterSortStateAtom)['sheet-1']?.directives).toEqual([
-        { colIndex: 2, direction: 'desc' },
-      ]),
-    )
-    await waitForEditing(store)
-
+    // `clear-column` now collapses onto the same rules-only semantics: there
+    // is no per-column sort state left to clear (#24).
     fireEvent.click(button(container, 'filter-clear'))
     await waitFor(() =>
       expect(store.getter(filterSortStateAtom)['sheet-1']).toEqual({
-        rules: [{ kind: 'equals', colIndex: 2, value: 'y' }],
-        directives: [{ colIndex: 2, direction: 'desc' }],
+        rules: [equalsRule(2, 'y')],
       }),
     )
   })
@@ -520,7 +472,7 @@ describe('vNext SpreadsheetFilterDropdown', () => {
     const { container } = renderDropdown(store, backend)
     await waitForEditing(store)
 
-    fireEvent.click(button(container, 'filter-sort-asc'))
+    applyEqualsDraft(container, 'North')
 
     await waitFor(() => {
       expect(store.getter(spreadsheetProjectionSnapshotAtom).result?.revision).toBe(2)
@@ -543,8 +495,8 @@ describe('vNext SpreadsheetFilterDropdown', () => {
     const b = renderDropdown(storeB, createFakeBackend())
     await Promise.all([waitForEditing(storeA), waitForEditing(storeB)])
 
-    fireEvent.click(button(a.container, 'filter-sort-asc'))
-    fireEvent.click(button(b.container, 'filter-sort-asc'))
+    applyEqualsDraft(a.container, 'alpha')
+    applyEqualsDraft(b.container, 'beta')
 
     await waitFor(() => {
       const text = a.container.querySelector('[data-testid="filter-error-text"]')?.textContent
@@ -552,9 +504,7 @@ describe('vNext SpreadsheetFilterDropdown', () => {
       expect(text).toContain('A failed')
     })
     await waitFor(() =>
-      expect(storeB.getter(filterSortStateAtom)['sheet-1']?.directives).toEqual([
-        { colIndex: 0, direction: 'asc' },
-      ]),
+      expect(storeB.getter(filterSortStateAtom)['sheet-1']?.rules).toEqual([equalsRule(0, 'beta')]),
     )
     expect(b.container.querySelector('[data-testid="filter-error-text"]')).toBeNull()
   })
@@ -589,10 +539,7 @@ describe('vNext SpreadsheetFilterDropdown — physical sort (design-engine-sort 
         return {
           sheetId: req.sheetId,
           requestId: req.requestId,
-          target:
-            req.direction === 'down'
-              ? { row: lastRow, col: 0 }
-              : { row: 0, col: lastCol },
+          target: req.direction === 'down' ? { row: lastRow, col: 0 } : { row: 0, col: lastCol },
         }
       },
       async sortRange(req: SortRangeRequest) {
@@ -638,9 +585,9 @@ describe('vNext SpreadsheetFilterDropdown — physical sort (design-engine-sort 
       keys: [{ col: 2, direction: 'desc' }],
       range: { rowStart: 1, rowEnd: 5, colStart: 0, colEnd: 3 },
     })
-    // No display directive is written on the physical path.
+    // The retired display permutation is never written.
     expect(filterRequests).toHaveLength(0)
-    expect(store.getter(filterSortStateAtom)['sheet-1']?.directives ?? []).toEqual([])
+    expect(store.getter(filterSortStateAtom)['sheet-1']).toBeUndefined()
     // Excel closes the AutoFilter menu once a sort applies.
     await waitFor(() => expect(store.getter(filterDropdownAtom).status).toBe('closed'))
   })
@@ -654,7 +601,7 @@ describe('vNext SpreadsheetFilterDropdown — physical sort (design-engine-sort 
     // and 4 away (display rows carry originalRow 0,1,3,5).
     store.setter(setFilterSortAtom, {
       sheetId: 'sheet-1',
-      state: { rules: [{ kind: 'equals', colIndex: 0, value: 'x' }], directives: [] },
+      state: { rules: [equalsRule(0, 'x')] },
     })
     seedReadyVisibleProjection(store, {
       status: 'ready',
@@ -692,10 +639,10 @@ describe('vNext SpreadsheetFilterDropdown — physical sort (design-engine-sort 
     expect(sortRequests[0].excludedRows).toEqual([2, 4])
   })
 
-  it('keeps the display-permutation directive when the host has no sortRange port', async () => {
+  it('withholds the whole sort section when the host has no sortRange port', async () => {
     const store = createStore()
     const filterRequests: SetFilterSortRequest[] = []
-    // No sortRange port → fallback to the existing dropdown display directive.
+    // No sortRange port → the host cannot sort at all (#24, fail-closed).
     const backend = createFakeBackend({
       async setFilterSort(req) {
         filterRequests.push(req)
@@ -706,15 +653,12 @@ describe('vNext SpreadsheetFilterDropdown — physical sort (design-engine-sort 
     const { container } = renderDropdown(store, backend)
     await waitForEditing(store)
 
-    fireEvent.click(button(container, 'filter-sort-asc'))
-
-    await waitFor(() =>
-      expect(store.getter(filterSortStateAtom)['sheet-1']?.directives).toEqual([
-        { colIndex: 3, direction: 'asc' },
-      ]),
-    )
-    expect(filterRequests).toHaveLength(1)
-    // Fallback keeps the dropdown open (display directive), unlike the physical path.
-    expect(store.getter(filterDropdownAtom).status).toBe('open')
+    expect(container.querySelector('[data-testid="filter-sort-section"]')).toBeNull()
+    expect(container.querySelector('[data-testid="filter-sort-asc"]')).toBeNull()
+    expect(container.querySelector('[data-testid="filter-sort-desc"]')).toBeNull()
+    // Filtering still works on the same host — only sort is withheld.
+    applyEqualsDraft(container, 'x')
+    await waitFor(() => expect(filterRequests).toHaveLength(1))
+    expect(store.getter(filterSortStateAtom)['sheet-1']?.rules).toEqual([equalsRule(3, 'x')])
   })
 })

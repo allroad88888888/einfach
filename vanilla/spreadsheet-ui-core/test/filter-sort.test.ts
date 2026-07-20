@@ -4,27 +4,20 @@ import type { DisplayCell } from '../src'
 import {
   FILTER_SORT_ACKNOWLEDGEMENT_ERROR,
   FILTER_SORT_CAPABILITY_ERROR,
-  FILTER_SORT_DROPDOWN_OPEN_ERROR,
   FILTER_SORT_INVALID_INPUT_ERROR,
   FILTER_SORT_OUTCOME_UNKNOWN_ERROR,
-  FILTER_SORT_PENDING_ERROR,
-  FILTER_SORT_STALE_OPERATION_ERROR,
-  FILTER_SORT_TARGET_ERROR,
   MAX_FILTER_LIST_VALUES,
   MAX_FILTER_SORT_SHEETS,
   captureFilterSortCapabilityAtom,
   clearColumnFilterSortAtom,
   clearColumnFilterRulesAtom,
-  clearColumnSortAtom,
   clearFilterSortAtom,
   closeFilterDropdownAtom,
-  dispatchSortAtom,
   filterDropdownAtom,
   filterSortDraftAtom,
   filterSortCapabilityAtom,
   filterSortCanCloseAtom,
   filterSortEntrypointOperationIdAtom,
-  filterSortEntrypointProjectionAtom,
   filterSortEntrypointStateAtom,
   filterSortErrorAtom,
   filterSortLifecycleAtom,
@@ -33,14 +26,10 @@ import {
   filterSortSyncTicketAtom,
   issueFilterSortSyncTicketAtom,
   notifyActiveSheetChangedAtom,
-  nextFilterSortOperationId,
   openFilterDropdownAtom,
   openFilterDropdownFromEntrypointAtom,
   retryFilterSortRefreshAtom,
-  runFilterSortEntrypointAtom,
   runFilterSortMutationAtom,
-  selectionAtom,
-  setWorkspaceActiveSheetAtom,
   setFilterSortAtom,
   setFilterSortErrorAtom,
   updateFilterSortAvailableValuesAtom,
@@ -57,7 +46,7 @@ function makeStore() {
   return createStore()
 }
 
-const emptyState: FilterSortState = { rules: [], directives: [] }
+const emptyState: FilterSortState = { rules: [] }
 
 type AtomHasPublicWrite<Entity> = Entity extends { write: unknown } ? true : false
 
@@ -86,20 +75,6 @@ function deferred<T>() {
     reject = rejectPromise
   })
   return { promise, resolve, reject }
-}
-
-function setEntrypointTarget(
-  store: ReturnType<typeof makeStore>,
-  sheetId: string,
-  colIndex: number,
-) {
-  store.setter(setWorkspaceActiveSheetAtom, { sheetId })
-  store.setter(selectionAtom, {
-    kind: 'cell',
-    sheetId,
-    anchor: { row: 0, col: colIndex },
-    focus: { row: 0, col: colIndex },
-  })
 }
 
 describe('filterSortStateAtom', () => {
@@ -141,17 +116,9 @@ describe('public filter and sort state boundary', () => {
     }
     const inputValues = ['two', 'one', 'two']
     const inputRule = { kind: 'list' as const, colIndex: 0, values: inputValues }
-    const inputDirective = { colIndex: 0, direction: 'asc' as const }
-    store.setter(setFilterSortAtom, {
-      sheetId: 'A',
-      state: {
-        rules: [inputRule],
-        directives: [inputDirective],
-      },
-    })
+    store.setter(setFilterSortAtom, { sheetId: 'A', state: { rules: [inputRule] } })
     inputRule.colIndex = 7
     inputValues[0] = 'changed-after-dispatch'
-    inputDirective.colIndex = 7
     store.setter(captureFilterSortCapabilityAtom, source)
     store.setter(openFilterDropdownAtom, { sheetId: 'A', colIndex: 0 })
     const sessionId = store.getter(filterSortSessionIdAtom)
@@ -176,7 +143,6 @@ describe('public filter and sort state boundary', () => {
     expect(Object.isFrozen(stateBySheet)).toBe(true)
     expect(Object.isFrozen(state)).toBe(true)
     expect(state.rules[0]?.colIndex).toBe(0)
-    expect(state.directives[0]?.colIndex).toBe(0)
     expect(Object.isFrozen(state.rules)).toBe(true)
     expect(Object.isFrozen(listRule)).toBe(true)
     expect(listRule.kind).toBe('list')
@@ -184,8 +150,6 @@ describe('public filter and sort state boundary', () => {
       expect(listRule.values).toEqual(['two', 'one', 'two'])
       expect(Object.isFrozen(listRule.values)).toBe(true)
     }
-    expect(Object.isFrozen(state.directives)).toBe(true)
-    expect(Object.isFrozen(state.directives[0])).toBe(true)
     expect(Object.isFrozen(dropdown)).toBe(true)
     expect(Object.isFrozen(draft)).toBe(true)
     expect(Object.isFrozen(draft.selectedValues)).toBe(true)
@@ -199,7 +163,6 @@ describe('setFilterSortAtom', () => {
     const store = makeStore()
     const state: FilterSortState = {
       rules: [{ kind: 'equals', colIndex: 0, value: 'foo' }],
-      directives: [{ colIndex: 0, direction: 'asc' }],
     }
     store.setter(setFilterSortAtom, { sheetId: 'A', state })
     expect(store.getter(filterSortStateAtom)['A']).toEqual(state)
@@ -209,11 +172,9 @@ describe('setFilterSortAtom', () => {
     const store = makeStore()
     const s1: FilterSortState = {
       rules: [{ kind: 'equals', colIndex: 0, value: 'a' }],
-      directives: [],
     }
     const s2: FilterSortState = {
       rules: [{ kind: 'contains', colIndex: 1, value: 'b' }],
-      directives: [],
     }
     store.setter(setFilterSortAtom, { sheetId: 'A', state: s1 })
     store.setter(setFilterSortAtom, { sheetId: 'A', state: s2 })
@@ -251,7 +212,6 @@ describe('setFilterSortAtom', () => {
     expect(Object.isFrozen(afterOverflow)).toBe(true)
     expect(Object.isFrozen(afterOverflow['overflow'])).toBe(true)
     expect(Object.isFrozen(afterOverflow['overflow']!.rules)).toBe(true)
-    expect(Object.isFrozen(afterOverflow['overflow']!.directives)).toBe(true)
   })
 
   test('updates an existing sheet at the cap without evicting or reordering entries', () => {
@@ -261,7 +221,6 @@ describe('setFilterSortAtom', () => {
     }
     const updatedState: FilterSortState = {
       rules: [{ kind: 'equals', colIndex: 2, value: 'updated' }],
-      directives: [{ colIndex: 2, direction: 'desc' }],
     }
 
     store.setter(setFilterSortAtom, { sheetId: 'sheet-0', state: updatedState })
@@ -286,7 +245,6 @@ describe('setFilterSortAtom', () => {
     const values = Array.from({ length: MAX_FILTER_LIST_VALUES + 1 }, (_, i) => String(i))
     const state: FilterSortState = {
       rules: [{ kind: 'list', colIndex: 0, values }],
-      directives: [],
     }
     store.setter(setFilterSortAtom, { sheetId: 'A', state })
     const stored = store.getter(filterSortStateAtom)['A']
@@ -350,7 +308,7 @@ describe('clearFilterSortAtom', () => {
 })
 
 describe('clearColumnFilterSortAtom', () => {
-  test('removes both rules and directives for the column', () => {
+  test('removes the rules for the column', () => {
     const store = makeStore()
     store.setter(setFilterSortAtom, {
       sheetId: 'A',
@@ -359,16 +317,11 @@ describe('clearColumnFilterSortAtom', () => {
           { kind: 'equals', colIndex: 1, value: 'x' },
           { kind: 'equals', colIndex: 2, value: 'y' },
         ],
-        directives: [
-          { colIndex: 1, direction: 'asc' },
-          { colIndex: 2, direction: 'desc' },
-        ],
       },
     })
     store.setter(clearColumnFilterSortAtom, { sheetId: 'A', colIndex: 1 })
     const state = store.getter(filterSortStateAtom)['A']
     expect(state?.rules).toEqual([{ kind: 'equals', colIndex: 2, value: 'y' }])
-    expect(state?.directives).toEqual([{ colIndex: 2, direction: 'desc' }])
   })
 
   test('no-op when sheet has no state', () => {
@@ -377,14 +330,11 @@ describe('clearColumnFilterSortAtom', () => {
     expect(store.getter(filterSortStateAtom)).toEqual({})
   })
 
-  test('no-op when column has neither rule nor directive', () => {
+  test('no-op when the column has no rule', () => {
     const store = makeStore()
     store.setter(setFilterSortAtom, {
       sheetId: 'A',
-      state: {
-        rules: [{ kind: 'equals', colIndex: 1, value: 'x' }],
-        directives: [{ colIndex: 1, direction: 'asc' }],
-      },
+      state: { rules: [{ kind: 'equals', colIndex: 1, value: 'x' }] },
     })
     const before = store.getter(filterSortStateAtom)
     store.setter(clearColumnFilterSortAtom, { sheetId: 'A', colIndex: 9 })
@@ -393,7 +343,7 @@ describe('clearColumnFilterSortAtom', () => {
 })
 
 describe('clearColumnFilterRulesAtom', () => {
-  test('removes only rules for the column and keeps sort directives', () => {
+  test('removes only the rules for the requested column', () => {
     const store = makeStore()
     store.setter(setFilterSortAtom, {
       sheetId: 'A',
@@ -401,10 +351,6 @@ describe('clearColumnFilterRulesAtom', () => {
         rules: [
           { kind: 'equals', colIndex: 1, value: 'x' },
           { kind: 'equals', colIndex: 2, value: 'y' },
-        ],
-        directives: [
-          { colIndex: 1, direction: 'asc' },
-          { colIndex: 2, direction: 'desc' },
         ],
       },
     })
@@ -413,38 +359,6 @@ describe('clearColumnFilterRulesAtom', () => {
 
     const state = store.getter(filterSortStateAtom)['A']
     expect(state?.rules).toEqual([{ kind: 'equals', colIndex: 2, value: 'y' }])
-    expect(state?.directives).toEqual([
-      { colIndex: 1, direction: 'asc' },
-      { colIndex: 2, direction: 'desc' },
-    ])
-  })
-})
-
-describe('clearColumnSortAtom', () => {
-  test('removes only sort directives for the column and keeps rules', () => {
-    const store = makeStore()
-    store.setter(setFilterSortAtom, {
-      sheetId: 'A',
-      state: {
-        rules: [
-          { kind: 'equals', colIndex: 1, value: 'x' },
-          { kind: 'equals', colIndex: 2, value: 'y' },
-        ],
-        directives: [
-          { colIndex: 1, direction: 'asc' },
-          { colIndex: 2, direction: 'desc' },
-        ],
-      },
-    })
-
-    store.setter(clearColumnSortAtom, { sheetId: 'A', colIndex: 1 })
-
-    const state = store.getter(filterSortStateAtom)['A']
-    expect(state?.rules).toEqual([
-      { kind: 'equals', colIndex: 1, value: 'x' },
-      { kind: 'equals', colIndex: 2, value: 'y' },
-    ])
-    expect(state?.directives).toEqual([{ colIndex: 2, direction: 'desc' }])
   })
 })
 
@@ -521,47 +435,6 @@ describe('closeFilterDropdownAtom', () => {
   })
 })
 
-describe('dispatchSortAtom', () => {
-  test('makes the latest sorted column primary and preserves old sorts as tie-breakers', () => {
-    const store = makeStore()
-    store.setter(setFilterSortAtom, {
-      sheetId: 'A',
-      state: {
-        rules: [{ kind: 'equals', colIndex: 4, value: 'open' }],
-        directives: [
-          { colIndex: 0, direction: 'desc' },
-          { colIndex: 2, direction: 'asc' },
-        ],
-      },
-    })
-
-    const next = store.setter(dispatchSortAtom, {
-      sheetId: 'A',
-      colIndex: 1,
-      direction: 'asc',
-    })
-
-    expect(next.rules).toEqual([{ kind: 'equals', colIndex: 4, value: 'open' }])
-    expect(next.directives).toEqual([
-      { colIndex: 1, direction: 'asc' },
-      { colIndex: 0, direction: 'desc' },
-      { colIndex: 2, direction: 'asc' },
-    ])
-
-    const replaced = store.setter(dispatchSortAtom, {
-      sheetId: 'A',
-      colIndex: 0,
-      direction: 'asc',
-    })
-
-    expect(replaced.directives).toEqual([
-      { colIndex: 0, direction: 'asc' },
-      { colIndex: 1, direction: 'asc' },
-      { colIndex: 2, direction: 'asc' },
-    ])
-  })
-})
-
 describe('notifyActiveSheetChangedAtom', () => {
   test('dropdown already closed — stays closed after sheet switch', () => {
     const store = makeStore()
@@ -603,6 +476,34 @@ describe('Core-owned filter/sort mutation lifecycle', () => {
     return store.getter(filterSortDraftAtom).sessionId
   }
 
+  /**
+   * Open a dropdown session whose draft already carries an equals condition,
+   * so `apply-draft` commits an observable rule. Sort intents no longer exist
+   * (#24 retired the display permutation); filter rules are the only payload
+   * this transport lane ever carries.
+   */
+  function openWithEqualsDraft(
+    store: ReturnType<typeof makeStore>,
+    source: FilterSortControllerPort,
+    value: string,
+    colIndex = 1,
+  ) {
+    const sessionId = openWithCapability(store, source, colIndex)
+    store.setter(updateFilterSortDraftAtom, {
+      sessionId,
+      patch: { conditionKind: 'equals', equalsInput: value },
+    })
+    return sessionId
+  }
+
+  const equalsRule = (colIndex: number, value: string) => ({
+    kind: 'equals',
+    colIndex,
+    value,
+  })
+
+  const applyDraft = { kind: 'apply-draft' } as const
+
   test('opens with a Core-owned draft whose default condition is none', () => {
     const store = makeStore()
     const source: FilterSortControllerPort = {
@@ -632,12 +533,12 @@ describe('Core-owned filter/sort mutation lifecycle', () => {
   test('missing setFilterSort blocks inline without transport or committed mutation', async () => {
     const store = makeStore()
     const source: FilterSortControllerPort = {}
-    const sessionId = openWithCapability(store, source)
+    const sessionId = openWithEqualsDraft(store, source, 'x')
 
     await store.setter(runFilterSortMutationAtom, {
       source,
       sessionId,
-      intent: { kind: 'sort', direction: 'asc' },
+      intent: applyDraft,
       refreshProjection: async () => undefined,
     })
 
@@ -656,11 +557,11 @@ describe('Core-owned filter/sort mutation lifecycle', () => {
         return acknowledgement.promise
       },
     }
-    const sessionId = openWithCapability(store, source)
+    const sessionId = openWithEqualsDraft(store, source, 'x')
     const input = {
       source,
       sessionId,
-      intent: { kind: 'sort', direction: 'asc' } as const,
+      intent: applyDraft,
       refreshProjection: async () => undefined,
     }
 
@@ -679,9 +580,7 @@ describe('Core-owned filter/sort mutation lifecycle', () => {
     })
     await Promise.all([first, second])
 
-    expect(store.getter(filterSortStateAtom)['A']?.directives).toEqual([
-      { colIndex: 1, direction: 'asc' },
-    ])
+    expect(store.getter(filterSortStateAtom)['A']?.rules).toEqual([equalsRule(1, 'x')])
     expect(store.getter(filterSortLifecycleAtom).status).toBe('editing')
   })
 
@@ -702,13 +601,13 @@ describe('Core-owned filter/sort mutation lifecycle', () => {
           return resultFor(request)
         },
       }
-      const sessionId = openWithCapability(store, source)
+      const sessionId = openWithEqualsDraft(store, source, 'x')
       const draftBefore = store.getter(filterSortDraftAtom)
 
       await store.setter(runFilterSortMutationAtom, {
         source,
         sessionId,
-        intent: { kind: 'sort', direction: 'desc' },
+        intent: applyDraft,
         refreshProjection: async () => undefined,
       })
 
@@ -722,7 +621,7 @@ describe('Core-owned filter/sort mutation lifecycle', () => {
       await store.setter(runFilterSortMutationAtom, {
         source,
         sessionId,
-        intent: { kind: 'sort', direction: 'desc' },
+        intent: applyDraft,
         refreshProjection: async () => undefined,
       })
 
@@ -742,7 +641,7 @@ describe('Core-owned filter/sort mutation lifecycle', () => {
     const store = makeStore()
     store.setter(setFilterSortAtom, {
       sheetId: 'A',
-      state: { rules: [], directives: [{ colIndex: 1, direction: 'asc' }] },
+      state: { rules: [equalsRule(1, 'seed')] },
     })
     let calls = 0
     const source: FilterSortControllerPort = {
@@ -751,19 +650,17 @@ describe('Core-owned filter/sort mutation lifecycle', () => {
         throw new Error('transport rejected')
       },
     }
-    const sessionId = openWithCapability(store, source)
+    const sessionId = openWithEqualsDraft(store, source, 'next')
     const draftBefore = store.getter(filterSortDraftAtom)
 
     await store.setter(runFilterSortMutationAtom, {
       source,
       sessionId,
-      intent: { kind: 'sort', direction: 'desc' },
+      intent: applyDraft,
       refreshProjection: async () => undefined,
     })
 
-    expect(store.getter(filterSortStateAtom)['A']?.directives).toEqual([
-      { colIndex: 1, direction: 'asc' },
-    ])
+    expect(store.getter(filterSortStateAtom)['A']?.rules).toEqual([equalsRule(1, 'seed')])
     expect(store.getter(filterSortDraftAtom)).toEqual(draftBefore)
     expect(store.getter(filterSortLifecycleAtom).status).toBe('outcome-unknown')
     expect(store.getter(filterSortErrorAtom)).toContain(FILTER_SORT_OUTCOME_UNKNOWN_ERROR)
@@ -773,7 +670,7 @@ describe('Core-owned filter/sort mutation lifecycle', () => {
     await store.setter(runFilterSortMutationAtom, {
       source,
       sessionId,
-      intent: { kind: 'sort', direction: 'desc' },
+      intent: applyDraft,
       refreshProjection: async () => undefined,
     })
     expect(calls).toBe(1)
@@ -789,11 +686,11 @@ describe('Core-owned filter/sort mutation lifecycle', () => {
         return acknowledgement.promise
       },
     }
-    const oldSessionId = openWithCapability(store, source)
+    const oldSessionId = openWithEqualsDraft(store, source, 'x')
     const pending = store.setter(runFilterSortMutationAtom, {
       source,
       sessionId: oldSessionId,
-      intent: { kind: 'sort', direction: 'asc' },
+      intent: applyDraft,
       refreshProjection: async () => undefined,
     })
     await Promise.resolve()
@@ -803,7 +700,6 @@ describe('Core-owned filter/sort mutation lifecycle', () => {
     store.setter(clearFilterSortAtom, 'A')
     store.setter(clearColumnFilterSortAtom, { sheetId: 'A', colIndex: 1 })
     store.setter(clearColumnFilterRulesAtom, { sheetId: 'A', colIndex: 1 })
-    store.setter(clearColumnSortAtom, { sheetId: 'A', colIndex: 1 })
     store.setter(captureFilterSortCapabilityAtom, {})
     store.setter(notifyActiveSheetChangedAtom, 'B')
     store.setter(openFilterDropdownAtom, { sheetId: 'A', colIndex: 3 })
@@ -828,9 +724,7 @@ describe('Core-owned filter/sort mutation lifecycle', () => {
     await pending
 
     expect(store.getter(filterSortCanCloseAtom)).toBe(true)
-    expect(store.getter(filterSortStateAtom)['A']?.directives).toEqual([
-      { colIndex: 1, direction: 'asc' },
-    ])
+    expect(store.getter(filterSortStateAtom)['A']?.rules).toEqual([equalsRule(1, 'x')])
     expect(store.getter(filterSortLifecycleAtom)).toMatchObject({
       status: 'editing',
       sessionId: oldSessionId,
@@ -848,13 +742,13 @@ describe('Core-owned filter/sort mutation lifecycle', () => {
         return { sheetId: request.sheetId, requestId: request.requestId, revision: 3 }
       },
     }
-    const sessionId = openWithCapability(store, source)
+    const sessionId = openWithEqualsDraft(store, source, 'x')
     let refreshCalls = 0
 
     await store.setter(runFilterSortMutationAtom, {
       source,
       sessionId,
-      intent: { kind: 'sort', direction: 'desc' },
+      intent: applyDraft,
       refreshProjection: async () => {
         refreshCalls += 1
         expect(store.getter(filterSortLifecycleAtom).status).toBe('refreshing')
@@ -862,9 +756,7 @@ describe('Core-owned filter/sort mutation lifecycle', () => {
       },
     })
 
-    expect(store.getter(filterSortStateAtom)['A']?.directives).toEqual([
-      { colIndex: 1, direction: 'desc' },
-    ])
+    expect(store.getter(filterSortStateAtom)['A']?.rules).toEqual([equalsRule(1, 'x')])
     expect(store.getter(filterSortLifecycleAtom).status).toBe('refresh-failed')
     expect(store.getter(filterSortErrorAtom)).toContain('projection failed')
     expect(store.getter(filterSortCanCloseAtom)).toBe(false)
@@ -926,744 +818,28 @@ describe('Core-owned filter/sort mutation lifecycle', () => {
         return { sheetId: request.sheetId, requestId: request.requestId }
       },
     }
-    const sessionA = openWithCapability(storeA, sourceA)
-    const sessionB = openWithCapability(storeB, sourceB)
+    const sessionA = openWithEqualsDraft(storeA, sourceA, 'a')
+    const sessionB = openWithEqualsDraft(storeB, sourceB, 'b')
 
     await Promise.all([
       storeA.setter(runFilterSortMutationAtom, {
         source: sourceA,
         sessionId: sessionA,
-        intent: { kind: 'sort', direction: 'asc' },
+        intent: applyDraft,
         refreshProjection: async () => undefined,
       }),
       storeB.setter(runFilterSortMutationAtom, {
         source: sourceB,
         sessionId: sessionB,
-        intent: { kind: 'sort', direction: 'desc' },
+        intent: applyDraft,
         refreshProjection: async () => undefined,
       }),
     ])
 
     expect(requestsA[0]?.requestId).toBe(1)
     expect(requestsB[0]?.requestId).toBe(1)
-    expect(storeA.getter(filterSortStateAtom)['A']?.directives[0]?.direction).toBe('asc')
-    expect(storeB.getter(filterSortStateAtom)['A']?.directives[0]?.direction).toBe('desc')
-  })
-})
-
-describe('filter and sort toolbar/menu entrypoint lifecycle', () => {
-  test('operation identity crosses MAX once, descends through MIN, then exhausts', () => {
-    expect(nextFilterSortOperationId(Number.MAX_SAFE_INTEGER - 1)).toBe(Number.MAX_SAFE_INTEGER)
-    expect(nextFilterSortOperationId(Number.MAX_SAFE_INTEGER)).toBe(-1)
-    expect(nextFilterSortOperationId(-1)).toBe(-2)
-    expect(nextFilterSortOperationId(Number.MIN_SAFE_INTEGER)).toBeNull()
-    expect(nextFilterSortOperationId(Number.MAX_SAFE_INTEGER + 1)).toBeNull()
-  })
-
-  test('public lifecycle projections are readable but cannot replace an active Core ticket', async () => {
-    const store = makeStore()
-    setEntrypointTarget(store, 'A', 2)
-    const acknowledgement = deferred<FilterSortMutationResult>()
-    const calls: SetFilterSortRequest[] = []
-    const source: FilterSortControllerPort = {
-      setFilterSort(request) {
-        calls.push(request)
-        if (calls.length === 1) return acknowledgement.promise
-        return Promise.resolve({ sheetId: request.sheetId, requestId: request.requestId })
-      },
-    }
-
-    const first = store.setter(runFilterSortEntrypointAtom, {
-      source,
-      entrypoint: 'toolbar',
-      direction: 'asc',
-      refreshProjection: async () => undefined,
-    })
-    await Promise.resolve()
-    await Promise.resolve()
-
-    expect(calls).toHaveLength(1)
-    expect(ENTRYPOINT_STATE_IS_READ_ONLY).toBe(false)
-    expect(ENTRYPOINT_OPERATION_ID_IS_READ_ONLY).toBe(false)
-    expect('write' in filterSortEntrypointStateAtom).toBe(false)
-    expect('write' in filterSortEntrypointOperationIdAtom).toBe(false)
-    const pendingState = store.getter(filterSortEntrypointStateAtom)
-    expect(pendingState.status).toBe('pending')
-    expect(store.getter(filterSortEntrypointOperationIdAtom)).toBe(1)
-
-    // Simulate an untyped legacy host. The public projections have no runtime
-    // write function, so even a cast cannot replace Core's private backing.
-    const writeWithoutTypes = store.setter as unknown as (
-      target: unknown,
-      value: unknown,
-    ) => unknown
-    expect(() =>
-      writeWithoutTypes(filterSortEntrypointStateAtom, { ...pendingState, status: 'idle' }),
-    ).toThrow()
-    expect(() => writeWithoutTypes(filterSortEntrypointOperationIdAtom, 999)).toThrow()
-    expect(store.getter(filterSortEntrypointStateAtom)).toBe(pendingState)
-    expect(store.getter(filterSortEntrypointOperationIdAtom)).toBe(1)
-
-    const request = calls[0]!
-    acknowledgement.resolve({ sheetId: request.sheetId, requestId: request.requestId })
-    await first
-    expect(store.getter(filterSortEntrypointStateAtom).status).toBe('idle')
-
-    await store.setter(runFilterSortEntrypointAtom, {
-      source,
-      entrypoint: 'menu-bar',
-      direction: 'desc',
-      refreshProjection: async () => undefined,
-    })
-    expect(calls).toHaveLength(2)
-    expect(store.getter(filterSortEntrypointOperationIdAtom)).toBe(2)
-  })
-
-  test('missing target and missing capability are blocked and explained before transport', async () => {
-    const noTargetStore = makeStore()
-    const calls: SetFilterSortRequest[] = []
-    const source: FilterSortControllerPort = {
-      async setFilterSort(request) {
-        calls.push(request)
-        return { sheetId: request.sheetId, requestId: request.requestId }
-      },
-    }
-
-    await noTargetStore.setter(runFilterSortEntrypointAtom, {
-      source,
-      entrypoint: 'toolbar',
-      direction: 'asc',
-      refreshProjection: async () => undefined,
-    })
-
-    expect(calls).toHaveLength(0)
-    expect(noTargetStore.getter(filterSortEntrypointStateAtom)).toMatchObject({
-      status: 'blocked',
-      error: FILTER_SORT_TARGET_ERROR,
-    })
-    expect(noTargetStore.getter(filterSortEntrypointProjectionAtom)).toMatchObject({
-      disabled: true,
-      disabledReason: FILTER_SORT_TARGET_ERROR,
-    })
-
-    const noCapabilityStore = makeStore()
-    setEntrypointTarget(noCapabilityStore, 'A', 2)
-    await noCapabilityStore.setter(runFilterSortEntrypointAtom, {
-      source: {},
-      entrypoint: 'menu-bar',
-      direction: 'desc',
-      refreshProjection: async () => undefined,
-    })
-
-    expect(noCapabilityStore.getter(filterSortStateAtom)).toEqual({})
-    expect(noCapabilityStore.getter(filterSortEntrypointStateAtom)).toMatchObject({
-      status: 'blocked',
-      target: { sheetId: 'A', colIndex: 2 },
-      error: FILTER_SORT_CAPABILITY_ERROR,
-    })
-  })
-
-  test('same-tick toolbar/menu dispatch shares one lane and commits the first exact acknowledgement', async () => {
-    const store = makeStore()
-    setEntrypointTarget(store, 'A', 2)
-    const acknowledgement = deferred<FilterSortMutationResult>()
-    const calls: SetFilterSortRequest[] = []
-    let refreshCount = 0
-    const source: FilterSortControllerPort = {
-      setFilterSort(request) {
-        calls.push(request)
-        return acknowledgement.promise
-      },
-    }
-    const toolbarInput = {
-      source,
-      entrypoint: 'toolbar' as const,
-      direction: 'asc' as const,
-      refreshProjection: async () => {
-        refreshCount += 1
-      },
-    }
-
-    const first = store.setter(runFilterSortEntrypointAtom, toolbarInput)
-    const second = store.setter(runFilterSortEntrypointAtom, {
-      ...toolbarInput,
-      entrypoint: 'menu-bar' as const,
-      direction: 'desc' as const,
-    })
-    await Promise.resolve()
-
-    expect(calls).toHaveLength(1)
-    expect(store.getter(filterSortStateAtom)).toEqual({})
-    expect(store.getter(filterSortEntrypointProjectionAtom)).toMatchObject({
-      status: 'pending',
-      pending: true,
-      disabled: true,
-    })
-
-    acknowledgement.resolve({
-      sheetId: 'A',
-      requestId: calls[0]!.requestId,
-      revision: 1,
-    })
-    await Promise.all([first, second])
-
-    expect(refreshCount).toBe(1)
-    expect(store.getter(filterSortStateAtom)['A']?.directives).toEqual([
-      { colIndex: 2, direction: 'asc' },
-    ])
-    expect(store.getter(filterSortEntrypointStateAtom)).toMatchObject({
-      status: 'idle',
-      operationId: 1,
-      requestId: 1,
-      attempt: 1,
-      error: '',
-    })
-  })
-
-  test('pre-launch authority drift releases the reservation without sending transport', async () => {
-    const store = makeStore()
-    setEntrypointTarget(store, 'A', 1)
-    const calls: SetFilterSortRequest[] = []
-    const refreshedSheets: string[] = []
-    const source: FilterSortControllerPort = {
-      async setFilterSort(request) {
-        calls.push(request)
-        return { sheetId: request.sheetId, requestId: request.requestId }
-      },
-    }
-
-    const pending = store.setter(runFilterSortEntrypointAtom, {
-      source,
-      entrypoint: 'toolbar',
-      direction: 'asc',
-      refreshProjection: async (sheetId) => {
-        refreshedSheets.push(sheetId)
-      },
-    })
-
-    // The Core command publishes its reservation synchronously, then yields
-    // once before calling the port. Drift during that window is pre-launch.
-    store.setter(selectionAtom, {
-      kind: 'cell',
-      sheetId: 'A',
-      anchor: { row: 0, col: 4 },
-      focus: { row: 0, col: 4 },
-    })
-    await pending
-
-    expect(calls).toHaveLength(0)
-    expect(refreshedSheets).toEqual([])
-    expect(store.getter(filterSortStateAtom)).toEqual({})
-    expect(store.getter(filterSortEntrypointStateAtom)).toMatchObject({
-      status: 'stale',
-      operationId: 1,
-      requestId: 1,
-      target: { sheetId: 'A', colIndex: 1 },
-      error: FILTER_SORT_STALE_OPERATION_ERROR,
-    })
-    expect(store.getter(filterSortEntrypointProjectionAtom)).toMatchObject({
-      status: 'stale',
-      target: { sheetId: 'A', colIndex: 4 },
-      pending: false,
-    })
-  })
-
-  test('mismatched acknowledgement retains an outcome-unknown ticket without resend', async () => {
-    const store = makeStore()
-    setEntrypointTarget(store, 'A', 4)
-    const calls: SetFilterSortRequest[] = []
-    const source: FilterSortControllerPort = {
-      async setFilterSort(request) {
-        calls.push(request)
-        return { sheetId: 'B', requestId: request.requestId }
-      },
-    }
-    const input = {
-      source,
-      entrypoint: 'menu-bar' as const,
-      direction: 'desc' as const,
-      refreshProjection: async () => undefined,
-    }
-
-    await store.setter(runFilterSortEntrypointAtom, input)
-
-    expect(store.getter(filterSortStateAtom)).toEqual({})
-    expect(store.getter(filterSortEntrypointStateAtom)).toMatchObject({
-      status: 'outcome-unknown',
-      operationId: 1,
-      requestId: 1,
-      attempt: 1,
-    })
-    expect(store.getter(filterSortEntrypointStateAtom).error).toContain(
-      FILTER_SORT_OUTCOME_UNKNOWN_ERROR,
-    )
-    expect(store.getter(filterSortEntrypointStateAtom).error).toContain(
-      FILTER_SORT_ACKNOWLEDGEMENT_ERROR,
-    )
-    expect(store.getter(filterSortEntrypointProjectionAtom)).toMatchObject({
-      status: 'outcome-unknown',
-      pending: true,
-      disabled: true,
-    })
-
-    await store.setter(runFilterSortEntrypointAtom, input)
-
-    let refreshCalls = 0
-    await store.setter(retryFilterSortRefreshAtom, {
-      refreshProjection: async () => {
-        refreshCalls += 1
-      },
-    })
-
-    expect(calls.map((request) => request.requestId)).toEqual([1])
-    expect(refreshCalls).toBe(0)
-    expect(store.getter(filterSortStateAtom)).toEqual({})
-  })
-
-  test('entrypoint refresh failure retries the captured sheet without resending transport', async () => {
-    const store = makeStore()
-    setEntrypointTarget(store, 'A', 1)
-    const calls: SetFilterSortRequest[] = []
-    const refreshedSheets: string[] = []
-    const source: FilterSortControllerPort = {
-      async setFilterSort(request) {
-        calls.push(request)
-        return { sheetId: request.sheetId, requestId: request.requestId }
-      },
-    }
-
-    await store.setter(runFilterSortEntrypointAtom, {
-      source,
-      entrypoint: 'toolbar',
-      direction: 'asc',
-      refreshProjection: async (sheetId) => {
-        refreshedSheets.push(sheetId)
-        throw new Error('projection failed')
-      },
-    })
-
-    expect(calls).toHaveLength(1)
-    expect(refreshedSheets).toEqual(['A'])
-    expect(store.getter(filterSortStateAtom)['A']?.directives).toEqual([
-      { colIndex: 1, direction: 'asc' },
-    ])
-    expect(store.getter(filterSortEntrypointStateAtom)).toMatchObject({
-      status: 'refresh-failed',
-      target: { sheetId: 'A', colIndex: 1 },
-    })
-
-    setEntrypointTarget(store, 'B', 2)
-    await store.setter(retryFilterSortRefreshAtom, {
-      refreshProjection: async (sheetId) => {
-        refreshedSheets.push(sheetId)
-      },
-    })
-
-    expect(calls).toHaveLength(1)
-    expect(refreshedSheets).toEqual(['A', 'A'])
-    expect(store.getter(filterSortEntrypointStateAtom).status).toBe('idle')
-
-    await store.setter(runFilterSortEntrypointAtom, {
-      source,
-      entrypoint: 'menu-bar',
-      direction: 'desc',
-      refreshProjection: async (sheetId) => {
-        refreshedSheets.push(sheetId)
-      },
-    })
-
-    expect(calls.map((request) => request.sheetId)).toEqual(['A', 'B'])
-    expect(refreshedSheets).toEqual(['A', 'A', 'B'])
-    expect(store.getter(filterSortStateAtom)['B']?.directives).toEqual([
-      { colIndex: 2, direction: 'desc' },
-    ])
-  })
-
-  test('transport rejection retains an outcome-unknown entrypoint ticket without resend', async () => {
-    const store = makeStore()
-    setEntrypointTarget(store, 'A', 4)
-    let calls = 0
-    const source: FilterSortControllerPort = {
-      async setFilterSort() {
-        calls += 1
-        throw new Error('transport rejected')
-      },
-    }
-    const input = {
-      source,
-      entrypoint: 'toolbar' as const,
-      direction: 'asc' as const,
-      refreshProjection: async () => undefined,
-    }
-
-    await store.setter(runFilterSortEntrypointAtom, input)
-    await store.setter(runFilterSortEntrypointAtom, input)
-
-    expect(calls).toBe(1)
-    expect(store.getter(filterSortStateAtom)).toEqual({})
-    expect(store.getter(filterSortEntrypointStateAtom)).toMatchObject({
-      status: 'outcome-unknown',
-      operationId: 1,
-      requestId: 1,
-    })
-    expect(store.getter(filterSortEntrypointStateAtom).error).toContain(
-      FILTER_SORT_OUTCOME_UNKNOWN_ERROR,
-    )
-    expect(store.getter(filterSortEntrypointStateAtom).error).toContain('transport rejected')
-  })
-
-  test.each([
-    [
-      'selection',
-      (store: ReturnType<typeof makeStore>) => {
-        store.setter(selectionAtom, {
-          kind: 'cell',
-          sheetId: 'A',
-          anchor: { row: 0, col: 4 },
-          focus: { row: 0, col: 4 },
-        })
-      },
-    ],
-    [
-      'workspace',
-      (store: ReturnType<typeof makeStore>) => {
-        store.setter(setWorkspaceActiveSheetAtom, { sheetId: 'B' })
-      },
-    ],
-  ])(
-    'post-launch %s witness drift retains the ticket and settles the captured target',
-    async (_kind, driftAuthority) => {
-      const store = makeStore()
-      setEntrypointTarget(store, 'A', 1)
-      const acknowledgement = deferred<FilterSortMutationResult>()
-      const calls: SetFilterSortRequest[] = []
-      const refreshedSheets: string[] = []
-      const source: FilterSortControllerPort = {
-        setFilterSort(request) {
-          calls.push(request)
-          return acknowledgement.promise
-        },
-      }
-      const pending = store.setter(runFilterSortEntrypointAtom, {
-        source,
-        entrypoint: 'toolbar',
-        direction: 'asc',
-        refreshProjection: async (sheetId) => {
-          refreshedSheets.push(sheetId)
-        },
-      })
-      await Promise.resolve()
-
-      expect(calls).toHaveLength(1)
-      driftAuthority(store)
-      expect(store.getter(filterSortEntrypointProjectionAtom)).toMatchObject({
-        status: 'stale',
-        pending: true,
-        disabled: true,
-        disabledReason: FILTER_SORT_PENDING_ERROR,
-        error: FILTER_SORT_STALE_OPERATION_ERROR,
-      })
-
-      await store.setter(runFilterSortEntrypointAtom, {
-        source,
-        entrypoint: 'menu-bar',
-        direction: 'desc',
-        refreshProjection: async () => undefined,
-      })
-      expect(calls).toHaveLength(1)
-
-      acknowledgement.resolve({
-        sheetId: 'A',
-        requestId: calls[0]!.requestId,
-      })
-      await pending
-
-      expect(calls).toHaveLength(1)
-      expect(refreshedSheets).toEqual(['A'])
-      expect(store.getter(filterSortStateAtom)['A']?.directives).toEqual([
-        { colIndex: 1, direction: 'asc' },
-      ])
-      expect(store.getter(filterSortEntrypointStateAtom).status).toBe('idle')
-    },
-  )
-
-  test('post-launch sheet target drift keeps one request, settles its target, then allows a new operation', async () => {
-    const store = makeStore()
-    setEntrypointTarget(store, 'A', 1)
-    const acknowledgement = deferred<FilterSortMutationResult>()
-    const calls: SetFilterSortRequest[] = []
-    const refreshedSheets: string[] = []
-    const source: FilterSortControllerPort = {
-      setFilterSort(nextRequest) {
-        calls.push(nextRequest)
-        if (calls.length === 1) return acknowledgement.promise
-        return Promise.resolve({
-          sheetId: nextRequest.sheetId,
-          requestId: nextRequest.requestId,
-        })
-      },
-    }
-    const firstInput = {
-      source,
-      entrypoint: 'toolbar' as const,
-      direction: 'asc' as const,
-      refreshProjection: async (sheetId: string) => {
-        refreshedSheets.push(sheetId)
-      },
-    }
-    const pending = store.setter(runFilterSortEntrypointAtom, firstInput)
-    await Promise.resolve()
-
-    expect(calls).toHaveLength(1)
-    setEntrypointTarget(store, 'B', 2)
-    expect(store.getter(filterSortEntrypointProjectionAtom)).toMatchObject({
-      status: 'stale',
-      pending: true,
-      disabled: true,
-      disabledReason: FILTER_SORT_PENDING_ERROR,
-      error: FILTER_SORT_STALE_OPERATION_ERROR,
-    })
-    store.setter(captureFilterSortCapabilityAtom, {})
-    store.setter(clearFilterSortAtom, 'A')
-    store.setter(openFilterDropdownAtom, { sheetId: 'B', colIndex: 2 })
-    store.setter(openFilterDropdownFromEntrypointAtom, {
-      source,
-      entrypoint: 'menu-bar',
-    })
-    await store.setter(runFilterSortEntrypointAtom, {
-      ...firstInput,
-      entrypoint: 'menu-bar',
-      direction: 'desc',
-    })
-
-    expect(calls).toHaveLength(1)
-    expect(store.getter(filterSortCapabilityAtom)).toBe(true)
-    expect(store.getter(filterDropdownAtom)).toEqual({ status: 'closed' })
-
-    acknowledgement.resolve({
-      sheetId: 'A',
-      requestId: calls[0]!.requestId,
-    })
-    await pending
-
-    expect(refreshedSheets).toEqual(['A'])
-    expect(store.getter(filterSortStateAtom)['A']?.directives).toEqual([
-      { colIndex: 1, direction: 'asc' },
-    ])
-    expect(store.getter(filterSortEntrypointStateAtom)).toMatchObject({
-      status: 'idle',
-      operationId: 1,
-      requestId: 1,
-      error: '',
-    })
-
-    await store.setter(runFilterSortEntrypointAtom, {
-      source,
-      entrypoint: 'menu-bar',
-      direction: 'desc',
-      refreshProjection: async (sheetId) => {
-        refreshedSheets.push(sheetId)
-      },
-    })
-
-    expect(calls.map((request) => [request.sheetId, request.requestId])).toEqual([
-      ['A', 1],
-      ['B', 2],
-    ])
-    expect(refreshedSheets).toEqual(['A', 'B'])
-    expect(store.getter(filterSortStateAtom)['B']?.directives).toEqual([
-      { colIndex: 2, direction: 'desc' },
-    ])
-  })
-
-  test('dropdown transport keeps the toolbar/menu lane disabled and blocks a second mutation', async () => {
-    const store = makeStore()
-    setEntrypointTarget(store, 'A', 1)
-    const acknowledgement = deferred<FilterSortMutationResult>()
-    const calls: SetFilterSortRequest[] = []
-    const source: FilterSortControllerPort = {
-      setFilterSort(request) {
-        calls.push(request)
-        return acknowledgement.promise
-      },
-    }
-    store.setter(captureFilterSortCapabilityAtom, source)
-    store.setter(openFilterDropdownAtom, { sheetId: 'A', colIndex: 1 })
-    const sessionId = store.getter(filterSortDraftAtom).sessionId
-
-    const dropdownPending = store.setter(runFilterSortMutationAtom, {
-      source,
-      sessionId,
-      intent: { kind: 'sort', direction: 'asc' },
-      refreshProjection: async () => undefined,
-    })
-    await Promise.resolve()
-
-    expect(calls).toHaveLength(1)
-    expect(store.getter(filterSortEntrypointProjectionAtom)).toMatchObject({
-      status: 'pending',
-      pending: true,
-      disabled: true,
-      disabledReason: FILTER_SORT_PENDING_ERROR,
-    })
-
-    await store.setter(runFilterSortEntrypointAtom, {
-      source,
-      entrypoint: 'menu-bar',
-      direction: 'desc',
-      refreshProjection: async () => undefined,
-    })
-    expect(calls).toHaveLength(1)
-    expect(store.getter(filterSortStateAtom)).toEqual({})
-
-    acknowledgement.resolve({
-      sheetId: 'A',
-      requestId: calls[0]!.requestId,
-    })
-    await dropdownPending
-
-    expect(store.getter(filterSortStateAtom)['A']?.directives).toEqual([
-      { colIndex: 1, direction: 'asc' },
-    ])
-    expect(store.getter(filterSortEntrypointProjectionAtom)).toMatchObject({
-      disabled: true,
-      disabledReason: FILTER_SORT_DROPDOWN_OPEN_ERROR,
-    })
-  })
-
-  test('an open dropdown draft disables toolbar/menu dispatch without leaving a stale draft', async () => {
-    const store = makeStore()
-    setEntrypointTarget(store, 'A', 3)
-    const calls: SetFilterSortRequest[] = []
-    const source: FilterSortControllerPort = {
-      async setFilterSort(request) {
-        calls.push(request)
-        return { sheetId: request.sheetId, requestId: request.requestId }
-      },
-    }
-    store.setter(captureFilterSortCapabilityAtom, source)
-    store.setter(openFilterDropdownAtom, { sheetId: 'A', colIndex: 3 })
-    const draftBefore = store.getter(filterSortDraftAtom)
-
-    expect(store.getter(filterSortEntrypointProjectionAtom)).toMatchObject({
-      disabled: true,
-      pending: false,
-      disabledReason: FILTER_SORT_DROPDOWN_OPEN_ERROR,
-    })
-
-    await store.setter(runFilterSortEntrypointAtom, {
-      source,
-      entrypoint: 'toolbar',
-      direction: 'asc',
-      refreshProjection: async () => undefined,
-    })
-
-    expect(calls).toHaveLength(0)
-    expect(store.getter(filterSortDraftAtom)).toEqual(draftBefore)
-    expect(store.getter(filterDropdownAtom)).toEqual({
-      status: 'open',
-      sheetId: 'A',
-      colIndex: 3,
-    })
-    expect(store.getter(filterSortStateAtom)).toEqual({})
-  })
-
-  test('toolbar/menu transport blocks direct and entrypoint dropdown opens until it settles', async () => {
-    const store = makeStore()
-    setEntrypointTarget(store, 'A', 3)
-    const acknowledgement = deferred<FilterSortMutationResult>()
-    const calls: SetFilterSortRequest[] = []
-    const source: FilterSortControllerPort = {
-      setFilterSort(request) {
-        calls.push(request)
-        return acknowledgement.promise
-      },
-    }
-
-    const entrypointPending = store.setter(runFilterSortEntrypointAtom, {
-      source,
-      entrypoint: 'toolbar',
-      direction: 'asc',
-      refreshProjection: async () => undefined,
-    })
-    await Promise.resolve()
-
-    expect(calls).toHaveLength(1)
-    expect(store.getter(filterSortEntrypointProjectionAtom)).toMatchObject({
-      status: 'pending',
-      pending: true,
-      disabled: true,
-      disabledReason: FILTER_SORT_PENDING_ERROR,
-    })
-
-    store.setter(openFilterDropdownAtom, { sheetId: 'A', colIndex: 3 })
-    store.setter(openFilterDropdownFromEntrypointAtom, {
-      source,
-      entrypoint: 'menu-bar',
-    })
-    expect(store.getter(filterDropdownAtom)).toEqual({ status: 'closed' })
-
-    await store.setter(runFilterSortMutationAtom, {
-      source,
-      sessionId: store.getter(filterSortDraftAtom).sessionId,
-      intent: { kind: 'sort', direction: 'desc' },
-      refreshProjection: async () => undefined,
-    })
-    expect(calls).toHaveLength(1)
-    expect(store.getter(filterSortStateAtom)).toEqual({})
-
-    acknowledgement.resolve({
-      sheetId: 'A',
-      requestId: calls[0]!.requestId,
-    })
-    await entrypointPending
-
-    expect(store.getter(filterSortStateAtom)['A']?.directives).toEqual([
-      { colIndex: 3, direction: 'asc' },
-    ])
-  })
-
-  test('independent stores reserve operation and request identities independently', async () => {
-    const storeA = makeStore()
-    const storeB = makeStore()
-    setEntrypointTarget(storeA, 'A', 0)
-    setEntrypointTarget(storeB, 'B', 3)
-    const requestsA: SetFilterSortRequest[] = []
-    const requestsB: SetFilterSortRequest[] = []
-    const sourceFor = (requests: SetFilterSortRequest[]): FilterSortControllerPort => ({
-      async setFilterSort(request) {
-        requests.push(request)
-        return { sheetId: request.sheetId, requestId: request.requestId }
-      },
-    })
-
-    await Promise.all([
-      storeA.setter(runFilterSortEntrypointAtom, {
-        source: sourceFor(requestsA),
-        entrypoint: 'toolbar',
-        direction: 'asc',
-        refreshProjection: async () => undefined,
-      }),
-      storeB.setter(runFilterSortEntrypointAtom, {
-        source: sourceFor(requestsB),
-        entrypoint: 'menu-bar',
-        direction: 'desc',
-        refreshProjection: async () => undefined,
-      }),
-    ])
-
-    expect(requestsA[0]?.requestId).toBe(1)
-    expect(requestsB[0]?.requestId).toBe(1)
-    expect(storeA.getter(filterSortEntrypointOperationIdAtom)).toBe(1)
-    expect(storeB.getter(filterSortEntrypointOperationIdAtom)).toBe(1)
-    expect(storeA.getter(filterSortStateAtom)['A']?.directives[0]).toEqual({
-      colIndex: 0,
-      direction: 'asc',
-    })
-    expect(storeB.getter(filterSortStateAtom)['B']?.directives[0]).toEqual({
-      colIndex: 3,
-      direction: 'desc',
-    })
+    expect(storeA.getter(filterSortStateAtom)['A']?.rules).toEqual([equalsRule(1, 'a')])
+    expect(storeB.getter(filterSortStateAtom)['A']?.rules).toEqual([equalsRule(1, 'b')])
   })
 })
 

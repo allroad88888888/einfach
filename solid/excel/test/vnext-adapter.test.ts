@@ -575,10 +575,8 @@ function createFakeWorkerWorkbookClient(): FakeWorkerWorkbookClient {
       return true
     },
     async beginImport(sessionIdOrOptions, options) {
-      const sessionId =
-        typeof sessionIdOrOptions === 'number' ? sessionIdOrOptions : nextImportId++
-      const importOptions =
-        typeof sessionIdOrOptions === 'number' ? options : sessionIdOrOptions
+      const sessionId = typeof sessionIdOrOptions === 'number' ? sessionIdOrOptions : nextImportId++
+      const importOptions = typeof sessionIdOrOptions === 'number' ? options : sessionIdOrOptions
       calls.beginImport.push(sessionId)
       calls.beginImportOptions.push({ sessionId, options: importOptions })
       return sessionId
@@ -997,7 +995,10 @@ describe('vnext adapter', () => {
   it('persists conditional format rule mutations in the static backend projection', async () => {
     const backend = createStaticSpreadsheetBackend({
       revision: 1,
-      matrix: [['Region', 'Q1'], ['North', 120]],
+      matrix: [
+        ['Region', 'Q1'],
+        ['North', 120],
+      ],
     })
     expect(backend.setConditionalFormatRule).toBeDefined()
     expect(backend.listConditionalFormatRules).toBeDefined()
@@ -1066,7 +1067,6 @@ describe('vnext adapter', () => {
       kind: 'set-filter-sort',
       sheetId: 'sheet-1',
       rules: [],
-      directives: [{ colIndex: 1, direction: 'desc' }],
     })
     const beforeSort = await backend.readVisibleProjection(
       createVisibleProjectionRequest({
@@ -1078,7 +1078,9 @@ describe('vnext adapter', () => {
     expect(
       beforeSort.cells.filter((cell) => cell.col === 0).map((cell) => cell.displayValue),
     ).toEqual(['Region', 'North', 'South', 'East', 'West'])
-    expect(beforeSort.cells.find((cell) => cell.row === 1 && cell.col === 0)?.originalRow).toBeUndefined()
+    expect(
+      beforeSort.cells.find((cell) => cell.row === 1 && cell.col === 0)?.originalRow,
+    ).toBeUndefined()
 
     // Physically sort the data region (rows 1..4, header row 0 excluded) by Q1
     // descending — this moves engine data, not a display permutation.
@@ -1103,15 +1105,13 @@ describe('vnext adapter', () => {
       }),
     )
     // Data physically moved: Q1 desc → East(200), West(140), North(120), South(80).
-    expect(projected.cells.filter((cell) => cell.col === 0).map((cell) => cell.displayValue)).toEqual([
-      'Region',
-      'East',
-      'West',
-      'North',
-      'South',
-    ])
+    expect(
+      projected.cells.filter((cell) => cell.col === 0).map((cell) => cell.displayValue),
+    ).toEqual(['Region', 'East', 'West', 'North', 'South'])
     // A physical move never stamps originalRow (that is a display-permutation fact).
-    expect(projected.cells.find((cell) => cell.row === 1 && cell.col === 0)?.originalRow).toBeUndefined()
+    expect(
+      projected.cells.find((cell) => cell.row === 1 && cell.col === 0)?.originalRow,
+    ).toBeUndefined()
   })
 
   it('applies static backend filter rules to visible projections', async () => {
@@ -1129,7 +1129,6 @@ describe('vnext adapter', () => {
       kind: 'set-filter-sort',
       sheetId: 'sheet-1',
       rules: [{ kind: 'equals', colIndex: 1, value: '120' }],
-      directives: [],
     })
 
     const projected = await backend.readVisibleProjection(
@@ -1140,15 +1139,14 @@ describe('vnext adapter', () => {
       }),
     )
 
-    expect(projected.cells.filter((cell) => cell.col === 0).map((cell) => cell.displayValue)).toEqual([
-      'Region',
-      'North',
-    ])
+    expect(
+      projected.cells.filter((cell) => cell.col === 0).map((cell) => cell.displayValue),
+    ).toEqual(['Region', 'North'])
     expect(projected.cells.some((cell) => cell.displayValue === 'South')).toBe(false)
     expect(projected.cells.some((cell) => cell.displayValue === 'East')).toBe(false)
   })
 
-  it('applies worker filter/sort as a bounded display permutation carrying originalRow', async () => {
+  it('applies worker filter visibility as a bounded display permutation carrying originalRow', async () => {
     const client = createFakeWorkerWorkbookClient()
     const backend = createWorkerWorkbookSpreadsheetBackend({
       client,
@@ -1179,16 +1177,17 @@ describe('vnext adapter', () => {
     })
 
     expect(typeof backend.setFilterSort).toBe('function')
+    // Filter VISIBILITY only. Sorting is never a `setFilterSort` payload any
+    // more (#24 retired the display-permutation sort branch).
     const ack = await backend.setFilterSort!({
       kind: 'set-filter-sort',
       sheetId: 'sheet-1',
-      rules: [],
-      directives: [{ colIndex: 1, direction: 'desc' }],
+      rules: [{ kind: 'equals', colIndex: 1, value: '120' }],
       requestId: 100,
     })
     expect(ack).toMatchObject({ sheetId: 'sheet-1', requestId: 100, revision: 8 })
     // The predicate scan is column-bounded: one single-column read per
-    // predicate column (col 0 summary probe + the directive column).
+    // predicate column (col 0 summary probe + the filter-rule column).
     expect(client.calls.readSparseRange).toEqual([
       { sheet: 0, startRow: 0, endRow: 3, startCol: 0, endCol: 0 },
       { sheet: 0, startRow: 0, endRow: 3, startCol: 1, endCol: 1 },
@@ -1203,18 +1202,17 @@ describe('vnext adapter', () => {
     )
 
     // The window fetch is a readCells batch bounded by the window itself
-    // (3 mapped rows x 2 columns), never a full-sheet read.
+    // (2 mapped rows x 2 columns), never a full-sheet read.
     expect(client.calls.readCells).toHaveLength(1)
-    expect(client.calls.readCells[0]).toHaveLength(6)
+    expect(client.calls.readCells[0]).toHaveLength(4)
     expect(projected.revision).toBe(8)
-    // Sort is a display permutation: rows reorder, each carries its source row.
+    // Filtered-out rows are compressed away; row ORDER is always source order.
     expect(
       projected.cells
         .filter((cell) => cell.col === 0)
         .map((cell) => [cell.displayValue, cell.originalRow]),
     ).toEqual([
       ['Region', 0],
-      ['East', 3],
       ['North', 1],
     ])
     // Engine data untouched — no writes were issued.
@@ -1699,10 +1697,34 @@ describe('vnext adapter', () => {
 
     expect(merged.cells).toEqual(
       expect.arrayContaining([
-        { row: 0, col: 0, displayValue: 'A1', valueKind: 'string', mergedSpan: { rows: 2, cols: 2 } },
-        { row: 0, col: 1, displayValue: 'B1', valueKind: 'string', mergeAnchor: { row: 0, col: 0 } },
-        { row: 1, col: 0, displayValue: 'A2', valueKind: 'string', mergeAnchor: { row: 0, col: 0 } },
-        { row: 1, col: 1, displayValue: 'B2', valueKind: 'string', mergeAnchor: { row: 0, col: 0 } },
+        {
+          row: 0,
+          col: 0,
+          displayValue: 'A1',
+          valueKind: 'string',
+          mergedSpan: { rows: 2, cols: 2 },
+        },
+        {
+          row: 0,
+          col: 1,
+          displayValue: 'B1',
+          valueKind: 'string',
+          mergeAnchor: { row: 0, col: 0 },
+        },
+        {
+          row: 1,
+          col: 0,
+          displayValue: 'A2',
+          valueKind: 'string',
+          mergeAnchor: { row: 0, col: 0 },
+        },
+        {
+          row: 1,
+          col: 1,
+          displayValue: 'B2',
+          valueKind: 'string',
+          mergeAnchor: { row: 0, col: 0 },
+        },
       ]),
     )
 
@@ -3833,9 +3855,7 @@ describe('vnext adapter', () => {
       }),
     )
 
-    expect(sheet1.cells).toEqual([
-      { row: 0, col: 0, displayValue: 'keep-me', valueKind: 'string' },
-    ])
+    expect(sheet1.cells).toEqual([{ row: 0, col: 0, displayValue: 'keep-me', valueKind: 'string' }])
     expect(sheet2.cells).toEqual([])
   })
 
@@ -3970,9 +3990,7 @@ describe('vnext adapter', () => {
         { id: 'sheet-1', name: 'Sheet1' },
         { id: 'sheet-2', name: 'Sheet2' },
       ],
-      cells: [
-        { row: 0, col: 0, displayValue: 'A1', valueKind: 'string', format: { bold: true } },
-      ],
+      cells: [{ row: 0, col: 0, displayValue: 'A1', valueKind: 'string', format: { bold: true } }],
     })
 
     await backend.setCellInput({
@@ -4576,9 +4594,9 @@ describe('vnext adapter', () => {
       anchor: { row: 0, col: 0 },
       focus: { row: 4, col: 1 },
     })
-    await expect(
-      store.setter(openRemoveDuplicatesFromSelectionAtom, { source }),
-    ).resolves.toBe('editing')
+    await expect(store.setter(openRemoveDuplicatesFromSelectionAtom, { source })).resolves.toBe(
+      'editing',
+    )
     store.setter(dispatchRemoveDuplicatesIntentAtom, {
       kind: 'toggle-key-column',
       column: 1,
@@ -5068,8 +5086,7 @@ describe('static backend undo/redo (reverse-delta history, audit D-2)', () => {
       }),
     )
     return {
-      displayValue: result.cells.find((cell) => cell.row === row && cell.col === col)
-        ?.displayValue,
+      displayValue: result.cells.find((cell) => cell.row === row && cell.col === col)?.displayValue,
       revision: result.revision,
     }
   }
@@ -5307,9 +5324,9 @@ describe('static backend undo/redo (reverse-delta history, audit D-2)', () => {
     await expect(
       backend.renameSheet!({ kind: 'rename-sheet', sheetId: 'sheet-1', name: '   ' }),
     ).rejects.toThrow('sheet name cannot be empty')
-    await expect(
-      backend.addSheet!({ kind: 'add-sheet', name: 'Sheet1' }),
-    ).rejects.toThrow('sheet name already exists')
+    await expect(backend.addSheet!({ kind: 'add-sheet', name: 'Sheet1' })).rejects.toThrow(
+      'sheet name already exists',
+    )
     await expect(
       backend.reorderSheet!({ kind: 'reorder-sheet', sheetId: 'missing-sheet' }),
     ).rejects.toThrow('unknown sheet')
@@ -5650,7 +5667,13 @@ describe('static backend undo/redo (reverse-delta history, audit D-2)', () => {
   })
 
   it('undo restores merge ranges removed by unmergeRange', async () => {
-    const backend = createStaticSpreadsheetBackend({ revision: 1, matrix: [['m', ''], ['', '']] })
+    const backend = createStaticSpreadsheetBackend({
+      revision: 1,
+      matrix: [
+        ['m', ''],
+        ['', ''],
+      ],
+    })
     const range = { rowStart: 0, rowEnd: 1, colStart: 0, colEnd: 1 }
     await backend.mergeRange!({ kind: 'merge-range', sheetId: 'sheet-1', range })
     await backend.unmergeRange!({ kind: 'unmerge-range', sheetId: 'sheet-1', range })

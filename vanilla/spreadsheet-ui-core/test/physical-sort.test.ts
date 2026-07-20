@@ -1,17 +1,21 @@
 import { describe, expect, test } from '@jest/globals'
 import { createStore } from '@einfach/core'
 import {
+  PHYSICAL_SORT_CAPABILITY_ERROR,
   PHYSICAL_SORT_REJECTION_MESSAGES,
   beginProjectionAtom,
+  captureFilterSortCapabilityAtom,
   captureSortRangeCapabilityAtom,
   clearPhysicalSortDiagnosticAtom,
   filterSortEntrypointStateAtom,
   filterSortStateAtom,
   hideRowsAtom,
   historyStackAtom,
+  openFilterDropdownAtom,
   physicalSortDiagnosticAtom,
   physicalSortRejectionMessage,
   resolveProjectionAtom,
+  retryFilterSortRefreshAtom,
   runPhysicalSortAtom,
   selectionAtom,
   setFilterSortAtom,
@@ -97,7 +101,11 @@ interface PhysicalSourceOptions {
 function makePhysicalSource(options: PhysicalSourceOptions = {}) {
   const sortRequests: SortRangeRequest[] = []
   const filterRequests: SetFilterSortRequest[] = []
-  const source: PhysicalSortControllerPort = {
+  // `setFilterSort` is present so the tests can prove the sort path NEVER
+  // touches it: the display-permutation fallback was retired with #24.
+  const source: PhysicalSortControllerPort & {
+    setFilterSort: (request: SetFilterSortRequest) => Promise<unknown>
+  } = {
     async setFilterSort(request) {
       filterRequests.push(request)
       return { sheetId: request.sheetId, requestId: request.requestId }
@@ -115,7 +123,7 @@ function makePhysicalSource(options: PhysicalSourceOptions = {}) {
 
 const noRefresh = async () => undefined
 
-describe('runPhysicalSortAtom — capability split', () => {
+describe('runPhysicalSortAtom — fail-closed capability gate', () => {
   test('with a sortRange port: dispatches a sort-range keyed by the active column', async () => {
     const store = makeStore()
     setActiveCell(store, 'sheet-1', 2, 1)
@@ -136,13 +144,15 @@ describe('runPhysicalSortAtom — capability split', () => {
       range: RANGE,
       keys: [{ col: 1, direction: 'desc' }],
     })
-    // Physical path writes engine data, never a display directive.
-    expect(store.getter(filterSortStateAtom)['sheet-1']?.directives ?? []).toEqual([])
+    // Physical path writes engine data; the retired display permutation is
+    // never reached, so `setFilterSort` stays untouched.
     expect(filterRequests).toHaveLength(0)
+    expect(store.getter(filterSortStateAtom)['sheet-1']).toBeUndefined()
     expect(store.getter(sortRangeSupportedAtom)).toBe(true)
+    expect(store.getter(physicalSortDiagnosticAtom)).toBeNull()
   })
 
-  test('without a sortRange port: falls back to display permutation (directives)', async () => {
+  test('without a sortRange port: sorting is unsupported — no transport, no view fallback', async () => {
     const store = makeStore()
     setActiveCell(store, 'sheet-1', 0, 2)
     const { source, filterRequests } = makePhysicalSource({ withoutSortRange: true })
@@ -151,21 +161,27 @@ describe('runPhysicalSortAtom — capability split', () => {
       source,
       entrypoint: 'toolbar',
       direction: 'asc',
-      range: null,
+      range: RANGE,
       refreshProjection: noRefresh,
     })
 
-    expect(filterRequests).toHaveLength(1)
-    expect(store.getter(filterSortStateAtom)['sheet-1']?.directives).toEqual([
-      { colIndex: 2, direction: 'asc' },
-    ])
+    // Fail-closed (#24): no display permutation is written and no filter
+    // transport is sent — the host simply has no sort.
+    expect(filterRequests).toHaveLength(0)
+    expect(store.getter(filterSortStateAtom)['sheet-1']).toBeUndefined()
     expect(store.getter(sortRangeSupportedAtom)).toBe(false)
+    expect(store.getter(physicalSortDiagnosticAtom)).toEqual({
+      code: 'unsupported',
+      message: PHYSICAL_SORT_CAPABILITY_ERROR,
+    })
+    expect(store.getter(filterSortEntrypointStateAtom).status).toBe('blocked')
+    expect(store.getter(filterSortEntrypointStateAtom).error).toBe(PHYSICAL_SORT_CAPABILITY_ERROR)
   })
 
-  test('null range falls back to the display permutation even when the port exists', async () => {
+  test('a null range rejects with invalid-range instead of falling back', async () => {
     const store = makeStore()
     setActiveCell(store, 'sheet-1', 2, 1)
-    const { source, sortRequests } = makePhysicalSource()
+    const { source, sortRequests, filterRequests } = makePhysicalSource()
 
     await store.setter(runPhysicalSortAtom, {
       source,
@@ -176,15 +192,16 @@ describe('runPhysicalSortAtom — capability split', () => {
     })
 
     expect(sortRequests).toHaveLength(0)
-    expect(store.getter(filterSortStateAtom)['sheet-1']?.directives).toEqual([
-      { colIndex: 1, direction: 'asc' },
-    ])
+    expect(filterRequests).toHaveLength(0)
+    expect(store.getter(filterSortStateAtom)['sheet-1']).toBeUndefined()
+    expect(store.getter(physicalSortDiagnosticAtom)?.code).toBe('invalid-range')
+    expect(store.getter(filterSortEntrypointStateAtom).status).toBe('blocked')
   })
 
-  test('a key column outside the range falls back to the display permutation', async () => {
+  test('a key column outside the range rejects with key-out-of-range', async () => {
     const store = makeStore()
     setActiveCell(store, 'sheet-1', 2, 7)
-    const { source, sortRequests } = makePhysicalSource()
+    const { source, sortRequests, filterRequests } = makePhysicalSource()
 
     await store.setter(runPhysicalSortAtom, {
       source,
@@ -195,17 +212,17 @@ describe('runPhysicalSortAtom — capability split', () => {
     })
 
     expect(sortRequests).toHaveLength(0)
-    expect(store.getter(filterSortStateAtom)['sheet-1']?.directives).toEqual([
-      { colIndex: 7, direction: 'asc' },
-    ])
+    expect(filterRequests).toHaveLength(0)
+    expect(store.getter(filterSortStateAtom)['sheet-1']).toBeUndefined()
+    expect(store.getter(physicalSortDiagnosticAtom)?.code).toBe('key-out-of-range')
   })
 
-  test('an active column filter now sorts physically with filtered-out rows excluded', async () => {
+  test('an active column filter sorts physically with filtered-out rows excluded', async () => {
     const store = makeStore()
     setActiveCell(store, 'sheet-1', 2, 1)
     store.setter(setFilterSortAtom, {
       sheetId: 'sheet-1',
-      state: { rules: [{ kind: 'equals', colIndex: 0, value: 'x' }], directives: [] },
+      state: { rules: [{ kind: 'equals', colIndex: 0, value: 'x' }] },
     })
     // Filter compresses source rows 2 and 4 away: display rows carry
     // originalRow 0 (header), 1, 3, 5. The gaps inside the observed span are
@@ -231,7 +248,10 @@ describe('runPhysicalSortAtom — capability split', () => {
     expect(sortRequests).toHaveLength(1)
     expect(sortRequests[0].excludedRows).toEqual([2, 4])
     expect(sortRequests[0].keys).toEqual([{ col: 1, direction: 'asc' }])
-    expect(store.getter(filterSortStateAtom)['sheet-1']?.directives ?? []).toEqual([])
+    // The filter rule is untouched — sorting never rewrites filter state.
+    expect(store.getter(filterSortStateAtom)['sheet-1']?.rules).toEqual([
+      { kind: 'equals', colIndex: 0, value: 'x' },
+    ])
   })
 })
 
@@ -241,7 +261,7 @@ describe('runPhysicalSortAtom — filter-hidden excluded rows', () => {
     setActiveCell(store, 'sheet-1', 2, 1)
     store.setter(setFilterSortAtom, {
       sheetId: 'sheet-1',
-      state: { rules: [{ kind: 'equals', colIndex: 0, value: 'x' }], directives: [] },
+      state: { rules: [{ kind: 'equals', colIndex: 0, value: 'x' }] },
     })
     // Manually hide row 5 (inside the range); filter compresses row 3 away.
     store.setter(hideRowsAtom, { sheetId: 'sheet-1', indices: [5] })
@@ -272,7 +292,7 @@ describe('runPhysicalSortAtom — filter-hidden excluded rows', () => {
     setActiveCell(store, 'sheet-1', 2, 1)
     store.setter(setFilterSortAtom, {
       sheetId: 'sheet-1',
-      state: { rules: [{ kind: 'equals', colIndex: 0, value: 'x' }], directives: [] },
+      state: { rules: [{ kind: 'equals', colIndex: 0, value: 'x' }] },
     })
     // Projection window only observes source rows 2 and 4 (scrolled). Row 3 is
     // a gap inside [2..4] → excluded; rows 1 and 5 are outside the observed
@@ -304,7 +324,7 @@ describe('runPhysicalSortAtom — filter-hidden excluded rows', () => {
     setActiveCell(store, 'sheet-1', 2, 1)
     store.setter(setFilterSortAtom, {
       sheetId: 'sheet-1',
-      state: { rules: [{ kind: 'equals', colIndex: 0, value: 'x' }], directives: [] },
+      state: { rules: [{ kind: 'equals', colIndex: 0, value: 'x' }] },
     })
     const { source, sortRequests } = makePhysicalSource()
 
@@ -316,7 +336,7 @@ describe('runPhysicalSortAtom — filter-hidden excluded rows', () => {
       refreshProjection: noRefresh,
     })
 
-    // Still physical (no directives), but with no projection to read the
+    // Still physical, but with no projection to read the
     // filtered-out rows cannot be derived — excludedRows is empty.
     expect(sortRequests).toHaveLength(1)
     expect(sortRequests[0].excludedRows).toEqual([])
@@ -327,7 +347,7 @@ describe('runPhysicalSortAtom — filter-hidden excluded rows', () => {
     setActiveCell(store, 'sheet-1', 2, 1)
     store.setter(setFilterSortAtom, {
       sheetId: 'sheet-1',
-      state: { rules: [{ kind: 'equals', colIndex: 0, value: 'x' }], directives: [] },
+      state: { rules: [{ kind: 'equals', colIndex: 0, value: 'x' }] },
     })
     publishProjection(
       store,
@@ -463,7 +483,7 @@ describe('runPhysicalSortAtom — structured rejections', () => {
     })
   }
 
-  test('source-too-large: user-readable diagnostic, no history, no directives', async () => {
+  test('source-too-large: user-readable diagnostic, no history, no data write', async () => {
     const store = makeStore()
     setActiveCell(store, 'sheet-1', 2, 1)
     const { source } = makePhysicalSource({ result: rejected('source-too-large') })
@@ -481,7 +501,7 @@ describe('runPhysicalSortAtom — structured rejections', () => {
       message: PHYSICAL_SORT_REJECTION_MESSAGES['source-too-large'],
     })
     expect(store.getter(historyStackAtom).entries).toHaveLength(0)
-    expect(store.getter(filterSortStateAtom)['sheet-1']?.directives ?? []).toEqual([])
+    expect(store.getter(filterSortStateAtom)['sheet-1']?.rules ?? []).toHaveLength(0)
   })
 
   test('merge-in-range: maps to the unmerge prompt', async () => {
@@ -580,6 +600,86 @@ describe('runPhysicalSortAtom — transport failure', () => {
 
     expect(store.getter(filterSortEntrypointStateAtom).status).toBe('outcome-unknown')
     expect(store.getter(historyStackAtom).entries).toHaveLength(0)
+  })
+})
+
+/**
+ * Lifecycle invariants that used to be pinned on the (retired) display
+ * entrypoint. They now belong to the physical command, which owns the same
+ * single backend lane and the same `filterSortEntrypointState` ticket.
+ */
+describe('runPhysicalSortAtom — single backend lane', () => {
+  test('an open filter dropdown makes the sort command inert', async () => {
+    const store = makeStore()
+    setActiveCell(store, 'sheet-1', 2, 1)
+    const { source, sortRequests } = makePhysicalSource()
+    store.setter(captureFilterSortCapabilityAtom, {
+      async setFilterSort(request: SetFilterSortRequest) {
+        return { sheetId: request.sheetId, requestId: request.requestId }
+      },
+    })
+    store.setter(openFilterDropdownAtom, { sheetId: 'sheet-1', colIndex: 1 })
+
+    await store.setter(runPhysicalSortAtom, {
+      source,
+      entrypoint: 'toolbar',
+      direction: 'asc',
+      range: RANGE,
+      refreshProjection: noRefresh,
+    })
+
+    expect(sortRequests).toHaveLength(0)
+  })
+
+  test('a same-tick second dispatch shares one lane and sends one sort-range', async () => {
+    const store = makeStore()
+    setActiveCell(store, 'sheet-1', 2, 1)
+    const { source, sortRequests } = makePhysicalSource()
+    const input = {
+      source,
+      entrypoint: 'toolbar' as const,
+      direction: 'asc' as const,
+      range: RANGE,
+      refreshProjection: noRefresh,
+    }
+
+    await Promise.all([
+      store.setter(runPhysicalSortAtom, input),
+      store.setter(runPhysicalSortAtom, input),
+    ])
+
+    expect(sortRequests).toHaveLength(1)
+  })
+
+  test('refresh failure keeps the applied ticket and retry never resends the sort', async () => {
+    const store = makeStore()
+    setActiveCell(store, 'sheet-1', 2, 1)
+    const { source, sortRequests } = makePhysicalSource()
+    let refreshCalls = 0
+
+    await store.setter(runPhysicalSortAtom, {
+      source,
+      entrypoint: 'toolbar',
+      direction: 'asc',
+      range: RANGE,
+      refreshProjection: async () => {
+        refreshCalls += 1
+        throw new Error('projection failed')
+      },
+    })
+
+    expect(store.getter(filterSortEntrypointStateAtom).status).toBe('refresh-failed')
+
+    await store.setter(retryFilterSortRefreshAtom, {
+      refreshProjection: async (sheetId) => {
+        refreshCalls += 1
+        expect(sheetId).toBe('sheet-1')
+      },
+    })
+
+    expect(sortRequests).toHaveLength(1)
+    expect(refreshCalls).toBe(2)
+    expect(store.getter(filterSortEntrypointStateAtom).status).toBe('idle')
   })
 })
 

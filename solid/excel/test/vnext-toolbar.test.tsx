@@ -6,6 +6,7 @@ import { cleanup, fireEvent, render, waitFor } from '@solidjs/testing-library'
 import type {
   MergeRangeRequest,
   SetFormatRangeRequest,
+  SortRangeRequest,
   SpreadsheetBackend,
   UnmergeRangeRequest,
   VisibleProjectionResult,
@@ -14,7 +15,6 @@ import type {
 import {
   beginProjectionAtom,
   diagnosticsAtom,
-  filterSortStateAtom,
   findReplaceOpenAtom,
   formatCellsEditorAtom,
   formatPainterStateAtom,
@@ -98,6 +98,20 @@ function createRecordingBackend() {
         requestId: request.requestId,
         revision: 2,
         affectedRange: { ...request.range },
+      }
+    },
+    // The Sort toolbar surface only renders when the host can physically sort
+    // (#24 retired the display-permutation fallback).
+    async sortRange(request) {
+      return {
+        kind: 'sort-range',
+        sheetId: request.sheetId,
+        applied: true,
+        movedRows: 0,
+        movedCells: 0,
+        affectedRange: request.range,
+        requestId: request.requestId,
+        revision: 2,
       }
     },
     async mergeRange(request) {
@@ -605,6 +619,7 @@ describe('vNext SpreadsheetToolbar', () => {
       },
     ]
     const setFormatRangeCalls: SetFormatRangeRequest[] = []
+    const sortRangeCalls: SortRangeRequest[] = []
     const backend: SpreadsheetBackend = {
       async readVisibleProjection(request) {
         return {
@@ -635,6 +650,27 @@ describe('vNext SpreadsheetToolbar', () => {
       async setFilterSort(request) {
         return { sheetId: request.sheetId, requestId: request.requestId, revision: 4 }
       },
+      // Sort is physical (#29) and capability-gated on this port (#24).
+      async resolveDataEdge(request) {
+        return {
+          kind: 'resolve-data-edge',
+          sheetId: request.sheetId,
+          target: request.direction === 'down' ? { row: 7, col: 0 } : { row: 0, col: 5 },
+        }
+      },
+      async sortRange(request) {
+        sortRangeCalls.push(request)
+        return {
+          kind: 'sort-range',
+          sheetId: request.sheetId,
+          applied: true,
+          movedRows: 2,
+          movedCells: 8,
+          affectedRange: request.range,
+          requestId: request.requestId,
+          revision: 5,
+        }
+      },
     }
 
     store.setter(setWorkspaceActiveSheetAtom, { sheetId: 'sheet-1' })
@@ -663,11 +699,8 @@ describe('vNext SpreadsheetToolbar', () => {
     fireEvent.click(
       container.querySelector('[data-testid="toolbar-sort-asc"]') as HTMLButtonElement,
     )
-    await waitFor(() =>
-      expect(store.getter(filterSortStateAtom)['sheet-1']?.directives).toEqual([
-        { colIndex: 4, direction: 'asc' },
-      ]),
-    )
+    await waitFor(() => expect(sortRangeCalls).toHaveLength(1))
+    expect(sortRangeCalls[0]!.keys).toEqual([{ col: 4, direction: 'asc' }])
 
     fireEvent.click(getButtons(container).numberFormat)
     const percentItem = document.body.querySelector(

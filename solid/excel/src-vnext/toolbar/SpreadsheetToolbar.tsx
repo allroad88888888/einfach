@@ -1,4 +1,4 @@
-import { createEffect, createSignal, For, onCleanup, Show } from 'solid-js'
+import { createEffect, createSignal, For, onCleanup, onMount, Show } from 'solid-js'
 import { useAtomValue } from '@einfach/solid'
 import { useT } from '../../src/i18n'
 import {
@@ -8,6 +8,7 @@ import {
   canUndoAtom,
   captureFilterSortCapabilityAtom,
   captureFindReplaceCapabilityAtom,
+  captureSortRangeCapabilityAtom,
   closeToolbarSurfaceAtom,
   dispatchToolbarFormatCommandAtom,
   exitFormatPainterAtom,
@@ -30,6 +31,7 @@ import {
   runPhysicalSortAtom,
   runToolbarMutationAtom,
   selectionSnapshotAtom,
+  sortRangeSupportedAtom,
   toolbarActiveSurfaceAtom,
   toolbarCommandAvailabilityAtom,
   toolbarMutationLifecycleAtom,
@@ -398,9 +400,26 @@ export function SpreadsheetToolbar(props: SpreadsheetToolbarProps) {
   const activeToolbarSurface = useAtomValue(toolbarActiveSurfaceAtom)
   const toolbarMutationLifecycle = useAtomValue(toolbarMutationLifecycleAtom)
 
+  const sortSupported = useAtomValue(sortRangeSupportedAtom)
+
   createEffect(() => {
     store.setter(captureFilterSortCapabilityAtom, backend)
     store.setter(captureFindReplaceCapabilityAtom, backend)
+    store.setter(captureSortRangeCapabilityAtom, backend)
+  })
+
+  // Worker backends resolve their fail-closed capability witness asynchronously
+  // (describeCapabilities lands after initWorkbook), so `sortRange` sampled at
+  // mount can be pre-witness. Recapture once the backend reports ready so the
+  // Sort entrypoint reflects post-witness truth (#24: no port → no sort).
+  onMount(() => {
+    const readyable = backend as typeof backend & { ready?: () => Promise<unknown> }
+    void readyable.ready
+      ?.call(backend)
+      .then(() => {
+        store.setter(captureSortRangeCapabilityAtom, backend)
+      })
+      .catch(() => {})
   })
   const projectionSnapshot = useAtomValue(spreadsheetProjectionSnapshotAtom)
   const selectionSnapshot = useAtomValue(selectionSnapshotAtom)
@@ -1085,19 +1104,16 @@ export function SpreadsheetToolbar(props: SpreadsheetToolbarProps) {
     })
   }
 
-  // Sort now dispatches ONE physical-sort command. When the backend exposes
-  // `sortRange` (worker host) the region is resolved and the engine reorders
-  // data physically; otherwise (static host) the command delegates to the
-  // display permutation. The capability split is transparent to this handler.
+  // Sort dispatches ONE physical-sort command: the backend `sortRange` port
+  // reorders engine DATA. There is no display-permutation fallback (#24) —
+  // the button only renders when the host exposes the port.
   async function handleSortSelect(direction: SortDirection) {
     closeToolbarSurface()
     const snap = store.getter(selectionSnapshotAtom)
     const sheetId = snap.activeCell.sheetId || availability().sheetId
     if (!sheetId) return
-    const range =
-      typeof backend.sortRange === 'function'
-        ? await resolveSortRange(store, backend, sheetId, snap.activeCell)
-        : null
+    if (typeof backend.sortRange !== 'function') return
+    const range = await resolveSortRange(store, backend, sheetId, snap.activeCell)
     void store.setter(runPhysicalSortAtom, {
       source: backend,
       entrypoint: 'toolbar',
@@ -1744,41 +1760,46 @@ export function SpreadsheetToolbar(props: SpreadsheetToolbarProps) {
       >
         <FilterIcon />
       </button>
-      <div
-        class="spreadsheet-toolbar-sort-wrapper"
-        style={{ position: 'relative', display: 'inline-flex' }}
-      >
-        <button
-          ref={(el) => (sortAnchorRef = el)}
-          type="button"
-          class={`fmt-btn spreadsheet-toolbar-button ${
-            sortDropdownOpen() ? 'fmt-btn-active' : ''
-          }`.trim()}
-          data-testid="toolbar-btn-sort"
-          data-tooltip={
-            physicalSortDiagnostic()?.message ??
-            filterSortEntrypoint().disabledReason ??
-            t('toolbar.sort.title')
-          }
-          aria-label={t('toolbar.sort.title')}
-          title={physicalSortDiagnostic()?.message ?? filterSortEntrypoint().disabledReason ?? ''}
-          aria-haspopup="menu"
-          aria-expanded={sortDropdownOpen()}
-          disabled={filterSortEntrypoint().disabled}
-          onClick={() => toggleToolbarDropdown('sort')}
+      {/* Sort is capability-gated on the engine `sortRange` port (#24). A host
+          that cannot physically reorder data (the fail-closed TS worker) has no
+          sort at all, so the entrypoint disappears instead of pretending. */}
+      <Show when={sortSupported()}>
+        <div
+          class="spreadsheet-toolbar-sort-wrapper"
+          style={{ position: 'relative', display: 'inline-flex' }}
         >
-          <SortIcon />
-        </button>
-        <SortDropdown
-          isOpen={sortDropdownOpen()}
-          anchorRef={sortAnchorRef ?? null}
-          disabled={filterSortEntrypoint().disabled}
-          disabledReason={filterSortEntrypoint().disabledReason}
-          onSelect={handleSortSelect}
-          onRequestClose={closeToolbarSurface}
-          t={t}
-        />
-      </div>
+          <button
+            ref={(el) => (sortAnchorRef = el)}
+            type="button"
+            class={`fmt-btn spreadsheet-toolbar-button ${
+              sortDropdownOpen() ? 'fmt-btn-active' : ''
+            }`.trim()}
+            data-testid="toolbar-btn-sort"
+            data-tooltip={
+              physicalSortDiagnostic()?.message ??
+              filterSortEntrypoint().disabledReason ??
+              t('toolbar.sort.title')
+            }
+            aria-label={t('toolbar.sort.title')}
+            title={physicalSortDiagnostic()?.message ?? filterSortEntrypoint().disabledReason ?? ''}
+            aria-haspopup="menu"
+            aria-expanded={sortDropdownOpen()}
+            disabled={filterSortEntrypoint().disabled}
+            onClick={() => toggleToolbarDropdown('sort')}
+          >
+            <SortIcon />
+          </button>
+          <SortDropdown
+            isOpen={sortDropdownOpen()}
+            anchorRef={sortAnchorRef ?? null}
+            disabled={filterSortEntrypoint().disabled}
+            disabledReason={filterSortEntrypoint().disabledReason}
+            onSelect={handleSortSelect}
+            onRequestClose={closeToolbarSurface}
+            t={t}
+          />
+        </div>
+      </Show>
       <button
         type="button"
         class="fmt-btn spreadsheet-toolbar-button"

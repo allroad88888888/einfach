@@ -3,6 +3,7 @@ import { useAtomValue } from '@einfach/solid'
 import { useT } from '../../src/i18n'
 import {
   captureFilterSortCapabilityAtom,
+  captureSortRangeCapabilityAtom,
   closeFilterDropdownAtom,
   filterDropdownAtom,
   filterSortCapabilityAtom,
@@ -15,6 +16,7 @@ import {
   runFilterSortMutationAtom,
   runPhysicalSortAtom,
   retryFilterSortRefreshAtom,
+  sortRangeSupportedAtom,
   updateFilterSortAvailableValuesAtom,
   updateFilterSortDraftAtom,
   type ColumnFilterRule,
@@ -38,7 +40,7 @@ export interface SpreadsheetFilterDropdownProps {
   'data-testid'?: string
 }
 
-const EMPTY_STATE: FilterSortState = { rules: [], directives: [] }
+const EMPTY_STATE: FilterSortState = { rules: [] }
 
 function isSummaryLabel(value: string): boolean {
   const normalized = value.trim().toLocaleLowerCase()
@@ -76,6 +78,7 @@ export function SpreadsheetFilterDropdown(props: SpreadsheetFilterDropdownProps)
   const draft = useAtomValue(filterSortDraftAtom)
   const lifecycle = useAtomValue(filterSortLifecycleAtom)
   const capabilityAvailable = useAtomValue(filterSortCapabilityAtom)
+  const sortSupported = useAtomValue(sortRangeSupportedAtom)
   const canClose = useAtomValue(filterSortCanCloseAtom)
   const errorText = useAtomValue(filterSortErrorAtom)
   const projectionSnapshot = useAtomValue(spreadsheetProjectionSnapshotAtom)
@@ -89,9 +92,6 @@ export function SpreadsheetFilterDropdown(props: SpreadsheetFilterDropdownProps)
   )
   const currentRulesForCol = createMemo<readonly ColumnFilterRule[]>(() =>
     currentState().rules.filter((rule) => rule.colIndex === colIndex()),
-  )
-  const currentSortForCol = createMemo(() =>
-    currentState().directives.find((directive) => directive.colIndex === colIndex()),
   )
   const availableValues = createMemo(() => draft().availableValues)
   const filteredValues = createMemo(() => {
@@ -121,9 +121,12 @@ export function SpreadsheetFilterDropdown(props: SpreadsheetFilterDropdownProps)
     )
   })
 
-  // The capability witness is projected into Core; the backend object is never retained there.
+  // The capability witnesses are projected into Core; the backend object is
+  // never retained there. `sortRange` gates the sort section: a host without
+  // that port has no sort at all (#24, fail-closed) and the section hides.
   createEffect(() => {
     store.setter(captureFilterSortCapabilityAtom, backend)
+    store.setter(captureSortRangeCapabilityAtom, backend)
   })
 
   // DOM/projection collection stays in Solid; Core owns cache merging and selection semantics.
@@ -171,25 +174,21 @@ export function SpreadsheetFilterDropdown(props: SpreadsheetFilterDropdownProps)
     })
   }
 
-  // Sort now dispatches the SAME physical-sort command as the toolbar / menu
-  // (design-engine-sort S6 / #29). When the host exposes `sortRange` and a data
-  // region resolves, the dropdown closes (Excel closes its AutoFilter menu on
-  // sort) and the engine reorders data by THIS dropdown's column — supplied as
-  // an explicit target because the header chevron never moved the selection.
-  // Without a `sortRange` port (or a resolvable region) the command keeps the
-  // existing display-permutation directive on the dropdown's column.
+  // Sort dispatches the SAME physical-sort command as the toolbar / menu
+  // (design-engine-sort S6 / #29). The dropdown closes (Excel closes its
+  // AutoFilter menu on sort) and the engine reorders data by THIS dropdown's
+  // column — supplied as an explicit target because the header chevron never
+  // moved the selection. There is no display-permutation fallback (#24): the
+  // buttons only render when the host exposes `sortRange`.
   async function runSort(direction: SortDirection) {
     const currentSheetId = sheetId()
     const currentCol = colIndex()
     if (!currentSheetId || currentCol < 0) return
-    const range =
-      typeof backend.sortRange === 'function'
-        ? await resolveSortRange(store, backend, currentSheetId, { row: 0, col: currentCol })
-        : null
-    if (range === null) {
-      run({ kind: 'sort', direction })
-      return
-    }
+    if (typeof backend.sortRange !== 'function') return
+    const range = await resolveSortRange(store, backend, currentSheetId, {
+      row: 0,
+      col: currentCol,
+    })
     store.setter(closeFilterDropdownAtom)
     void store.setter(runPhysicalSortAtom, {
       source: backend,
@@ -270,15 +269,8 @@ export function SpreadsheetFilterDropdown(props: SpreadsheetFilterDropdownProps)
           </button>
         </div>
 
-        <Show when={currentRulesForCol().length > 0 || currentSortForCol()}>
+        <Show when={currentRulesForCol().length > 0}>
           <div class="filter-dropdown-rules" data-testid="filter-active-summary">
-            {currentSortForCol() ? (
-              <span class="filter-rule" data-rule-kind="sort">
-                {currentSortForCol()!.direction === 'asc'
-                  ? t('filterSort.sortAsc')
-                  : t('filterSort.sortDesc')}
-              </span>
-            ) : null}
             {currentRulesForCol().map((rule, index) => (
               <span class="filter-rule" data-rule-index={index} data-rule-kind={rule.kind}>
                 {ruleSummary(rule)}
@@ -287,38 +279,34 @@ export function SpreadsheetFilterDropdown(props: SpreadsheetFilterDropdownProps)
           </div>
         </Show>
 
-        <div class="filter-section">
-          <div class="filter-section-title">{t('filterSort.sortSection')}</div>
-          <div class="filter-action-row">
-            <button
-              type="button"
-              class="filter-btn"
-              data-testid="filter-sort-asc"
-              disabled={mutationDisabled()}
-              onClick={() => void runSort('asc')}
-            >
-              {t('filterSort.sortAsc')}
-            </button>
-            <button
-              type="button"
-              class="filter-btn"
-              data-testid="filter-sort-desc"
-              disabled={mutationDisabled()}
-              onClick={() => void runSort('desc')}
-            >
-              {t('filterSort.sortDesc')}
-            </button>
-            <button
-              type="button"
-              class="filter-btn"
-              data-testid="filter-clear-sort"
-              disabled={mutationDisabled()}
-              onClick={() => run({ kind: 'clear-sort' })}
-            >
-              {t('filterSort.clearSort')}
-            </button>
+        {/* Sort is a physical engine mutation (#29). A host without the
+            `sortRange` port has no sort at all, so the whole section is
+            withheld rather than shown as a no-op (#24, fail-closed). */}
+        <Show when={sortSupported()}>
+          <div class="filter-section" data-testid="filter-sort-section">
+            <div class="filter-section-title">{t('filterSort.sortSection')}</div>
+            <div class="filter-action-row">
+              <button
+                type="button"
+                class="filter-btn"
+                data-testid="filter-sort-asc"
+                disabled={mutationDisabled()}
+                onClick={() => void runSort('asc')}
+              >
+                {t('filterSort.sortAsc')}
+              </button>
+              <button
+                type="button"
+                class="filter-btn"
+                data-testid="filter-sort-desc"
+                disabled={mutationDisabled()}
+                onClick={() => void runSort('desc')}
+              >
+                {t('filterSort.sortDesc')}
+              </button>
+            </div>
           </div>
-        </div>
+        </Show>
 
         <div class="filter-section">
           <div class="filter-section-title">{t('filterSort.valuesSection')}</div>

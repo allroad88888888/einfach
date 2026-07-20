@@ -15,8 +15,8 @@ import {
  * display-permutation convention (`headerRow: 0, startRow: 1`).
  *
  * Returns `null` when the host exposes no `resolveDataEdge` port or the sheet
- * carries no data past the header; the caller then routes `runPhysicalSortAtom`
- * to the display-permutation fallback.
+ * carries no data past the header; `runPhysicalSortAtom` then rejects the sort
+ * with an `invalid-range` diagnostic (there is no display fallback — #24).
  */
 export async function resolveSortRange(
   store: Store,

@@ -182,7 +182,10 @@ describe('audit D-1 · P-A · FIXED (W2.4) · TS runtime clearRange walks existi
     // Column 1 cells are untouched.
     const survivors = (await rpc({
       cmd: 'readCells',
-      cells: [{ sheet: 0, addr: 'B1' }, { sheet: 0, addr: 'B5' }],
+      cells: [
+        { sheet: 0, addr: 'B1' },
+        { sheet: 0, addr: 'B5' },
+      ],
     })) as Array<{ display: string }>
     expect(survivors.map((c) => c.display)).toEqual(['0', '4'])
   })
@@ -193,15 +196,17 @@ describe('audit D-1 · P-A · FIXED (W2.4) · TS runtime clearRange walks existi
     await rpc({ cmd: 'setFormulaDetailed', sheet: 0, addr: 'A1', formula: '=SEQUENCE(3, 2)' })
 
     const readSpill = async () =>
-      ((await rpc({
-        cmd: 'readCells',
-        cells: [
-          { sheet: 0, addr: 'A1' },
-          { sheet: 0, addr: 'B2' },
-          { sheet: 0, addr: 'A3' },
-          { sheet: 0, addr: 'B3' },
-        ],
-      })) as Array<{ display: string }>).map((c) => c.display)
+      (
+        (await rpc({
+          cmd: 'readCells',
+          cells: [
+            { sheet: 0, addr: 'A1' },
+            { sheet: 0, addr: 'B2' },
+            { sheet: 0, addr: 'A3' },
+            { sheet: 0, addr: 'B3' },
+          ],
+        })) as Array<{ display: string }>
+      ).map((c) => c.display)
     expect(await readSpill()).toEqual(['1', '4', '5', '6'])
 
     // Clear rows 2-3 only (spill TARGETS, not the anchor). Targets are
@@ -291,9 +296,9 @@ describe('audit D-5 · P-D · FIXED — structural sheet ops keep probes bound t
 
     // FIXED (D-5): both sessions were dropped by the sheet op; the next
     // session RPC fails loudly instead of landing on the wrong sheet.
-    await expect(
-      rpc({ cmd: 'commitImport', sessionId: importSession }),
-    ).rejects.toThrow('INVALID_IMPORT_SESSION')
+    await expect(rpc({ cmd: 'commitImport', sessionId: importSession })).rejects.toThrow(
+      'INVALID_IMPORT_SESSION',
+    )
     await expect(
       rpc({ cmd: 'nextSnapshotRangeSparseChunk', sessionId: snapshotSession.sessionId }),
     ).rejects.toThrow('SNAPSHOT_SESSION_MISSING')
@@ -403,13 +408,14 @@ describe('audit D-4 · P-D · FIXED — worker backend deleteSheet drops per-she
   })
 })
 
-describe('audit D-7 · P-A · FLIPPED — worker filter/sort is a supported bounded display permutation', () => {
+describe('audit D-7 · P-A · FLIPPED — worker filter visibility is a supported bounded permutation', () => {
   // Was: the adapter omitted `setFilterSort` and the projection stayed
   // canonical. Parity slice #29 lands the port: the adapter mirrors the
-  // ui-core canonical rules, computes the permutation at projection time
-  // with the shared pure helper, and reads stay explicitly bounded — a
-  // single-column predicate scan per predicate column plus a
-  // window-bounded `readCells` batch. Engine data is never reordered.
+  // ui-core canonical rules, computes the VISIBILITY permutation at
+  // projection time with the shared pure helper, and reads stay explicitly
+  // bounded — a single-column predicate scan per predicate column plus a
+  // window-bounded `readCells` batch. Engine data is never reordered, and
+  // sort is not part of this path at all (#24).
   test('implements the port with bounded predicate scans and originalRow projections', async () => {
     const client = createWorkerWorkbook({ workerFactory: () => createInProcessWorker() })
     const readRanges: SparseRangeWire[] = []
@@ -427,7 +433,7 @@ describe('audit D-7 · P-A · FLIPPED — worker filter/sort is a supported boun
     })
     await backend.ready()
 
-    // Descending values make the ascending display permutation obvious.
+    // Descending values make the filter's row compression obvious.
     await backend.importCells?.({
       kind: 'import-cells',
       sheetId: 'sheet-1',
@@ -449,8 +455,9 @@ describe('audit D-7 · P-A · FLIPPED — worker filter/sort is a supported boun
     const ack = await backend.setFilterSort!({
       kind: 'set-filter-sort',
       sheetId: 'sheet-1',
-      rules: [],
-      directives: [{ colIndex: 0, direction: 'asc' }],
+      // Keep only values <= 90, i.e. source rows 10..30 — the compression
+      // pushes source row 10 into display row 1.
+      rules: [{ kind: 'range', colIndex: 0, max: 90 }],
       requestId: 2,
     })
     expect(ack).toMatchObject({ sheetId: 'sheet-1', requestId: 2 })
@@ -467,12 +474,13 @@ describe('audit D-7 · P-A · FLIPPED — worker filter/sort is a supported boun
       { sheet: 0, startRow: 0, endRow: 20, startCol: 0, endCol: 5 },
       { sheet: 0, startRow: 0, endRow: 30, startCol: 0, endCol: 0 },
     ])
-    // Header row 0 passes through; data rows sort ascending by value, so
-    // display row 1 is source row 30 (value 70) with its originalRow fact.
+    // Header row 0 passes through; filtered-out rows compress away, so
+    // display row 1 is source row 10 (value 90) with its originalRow fact.
+    // Row ORDER stays source order — the sort branch is gone (#24).
     expect(after.cells.find((cell) => cell.row === 0 && cell.col === 0)?.displayValue).toBe('100')
     expect(after.cells.find((cell) => cell.row === 1 && cell.col === 0)).toMatchObject({
-      displayValue: '70',
-      originalRow: 30,
+      displayValue: '90',
+      originalRow: 10,
     })
     // The mutation ACK bumped the revision; the engine rows themselves
     // did not move (clearing the state restores the canonical order).
@@ -481,7 +489,6 @@ describe('audit D-7 · P-A · FLIPPED — worker filter/sort is a supported boun
       kind: 'set-filter-sort',
       sheetId: 'sheet-1',
       rules: [],
-      directives: [],
       requestId: 4,
     })
     const cleared = await backend.readVisibleProjection(
@@ -614,7 +621,7 @@ describe('audit D-10 · P-B · FIXED — removeRows batches contiguous rows into
 })
 
 describe('audit C-8 · wire-type · FIXED — bulk import preserves wire typing end to end', () => {
-  test("text wires that LOOK numeric/boolean/formula/error stay text through the bulk path", async () => {
+  test('text wires that LOOK numeric/boolean/formula/error stay text through the bulk path', async () => {
     const { rpc } = makeRpc()
     await rpc({ cmd: 'initWorkbook', sheets: ['Sheet1'] })
 
@@ -719,12 +726,14 @@ describe('audit D-2 · P-A · FIXED — static backend history is reverse deltas
 })
 
 describe('audit D-11 · P-A · FIXED — conditional-format rules are pre-filtered by window bounds', () => {
-  async function seededBackend(rules: ReadonlyArray<{
-    priority: number
-    range: CellRange
-    bgColor: string
-    gt: string
-  }>) {
+  async function seededBackend(
+    rules: ReadonlyArray<{
+      priority: number
+      range: CellRange
+      bgColor: string
+      gt: string
+    }>,
+  ) {
     const backend = createWorkerWorkbookSpreadsheetBackend({
       workerFactory: () => createInProcessWorker(),
       sheets: ['One'],

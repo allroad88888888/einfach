@@ -196,7 +196,7 @@ const MAX_IMPORT_CELLS_PER_CHUNK = 10_000
  *
  * The shared pure helper `buildFilterSortDisplayRows` needs the display
  * value of every data row in each predicate column (column 0 for the
- * summary-row probe, plus every rule/directive column). On the worker
+ * summary-row probe, plus every filter-rule column). On the worker
  * path those values live behind RPC, so the scan must be explicitly
  * bounded: `dataRowCount x predicateColumnCount` may not exceed this cap
  * (same 50k-cell budget as `DEFAULT_MAX_PROJECTION_CELLS` and
@@ -232,10 +232,7 @@ export const MAX_SORT_SOURCE_CELLS = 50_000
 export const PASTE_RANGE_FORMATS_UNSUPPORTED = 'PASTE_RANGE_FORMATS_UNSUPPORTED'
 
 /** Value-leg-only paste kinds offered when the runtime models no formats. */
-const WORKER_PASTE_VALUE_KINDS: readonly PasteSpecialKind[] = Object.freeze([
-  'values',
-  'transpose',
-])
+const WORKER_PASTE_VALUE_KINDS: readonly PasteSpecialKind[] = Object.freeze(['values', 'transpose'])
 
 /**
  * Host-orchestrated undo/redo (parity #15/#36, CANONICAL_OWNERSHIP §4).
@@ -622,18 +619,12 @@ function shiftMergeRangeList(
   }
 }
 
-function namedRangeMatches(
-  entry: NamedRange,
-  name: string,
-  scope: NamedRange['scope'],
-): boolean {
+function namedRangeMatches(entry: NamedRange, name: string, scope: NamedRange['scope']): boolean {
   const targetIdentity = namedRangeIdentity(name, scope)
   return targetIdentity !== null && namedRangeIdentity(entry.name, entry.scope) === targetIdentity
 }
 
-function namedRangeAddressEndpoints(
-  address: string,
-): { start: string; end: string } | null {
+function namedRangeAddressEndpoints(address: string): { start: string; end: string } | null {
   const parts = address
     .trim()
     .split(':')
@@ -1571,10 +1562,7 @@ export function createWorkerWorkbookSpreadsheetBackend(
     if (!record) {
       return historyNotApplied(request, `no recorded backend transaction to ${action}`)
     }
-    if (
-      record.boundTransactionId !== null &&
-      record.boundTransactionId !== request.transactionId
-    ) {
+    if (record.boundTransactionId !== null && record.boundTransactionId !== request.transactionId) {
       return historyNotApplied(request, `unknown transactionId: ${request.transactionId}`)
     }
     if ((record.before === null || record.after === null) && !record.mergeOverlay) {
@@ -1804,11 +1792,10 @@ export function createWorkerWorkbookSpreadsheetBackend(
     return sheet
   }
 
-  /** Column 0 (summary-row probe) plus every rule and directive column. */
+  /** Column 0 (summary-row probe) plus every filter-rule column. */
   function filterSortPredicateColumns(state: FilterSortState): number[] {
     const cols = new Set<number>([0])
     for (const rule of state.rules) cols.add(rule.colIndex)
-    for (const directive of state.directives) cols.add(directive.colIndex)
     return [...cols]
   }
 
@@ -1864,8 +1851,10 @@ export function createWorkerWorkbookSpreadsheetBackend(
     }
 
     return (
-      buildFilterSortDisplayRows(state, { headerRow: 0, startRow: 1, endRow: rowCount }, (row, col) =>
-        values.get(keyFor(row, col)) ?? '',
+      buildFilterSortDisplayRows(
+        state,
+        { headerRow: 0, startRow: 1, endRow: rowCount },
+        (row, col) => values.get(keyFor(row, col)) ?? '',
       ) ?? []
     )
   }
@@ -2672,11 +2661,7 @@ export function createWorkerWorkbookSpreadsheetBackend(
           const sessionId = await client.beginImport({ mode: 'direct' })
           let committed = false
           try {
-            for (
-              let index = 0;
-              index < wires.length;
-              index += DEFAULT_IMPORT_CELLS_PER_CHUNK
-            ) {
+            for (let index = 0; index < wires.length; index += DEFAULT_IMPORT_CELLS_PER_CHUNK) {
               await client.importChunk(
                 sessionId,
                 wires.slice(index, index + DEFAULT_IMPORT_CELLS_PER_CHUNK),
@@ -2779,8 +2764,7 @@ export function createWorkerWorkbookSpreadsheetBackend(
     const sheet = await resolveSheet(request.sheetId)
     const range = normalizeRange(request.range)
 
-    const rangeArea =
-      (range.rowEnd - range.rowStart + 1) * (range.colEnd - range.colStart + 1)
+    const rangeArea = (range.rowEnd - range.rowStart + 1) * (range.colEnd - range.colStart + 1)
     if (rangeArea > MAX_SORT_SOURCE_CELLS) {
       return sortRejectedResult(
         request,
@@ -2855,9 +2839,7 @@ export function createWorkerWorkbookSpreadsheetBackend(
    * worker ACKs so the provider can order a follow-up projection read after
    * the epoch bump has applied.
    */
-  async function setEvalHiddenRowsThroughWorker(
-    request: SetEvalHiddenRowsRequest,
-  ): Promise<void> {
+  async function setEvalHiddenRowsThroughWorker(request: SetEvalHiddenRowsRequest): Promise<void> {
     const sheet = await resolveSheet(request.sheetId)
     const rows: number[] = []
     for (const value of request.rows) {
@@ -3602,9 +3584,7 @@ export function createWorkerWorkbookSpreadsheetBackend(
           throw error
         }
 
-        namedRanges = namedRanges.filter(
-          (item) => !namedRangeMatches(item, name, request.scope),
-        )
+        namedRanges = namedRanges.filter((item) => !namedRangeMatches(item, name, request.scope))
         return workerNamedRangeMutationResult(request, 'w0-acknowledged', bumpRevision())
       })
     },
@@ -3624,9 +3604,7 @@ export function createWorkerWorkbookSpreadsheetBackend(
       }
     },
 
-    async clearValidationRule(
-      request: ClearValidationRuleRequest,
-    ): Promise<BackendMutationResult> {
+    async clearValidationRule(request: ClearValidationRuleRequest): Promise<BackendMutationResult> {
       const range = normalizeRange(request.range)
       const current = validationRulesBySheetId.get(request.sheetId) ?? []
       validationRulesBySheetId.set(
@@ -3665,7 +3643,7 @@ export function createWorkerWorkbookSpreadsheetBackend(
         id:
           existingIndex >= 0
             ? current[existingIndex].id
-            : request.ruleId ?? nextConditionalFormatRuleId(current),
+            : (request.ruleId ?? nextConditionalFormatRuleId(current)),
         scope: { range: normalizeRange(request.scope.range) },
         priority:
           request.priority ??
@@ -3704,24 +3682,23 @@ export function createWorkerWorkbookSpreadsheetBackend(
     },
 
     /**
-     * Parity item #29 — filter visibility on the worker path. The rules
+     * Parity item #29 — filter VISIBILITY on the worker path. The rules
      * stay ui-core canonical (this ACK is what lets ui-core commit
-     * them); the adapter mirrors the payload and computes the display
+     * them); the adapter mirrors the payload and computes the visibility
      * permutation with the shared pure helper at projection time, so the
-     * engine data is never reordered (sort is a display permutation;
-     * physical engine sort is later-phase data-fact work). The
-     * permutation is computed BEFORE acknowledging: an over-cap source
-     * rejects with FILTER_SORT_SOURCE_TOO_LARGE and the filter never
-     * activates — fail-closed, no silent truncation. Clearing (a
-     * no-effect payload) never scans and therefore always succeeds, so
-     * an over-cap state can always be exited.
+     * engine data is never reordered. Sorting is NOT part of this path
+     * at all: the display-permutation sort was retired with #24, and a
+     * physical sort goes through `sortRange` (which the TS runtime
+     * withholds — that host simply has no sort). The permutation is
+     * computed BEFORE acknowledging: an over-cap source rejects with
+     * FILTER_SORT_SOURCE_TOO_LARGE and the filter never activates —
+     * fail-closed, no silent truncation. Clearing (a no-effect payload)
+     * never scans and therefore always succeeds, so an over-cap state
+     * can always be exited.
      */
     async setFilterSort(request: SetFilterSortRequest): Promise<BackendMutationResult> {
       const sheet = await resolveSheet(request.sheetId)
-      const next = cloneFilterSortState({
-        rules: request.rules,
-        directives: request.directives,
-      })
+      const next = cloneFilterSortState({ rules: request.rules })
 
       if (!filterSortHasEffect(next)) {
         filterSortStateBySheetId.delete(request.sheetId)

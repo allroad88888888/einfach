@@ -35,12 +35,11 @@ import type {
   FilterSortStateBySheet,
   PhysicalSortControllerPort,
   PhysicalSortDiagnostic,
-  RunFilterSortEntrypointInput,
+  PhysicalSortDiagnosticCode,
   RunFilterSortMutationInput,
   RunPhysicalSortInput,
   RetryFilterSortRefreshInput,
   SortDirection,
-  SortDirective,
   UpdateFilterSortAvailableValuesInput,
   UpdateFilterSortDraftInput,
 } from './types'
@@ -66,7 +65,6 @@ export const FILTER_SORT_OUTCOME_UNKNOWN_ERROR =
 
 const EMPTY_FILTER_SORT_STATE: FilterSortState = Object.freeze({
   rules: Object.freeze([]),
-  directives: Object.freeze([]),
 })
 
 const EMPTY_FILTER_SORT_STATE_BY_SHEET: FilterSortStateBySheet = Object.freeze({})
@@ -192,10 +190,7 @@ function normalizeRules(rules: readonly ColumnFilterRule[]): readonly ColumnFilt
 }
 
 function normalizeState(state: FilterSortState): FilterSortState {
-  return Object.freeze({
-    rules: normalizeRules(state.rules),
-    directives: Object.freeze(state.directives.map((directive) => Object.freeze({ ...directive }))),
-  })
+  return Object.freeze({ rules: normalizeRules(state.rules) })
 }
 
 function stateStoreWith(
@@ -310,13 +305,6 @@ function parseNumberInput(value: string): { valid: boolean; value?: number } {
   return Number.isFinite(parsed) ? { valid: true, value: parsed } : { valid: false }
 }
 
-function prioritizeSortDirective(
-  directives: readonly SortDirective[],
-  directive: SortDirective,
-): SortDirective[] {
-  return [directive, ...directives.filter((item) => item.colIndex !== directive.colIndex)]
-}
-
 function deriveMutationState(
   current: FilterSortState,
   draft: FilterSortDraftState,
@@ -327,42 +315,9 @@ function deriveMutationState(
     return { state: null, error: FILTER_SORT_INVALID_INPUT_ERROR }
   }
 
-  if (intent.kind === 'sort') {
+  if (intent.kind === 'clear-filter' || intent.kind === 'clear-column') {
     return {
-      state: {
-        rules: current.rules,
-        directives: prioritizeSortDirective(current.directives, {
-          colIndex,
-          direction: intent.direction,
-        }),
-      },
-      error: null,
-    }
-  }
-  if (intent.kind === 'clear-sort') {
-    return {
-      state: {
-        rules: current.rules,
-        directives: current.directives.filter((directive) => directive.colIndex !== colIndex),
-      },
-      error: null,
-    }
-  }
-  if (intent.kind === 'clear-filter') {
-    return {
-      state: {
-        rules: current.rules.filter((rule) => rule.colIndex !== colIndex),
-        directives: current.directives,
-      },
-      error: null,
-    }
-  }
-  if (intent.kind === 'clear-column') {
-    return {
-      state: {
-        rules: current.rules.filter((rule) => rule.colIndex !== colIndex),
-        directives: current.directives.filter((directive) => directive.colIndex !== colIndex),
-      },
+      state: { rules: current.rules.filter((rule) => rule.colIndex !== colIndex) },
       error: null,
     }
   }
@@ -399,7 +354,7 @@ function deriveMutationState(
     }
   }
 
-  return { state: { rules, directives: current.directives }, error: null }
+  return { state: { rules }, error: null }
 }
 
 function lifecycleFor(
@@ -778,21 +733,10 @@ export const clearColumnFilterSortAtom = atom(
     const sheetState = current[sheetId]
     if (!sheetState) return
     const nextRules = sheetState.rules.filter((rule) => rule.colIndex !== colIndex)
-    const nextDirectives = sheetState.directives.filter(
-      (directive) => directive.colIndex !== colIndex,
-    )
-    if (
-      nextRules.length === sheetState.rules.length &&
-      nextDirectives.length === sheetState.directives.length
-    ) {
-      return
-    }
+    if (nextRules.length === sheetState.rules.length) return
     set(
       filterSortStateBackingAtom,
-      stateStoreWith(get(filterSortStateBackingAtom), sheetId, {
-        rules: nextRules,
-        directives: nextDirectives,
-      }),
+      stateStoreWith(get(filterSortStateBackingAtom), sheetId, { rules: nextRules }),
     )
   },
 )
@@ -814,41 +758,11 @@ export const clearColumnFilterRulesAtom = atom(
     if (nextRules.length === sheetState.rules.length) return
     set(
       filterSortStateBackingAtom,
-      stateStoreWith(get(filterSortStateBackingAtom), sheetId, {
-        rules: nextRules,
-        directives: sheetState.directives,
-      }),
+      stateStoreWith(get(filterSortStateBackingAtom), sheetId, { rules: nextRules }),
     )
   },
 )
 clearColumnFilterRulesAtom.debugLabel = 'spreadsheet.filterSort.clearColumnRules'
-
-export const clearColumnSortAtom = atom(
-  (get) => get(filterSortStateAtom),
-  (get, set, { sheetId, colIndex }: { sheetId: string; colIndex: number }) => {
-    if (
-      get(activeFilterSortMutationAtom) !== null ||
-      get(activeFilterSortEntrypointAtom) !== null
-    ) {
-      return
-    }
-    const current = get(filterSortStateAtom)
-    const sheetState = current[sheetId]
-    if (!sheetState) return
-    const nextDirectives = sheetState.directives.filter(
-      (directive) => directive.colIndex !== colIndex,
-    )
-    if (nextDirectives.length === sheetState.directives.length) return
-    set(
-      filterSortStateBackingAtom,
-      stateStoreWith(get(filterSortStateBackingAtom), sheetId, {
-        rules: sheetState.rules,
-        directives: nextDirectives,
-      }),
-    )
-  },
-)
-clearColumnSortAtom.debugLabel = 'spreadsheet.filterSort.clearColumnSort'
 
 export const openFilterDropdownAtom = atom(
   (get) => get(filterDropdownAtom),
@@ -1127,7 +1041,6 @@ export const runFilterSortMutationAtom = atom(
         kind: 'set-filter-sort',
         sheetId,
         rules: ticket.next.rules,
-        directives: ticket.next.directives,
         requestId,
       })
     } catch (error) {
@@ -1204,220 +1117,6 @@ export const runFilterSortMutationAtom = atom(
   },
 )
 runFilterSortMutationAtom.debugLabel = 'spreadsheet.filterSort.runMutation'
-
-export const runFilterSortEntrypointAtom = atom(
-  null,
-  async (get, set, input: RunFilterSortEntrypointInput): Promise<void> => {
-    // Authority drift is not transport cancellation. An already-launched
-    // request retains the single-lane ticket until its own settlement, even
-    // while the derived projection reports stale for the captured target.
-    if (get(activeFilterSortEntrypointAtom) !== null) return
-
-    // The filter dropdown owns the same setFilterSort transport lane. Its
-    // ticket remains active through local acknowledgement and projection
-    // refresh, so a toolbar/menu command must stay inert for that full span.
-    if (get(activeFilterSortMutationAtom) !== null) return
-
-    // A Core-owned dropdown draft is a live editing session. Starting a
-    // toolbar/menu operation beside it would leave the draft based on the
-    // pre-command committed state, so entrypoints stay inert until it closes.
-    if (get(filterDropdownAtom).status === 'open') return
-
-    const target = resolveFilterSortEntrypointTarget(get)
-    const previous = get(filterSortEntrypointStateBackingAtom)
-    const directionIsValid = input.direction === 'asc' || input.direction === 'desc'
-    const entrypointIsValid = input.entrypoint === 'toolbar' || input.entrypoint === 'menu-bar'
-    let execute: FilterSortControllerPort['setFilterSort']
-    try {
-      execute = input.source?.setFilterSort
-    } catch {
-      execute = undefined
-    }
-    if (typeof execute !== 'function') {
-      set(filterSortCapabilityBackingAtom, false)
-      set(
-        filterSortEntrypointStateBackingAtom,
-        entrypointStateFor('blocked', {
-          entrypoint: entrypointIsValid ? input.entrypoint : null,
-          target,
-          direction: directionIsValid ? input.direction : null,
-          attempt:
-            target !== null && entrypointIsValid && directionIsValid
-              ? nextEntrypointAttempt(previous, input.entrypoint, target, input.direction)
-              : 1,
-          error: FILTER_SORT_CAPABILITY_ERROR,
-        }),
-      )
-      return
-    }
-    set(filterSortCapabilityBackingAtom, true)
-
-    if (
-      target === null ||
-      !directionIsValid ||
-      !entrypointIsValid ||
-      typeof input.refreshProjection !== 'function'
-    ) {
-      set(
-        filterSortEntrypointStateBackingAtom,
-        entrypointStateFor('blocked', {
-          entrypoint: entrypointIsValid ? input.entrypoint : null,
-          target,
-          direction: directionIsValid ? input.direction : null,
-          attempt: 1,
-          error: target === null ? FILTER_SORT_TARGET_ERROR : FILTER_SORT_INVALID_INPUT_ERROR,
-        }),
-      )
-      return
-    }
-
-    const operationId = nextFilterSortOperationId(get(filterSortEntrypointOperationIdStateAtom))
-    const requestId = nextFilterSortRequestId(get(filterSortSyncTicketAtom))
-    if (operationId === null || requestId === null) {
-      set(
-        filterSortEntrypointStateBackingAtom,
-        entrypointStateFor('blocked', {
-          entrypoint: input.entrypoint,
-          target,
-          direction: input.direction,
-          attempt: 1,
-          error: 'Filter and sort command identity space is exhausted.',
-        }),
-      )
-      return
-    }
-
-    const currentState = get(filterSortStateAtom)[target.sheetId] ?? EMPTY_FILTER_SORT_STATE
-    const next = normalizeState({
-      rules: currentState.rules,
-      directives: prioritizeSortDirective(currentState.directives, {
-        colIndex: target.colIndex,
-        direction: input.direction,
-      }),
-    })
-    const ticket: FilterSortEntrypointTicket = Object.freeze({
-      operationId,
-      requestId,
-      entrypoint: input.entrypoint,
-      target,
-      direction: input.direction,
-      attempt: nextEntrypointAttempt(previous, input.entrypoint, target, input.direction),
-      next,
-      selectionWitness: get(selectionAuthorityWitnessAtom),
-      workspaceWitness: get(workspaceActiveSheetAuthorityWitnessAtom),
-    })
-    set(filterSortEntrypointOperationIdStateAtom, operationId)
-    set(filterSortSyncTicketBackingAtom, requestId)
-    set(activeFilterSortEntrypointAtom, ticket)
-    set(filterSortEntrypointStateBackingAtom, entrypointStateForTicket('pending', ticket))
-
-    const ownsTicket = (): boolean => {
-      const state = get(filterSortEntrypointStateBackingAtom)
-      return (
-        get(activeFilterSortEntrypointAtom) === ticket &&
-        state.operationId === ticket.operationId &&
-        state.requestId === ticket.requestId &&
-        state.entrypoint === ticket.entrypoint &&
-        state.direction === ticket.direction &&
-        sameFilterSortTarget(state.target, ticket.target)
-      )
-    }
-    const authorityIsCurrent = (): boolean =>
-      get(selectionAuthorityWitnessAtom) === ticket.selectionWitness &&
-      get(workspaceActiveSheetAuthorityWitnessAtom) === ticket.workspaceWitness &&
-      sameFilterSortTarget(resolveFilterSortEntrypointTarget(get), ticket.target)
-    const rejectPrelaunchStaleTicket = (): void => {
-      if (!ownsTicket() || authorityIsCurrent()) return
-      set(activeFilterSortEntrypointAtom, null)
-      set(
-        filterSortEntrypointStateBackingAtom,
-        entrypointStateForTicket('stale', ticket, FILTER_SORT_STALE_OPERATION_ERROR),
-      )
-    }
-    // Publish the reservation before transport launch so same-tick re-entry is inert.
-    await Promise.resolve()
-    if (!ownsTicket()) return
-    if (!authorityIsCurrent()) {
-      // No transport exists yet, so this local reservation can be released.
-      rejectPrelaunchStaleTicket()
-      return
-    }
-    set(filterSortEntrypointStateBackingAtom, get(filterSortEntrypointStateBackingAtom))
-
-    let acknowledgement: unknown
-    try {
-      acknowledgement = await execute.call(input.source, {
-        kind: 'set-filter-sort',
-        sheetId: ticket.target.sheetId,
-        rules: ticket.next.rules,
-        directives: ticket.next.directives,
-        requestId: ticket.requestId,
-      })
-    } catch (error) {
-      if (!ownsTicket()) return
-      set(
-        filterSortEntrypointStateBackingAtom,
-        entrypointStateForTicket(
-          'outcome-unknown',
-          ticket,
-          outcomeUnknownError(errorMessage(error)),
-        ),
-      )
-      return
-    }
-
-    if (!ownsTicket()) return
-    let acknowledgementMatches = false
-    try {
-      acknowledgementMatches =
-        typeof acknowledgement === 'object' &&
-        acknowledgement !== null &&
-        (acknowledgement as { sheetId?: unknown }).sheetId === ticket.target.sheetId &&
-        (acknowledgement as { requestId?: unknown }).requestId === ticket.requestId
-    } catch {
-      acknowledgementMatches = false
-    }
-    if (!acknowledgementMatches) {
-      set(
-        filterSortEntrypointStateBackingAtom,
-        entrypointStateForTicket(
-          'outcome-unknown',
-          ticket,
-          outcomeUnknownError(FILTER_SORT_ACKNOWLEDGEMENT_ERROR),
-        ),
-      )
-      return
-    }
-
-    const stateBeforeCommit = get(filterSortStateBackingAtom)
-    set(
-      filterSortStateBackingAtom,
-      stateStoreWith(stateBeforeCommit, ticket.target.sheetId, ticket.next),
-    )
-    set(
-      filterSortEntrypointStateBackingAtom,
-      entrypointStateForTicket('local-acknowledged', ticket),
-    )
-
-    await Promise.resolve()
-    if (!ownsTicket()) return
-    set(filterSortEntrypointStateBackingAtom, entrypointStateForTicket('refreshing', ticket))
-    try {
-      await input.refreshProjection(ticket.target.sheetId)
-    } catch (error) {
-      if (!ownsTicket()) return
-      set(
-        filterSortEntrypointStateBackingAtom,
-        entrypointStateForTicket('refresh-failed', ticket, refreshFailureError(error)),
-      )
-      return
-    }
-    if (!ownsTicket()) return
-    set(activeFilterSortEntrypointAtom, null)
-    set(filterSortEntrypointStateBackingAtom, entrypointStateForTicket('idle', ticket))
-  },
-)
-runFilterSortEntrypointAtom.debugLabel = 'spreadsheet.filterSort.runEntrypoint'
 
 export const retryFilterSortRefreshAtom = atom(
   null,
@@ -1506,35 +1205,6 @@ export const retryFilterSortRefreshAtom = atom(
 )
 retryFilterSortRefreshAtom.debugLabel = 'spreadsheet.filterSort.retryRefresh'
 
-// Legacy optimistic command retained for non-entrypoint compatibility consumers.
-// Toolbar, MenuBar, and the dropdown use acknowledged Core-owned command lifecycles.
-export const dispatchSortAtom = atom(
-  (get) => get(filterSortStateAtom),
-  (
-    get,
-    set,
-    input: { sheetId: string; colIndex: number; direction: SortDirection },
-  ): FilterSortState => {
-    if (!input.sheetId || input.sheetId.length === 0) return EMPTY_FILTER_SORT_STATE
-    const current = get(filterSortStateAtom)
-    const sheetState = current[input.sheetId] ?? EMPTY_FILTER_SORT_STATE
-    const next: FilterSortState = {
-      rules: sheetState.rules,
-      directives: prioritizeSortDirective(sheetState.directives, {
-        colIndex: input.colIndex,
-        direction: input.direction,
-      }),
-    }
-    const normalized = normalizeState(next)
-    set(
-      filterSortStateBackingAtom,
-      stateStoreWith(get(filterSortStateBackingAtom), input.sheetId, normalized),
-    )
-    return normalized
-  },
-)
-dispatchSortAtom.debugLabel = 'spreadsheet.filterSort.dispatchSort'
-
 export const notifyActiveSheetChangedAtom = atom(
   (get) => get(filterDropdownAtom),
   (get, set, nextSheetId: string | null) => {
@@ -1548,32 +1218,43 @@ export const notifyActiveSheetChangedAtom = atom(
 notifyActiveSheetChangedAtom.debugLabel = 'spreadsheet.filterSort.notifyActiveSheet'
 
 // ===========================================================================
-// Engine physical sort (design-engine-sort S5)
+// Engine physical sort (design-engine-sort S5 / S6 / §10, parity #29)
 //
-// `runPhysicalSortAtom` is the single command the toolbar / menu sort
-// entrypoints dispatch. It routes by capability: when the host backend
-// exposes `sortRange` (and a physical sort is applicable) it reorders engine
-// DATA through that port with host-orchestrated undo; otherwise it delegates
-// to `runFilterSortEntrypointAtom` so the existing display permutation keeps
-// working. Both paths share the single backend lane (`activeFilterSort*`).
+// `runPhysicalSortAtom` is the ONLY sort command. It reorders engine DATA
+// through the host `sortRange` port with host-orchestrated undo. There is no
+// display-permutation fallback any more (#24): a host without `sortRange`
+// simply has no sort — the command reports an `unsupported` diagnostic and
+// hosts hide/disable the sort entrypoints off `sortRangeSupportedAtom`.
+// It still shares the single backend lane (`activeFilterSort*`) with the
+// filter dropdown so a filter mutation and a sort never overlap.
 // ===========================================================================
 
+/**
+ * Fail-closed reason surfaced when the host backend exposes no `sortRange`
+ * port. There is no display-permutation fallback (#24) — sorting simply does
+ * not exist for that host, and its sort entrypoints stay hidden/disabled.
+ */
+export const PHYSICAL_SORT_CAPABILITY_ERROR =
+  'Sort is unavailable because this workbook backend cannot reorder data.'
+
 /** Structured-reject code → user-readable prompt (design §3/§5). */
-export const PHYSICAL_SORT_REJECTION_MESSAGES: Readonly<Record<SortRangeRejectionCode, string>> =
-  Object.freeze({
-    'invalid-range': 'Sort could not run: the sort range is invalid.',
-    'empty-keys': 'Sort could not run: no sort column was provided.',
-    'key-out-of-range': 'Sort could not run: the sort column is outside the sorted range.',
-    'spill-in-range':
-      'Sort could not run: the range overlaps a spilled array. Move or clear the array first.',
-    'invalid-payload': 'Sort could not run: the sort request was malformed.',
-    'source-too-large': 'Sort could not run: the range is too large to sort.',
-    'merge-in-range':
-      'Sort could not run: the range contains merged cells. Unmerge them before sorting.',
-  })
+export const PHYSICAL_SORT_REJECTION_MESSAGES: Readonly<
+  Record<PhysicalSortDiagnosticCode, string>
+> = Object.freeze({
+  unsupported: PHYSICAL_SORT_CAPABILITY_ERROR,
+  'invalid-range': 'Sort could not run: the sort range is invalid.',
+  'empty-keys': 'Sort could not run: no sort column was provided.',
+  'key-out-of-range': 'Sort could not run: the sort column is outside the sorted range.',
+  'spill-in-range':
+    'Sort could not run: the range overlaps a spilled array. Move or clear the array first.',
+  'invalid-payload': 'Sort could not run: the sort request was malformed.',
+  'source-too-large': 'Sort could not run: the range is too large to sort.',
+  'merge-in-range':
+    'Sort could not run: the range contains merged cells. Unmerge them before sorting.',
+})
 
 export function physicalSortRejectionMessage(
-  code: SortRangeRejectionCode,
+  code: PhysicalSortDiagnosticCode,
   fallback?: string,
 ): string {
   return PHYSICAL_SORT_REJECTION_MESSAGES[code] ?? fallback ?? 'Sort could not run.'
@@ -1721,8 +1402,8 @@ export function buildSortExcludedRows(get: Getter, sheetId: string, range: CellR
 export const runPhysicalSortAtom = atom(
   null,
   async (get, set, input: RunPhysicalSortInput): Promise<void> => {
-    // Single backend lane: a display mutation, a display entrypoint, and a
-    // physical sort must never overlap on the same sheet transport.
+    // Single backend lane: a filter mutation and a physical sort must never
+    // overlap on the same sheet transport.
     if (get(activeFilterSortEntrypointAtom) !== null) return
     if (get(activeFilterSortMutationAtom) !== null) return
     // A live dropdown draft owns the same lane; stay inert until it closes.
@@ -1743,23 +1424,39 @@ export const runPhysicalSortAtom = atom(
       target.colIndex >= range!.colStart &&
       target.colIndex <= range!.colEnd
 
-    // Capability-driven split: physical whenever the port and a valid region
-    // are present and the key column sits inside the region. Filter-active
-    // sheets now sort physically too — the filtered-out rows ride in
-    // `excludedRows` (flip step 3, design §2.2 / §6.1) so they stay in place.
-    // Everything else falls back to the display permutation so hosts without
-    // a `sortRange` port keep working.
-    const physicalApplicable =
-      port !== undefined && target !== null && rangeIsValid && columnInRange
+    const directionIsValid = input.direction === 'asc' || input.direction === 'desc'
+    const entrypointIsValid = input.entrypoint === 'toolbar' || input.entrypoint === 'menu-bar'
 
-    if (!physicalApplicable || target === null || range === null) {
-      set(physicalSortDiagnosticBackingAtom, null)
-      await set(runFilterSortEntrypointAtom, {
-        source: input.source,
-        entrypoint: input.entrypoint,
-        direction: input.direction,
-        refreshProjection: input.refreshProjection,
-      })
+    // Fail-closed, no fallback (#24): a host without `sortRange` cannot sort.
+    // Filter-active sheets DO sort physically — the filtered-out rows ride in
+    // `excludedRows` (design §2.2 / §6.1) so they stay in place.
+    const rejection: PhysicalSortDiagnosticCode | null =
+      port === undefined
+        ? 'unsupported'
+        : !directionIsValid || !entrypointIsValid || typeof input.refreshProjection !== 'function'
+          ? 'invalid-payload'
+          : target === null
+            ? 'empty-keys'
+            : !rangeIsValid || range === null
+              ? 'invalid-range'
+              : !columnInRange
+                ? 'key-out-of-range'
+                : null
+
+    if (rejection !== null || port === undefined || target === null || range === null) {
+      const code = rejection ?? 'invalid-range'
+      const message = physicalSortRejectionMessage(code)
+      set(physicalSortDiagnosticBackingAtom, Object.freeze({ code, message }))
+      set(
+        filterSortEntrypointStateBackingAtom,
+        entrypointStateFor('blocked', {
+          entrypoint: entrypointIsValid ? input.entrypoint : null,
+          target,
+          direction: directionIsValid ? input.direction : null,
+          attempt: 1,
+          error: message,
+        }),
+      )
       return
     }
 

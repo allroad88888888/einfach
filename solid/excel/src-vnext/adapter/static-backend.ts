@@ -189,7 +189,10 @@ function compareCells(left: DisplayCell, right: DisplayCell): number {
   return left.row === right.row ? left.col - right.col : left.row - right.row
 }
 
-function extractMergeRanges(cells: readonly DisplayCell[], sheetId: string): Map<string, CellRange[]> {
+function extractMergeRanges(
+  cells: readonly DisplayCell[],
+  sheetId: string,
+): Map<string, CellRange[]> {
   const ranges: CellRange[] = []
   for (const cell of cells) {
     if (!cell.mergedSpan) continue
@@ -511,9 +514,9 @@ function recordRangeFormatsBefore(state: StaticBackendState, sheetId: string): v
 function recordConditionalRulesBefore(state: StaticBackendState, sheetId: string): void {
   const sheet = pendingSheetDelta(state, sheetId)
   if (!sheet || sheet.conditionalFormatRules) return
-  sheet.conditionalFormatRules = (
-    state.conditionalFormatRulesBySheetId.get(sheetId) ?? []
-  ).map(cloneConditionalFormatRuleEntry)
+  sheet.conditionalFormatRules = (state.conditionalFormatRulesBySheetId.get(sheetId) ?? []).map(
+    cloneConditionalFormatRuleEntry,
+  )
 }
 
 function recordMergeRangesBefore(state: StaticBackendState, sheetId: string): void {
@@ -587,9 +590,9 @@ function captureFullSheet(state: StaticBackendState, sheetId: string): FullSheet
       ]),
     ),
     rangeFormats: cloneRangeFormatLayers(state.rangeFormatsBySheetId.get(sheetId) ?? []),
-    conditionalFormatRules: (
-      state.conditionalFormatRulesBySheetId.get(sheetId) ?? []
-    ).map(cloneConditionalFormatRuleEntry),
+    conditionalFormatRules: (state.conditionalFormatRulesBySheetId.get(sheetId) ?? []).map(
+      cloneConditionalFormatRuleEntry,
+    ),
     mergeRanges: (state.mergeRangesBySheetId.get(sheetId) ?? []).map((r) => ({ ...r })),
     rowHeights: new Map(state.rowHeightsBySheetId.get(sheetId) ?? []),
     colWidths: new Map(state.colWidthsBySheetId.get(sheetId) ?? []),
@@ -839,10 +842,7 @@ function getOrCreateCellFormats(
   return formats
 }
 
-function getOrCreateRangeFormats(
-  state: StaticBackendState,
-  sheetId: string,
-): RangeFormatLayer[] {
+function getOrCreateRangeFormats(state: StaticBackendState, sheetId: string): RangeFormatLayer[] {
   let layers = state.rangeFormatsBySheetId.get(sheetId)
   if (!layers) {
     layers = []
@@ -884,10 +884,7 @@ function matrixToCells(matrix: StaticSeedMatrix): DisplayCell[] {
 }
 
 function sparseCellsToCells(cells: StaticSeedCells): DisplayCell[] {
-  return cells
-    .filter(isSeedCell)
-    .map(cloneCell)
-    .sort(compareCells)
+  return cells.filter(isSeedCell).map(cloneCell).sort(compareCells)
 }
 
 function buildState(
@@ -925,9 +922,7 @@ function buildState(
     colWidthsBySheetId: new Map(),
     hiddenRowsBySheetId: new Map(),
     hiddenColsBySheetId: new Map(),
-    freezeBySheetId: new Map(
-      sheets.map((sheet) => [sheet.id, { rows: 0, cols: 0 }]),
-    ),
+    freezeBySheetId: new Map(sheets.map((sheet) => [sheet.id, { rows: 0, cols: 0 }])),
     sheets,
     revision,
     undoStack: [],
@@ -1008,9 +1003,10 @@ function exportRangeTsvFromState(
 
 function normalizeSeed(input: StaticSpreadsheetSeedInput): StaticBackendState {
   if (Array.isArray(input)) {
-    const cells = input.length > 0 && input.some((item) => Array.isArray(item))
-      ? matrixToCells(input as StaticSeedMatrix)
-      : sparseCellsToCells(input as StaticSeedCells)
+    const cells =
+      input.length > 0 && input.some((item) => Array.isArray(item))
+        ? matrixToCells(input as StaticSeedMatrix)
+        : sparseCellsToCells(input as StaticSeedCells)
 
     return buildState(cells, 0)
   }
@@ -1038,7 +1034,7 @@ function normalizeStaticSheets(
   const seenNames = new Set<string>()
 
   input.forEach((sheet, index) => {
-    const id = typeof sheet === 'string' ? `sheet-${index + 1}` : sheet.id ?? `sheet-${index + 1}`
+    const id = typeof sheet === 'string' ? `sheet-${index + 1}` : (sheet.id ?? `sheet-${index + 1}`)
     const name = typeof sheet === 'string' ? sheet : sheet.name
     const normalizedId = id.trim()
     const normalizedName = name.trim()
@@ -1098,10 +1094,7 @@ function createNextSheetName(sheets: readonly SpreadsheetSheetMetadata[]): strin
   return name
 }
 
-function normalizeSheetMutationName(
-  name: string | undefined,
-  fallback: string,
-): string {
+function normalizeSheetMutationName(name: string | undefined, fallback: string): string {
   const normalized = name?.trim() ?? ''
   return normalized.length > 0 ? normalized : fallback
 }
@@ -1205,7 +1198,10 @@ function sheetMutationResult(
   }
 }
 
-function isCellInsideRange(cell: DisplayCell, range: { rowStart: number; rowEnd: number; colStart: number; colEnd: number }): boolean {
+function isCellInsideRange(
+  cell: DisplayCell,
+  range: { rowStart: number; rowEnd: number; colStart: number; colEnd: number },
+): boolean {
   return (
     cell.row >= range.rowStart &&
     cell.row <= range.rowEnd &&
@@ -1251,7 +1247,11 @@ function applyNumberFormatToCell(cell: DisplayCell, workbookLocale: string): voi
   const numberFormat = cell.format?.numberFormat
   if (!numberFormat) return
   if (cell.valueKind === 'error') return
-  if (cell.valueKind !== 'number' && numberFormat.kind !== 'text' && numberFormat.kind !== 'custom') {
+  if (
+    cell.valueKind !== 'number' &&
+    numberFormat.kind !== 'text' &&
+    numberFormat.kind !== 'custom'
+  ) {
     return
   }
   if (cell.valueKind === 'number' && !Number.isFinite(cell.numericValue)) return
@@ -1292,15 +1292,11 @@ function buildFilterSortDisplayRows(
   state: FilterSortState | undefined,
 ): number[] | null {
   const maxRow = getMaxSourceRow(sheetCells)
-  // Physical sort (#29) is the sole sort authority for the static backend now:
-  // the toolbar / menu sort entrypoints reorder engine data through `sortRange`.
-  // The display-permutation path here keeps ONLY filter visibility (`rules`);
-  // the `directives` sort branch is retired so a stray sort directive can never
-  // double-sort on top of the physical reorder (design-engine-sort §2.1 / #19).
-  const filterOnly: FilterSortState | undefined =
-    state === undefined ? undefined : { rules: state.rules, directives: [] }
+  // Filter VISIBILITY only. Physical sort (`sortRange`, #29) is the sole sort
+  // authority for the static backend; the display-permutation sort branch was
+  // retired entirely with #24, so this permutation can never reorder rows.
   return buildFilterSortDisplayRowsShared(
-    filterOnly,
+    state,
     { headerRow: 0, startRow: 1, endRow: maxRow + 1 },
     (row, col) => readFilterSortValue(sheetCells, lookup, row, col),
   )
@@ -1476,7 +1472,7 @@ function setConditionalFormatRuleInState(
     id:
       existingIndex >= 0
         ? current[existingIndex].id
-        : request.ruleId ?? nextConditionalFormatRuleId(current),
+        : (request.ruleId ?? nextConditionalFormatRuleId(current)),
     scope: { range: cloneRange(normalizeRange(request.scope.range)) },
     priority:
       request.priority ?? (existingIndex >= 0 ? current[existingIndex].priority : current.length),
@@ -1503,11 +1499,7 @@ function removeConditionalFormatRuleFromState(
   return next.length !== current.length
 }
 
-function namedRangeMatches(
-  entry: NamedRange,
-  name: string,
-  scope: NamedRange['scope'],
-): boolean {
+function namedRangeMatches(entry: NamedRange, name: string, scope: NamedRange['scope']): boolean {
   const targetIdentity = namedRangeIdentity(name, scope)
   return targetIdentity !== null && namedRangeIdentity(entry.name, entry.scope) === targetIdentity
 }
@@ -1520,8 +1512,8 @@ function setNamedRangeInState(state: StaticBackendState, request: SetNamedRangeR
     scope: request.scope === 'workbook' ? 'workbook' : { sheetId: request.scope.sheetId },
     refersTo: { ...request.refersTo },
   }
-  const existingIndex = state.namedRanges.findIndex(
-    (item) => namedRangeMatches(item, name, request.scope),
+  const existingIndex = state.namedRanges.findIndex((item) =>
+    namedRangeMatches(item, name, request.scope),
   )
   state.namedRanges =
     existingIndex >= 0
@@ -1636,7 +1628,7 @@ function buildProjectionResult(
   applyMergeMetadata(
     resultCellMap,
     range,
-    filterSortActive ? [] : state.mergeRangesBySheetId.get(request.sheetId) ?? [],
+    filterSortActive ? [] : (state.mergeRangesBySheetId.get(request.sheetId) ?? []),
   )
   const resultCells = [...resultCellMap.values()].sort(compareCells)
 
@@ -1683,11 +1675,15 @@ function buildViewportSizeProjectionResult(
     )
   }
   const rowHeights = [...(state.rowHeightsBySheetId.get(request.sheetId) ?? new Map()).entries()]
-    .filter(([rowIndex]) => rowIndex >= request.window.rowStart && rowIndex <= request.window.rowEnd)
+    .filter(
+      ([rowIndex]) => rowIndex >= request.window.rowStart && rowIndex <= request.window.rowEnd,
+    )
     .map(([rowIndex, heightPx]) => ({ rowIndex, heightPx }))
     .sort((left, right) => left.rowIndex - right.rowIndex)
   const colWidths = [...(state.colWidthsBySheetId.get(request.sheetId) ?? new Map()).entries()]
-    .filter(([colIndex]) => colIndex >= request.window.colStart && colIndex <= request.window.colEnd)
+    .filter(
+      ([colIndex]) => colIndex >= request.window.colStart && colIndex <= request.window.colEnd,
+    )
     .map(([colIndex, widthPx]) => ({ colIndex, widthPx }))
     .sort((left, right) => left.colIndex - right.colIndex)
   const hiddenRowIndices = [...(state.hiddenRowsBySheetId.get(request.sheetId) ?? new Set())]
@@ -1980,9 +1976,7 @@ function buildStaticReplacementPlan(
       let nextInput = haystack
       for (const match of effective.slice().reverse()) {
         nextInput =
-          nextInput.slice(0, match.matchStart) +
-          replacement +
-          nextInput.slice(match.matchEnd)
+          nextInput.slice(0, match.matchStart) + replacement + nextInput.slice(match.matchEnd)
       }
       cells.push({
         sheetId,
@@ -2033,9 +2027,7 @@ function collectLiteralFindSpans(
   const normalizedNeedle = normalize(needle)
 
   if (wholeMatch) {
-    return normalizedHaystack === normalizedNeedle
-      ? [{ start: 0, end: haystack.length }]
-      : []
+    return normalizedHaystack === normalizedNeedle ? [{ start: 0, end: haystack.length }] : []
   }
 
   const start = normalizedHaystack.indexOf(normalizedNeedle)
@@ -2281,9 +2273,7 @@ function invalidFillSeries(message: string): never {
   throw new Error(`invalid fill series: ${message}`)
 }
 
-function isFillSeriesDirection(
-  value: unknown,
-): value is FillSeriesRequest['direction'] {
+function isFillSeriesDirection(value: unknown): value is FillSeriesRequest['direction'] {
   return value === 'up' || value === 'down' || value === 'left' || value === 'right'
 }
 
@@ -2392,11 +2382,7 @@ function preflightFillSeries(
   if (request.series !== 'integer-step' && request.series !== 'decimal-step') {
     invalidFillSeries('static backend only accepts numeric step series')
   }
-  if (
-    typeof request.step !== 'number' ||
-    !Number.isFinite(request.step) ||
-    request.step === 0
-  ) {
+  if (typeof request.step !== 'number' || !Number.isFinite(request.step) || request.step === 0) {
     invalidFillSeries('step must be finite and non-zero')
   }
 
@@ -2407,17 +2393,13 @@ function preflightFillSeries(
   if (request.direction === 'down' || request.direction === 'up') {
     for (let row = request.sourceRange.rowStart; row <= request.sourceRange.rowEnd; row += 1) {
       sourceValues.push(
-        readCanonicalFillSeriesValue(
-          sheetCells.get(keyFor(row, request.sourceRange.colStart)),
-        ),
+        readCanonicalFillSeriesValue(sheetCells.get(keyFor(row, request.sourceRange.colStart))),
       )
     }
   } else {
     for (let col = request.sourceRange.colStart; col <= request.sourceRange.colEnd; col += 1) {
       sourceValues.push(
-        readCanonicalFillSeriesValue(
-          sheetCells.get(keyFor(request.sourceRange.rowStart, col)),
-        ),
+        readCanonicalFillSeriesValue(sheetCells.get(keyFor(request.sourceRange.rowStart, col))),
       )
     }
   }
@@ -2470,12 +2452,7 @@ function preflightFillSeries(
       }
 
       const sourceCoord = getFillHandleSourceCoord(request.sourceRange, { row, col })
-      const format = getEffectiveFormat(
-        sourceCoord.row,
-        sourceCoord.col,
-        cellFormats,
-        rangeFormats,
-      )
+      const format = getEffectiveFormat(sourceCoord.row, sourceCoord.col, cellFormats, rangeFormats)
       cells.push({
         row,
         col,
@@ -3004,11 +2981,7 @@ function shiftFreezeConfig(
 }
 
 function structuralMutationResult(
-  request:
-    | InsertRowsRequest
-    | DeleteRowsRequest
-    | InsertColumnsRequest
-    | DeleteColumnsRequest,
+  request: InsertRowsRequest | DeleteRowsRequest | InsertColumnsRequest | DeleteColumnsRequest,
   revision: ProjectionRevision,
 ): BackendMutationResult {
   const structuralShift: BackendStructuralShift =
@@ -3053,7 +3026,10 @@ export function matrixToVisibleProjectionResult(
   request: VisibleProjectionRequest,
   revision?: ProjectionRevision,
 ): VisibleProjectionResult {
-  return buildProjectionResult(request, buildState(matrixToCells(matrix), revision ?? 0)) as VisibleProjectionResult
+  return buildProjectionResult(
+    request,
+    buildState(matrixToCells(matrix), revision ?? 0),
+  ) as VisibleProjectionResult
 }
 
 export function matrixToRangeProjectionResult(
@@ -3061,7 +3037,10 @@ export function matrixToRangeProjectionResult(
   request: RangeProjectionRequest,
   revision?: ProjectionRevision,
 ): RangeProjectionResult {
-  return buildProjectionResult(request, buildState(matrixToCells(matrix), revision ?? 0)) as RangeProjectionResult
+  return buildProjectionResult(
+    request,
+    buildState(matrixToCells(matrix), revision ?? 0),
+  ) as RangeProjectionResult
 }
 
 // === Engine physical sort (design-engine-sort §3-§6, parity #29) ============
@@ -3124,7 +3103,9 @@ function cellToSortValue(cell: DisplayCell | undefined, lookup: EvalCellLookup):
     case 'blank':
       return { kind: 'empty' }
     default:
-      return cell.displayValue === '' ? { kind: 'empty' } : { kind: 'text', value: cell.displayValue }
+      return cell.displayValue === ''
+        ? { kind: 'empty' }
+        : { kind: 'text', value: cell.displayValue }
   }
 }
 
@@ -3146,7 +3127,12 @@ function intersectSortRange(a: CellRange, b: CellRange): CellRange {
 function subtractSortRange(a: CellRange, b: CellRange): CellRange[] {
   const out: CellRange[] = []
   if (a.rowStart < b.rowStart) {
-    out.push({ rowStart: a.rowStart, rowEnd: b.rowStart - 1, colStart: a.colStart, colEnd: a.colEnd })
+    out.push({
+      rowStart: a.rowStart,
+      rowEnd: b.rowStart - 1,
+      colStart: a.colStart,
+      colEnd: a.colEnd,
+    })
   }
   if (a.rowEnd > b.rowEnd) {
     out.push({ rowStart: b.rowEnd + 1, rowEnd: a.rowEnd, colStart: a.colStart, colEnd: a.colEnd })
@@ -3286,7 +3272,12 @@ function applyStaticSortRange(
   const revisionBefore = state.revision
 
   if (isMalformedSortRange(request.range)) {
-    return sortRejectedResult(request, revisionBefore, 'invalid-payload', 'the sort request is missing a valid range')
+    return sortRejectedResult(
+      request,
+      revisionBefore,
+      'invalid-payload',
+      'the sort request is missing a valid range',
+    )
   }
   if (!Array.isArray(request.keys) || request.keys.length === 0) {
     return sortRejectedResult(request, revisionBefore, 'empty-keys', 'no sort key was provided')
@@ -3313,7 +3304,12 @@ function applyStaticSortRange(
   }
 
   if (request.keys.some((key) => key.col < range.colStart || key.col > range.colEnd)) {
-    return sortRejectedResult(request, revisionBefore, 'key-out-of-range', 'a sort key column is outside the sorted range')
+    return sortRejectedResult(
+      request,
+      revisionBefore,
+      'key-out-of-range',
+      'a sort key column is outside the sorted range',
+    )
   }
 
   // Merge authority gate (design §5.2): the engine models no merge, so the
@@ -3395,7 +3391,10 @@ export function sparseCellsToVisibleProjectionResult(
   request: VisibleProjectionRequest,
   revision?: ProjectionRevision,
 ): VisibleProjectionResult {
-  return buildProjectionResult(request, buildState(sparseCellsToCells(cells), revision ?? 0)) as VisibleProjectionResult
+  return buildProjectionResult(
+    request,
+    buildState(sparseCellsToCells(cells), revision ?? 0),
+  ) as VisibleProjectionResult
 }
 
 export function sparseCellsToRangeProjectionResult(
@@ -3403,7 +3402,10 @@ export function sparseCellsToRangeProjectionResult(
   request: RangeProjectionRequest,
   revision?: ProjectionRevision,
 ): RangeProjectionResult {
-  return buildProjectionResult(request, buildState(sparseCellsToCells(cells), revision ?? 0)) as RangeProjectionResult
+  return buildProjectionResult(
+    request,
+    buildState(sparseCellsToCells(cells), revision ?? 0),
+  ) as RangeProjectionResult
 }
 
 // === Excel Table registry (design-excel-table.md §4-§5, parity #32) =========
@@ -3729,7 +3731,10 @@ function remapTableGeometry(
       const nsR = sR >= at ? sR + count : sR
       const neR = eR >= at ? eR + count : eR
       if (nsR === sR && neR === eR) return 'keep'
-      return { range: { rowStart: nsR, rowEnd: neR, colStart: sC, colEnd: eC }, columns: [...columns] }
+      return {
+        range: { rowStart: nsR, rowEnd: neR, colStart: sC, colEnd: eC },
+        columns: [...columns],
+      }
     }
     const d0 = at
     const d1 = at + count - 1
@@ -3738,7 +3743,10 @@ function remapTableGeometry(
     if (!shrunk) return 'delete'
     const [nsR, neR] = shrunk
     if (nsR === sR && neR === eR) return 'keep'
-    return { range: { rowStart: nsR, rowEnd: neR, colStart: sC, colEnd: eC }, columns: [...columns] }
+    return {
+      range: { rowStart: nsR, rowEnd: neR, colStart: sC, colEnd: eC },
+      columns: [...columns],
+    }
   }
 
   if (direction === 1) {
@@ -4267,11 +4275,7 @@ export function createStaticSpreadsheetBackend(
           if (geometry.writeValues) {
             const baseInput = srcCell?.formula ?? srcDisplay
             const targetCell = targetSheetCells.get(tgtKey)
-            const finalInput = applyPasteArithmetic(
-              request.op,
-              baseInput,
-              targetCell?.displayValue,
-            )
+            const finalInput = applyPasteArithmetic(request.op, baseInput, targetCell?.displayValue)
             // `applyPasteArithmetic` returns `null` when arithmetic
             // coercion would be ill-defined (text/error sides) — preserve
             // the target verbatim. Otherwise reuse the in-place
@@ -4325,9 +4329,7 @@ export function createStaticSpreadsheetBackend(
       // Empty input is a no-op (no snapshot recorded, no revision bump) so
       // that an accidental "no duplicates found → confirm" round-trip does
       // not pollute the undo stack.
-      const unique = Array.from(new Set(request.rows)).filter(
-        (r) => Number.isInteger(r) && r >= 0,
-      )
+      const unique = Array.from(new Set(request.rows)).filter((r) => Number.isInteger(r) && r >= 0)
       if (unique.length === 0) {
         return {
           sheetId: request.sheetId,
@@ -4446,9 +4448,7 @@ export function createStaticSpreadsheetBackend(
         authority: 'static-session-registry',
       }
     },
-    async deleteNamedRange(
-      request: DeleteNamedRangeRequest,
-    ): Promise<NamedRangeMutationResult> {
+    async deleteNamedRange(request: DeleteNamedRangeRequest): Promise<NamedRangeMutationResult> {
       const exists = state.namedRanges.some((item) =>
         namedRangeMatches(item, request.name, request.scope),
       )
@@ -4471,17 +4471,13 @@ export function createStaticSpreadsheetBackend(
         authority: 'static-session-registry',
       }
     },
-    async setValidationRule(
-      request: SetValidationRuleRequest,
-    ): Promise<BackendMutationResult> {
+    async setValidationRule(request: SetValidationRuleRequest): Promise<BackendMutationResult> {
       beginUndoableMutation(state)
       applyValidationRule(state, request)
       state.revision = bumpRevision(state.revision)
       return mutationResult(request, state.revision, request.range)
     },
-    async clearValidationRule(
-      request: ClearValidationRuleRequest,
-    ): Promise<BackendMutationResult> {
+    async clearValidationRule(request: ClearValidationRuleRequest): Promise<BackendMutationResult> {
       beginUndoableMutation(state)
       clearValidationRule(state, request)
       state.revision = bumpRevision(state.revision)
@@ -4517,10 +4513,7 @@ export function createStaticSpreadsheetBackend(
     },
     async setFilterSort(request: SetFilterSortRequest): Promise<BackendMutationResult> {
       const nextRevision = nextRevisionOrThrow(state.revision)
-      const next = cloneFilterSortState({
-        rules: request.rules,
-        directives: request.directives,
-      })
+      const next = cloneFilterSortState({ rules: request.rules })
       if (filterSortHasEffect(next)) {
         state.filterSortBySheetId.set(request.sheetId, next)
       } else {
@@ -4618,9 +4611,7 @@ export function createStaticSpreadsheetBackend(
       }
       matches.sort(
         (a, b) =>
-          a.coord.row - b.coord.row ||
-          a.coord.col - b.coord.col ||
-          a.matchStart - b.matchStart,
+          a.coord.row - b.coord.row || a.coord.col - b.coord.col || a.matchStart - b.matchStart,
       )
       const page = matches.slice(pageStart, pageStart + request.pageSize)
       return {
@@ -4971,7 +4962,11 @@ export function createStaticSpreadsheetBackend(
       state.tablesByKey.set(newName.toUpperCase(), entry)
       // Rewrite `OldName[...]` → `NewName[...]` across every sheet so existing
       // structured references keep resolving (design §4.3).
-      rewriteTableRefsAcrossWorkbook(state, { kind: 'rename-table', fromUpper: oldKey, to: newName })
+      rewriteTableRefsAcrossWorkbook(state, {
+        kind: 'rename-table',
+        fromUpper: oldKey,
+        to: newName,
+      })
       state.revision = bumpRevision(state.revision)
       return {
         kind: 'table-mutation',
@@ -4981,9 +4976,7 @@ export function createStaticSpreadsheetBackend(
         revision: request.revision ?? state.revision,
       }
     },
-    async renameTableColumn(
-      request: RenameTableColumnRequest,
-    ): Promise<TableMutationResult> {
+    async renameTableColumn(request: RenameTableColumnRequest): Promise<TableMutationResult> {
       if (request.newColumn.trim().length === 0) {
         return tableRejected(state, request, 'invalid-column-name')
       }

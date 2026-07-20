@@ -1990,9 +1990,7 @@ describe('vNext SpreadsheetGrid', () => {
 
     // One windowed sizes hydration (with requestId) plus the one-shot
     // full-sheet hidden seed (without requestId).
-    const windowedSizeRequests = sizeRequests.filter(
-      (request) => request.requestId !== undefined,
-    )
+    const windowedSizeRequests = sizeRequests.filter((request) => request.requestId !== undefined)
     expect(windowedSizeRequests).toHaveLength(1)
     expect(windowedSizeRequests[0].window).toEqual({
       rowStart: 0,
@@ -2850,9 +2848,12 @@ describe('vNext SpreadsheetGrid', () => {
 
     // A2:B3 = display rows 1..2, cols 0..1 → source rows 5 and 3.
     fireEvent.click(container.querySelector('[data-cell-addr="A2"] .spreadsheet-grid-cell-button')!)
-    fireEvent.click(container.querySelector('[data-cell-addr="B3"] .spreadsheet-grid-cell-button')!, {
-      shiftKey: true,
-    })
+    fireEvent.click(
+      container.querySelector('[data-cell-addr="B3"] .spreadsheet-grid-cell-button')!,
+      {
+        shiftKey: true,
+      },
+    )
     fireEvent.keyDown(container.querySelector('[data-testid="grid"]')!, {
       key: 'b',
       ctrlKey: true,
@@ -2912,7 +2913,7 @@ describe('vNext SpreadsheetGrid', () => {
 
     store.setter(setFilterSortAtom, {
       sheetId: 'sheet-1',
-      state: { rules: [{ kind: 'equals', colIndex: 1, value: 'yes' }], directives: [] },
+      state: { rules: [{ kind: 'equals', colIndex: 1, value: 'yes' }] },
     })
 
     const viewport = {
@@ -2966,7 +2967,7 @@ describe('vNext SpreadsheetGrid', () => {
     store.setter(setWorkspaceActiveSheetAtom, { sheetId: 'sheet-1' })
     store.setter(setFilterSortAtom, {
       sheetId: 'sheet-1',
-      state: { rules: [{ kind: 'equals', colIndex: 0, value: 'yes' }], directives: [] },
+      state: { rules: [{ kind: 'equals', colIndex: 0, value: 'yes' }] },
     })
 
     const viewport = {

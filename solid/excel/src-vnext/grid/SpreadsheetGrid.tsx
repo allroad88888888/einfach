@@ -337,8 +337,7 @@ function getCellFormatStyle(format: SpreadsheetCellFormat | undefined): Record<s
     // but the CSS `vertical-align` keyword is `'middle'`. Map the engine
     // value through so the inline style matches the spec for the parent
     // table-cell context.
-    const cssVerticalAlign =
-      format.verticalAlign === 'center' ? 'middle' : format.verticalAlign
+    const cssVerticalAlign = format.verticalAlign === 'center' ? 'middle' : format.verticalAlign
     style['vertical-align'] = cssVerticalAlign
     style['--cell-vertical-align'] = format.verticalAlign
     style['height'] = 'auto'
@@ -498,10 +497,7 @@ function getRangeCellCount(range: CellRange): number {
 
 function isCoordInRange(row: number, col: number, range: CellRange): boolean {
   return (
-    row >= range.rowStart &&
-    row <= range.rowEnd &&
-    col >= range.colStart &&
-    col <= range.colEnd
+    row >= range.rowStart && row <= range.rowEnd && col >= range.colStart && col <= range.colEnd
   )
 }
 
@@ -813,9 +809,7 @@ export function SpreadsheetGrid(props: SpreadsheetGridProps) {
     index: number,
     level: number,
   ): OutlineGroupWithLevel | undefined {
-    return getOutlineGroups(axis).find(
-      (group) => group.end + 1 === index && group.level === level,
-    )
+    return getOutlineGroups(axis).find((group) => group.end + 1 === index && group.level === level)
   }
 
   function outlineSlotHasLine(axis: OutlineAxis, index: number, level: number): boolean {
@@ -1241,9 +1235,7 @@ export function SpreadsheetGrid(props: SpreadsheetGridProps) {
     store.setter(cancelPointerAtom)
   })
 
-  async function commitCellEdit(
-    move: 'none' | 'down' | 'up' | 'left' | 'right' = 'none',
-  ) {
+  async function commitCellEdit(move: 'none' | 'down' | 'up' | 'left' | 'right' = 'none') {
     const session = store.getter(editingSessionAtom)
     if (session.status !== 'drafting' || session.source === null) return
     const source = session.source
@@ -1340,9 +1332,7 @@ export function SpreadsheetGrid(props: SpreadsheetGridProps) {
         target,
       })
       const revision =
-        typeof result?.revision === 'number'
-          ? result.revision
-          : Number(result?.revision ?? 0) || 0
+        typeof result?.revision === 'number' ? result.revision : Number(result?.revision ?? 0) || 0
       store.setter(pushHistoryAtom, {
         transactionId: nextHistoryTransactionId(),
         kind: 'range.clear',
@@ -1476,8 +1466,7 @@ export function SpreadsheetGrid(props: SpreadsheetGridProps) {
 
   function appendRangeSelection(row: number, col: number) {
     const snapshot = selectionSnapshot()
-    const anchor =
-      snapshot.selection.sheetId === props.sheetId ? snapshot.activeCell : { row, col }
+    const anchor = snapshot.selection.sheetId === props.sheetId ? snapshot.activeCell : { row, col }
     store.setter(addSelectionRegionAtom, {
       region: {
         kind: 'range',
@@ -1833,22 +1822,22 @@ export function SpreadsheetGrid(props: SpreadsheetGridProps) {
                 sheetId: props.sheetId,
                 range: target.range,
               }
-          : target.kind === 'row'
-            ? {
-                kind: 'row',
-                sheetId: props.sheetId,
-                rowIndex: target.row,
-              }
-            : target.kind === 'column'
+            : target.kind === 'row'
               ? {
-                  kind: 'column',
+                  kind: 'row',
                   sheetId: props.sheetId,
-                  colIndex: target.col,
+                  rowIndex: target.row,
                 }
-              : {
-                  kind: 'all',
-                  sheetId: props.sheetId,
-                },
+              : target.kind === 'column'
+                ? {
+                    kind: 'column',
+                    sheetId: props.sheetId,
+                    colIndex: target.col,
+                  }
+                : {
+                    kind: 'all',
+                    sheetId: props.sheetId,
+                  },
       position: {
         x: event.clientX,
         y: event.clientY,
@@ -1862,7 +1851,9 @@ export function SpreadsheetGrid(props: SpreadsheetGridProps) {
   function getCellContextTarget(
     row: number,
     col: number,
-  ): { kind: 'cell'; row: number; col: number } | { kind: 'range'; row: number; col: number; range: CellRange } {
+  ):
+    | { kind: 'cell'; row: number; col: number }
+    | { kind: 'range'; row: number; col: number; range: CellRange } {
     const range = getSelectionRangeContaining(row, col)
     if (range) {
       // A single-cell "range" (rowStart===rowEnd && colStart===colEnd) is
@@ -1873,8 +1864,7 @@ export function SpreadsheetGrid(props: SpreadsheetGridProps) {
       // (vnext-smoke.spec.ts 'toolbar and context menu use vNext interaction
       // atoms') without losing the multi-cell range path used by adjacent
       // tests ('range context menu clear preserves selection...').
-      const isSingleCell =
-        range.rowStart === range.rowEnd && range.colStart === range.colEnd
+      const isSingleCell = range.rowStart === range.rowEnd && range.colStart === range.colEnd
       if (!isSingleCell) {
         return { kind: 'range', row, col, range }
       }
@@ -1988,9 +1978,7 @@ export function SpreadsheetGrid(props: SpreadsheetGridProps) {
         range: affectedRange,
       })
       const revision =
-        typeof result?.revision === 'number'
-          ? result.revision
-          : Number(result?.revision ?? 0) || 0
+        typeof result?.revision === 'number' ? result.revision : Number(result?.revision ?? 0) || 0
       store.setter(pushHistoryAtom, {
         transactionId: nextHistoryTransactionId(),
         kind: 'range.fill',
@@ -2014,9 +2002,7 @@ export function SpreadsheetGrid(props: SpreadsheetGridProps) {
         input: write.input,
       })
       const revision =
-        typeof result?.revision === 'number'
-          ? result.revision
-          : Number(result?.revision ?? 0) || 0
+        typeof result?.revision === 'number' ? result.revision : Number(result?.revision ?? 0) || 0
       store.setter(pushHistoryAtom, {
         transactionId: nextHistoryTransactionId(),
         kind: 'cell.set-input',
@@ -2286,7 +2272,7 @@ export function SpreadsheetGrid(props: SpreadsheetGridProps) {
     const existingDraft = cell?.formula ?? cell?.displayValue ?? ''
     const draft =
       options?.clearOnStart === true
-        ? options.initialDraft ?? ''
+        ? (options.initialDraft ?? '')
         : options?.initialDraft !== undefined
           ? `${existingDraft}${options.initialDraft}`
           : existingDraft
@@ -2374,8 +2360,7 @@ export function SpreadsheetGrid(props: SpreadsheetGridProps) {
     }
 
     const range = selection.range
-    const cellCount =
-      (range.rowEnd - range.rowStart + 1) * (range.colEnd - range.colStart + 1)
+    const cellCount = (range.rowEnd - range.rowStart + 1) * (range.colEnd - range.colStart + 1)
     const originAddr = `${getColumnLabel(range.colStart)}${range.rowStart + 1}`
 
     let text: string
@@ -2466,7 +2451,10 @@ export function SpreadsheetGrid(props: SpreadsheetGridProps) {
     store.setter(operation === 'cut' ? cutClipboardAtom : copyClipboardAtom, transferInput)
 
     if (!(await writeClipboardText(text))) {
-      store.setter(setClipboardErrorAtom, { code: 'BACKEND_ERROR', message: 'Clipboard write failed.' })
+      store.setter(setClipboardErrorAtom, {
+        code: 'BACKEND_ERROR',
+        message: 'Clipboard write failed.',
+      })
       return
     }
     store.setter(markClipboardReadyAtom)
@@ -2484,7 +2472,10 @@ export function SpreadsheetGrid(props: SpreadsheetGridProps) {
 
     const text = await readClipboardText()
     if (text === null || text.length === 0) {
-      store.setter(setClipboardErrorAtom, { code: 'BACKEND_ERROR', message: 'Clipboard read failed.' })
+      store.setter(setClipboardErrorAtom, {
+        code: 'BACKEND_ERROR',
+        message: 'Clipboard read failed.',
+      })
       return
     }
 
@@ -2579,9 +2570,7 @@ export function SpreadsheetGrid(props: SpreadsheetGridProps) {
         range: affectedRange,
       })
       const revision =
-        typeof result?.revision === 'number'
-          ? result.revision
-          : Number(result?.revision ?? 0) || 0
+        typeof result?.revision === 'number' ? result.revision : Number(result?.revision ?? 0) || 0
       store.setter(pushHistoryAtom, {
         transactionId: nextHistoryTransactionId(),
         kind: 'cells.import',
@@ -2602,10 +2591,7 @@ export function SpreadsheetGrid(props: SpreadsheetGridProps) {
           col: write.col,
           input: write.input,
         })
-        const rev =
-          typeof r?.revision === 'number'
-            ? r.revision
-            : Number(r?.revision ?? 0) || 0
+        const rev = typeof r?.revision === 'number' ? r.revision : Number(r?.revision ?? 0) || 0
         store.setter(pushHistoryAtom, {
           transactionId: nextHistoryTransactionId(),
           kind: 'cell.set-input',
@@ -2674,9 +2660,7 @@ export function SpreadsheetGrid(props: SpreadsheetGridProps) {
         format: nextFormat,
       })
       const revision =
-        typeof result?.revision === 'number'
-          ? result.revision
-          : Number(result?.revision ?? 0) || 0
+        typeof result?.revision === 'number' ? result.revision : Number(result?.revision ?? 0) || 0
       store.setter(pushHistoryAtom, {
         transactionId: nextHistoryTransactionId(),
         kind: 'format.set',
@@ -3054,14 +3038,8 @@ export function SpreadsheetGrid(props: SpreadsheetGridProps) {
     if (mergeRange && mergeRange.rowStart === row && mergeRange.colStart === col) {
       const rows = getRows().filter((index) => index >= row && index <= mergeRange.rowEnd)
       const cols = getCols().filter((index) => index >= col && index <= mergeRange.colEnd)
-      const height = rows.reduce(
-        (sum, index) => sum + getRenderedRowHeight(index),
-        0,
-      )
-      const width = cols.reduce(
-        (sum, index) => sum + getRenderedColumnWidth(index),
-        0,
-      )
+      const height = rows.reduce((sum, index) => sum + getRenderedRowHeight(index), 0)
+      const width = cols.reduce((sum, index) => sum + getRenderedColumnWidth(index), 0)
       return {
         ...backgroundStyle,
         ...stickyStyle,
@@ -3084,7 +3062,10 @@ export function SpreadsheetGrid(props: SpreadsheetGridProps) {
       return 1
     }
 
-    return Math.max(1, getRows().filter((index) => index >= row && index <= mergeRange.rowEnd).length)
+    return Math.max(
+      1,
+      getRows().filter((index) => index >= row && index <= mergeRange.rowEnd).length,
+    )
   }
 
   function getCellColSpan(row: number, col: number) {
@@ -3093,7 +3074,10 @@ export function SpreadsheetGrid(props: SpreadsheetGridProps) {
       return 1
     }
 
-    return Math.max(1, getCols().filter((index) => index >= col && index <= mergeRange.colEnd).length)
+    return Math.max(
+      1,
+      getCols().filter((index) => index >= col && index <= mergeRange.colEnd).length,
+    )
   }
 
   function getRowHeaderStyle(row: number): Record<string, string> {
@@ -3389,19 +3373,8 @@ export function SpreadsheetGrid(props: SpreadsheetGridProps) {
     return state[props.sheetId]?.rules ?? []
   }
 
-  function getSortDirectivesForSheet() {
-    renderTick()
-    const state = store.getter(filterSortStateAtom)
-    return state[props.sheetId]?.directives ?? []
-  }
-
   function colHasFilterRule(col: number): boolean {
     return getFilterRulesForSheet().some((r) => r.colIndex === col)
-  }
-
-  function getColumnSortDirection(col: number): 'asc' | 'desc' | null {
-    return getSortDirectivesForSheet().find((directive) => directive.colIndex === col)
-      ?.direction ?? null
   }
 
   function getRemoteCursorsForSheet() {
@@ -3410,7 +3383,8 @@ export function SpreadsheetGrid(props: SpreadsheetGridProps) {
   }
 
   function getParticipantColorHint(participantId: string): string | undefined {
-    return store.getter(presenceStateAtom).participants.find((p) => p.id === participantId)?.colorHint
+    return store.getter(presenceStateAtom).participants.find((p) => p.id === participantId)
+      ?.colorHint
   }
 
   function findMergeAnchorCovering(
@@ -3433,7 +3407,10 @@ export function SpreadsheetGrid(props: SpreadsheetGridProps) {
     return null
   }
 
-  function getOverlayCellRect(row: number, col: number): { x: number; y: number; w: number; h: number } | null {
+  function getOverlayCellRect(
+    row: number,
+    col: number,
+  ): { x: number; y: number; w: number; h: number } | null {
     if (!gridRoot || !scrollRoot) return null
     const td = gridRoot.querySelector(
       `td.spreadsheet-grid-cell[data-row="${row}"][data-col="${col}"]`,
@@ -3519,7 +3496,9 @@ export function SpreadsheetGrid(props: SpreadsheetGridProps) {
     }
   }
 
-  function getRemoteCursorStyle(cursor: ReturnType<typeof getRemoteCursorsForSheet>[number]): Record<string, string> {
+  function getRemoteCursorStyle(
+    cursor: ReturnType<typeof getRemoteCursorsForSheet>[number],
+  ): Record<string, string> {
     const bounds = getSelectionBounds()
     const range = getSelectionRange(cursor.selection, bounds)
     const rows = getRows()
@@ -3648,221 +3627,83 @@ export function SpreadsheetGrid(props: SpreadsheetGridProps) {
         style={getScrollViewportStyle()}
         onScroll={handleViewportScroll}
       >
-      <table
-        class="spreadsheet-grid-table"
-        style={{
-          width: `${getTotalTableWidth()}px`,
-          'min-width': `${getTotalTableWidth()}px`,
-        }}
-      >
-        <tbody>
-          <Show when={getRows().length > 0 && getCols().length > 0}>
-            <Show when={hasColOutline()}>
-              <tr class="spreadsheet-grid-outline-col-row" data-testid="outline-col-band">
-                <Show when={hasRowOutline() || showHeadings()}>
-                  <th
-                    class="spreadsheet-grid-outline-corner"
-                    data-testid="outline-col-levels"
-                    colSpan={(hasRowOutline() ? 1 : 0) + (showHeadings() ? 1 : 0)}
-                    style={{ height: `${getColOutlineBandHeight()}px` }}
-                  >
-                    {renderOutlineLevelButtons('column')}
-                  </th>
-                </Show>
-                <Show when={getLeftSpacerWidth() > 0}>
-                  <th
-                    class="spreadsheet-grid-virtual-spacer"
-                    aria-hidden="true"
-                    style={{ width: `${getLeftSpacerWidth()}px` }}
-                  />
-                </Show>
-                <For each={getCols()}>
-                  {(col) => (
+        <table
+          class="spreadsheet-grid-table"
+          style={{
+            width: `${getTotalTableWidth()}px`,
+            'min-width': `${getTotalTableWidth()}px`,
+          }}
+        >
+          <tbody>
+            <Show when={getRows().length > 0 && getCols().length > 0}>
+              <Show when={hasColOutline()}>
+                <tr class="spreadsheet-grid-outline-col-row" data-testid="outline-col-band">
+                  <Show when={hasRowOutline() || showHeadings()}>
                     <th
-                      class="spreadsheet-grid-outline-col-cell"
-                      data-outline-col={col}
+                      class="spreadsheet-grid-outline-corner"
+                      data-testid="outline-col-levels"
+                      colSpan={(hasRowOutline() ? 1 : 0) + (showHeadings() ? 1 : 0)}
                       style={{ height: `${getColOutlineBandHeight()}px` }}
                     >
-                      {renderOutlineSlots('column', col)}
+                      {renderOutlineLevelButtons('column')}
                     </th>
-                  )}
-                </For>
-                <Show when={getRightSpacerWidth() > 0}>
-                  <th
-                    class="spreadsheet-grid-virtual-spacer"
-                    aria-hidden="true"
-                    style={{ width: `${getRightSpacerWidth()}px` }}
-                  />
-                </Show>
-              </tr>
-            </Show>
-            <Show when={showHeadings()}>
-            <tr>
-              <Show when={hasRowOutline()}>
-                <th
-                  class="spreadsheet-grid-outline-header"
-                  data-testid="outline-row-levels"
-                  style={{
-                    width: `${getRowOutlineGutterWidth()}px`,
-                    ...(hasColOutline() ? { top: `${getColOutlineBandHeight()}px` } : {}),
-                  }}
-                >
-                  {renderOutlineLevelButtons('row')}
-                </th>
-              </Show>
-              <th
-                class="spreadsheet-grid-corner"
-                style={getCornerStyle()}
-                data-selected={isAllSelected() ? 'true' : 'false'}
-                onClick={() => {
-                  store.setter(selectAllAtom, props.sheetId)
-                  bumpRender()
-                  focusGrid()
-                }}
-                onContextMenu={(event) => {
-                  openContextMenu(event, { kind: 'all' })
-                }}
-              />
-              <Show when={getLeftSpacerWidth() > 0}>
-                <th
-                  class="spreadsheet-grid-virtual-spacer"
-                  aria-hidden="true"
-                  style={{ width: `${getLeftSpacerWidth()}px` }}
-                />
-              </Show>
-              <For each={getCols()}>
-                {(col) => {
-                  const selected = () => isColumnSelected(col)
-
-                  return (
-                    <th
-                      class={`spreadsheet-grid-col-header ${selected() ? 'is-selected' : ''}`.trim()}
-                      data-col={col}
-                      data-selected={selected() ? 'true' : 'false'}
-                      data-frozen-col={col < freezeColCount() ? 'true' : undefined}
-                      data-freeze-boundary-right={
-                        freezeColCount() > 0 && col === freezeColCount() - 1
-                          ? 'true'
-                          : undefined
-                      }
-                      style={getColumnStyle(col)}
-                      onClick={(event) => {
-                        selectColumn(col, event.shiftKey, event.ctrlKey || event.metaKey)
-                      }}
-                      onContextMenu={(event) => {
-                        openContextMenu(event, { kind: 'column', col })
-                      }}
-                    >
-                      <span class="spreadsheet-grid-header-label">{getColumnLabel(col)}</span>
-                      <Show when={colHasFilterRule(col) || getColumnSortDirection(col)}>
-                        <button
-                          type="button"
-                          class="spreadsheet-grid-filter-chevron"
-                          data-testid={`filter-chevron-${col}`}
-                          aria-label={`Filter column ${getColumnLabel(col)}`}
-                          onClick={(event) => {
-                            event.stopPropagation()
-                            store.setter(openFilterDropdownAtom, {
-                              sheetId: props.sheetId,
-                              colIndex: col,
-                            })
-                            bumpRender()
-                          }}
-                        >
-                          {getColumnSortDirection(col) === 'asc'
-                            ? '↑'
-                            : getColumnSortDirection(col) === 'desc'
-                              ? '↓'
-                              : '▾'}
-                        </button>
-                      </Show>
-                      <button
-                        type="button"
-                        class="spreadsheet-grid-col-resize-handle"
-                        data-testid={`col-resize-${col}`}
-                        aria-label={`Resize column ${getColumnLabel(col)}`}
-                        onPointerDown={(event) => startColumnResize(event, col)}
-                        onDblClick={(event) => {
-                          event.preventDefault()
-                          event.stopPropagation()
-                          void autoFitColumn(col)
-                        }}
-                      />
-                    </th>
-                  )
-                }}
-              </For>
-              <Show when={getRightSpacerWidth() > 0}>
-                <th
-                  class="spreadsheet-grid-virtual-spacer"
-                  aria-hidden="true"
-                  style={{ width: `${getRightSpacerWidth()}px` }}
-                />
-              </Show>
-            </tr>
-            </Show>
-            <Show when={getTopSpacerHeight() > 0}>
-              <tr class="spreadsheet-grid-virtual-spacer-row" aria-hidden="true">
-                <td
-                  class="spreadsheet-grid-virtual-spacer"
-                  colSpan={getVirtualColumnSpan()}
-                  style={{ height: `${getTopSpacerHeight()}px` }}
-                />
-              </tr>
-            </Show>
-            <For each={getRows()}>
-              {(row) => (
-                <tr class="spreadsheet-grid-row">
-                  <Show when={hasRowOutline()}>
-                    <th
-                      class="spreadsheet-grid-outline-row-cell"
-                      data-outline-row={row}
-                      style={{
-                        width: `${getRowOutlineGutterWidth()}px`,
-                        height: `${getRenderedRowHeight(row)}px`,
-                      }}
-                    >
-                      {renderOutlineSlots('row', row)}
-                    </th>
-                  </Show>
-                  <Show when={showHeadings()}>
-                  <th
-                    class={`spreadsheet-grid-row-header ${
-                      isRowSelected(row) ? 'is-selected' : ''
-                    }`.trim()}
-                    data-row={row}
-                    data-selected={isRowSelected(row) ? 'true' : 'false'}
-                    data-frozen-row={row < freezeRowCount() ? 'true' : undefined}
-                    data-freeze-boundary-bottom={
-                      freezeRowCount() > 0 && row === freezeRowCount() - 1
-                        ? 'true'
-                        : undefined
-                    }
-                    style={getRowHeaderStyle(row)}
-                    onClick={(event) => {
-                      selectRow(row, event.shiftKey, event.ctrlKey || event.metaKey)
-                    }}
-                    onContextMenu={(event) => {
-                      openContextMenu(event, { kind: 'row', row })
-                    }}
-                  >
-                    <span class="spreadsheet-grid-header-label">{row + 1}</span>
-                    <button
-                      type="button"
-                      class="spreadsheet-grid-row-resize-handle"
-                      data-testid={`row-resize-${row}`}
-                      aria-label={`Resize row ${row + 1}`}
-                      onPointerDown={(event) => startRowResize(event, row)}
-                      onDblClick={(event) => {
-                        event.preventDefault()
-                        event.stopPropagation()
-                        void autoFitRow(row)
-                      }}
-                    />
-                  </th>
                   </Show>
                   <Show when={getLeftSpacerWidth() > 0}>
-                    <td
+                    <th
+                      class="spreadsheet-grid-virtual-spacer"
+                      aria-hidden="true"
+                      style={{ width: `${getLeftSpacerWidth()}px` }}
+                    />
+                  </Show>
+                  <For each={getCols()}>
+                    {(col) => (
+                      <th
+                        class="spreadsheet-grid-outline-col-cell"
+                        data-outline-col={col}
+                        style={{ height: `${getColOutlineBandHeight()}px` }}
+                      >
+                        {renderOutlineSlots('column', col)}
+                      </th>
+                    )}
+                  </For>
+                  <Show when={getRightSpacerWidth() > 0}>
+                    <th
+                      class="spreadsheet-grid-virtual-spacer"
+                      aria-hidden="true"
+                      style={{ width: `${getRightSpacerWidth()}px` }}
+                    />
+                  </Show>
+                </tr>
+              </Show>
+              <Show when={showHeadings()}>
+                <tr>
+                  <Show when={hasRowOutline()}>
+                    <th
+                      class="spreadsheet-grid-outline-header"
+                      data-testid="outline-row-levels"
+                      style={{
+                        width: `${getRowOutlineGutterWidth()}px`,
+                        ...(hasColOutline() ? { top: `${getColOutlineBandHeight()}px` } : {}),
+                      }}
+                    >
+                      {renderOutlineLevelButtons('row')}
+                    </th>
+                  </Show>
+                  <th
+                    class="spreadsheet-grid-corner"
+                    style={getCornerStyle()}
+                    data-selected={isAllSelected() ? 'true' : 'false'}
+                    onClick={() => {
+                      store.setter(selectAllAtom, props.sheetId)
+                      bumpRender()
+                      focusGrid()
+                    }}
+                    onContextMenu={(event) => {
+                      openContextMenu(event, { kind: 'all' })
+                    }}
+                  />
+                  <Show when={getLeftSpacerWidth() > 0}>
+                    <th
                       class="spreadsheet-grid-virtual-spacer"
                       aria-hidden="true"
                       style={{ width: `${getLeftSpacerWidth()}px` }}
@@ -3870,284 +3711,418 @@ export function SpreadsheetGrid(props: SpreadsheetGridProps) {
                   </Show>
                   <For each={getCols()}>
                     {(col) => {
-                      const addr = getCellAddress(row, col)
-                      const cell = () => getCell(row, col)
-                      const selected = () => isSelected(row, col)
-                      const active = () => isActive(row, col)
-                      const editing = () => isEditing(row, col)
-                      const mergeAnchor = () => isCellMergeAnchor(row, col)
-                      const validationSeverity = () => getCellValidationSeverity(cell())
+                      const selected = () => isColumnSelected(col)
+
                       return (
-                        <Show when={!isCellCoveredByMerge(row, col)}>
-                          <td
-                            class={`spreadsheet-grid-cell cell ${
-                              selected() ? 'is-selected cell-in-range' : ''
-                            } ${
-                              active() ? 'cell-active' : ''
-                            } ${
-                              isFillPreviewCell(row, col) ? 'cell-fill-preview' : ''
-                            } ${
-                              mergeAnchor() ? 'cell-merge-anchor' : ''
-                            } ${
-                              validationSeverity()
-                                ? `cell-validation-${validationSeverity()}`
-                                : ''
-                            } ${cell()?.valueKind ? `kind-${cell()?.valueKind}` : ''}`.trim()}
-                            data-row={row}
-                            data-col={col}
-                            data-cell-addr={addr}
-                            data-frozen-row={row < freezeRowCount() ? 'true' : undefined}
-                            data-frozen-col={col < freezeColCount() ? 'true' : undefined}
-                            data-freeze-boundary-bottom={
-                              freezeRowCount() > 0 && row === freezeRowCount() - 1
-                                ? 'true'
-                                : undefined
-                            }
-                            data-freeze-boundary-right={
-                              freezeColCount() > 0 && col === freezeColCount() - 1
-                                ? 'true'
-                                : undefined
-                            }
-                            data-selected={selected() ? 'true' : 'false'}
-                            data-active={active() ? 'true' : 'false'}
-                            data-merge-anchor={mergeAnchor() ? 'true' : 'false'}
-                            data-validation-code={cell()?.validation?.code}
-                            data-validation-severity={validationSeverity()}
-                            data-has-conditional-format={
-                              cell()?.conditionalFormat ? 'true' : 'false'
-                            }
-                            data-rich-kind={cell()?.richValue?.kind}
-                            data-rich-url={getCellRichUrl(cell())}
-                            data-borders={getCellBordersAttr(cell())}
-                            aria-selected={selected() ? 'true' : 'false'}
-                            title={getCellValidationMessage(cell())}
-                            rowSpan={getCellRowSpan(row, col)}
-                            colSpan={getCellColSpan(row, col)}
-                            style={getCellBoxStyle(row, col)}
-                            onClick={(event) => {
-                              // Suppress selection mutation during formula-
-                              // reference pick mode (handled by onPointerDown).
-                              if (store.getter(formulaReferenceSessionAtom)) return
-                              selectCellFromEvent(row, col, event)
-                            }}
-                            onMouseDown={(event) => {
-                              if (!event.shiftKey || event.ctrlKey || event.metaKey) {
-                                return
-                              }
-                              event.preventDefault()
-                              store.setter(selectCellAtom, {
-                                sheetId: props.sheetId,
-                                coord: { row, col },
-                                extend: true,
-                              })
-                              bumpRender()
-                              focusGrid()
-                            }}
-                            onPointerDown={(event) => {
-                              if (event.pointerType === 'mouse' && event.button !== 0) return
-                              // Formula-reference pick mode: clicking a cell
-                              // inserts an A1 ref into the current draft; a
-                              // drag expands the pick to a range like B2:E2.
-                              // Selection is NOT mutated — pick re-focuses
-                              // the editing input on release.
-                              if (store.getter(formulaReferenceSessionAtom)) {
-                                event.preventDefault()
+                        <th
+                          class={`spreadsheet-grid-col-header ${selected() ? 'is-selected' : ''}`.trim()}
+                          data-col={col}
+                          data-selected={selected() ? 'true' : 'false'}
+                          data-frozen-col={col < freezeColCount() ? 'true' : undefined}
+                          data-freeze-boundary-right={
+                            freezeColCount() > 0 && col === freezeColCount() - 1
+                              ? 'true'
+                              : undefined
+                          }
+                          style={getColumnStyle(col)}
+                          onClick={(event) => {
+                            selectColumn(col, event.shiftKey, event.ctrlKey || event.metaKey)
+                          }}
+                          onContextMenu={(event) => {
+                            openContextMenu(event, { kind: 'column', col })
+                          }}
+                        >
+                          <span class="spreadsheet-grid-header-label">{getColumnLabel(col)}</span>
+                          {/* Filter is the only persistent column view fact — a
+                          physical sort (#29/#24) leaves no per-column state. */}
+                          <Show when={colHasFilterRule(col)}>
+                            <button
+                              type="button"
+                              class="spreadsheet-grid-filter-chevron"
+                              data-testid={`filter-chevron-${col}`}
+                              aria-label={`Filter column ${getColumnLabel(col)}`}
+                              onClick={(event) => {
                                 event.stopPropagation()
-                                startFormulaReferenceDragPick(event, row, col)
-                                return
-                              }
-                              if (event.shiftKey || event.ctrlKey || event.metaKey) return
-                              startDragSelection(event, row, col)
-                            }}
-                            onDblClick={() => {
-                              startEditingCell(row, col, 'cell')
-                            }}
-                            onContextMenu={(event) => {
-                              openContextMenu(event, getCellContextTarget(row, col))
-                            }}
-                          >
-                            <SpreadsheetCellBorders borders={cell()?.format?.borders} />
-                            <Show
-                              when={editing()}
-                              fallback={
-                                <div class="spreadsheet-grid-cell-button">
-                                  <span
-                                    class="cell-display"
-                                    style={getCellFormatStyle(getDisplayCellFormat(cell()))}
-                                  >
-                                    <SpreadsheetCellDisplayValue cell={cell()} />
-                                  </span>
-                                </div>
-                              }
+                                store.setter(openFilterDropdownAtom, {
+                                  sheetId: props.sheetId,
+                                  colIndex: col,
+                                })
+                                bumpRender()
+                              }}
                             >
-                              <input
-                                class="cell-input"
-                                value={editingDraft()}
-                                ref={(el) => {
-                                  // autofocus is blocked when grid root already
-                                  // has focus; queue an explicit focus + caret
-                                  // placement so subsequent keystrokes land on
-                                  // the input, not on the grid keydown handler.
-                                  //
-                                  // Skip when the editing session is owned by
-                                  // the formula bar — otherwise the cell-input
-                                  // mount on every draft change would steal
-                                  // focus away from the formula bar input.
-                                  if (el) {
-                                    queueMicrotask(() => {
-                                      const session = store.getter(editingSessionAtom)
-                                      const ownedByFormulaBar =
-                                        session.status === 'drafting' &&
-                                        session.source?.source === 'formula-bar'
-                                      if (ownedByFormulaBar) return
-                                      el.focus()
-                                      const len = el.value.length
-                                      el.setSelectionRange(len, len)
-                                    })
-                                  }
-                                }}
-                                onInput={(event) => {
-                                  store.setter(editingDraftAtom, {
-                                    draft: event.currentTarget.value,
-                                  })
-                                  notifyDraftTypedChar(
-                                    store,
-                                    event.currentTarget.selectionStart ?? event.currentTarget.value.length,
-                                  )
-                                  bumpRender()
-                                }}
-                                onSelect={(event) => {
-                                  syncFormulaReferenceCaret(
-                                    store,
-                                    event.currentTarget.selectionStart ?? 0,
-                                  )
-                                }}
-                                onKeyUp={(event) => {
-                                  // ArrowLeft/Right/Home/End move the caret
-                                  // without firing onSelect. Re-sync so the
-                                  // signature tooltip + autocomplete fragment
-                                  // recompute against the new caret position.
-                                  if (
-                                    event.key === 'ArrowLeft' ||
-                                    event.key === 'ArrowRight' ||
-                                    event.key === 'Home' ||
-                                    event.key === 'End'
-                                  ) {
-                                    syncFormulaReferenceCaret(
-                                      store,
-                                      event.currentTarget.selectionStart ?? 0,
-                                    )
-                                  }
-                                }}
-                                onKeyDown={(event) => {
-                                  // Autocomplete first: ArrowUp/Down move
-                                  // the dropdown cursor, Tab/Enter accept,
-                                  // Esc dismisses without ending editing.
-                                  const suggestionsOpen =
-                                    store.getter(formulaFunctionSuggestionsAtom).length > 0
-                                  if (suggestionsOpen) {
-                                    if (event.key === 'ArrowDown' || event.key === 'ArrowUp') {
-                                      event.preventDefault()
-                                      const list = store.getter(formulaFunctionSuggestionsAtom)
-                                      const current = store.getter(
-                                        formulaFunctionSuggestionCursorAtom,
-                                      )
-                                      const next =
-                                        event.key === 'ArrowDown'
-                                          ? (current + 1) % list.length
-                                          : (current - 1 + list.length) % list.length
-                                      store.setter(formulaFunctionSuggestionCursorAtom, next)
-                                      bumpRender()
-                                      return
-                                    }
-                                    if (event.key === 'Tab' || event.key === 'Enter') {
-                                      const suggestion = readActiveFormulaSuggestion(store)
-                                      if (suggestion) {
-                                        event.preventDefault()
-                                        const inputEl = event.currentTarget
-                                        const { caret } = acceptFormulaSuggestion(store, suggestion)
-                                        // Solid swaps the input's value on the
-                                        // next reactive tick; defer caret
-                                        // placement so it lands on the post-
-                                        // splice value. Capture the input
-                                        // synchronously — event.currentTarget
-                                        // is reset to null once the handler
-                                        // returns.
-                                        queueMicrotask(() => {
-                                          inputEl.focus()
-                                          inputEl.setSelectionRange(caret, caret)
-                                        })
-                                        bumpRender()
-                                        return
-                                      }
-                                    }
-                                    if (event.key === 'Escape') {
-                                      event.preventDefault()
-                                      store.setter(dismissFormulaSuggestionsAtom)
-                                      store.setter(formulaFunctionSuggestionCursorAtom, 0)
-                                      bumpRender()
-                                      return
-                                    }
-                                  }
-                                  if (event.key === 'Enter') {
-                                    event.preventDefault()
-                                    void commitCellEdit(event.shiftKey ? 'up' : 'down')
-                                  } else if (event.key === 'Tab') {
-                                    event.preventDefault()
-                                    void commitCellEdit(event.shiftKey ? 'left' : 'right')
-                                  } else if (event.key === 'Escape') {
-                                    event.preventDefault()
-                                    dispatchEditingCancel(store)
-                                    bumpRender()
-                                  }
-                                }}
-                                onBlur={() => {
-                                  // Do not commit if the blur was caused by
-                                  // a formula-reference pick — focus will be
-                                  // restored in the next microtask.
-                                  if (store.getter(formulaReferenceSessionAtom)) return
-                                  if (store.getter(editingSessionAtom).status === 'drafting') {
-                                    void commitCellEdit()
-                                  }
-                                }}
-                              />
-                            </Show>
-                            <Show when={active() && !editing()}>
-                              <button
-                                type="button"
-                                class="spreadsheet-grid-fill-handle"
-                                data-testid={`fill-handle-${addr}`}
-                                aria-label={`Fill from ${addr}`}
-                                onPointerDown={startFillHandle}
-                              />
-                            </Show>
-                          </td>
-                        </Show>
+                              ▾
+                            </button>
+                          </Show>
+                          <button
+                            type="button"
+                            class="spreadsheet-grid-col-resize-handle"
+                            data-testid={`col-resize-${col}`}
+                            aria-label={`Resize column ${getColumnLabel(col)}`}
+                            onPointerDown={(event) => startColumnResize(event, col)}
+                            onDblClick={(event) => {
+                              event.preventDefault()
+                              event.stopPropagation()
+                              void autoFitColumn(col)
+                            }}
+                          />
+                        </th>
                       )
                     }}
                   </For>
                   <Show when={getRightSpacerWidth() > 0}>
-                    <td
+                    <th
                       class="spreadsheet-grid-virtual-spacer"
                       aria-hidden="true"
                       style={{ width: `${getRightSpacerWidth()}px` }}
                     />
                   </Show>
                 </tr>
-              )}
-            </For>
-            <Show when={getBottomSpacerHeight() > 0}>
-              <tr class="spreadsheet-grid-virtual-spacer-row" aria-hidden="true">
-                <td
-                  class="spreadsheet-grid-virtual-spacer"
-                  colSpan={getVirtualColumnSpan()}
-                  style={{ height: `${getBottomSpacerHeight()}px` }}
-                />
-              </tr>
+              </Show>
+              <Show when={getTopSpacerHeight() > 0}>
+                <tr class="spreadsheet-grid-virtual-spacer-row" aria-hidden="true">
+                  <td
+                    class="spreadsheet-grid-virtual-spacer"
+                    colSpan={getVirtualColumnSpan()}
+                    style={{ height: `${getTopSpacerHeight()}px` }}
+                  />
+                </tr>
+              </Show>
+              <For each={getRows()}>
+                {(row) => (
+                  <tr class="spreadsheet-grid-row">
+                    <Show when={hasRowOutline()}>
+                      <th
+                        class="spreadsheet-grid-outline-row-cell"
+                        data-outline-row={row}
+                        style={{
+                          width: `${getRowOutlineGutterWidth()}px`,
+                          height: `${getRenderedRowHeight(row)}px`,
+                        }}
+                      >
+                        {renderOutlineSlots('row', row)}
+                      </th>
+                    </Show>
+                    <Show when={showHeadings()}>
+                      <th
+                        class={`spreadsheet-grid-row-header ${
+                          isRowSelected(row) ? 'is-selected' : ''
+                        }`.trim()}
+                        data-row={row}
+                        data-selected={isRowSelected(row) ? 'true' : 'false'}
+                        data-frozen-row={row < freezeRowCount() ? 'true' : undefined}
+                        data-freeze-boundary-bottom={
+                          freezeRowCount() > 0 && row === freezeRowCount() - 1 ? 'true' : undefined
+                        }
+                        style={getRowHeaderStyle(row)}
+                        onClick={(event) => {
+                          selectRow(row, event.shiftKey, event.ctrlKey || event.metaKey)
+                        }}
+                        onContextMenu={(event) => {
+                          openContextMenu(event, { kind: 'row', row })
+                        }}
+                      >
+                        <span class="spreadsheet-grid-header-label">{row + 1}</span>
+                        <button
+                          type="button"
+                          class="spreadsheet-grid-row-resize-handle"
+                          data-testid={`row-resize-${row}`}
+                          aria-label={`Resize row ${row + 1}`}
+                          onPointerDown={(event) => startRowResize(event, row)}
+                          onDblClick={(event) => {
+                            event.preventDefault()
+                            event.stopPropagation()
+                            void autoFitRow(row)
+                          }}
+                        />
+                      </th>
+                    </Show>
+                    <Show when={getLeftSpacerWidth() > 0}>
+                      <td
+                        class="spreadsheet-grid-virtual-spacer"
+                        aria-hidden="true"
+                        style={{ width: `${getLeftSpacerWidth()}px` }}
+                      />
+                    </Show>
+                    <For each={getCols()}>
+                      {(col) => {
+                        const addr = getCellAddress(row, col)
+                        const cell = () => getCell(row, col)
+                        const selected = () => isSelected(row, col)
+                        const active = () => isActive(row, col)
+                        const editing = () => isEditing(row, col)
+                        const mergeAnchor = () => isCellMergeAnchor(row, col)
+                        const validationSeverity = () => getCellValidationSeverity(cell())
+                        return (
+                          <Show when={!isCellCoveredByMerge(row, col)}>
+                            <td
+                              class={`spreadsheet-grid-cell cell ${
+                                selected() ? 'is-selected cell-in-range' : ''
+                              } ${active() ? 'cell-active' : ''} ${
+                                isFillPreviewCell(row, col) ? 'cell-fill-preview' : ''
+                              } ${mergeAnchor() ? 'cell-merge-anchor' : ''} ${
+                                validationSeverity()
+                                  ? `cell-validation-${validationSeverity()}`
+                                  : ''
+                              } ${cell()?.valueKind ? `kind-${cell()?.valueKind}` : ''}`.trim()}
+                              data-row={row}
+                              data-col={col}
+                              data-cell-addr={addr}
+                              data-frozen-row={row < freezeRowCount() ? 'true' : undefined}
+                              data-frozen-col={col < freezeColCount() ? 'true' : undefined}
+                              data-freeze-boundary-bottom={
+                                freezeRowCount() > 0 && row === freezeRowCount() - 1
+                                  ? 'true'
+                                  : undefined
+                              }
+                              data-freeze-boundary-right={
+                                freezeColCount() > 0 && col === freezeColCount() - 1
+                                  ? 'true'
+                                  : undefined
+                              }
+                              data-selected={selected() ? 'true' : 'false'}
+                              data-active={active() ? 'true' : 'false'}
+                              data-merge-anchor={mergeAnchor() ? 'true' : 'false'}
+                              data-validation-code={cell()?.validation?.code}
+                              data-validation-severity={validationSeverity()}
+                              data-has-conditional-format={
+                                cell()?.conditionalFormat ? 'true' : 'false'
+                              }
+                              data-rich-kind={cell()?.richValue?.kind}
+                              data-rich-url={getCellRichUrl(cell())}
+                              data-borders={getCellBordersAttr(cell())}
+                              aria-selected={selected() ? 'true' : 'false'}
+                              title={getCellValidationMessage(cell())}
+                              rowSpan={getCellRowSpan(row, col)}
+                              colSpan={getCellColSpan(row, col)}
+                              style={getCellBoxStyle(row, col)}
+                              onClick={(event) => {
+                                // Suppress selection mutation during formula-
+                                // reference pick mode (handled by onPointerDown).
+                                if (store.getter(formulaReferenceSessionAtom)) return
+                                selectCellFromEvent(row, col, event)
+                              }}
+                              onMouseDown={(event) => {
+                                if (!event.shiftKey || event.ctrlKey || event.metaKey) {
+                                  return
+                                }
+                                event.preventDefault()
+                                store.setter(selectCellAtom, {
+                                  sheetId: props.sheetId,
+                                  coord: { row, col },
+                                  extend: true,
+                                })
+                                bumpRender()
+                                focusGrid()
+                              }}
+                              onPointerDown={(event) => {
+                                if (event.pointerType === 'mouse' && event.button !== 0) return
+                                // Formula-reference pick mode: clicking a cell
+                                // inserts an A1 ref into the current draft; a
+                                // drag expands the pick to a range like B2:E2.
+                                // Selection is NOT mutated — pick re-focuses
+                                // the editing input on release.
+                                if (store.getter(formulaReferenceSessionAtom)) {
+                                  event.preventDefault()
+                                  event.stopPropagation()
+                                  startFormulaReferenceDragPick(event, row, col)
+                                  return
+                                }
+                                if (event.shiftKey || event.ctrlKey || event.metaKey) return
+                                startDragSelection(event, row, col)
+                              }}
+                              onDblClick={() => {
+                                startEditingCell(row, col, 'cell')
+                              }}
+                              onContextMenu={(event) => {
+                                openContextMenu(event, getCellContextTarget(row, col))
+                              }}
+                            >
+                              <SpreadsheetCellBorders borders={cell()?.format?.borders} />
+                              <Show
+                                when={editing()}
+                                fallback={
+                                  <div class="spreadsheet-grid-cell-button">
+                                    <span
+                                      class="cell-display"
+                                      style={getCellFormatStyle(getDisplayCellFormat(cell()))}
+                                    >
+                                      <SpreadsheetCellDisplayValue cell={cell()} />
+                                    </span>
+                                  </div>
+                                }
+                              >
+                                <input
+                                  class="cell-input"
+                                  value={editingDraft()}
+                                  ref={(el) => {
+                                    // autofocus is blocked when grid root already
+                                    // has focus; queue an explicit focus + caret
+                                    // placement so subsequent keystrokes land on
+                                    // the input, not on the grid keydown handler.
+                                    //
+                                    // Skip when the editing session is owned by
+                                    // the formula bar — otherwise the cell-input
+                                    // mount on every draft change would steal
+                                    // focus away from the formula bar input.
+                                    if (el) {
+                                      queueMicrotask(() => {
+                                        const session = store.getter(editingSessionAtom)
+                                        const ownedByFormulaBar =
+                                          session.status === 'drafting' &&
+                                          session.source?.source === 'formula-bar'
+                                        if (ownedByFormulaBar) return
+                                        el.focus()
+                                        const len = el.value.length
+                                        el.setSelectionRange(len, len)
+                                      })
+                                    }
+                                  }}
+                                  onInput={(event) => {
+                                    store.setter(editingDraftAtom, {
+                                      draft: event.currentTarget.value,
+                                    })
+                                    notifyDraftTypedChar(
+                                      store,
+                                      event.currentTarget.selectionStart ??
+                                        event.currentTarget.value.length,
+                                    )
+                                    bumpRender()
+                                  }}
+                                  onSelect={(event) => {
+                                    syncFormulaReferenceCaret(
+                                      store,
+                                      event.currentTarget.selectionStart ?? 0,
+                                    )
+                                  }}
+                                  onKeyUp={(event) => {
+                                    // ArrowLeft/Right/Home/End move the caret
+                                    // without firing onSelect. Re-sync so the
+                                    // signature tooltip + autocomplete fragment
+                                    // recompute against the new caret position.
+                                    if (
+                                      event.key === 'ArrowLeft' ||
+                                      event.key === 'ArrowRight' ||
+                                      event.key === 'Home' ||
+                                      event.key === 'End'
+                                    ) {
+                                      syncFormulaReferenceCaret(
+                                        store,
+                                        event.currentTarget.selectionStart ?? 0,
+                                      )
+                                    }
+                                  }}
+                                  onKeyDown={(event) => {
+                                    // Autocomplete first: ArrowUp/Down move
+                                    // the dropdown cursor, Tab/Enter accept,
+                                    // Esc dismisses without ending editing.
+                                    const suggestionsOpen =
+                                      store.getter(formulaFunctionSuggestionsAtom).length > 0
+                                    if (suggestionsOpen) {
+                                      if (event.key === 'ArrowDown' || event.key === 'ArrowUp') {
+                                        event.preventDefault()
+                                        const list = store.getter(formulaFunctionSuggestionsAtom)
+                                        const current = store.getter(
+                                          formulaFunctionSuggestionCursorAtom,
+                                        )
+                                        const next =
+                                          event.key === 'ArrowDown'
+                                            ? (current + 1) % list.length
+                                            : (current - 1 + list.length) % list.length
+                                        store.setter(formulaFunctionSuggestionCursorAtom, next)
+                                        bumpRender()
+                                        return
+                                      }
+                                      if (event.key === 'Tab' || event.key === 'Enter') {
+                                        const suggestion = readActiveFormulaSuggestion(store)
+                                        if (suggestion) {
+                                          event.preventDefault()
+                                          const inputEl = event.currentTarget
+                                          const { caret } = acceptFormulaSuggestion(
+                                            store,
+                                            suggestion,
+                                          )
+                                          // Solid swaps the input's value on the
+                                          // next reactive tick; defer caret
+                                          // placement so it lands on the post-
+                                          // splice value. Capture the input
+                                          // synchronously — event.currentTarget
+                                          // is reset to null once the handler
+                                          // returns.
+                                          queueMicrotask(() => {
+                                            inputEl.focus()
+                                            inputEl.setSelectionRange(caret, caret)
+                                          })
+                                          bumpRender()
+                                          return
+                                        }
+                                      }
+                                      if (event.key === 'Escape') {
+                                        event.preventDefault()
+                                        store.setter(dismissFormulaSuggestionsAtom)
+                                        store.setter(formulaFunctionSuggestionCursorAtom, 0)
+                                        bumpRender()
+                                        return
+                                      }
+                                    }
+                                    if (event.key === 'Enter') {
+                                      event.preventDefault()
+                                      void commitCellEdit(event.shiftKey ? 'up' : 'down')
+                                    } else if (event.key === 'Tab') {
+                                      event.preventDefault()
+                                      void commitCellEdit(event.shiftKey ? 'left' : 'right')
+                                    } else if (event.key === 'Escape') {
+                                      event.preventDefault()
+                                      dispatchEditingCancel(store)
+                                      bumpRender()
+                                    }
+                                  }}
+                                  onBlur={() => {
+                                    // Do not commit if the blur was caused by
+                                    // a formula-reference pick — focus will be
+                                    // restored in the next microtask.
+                                    if (store.getter(formulaReferenceSessionAtom)) return
+                                    if (store.getter(editingSessionAtom).status === 'drafting') {
+                                      void commitCellEdit()
+                                    }
+                                  }}
+                                />
+                              </Show>
+                              <Show when={active() && !editing()}>
+                                <button
+                                  type="button"
+                                  class="spreadsheet-grid-fill-handle"
+                                  data-testid={`fill-handle-${addr}`}
+                                  aria-label={`Fill from ${addr}`}
+                                  onPointerDown={startFillHandle}
+                                />
+                              </Show>
+                            </td>
+                          </Show>
+                        )
+                      }}
+                    </For>
+                    <Show when={getRightSpacerWidth() > 0}>
+                      <td
+                        class="spreadsheet-grid-virtual-spacer"
+                        aria-hidden="true"
+                        style={{ width: `${getRightSpacerWidth()}px` }}
+                      />
+                    </Show>
+                  </tr>
+                )}
+              </For>
+              <Show when={getBottomSpacerHeight() > 0}>
+                <tr class="spreadsheet-grid-virtual-spacer-row" aria-hidden="true">
+                  <td
+                    class="spreadsheet-grid-virtual-spacer"
+                    colSpan={getVirtualColumnSpan()}
+                    style={{ height: `${getBottomSpacerHeight()}px` }}
+                  />
+                </tr>
+              </Show>
             </Show>
-          </Show>
-        </tbody>
-      </table>
+          </tbody>
+        </table>
       </div>
       <Show when={freezeRowCount() > 0 || freezeColCount() > 0}>
         <svg

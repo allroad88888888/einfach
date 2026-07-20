@@ -34,6 +34,9 @@ export interface MenuItemDescriptor {
    *   after their async capability witness resolves)
    * - `'insertColumns'` → `backend.insertColumns != null` (structural
    *   column edits; same per-open read)
+   * - `'sortRange'` → `backend.sortRange != null` (Data → Sort asc/desc;
+   *   physical engine sort is the ONLY sort mechanism since #24, so a host
+   *   without the port hides both entries; same per-open read)
    *
    * TODO(paste-special review LOW #5): tighten this to a union of the
    * known capability literals so typos in registry entries become

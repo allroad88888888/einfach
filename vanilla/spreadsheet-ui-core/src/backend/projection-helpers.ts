@@ -1,5 +1,5 @@
 import type { CellRange, SpreadsheetErrorSeverity } from '../shared'
-import type { ColumnFilterRule, FilterSortState, SortDirective } from '../filter-sort/types'
+import type { ColumnFilterRule, FilterSortState } from '../filter-sort/types'
 import type {
   ConditionalFormatRule,
   ConditionalFormatRuleEntry,
@@ -9,10 +9,7 @@ import type { NamedRange } from '../named-ranges/types'
 import type { DisplayCellRichValue } from '../rich-types/types'
 import type { DisplayCell, SpreadsheetCellFormat } from './types'
 
-export type CellValueOperator = Extract<
-  ConditionalFormatRule,
-  { kind: 'cell-value' }
->['operator']
+export type CellValueOperator = Extract<ConditionalFormatRule, { kind: 'cell-value' }>['operator']
 
 export interface RangeFormatLayer {
   range: CellRange
@@ -61,14 +58,11 @@ export function cloneFilterSortRule(rule: ColumnFilterRule): ColumnFilterRule {
 }
 
 export function cloneFilterSortState(state: FilterSortState): FilterSortState {
-  return {
-    rules: state.rules.map(cloneFilterSortRule),
-    directives: state.directives.map((directive) => ({ ...directive })),
-  }
+  return { rules: state.rules.map(cloneFilterSortRule) }
 }
 
 export function filterSortHasEffect(state: FilterSortState | undefined): boolean {
-  return !!state && (state.rules.length > 0 || state.directives.length > 0)
+  return !!state && state.rules.length > 0
 }
 
 export function keyFor(row: number, col: number): string {
@@ -81,10 +75,7 @@ export function isCoordInsideRange(
   range: { rowStart: number; rowEnd: number; colStart: number; colEnd: number },
 ): boolean {
   return (
-    row >= range.rowStart &&
-    row <= range.rowEnd &&
-    col >= range.colStart &&
-    col <= range.colEnd
+    row >= range.rowStart && row <= range.rowEnd && col >= range.colStart && col <= range.colEnd
   )
 }
 
@@ -164,7 +155,7 @@ export function isDefaultFormat(format: SpreadsheetCellFormat): boolean {
     !format.strikethrough &&
     !format.wrap &&
     (format.align === undefined || format.align === 'default') &&
-    (format.verticalAlign === undefined) &&
+    format.verticalAlign === undefined &&
     format.fontSize === undefined &&
     (format.fontFamily === undefined || format.fontFamily.length === 0) &&
     (format.fgColor === undefined || format.fgColor.length === 0) &&
@@ -253,20 +244,6 @@ export function compareCellValue(
     default:
       return false
   }
-}
-
-export function compareFilterSortValues(left: string, right: string): number {
-  if (left.length === 0 && right.length === 0) return 0
-  if (left.length === 0) return 1
-  if (right.length === 0) return -1
-
-  const leftNumber = numericValue(left)
-  const rightNumber = numericValue(right)
-  if (leftNumber !== null && rightNumber !== null) {
-    return leftNumber - rightNumber
-  }
-
-  return left.localeCompare(right, undefined, { numeric: true, sensitivity: 'base' })
 }
 
 export function cloneConditionalFormatRule(rule: ConditionalFormatRule): ConditionalFormatRule {
@@ -380,24 +357,12 @@ export function rowMatchesFilterSortRules(
   return true
 }
 
-export function compareFilterSortRowsWith(
-  readValue: (row: number, col: number) => string,
-  directives: readonly SortDirective[],
-  leftRow: number,
-  rightRow: number,
-): number {
-  for (const directive of directives) {
-    const valueCompare = compareFilterSortValues(
-      readValue(leftRow, directive.colIndex),
-      readValue(rightRow, directive.colIndex),
-    )
-    if (valueCompare !== 0) {
-      return directive.direction === 'asc' ? valueCompare : -valueCompare
-    }
-  }
-  return 0
-}
-
+/**
+ * Filter VISIBILITY permutation — never a sort. The display-permutation sort
+ * branch was retired with parity #29 / #24: sorting is a physical engine data
+ * mutation (`sortRange`), so the projection only ever compresses filtered-out
+ * rows away here. Row order is always source order.
+ */
 export function buildFilterSortDisplayRows(
   state: FilterSortState | undefined,
   options: FilterSortOptions,
@@ -426,27 +391,13 @@ export function buildFilterSortDisplayRows(
   const dataRowStart = options.startRow
   const dataRowEnd = hasSummary ? maxRow - 1 : maxRow
 
-  const dataRows: Array<{ row: number; index: number }> = []
+  const dataRows: number[] = []
   for (let row = dataRowStart; row <= dataRowEnd; row += 1) {
-    if (rowMatchesFilterSortRules(readValue, row, state!.rules)) {
-      dataRows.push({ row, index: dataRows.length })
-    }
+    if (rowMatchesFilterSortRules(readValue, row, state!.rules)) dataRows.push(row)
   }
 
-  if (state!.directives.length > 0) {
-    dataRows.sort((left, right) => {
-      const valueCompare = compareFilterSortRowsWith(
-        readValue,
-        state!.directives,
-        left.row,
-        right.row,
-      )
-      return valueCompare === 0 ? left.index - right.index : valueCompare
-    })
-  }
-
-  dataRows.forEach((item, index) => {
-    rows[dataRowStart + index] = item.row
+  dataRows.forEach((row, index) => {
+    rows[dataRowStart + index] = row
   })
   for (const row of summaryRows) rows[row] = row
   return rows

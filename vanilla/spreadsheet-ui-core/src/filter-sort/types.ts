@@ -9,20 +9,20 @@ import type {
 
 export type SortDirection = 'asc' | 'desc'
 
-export interface SortDirective {
-  colIndex: number
-  direction: SortDirection
-}
-
 export type ColumnFilterRule =
   | { kind: 'equals'; colIndex: number; value: string; caseSensitive?: boolean }
   | { kind: 'contains'; colIndex: number; value: string; caseSensitive?: boolean }
   | { kind: 'range'; colIndex: number; min?: number; max?: number }
   | { kind: 'list'; colIndex: number; values: readonly string[] }
 
+/**
+ * Column filter visibility only. Sort is NOT part of this state: the display
+ * permutation was retired with #29/#24 — sorting is a physical engine DATA
+ * mutation dispatched through `runPhysicalSortAtom` / the `sortRange` port,
+ * never a view directive.
+ */
 export interface FilterSortState {
   rules: readonly ColumnFilterRule[]
-  directives: readonly SortDirective[]
 }
 
 export type FilterSortStateBySheet = Record<string, FilterSortState>
@@ -36,7 +36,6 @@ export interface FilterDropdownState {
 export interface SetFilterSortRequest extends SheetRef {
   kind: 'set-filter-sort'
   rules: readonly ColumnFilterRule[]
-  directives: readonly SortDirective[]
   requestId?: ProjectionRequestId
   revision?: ProjectionRevision
 }
@@ -149,8 +148,6 @@ export interface FilterSortLifecycleState {
 }
 
 export type FilterSortMutationIntent =
-  | { readonly kind: 'sort'; readonly direction: SortDirection }
-  | { readonly kind: 'clear-sort' }
   | { readonly kind: 'clear-filter' }
   | { readonly kind: 'clear-column' }
   | { readonly kind: 'apply-draft' }
@@ -174,25 +171,21 @@ export interface UpdateFilterSortAvailableValuesInput {
   readonly values: readonly string[]
 }
 
-// --- engine physical sort (design-engine-sort S5) ---------------------------
+// --- engine physical sort (design-engine-sort S5 / S6, #29) -----------------
 //
-// The toolbar / menu sort entrypoints dispatch ONE command
-// (`runPhysicalSortAtom`). When the host backend exposes the `sortRange`
-// port the command physically reorders workbook data through it (engine
-// DATA fact, #29); otherwise — and whenever a physical sort is not
-// applicable (no resolved range, or an active column filter the engine
-// cannot yet honour) — it delegates to the existing display-permutation
-// entrypoint (`runFilterSortEntrypointAtom`). The split is capability
-// driven and transparent to the caller; wholesale removal of the display
-// permutation path is deferred (design-engine-sort #19).
+// The toolbar / menu / filter-dropdown sort entrypoints dispatch ONE command
+// (`runPhysicalSortAtom`). Physical reorder through the host `sortRange` port
+// is the ONLY sort mechanism: the display permutation was retired with #24.
+// A host that does not expose `sortRange` (e.g. the fail-closed TS worker
+// development backend) has NO sort at all — the command reports an unsupported
+// diagnostic and the sort entrypoints hide behind `sortRangeSupportedAtom`.
 
 /**
- * Framework-neutral transport for the physical-sort command. A host
- * backend that reorders engine data exposes `sortRange`; the optional
- * `setFilterSort` inherited from `FilterSortControllerPort` is the
- * display-permutation fallback. The command retains neither.
+ * Framework-neutral transport for the physical-sort command. A host backend
+ * that reorders engine data exposes `sortRange`; without it sorting is
+ * unavailable (fail-closed). The command never retains the source.
  */
-export interface PhysicalSortControllerPort extends FilterSortControllerPort {
+export interface PhysicalSortControllerPort {
   sortRange?: (request: SortRangeRequest) => Promise<SortRangeResult>
 }
 
@@ -204,19 +197,26 @@ export interface RunPhysicalSortInput {
    * The data region to physically reorder, header row already excluded by
    * the caller (its first row is a data row). `null` means the caller could
    * not resolve a region (e.g. the backend exposes no `resolveDataEdge`),
-   * which routes the command to the display-permutation fallback.
+   * which makes the sort inapplicable — the command rejects with an
+   * `invalid-range` diagnostic instead of writing anything.
    */
   readonly range: CellRange | null
   /**
    * Explicit sort target. The toolbar / menu omit it so the command derives
    * the key column from the active selection; the filter dropdown supplies
    * its own `{ sheetId, colIndex }` because clicking the header chevron does
-   * not move the selection onto that column. Ignored by the display fallback
-   * (that path stays selection-authoritative).
+   * not move the selection onto that column.
    */
   readonly target?: FilterSortEntrypointTarget
   readonly refreshProjection: (sheetId: string) => Promise<void>
 }
+
+/**
+ * Every reason a physical sort can refuse to write. `'unsupported'` is the
+ * UI-core-only code raised when the host exposes no `sortRange` port at all
+ * (fail-closed, #24); the rest mirror the engine's structured rejections.
+ */
+export type PhysicalSortDiagnosticCode = SortRangeRejectionCode | 'unsupported'
 
 /**
  * User-readable evidence that a physical sort was rejected before it wrote
@@ -224,7 +224,7 @@ export interface RunPhysicalSortInput {
  * inline prompt; cleared on the next dispatch and on a successful sort.
  */
 export interface PhysicalSortDiagnostic {
-  readonly code: SortRangeRejectionCode
+  readonly code: PhysicalSortDiagnosticCode
   readonly message: string
   /** Present only for `spill-in-range` — the intersecting anchor (A1). */
   readonly anchor?: string

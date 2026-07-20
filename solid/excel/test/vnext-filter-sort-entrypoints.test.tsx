@@ -4,8 +4,8 @@ import { afterEach, describe, expect, it } from '@jest/globals'
 import { createStore } from '@einfach/core'
 import { cleanup, fireEvent, render, waitFor } from '@solidjs/testing-library'
 import type {
-  FilterSortMutationResult,
-  SetFilterSortRequest,
+  SortRangeRequest,
+  SortRangeResult,
   SpreadsheetBackend,
   VisibleProjectionRequest,
 } from '@einfach/spreadsheet-ui-core'
@@ -14,7 +14,7 @@ import {
   createVisibleProjectionRequest,
   filterDropdownAtom,
   filterSortEntrypointStateAtom,
-  filterSortStateAtom,
+  physicalSortDiagnosticAtom,
   selectionAtom,
   setWorkspaceActiveSheetAtom,
 } from '@einfach/spreadsheet-ui-core'
@@ -60,7 +60,32 @@ function createBackend(overrides: Partial<SpreadsheetBackend> = {}): Spreadsheet
         revision: 1,
       }
     },
+    // Sort is a physical engine mutation and the display permutation is
+    // retired (#24), so every sort entrypoint here rides `sortRange`.
+    async resolveDataEdge(request) {
+      return {
+        kind: 'resolve-data-edge',
+        sheetId: request.sheetId,
+        target: request.direction === 'down' ? { row: 8, col: 0 } : { row: 0, col: 5 },
+      }
+    },
+    async sortRange(request) {
+      return appliedSortResult(request)
+    },
     ...overrides,
+  }
+}
+
+function appliedSortResult(request: SortRangeRequest): SortRangeResult {
+  return {
+    kind: 'sort-range',
+    sheetId: request.sheetId,
+    applied: true,
+    movedRows: 2,
+    movedCells: 8,
+    affectedRange: request.range,
+    requestId: request.requestId,
+    revision: 2,
   }
 }
 
@@ -160,11 +185,11 @@ describe('vNext filter/sort entrypoints', () => {
     const store = createStore()
     setTarget(store, 'sheet-a', 1)
     seedProjection(store, 'sheet-a')
-    const acknowledgement = deferred<FilterSortMutationResult>()
-    const requests: SetFilterSortRequest[] = []
+    const acknowledgement = deferred<SortRangeResult>()
+    const requests: SortRangeRequest[] = []
     const reads: VisibleProjectionRequest[] = []
     const backend = createBackend({
-      async setFilterSort(request) {
+      sortRange(request) {
         requests.push(request)
         return acknowledgement.promise
       },
@@ -202,30 +227,23 @@ describe('vNext filter/sort entrypoints', () => {
     fireEvent.click(menuSort)
     expect(requests).toHaveLength(1)
 
-    const request = requests[0]!
-    acknowledgement.resolve({
-      sheetId: request.sheetId,
-      requestId: request.requestId,
-      revision: 2,
-    })
+    acknowledgement.resolve(appliedSortResult(requests[0]!))
     await waitFor(() => expect(store.getter(filterSortEntrypointStateAtom).status).toBe('idle'))
 
-    expect(store.getter(filterSortStateAtom)['sheet-a']?.directives).toEqual([
-      { colIndex: 1, direction: 'asc' },
-    ])
+    expect(requests[0]!.keys).toEqual([{ col: 1, direction: 'asc' }])
     expect(reads.map((read) => read.sheetId)).toEqual(['sheet-a'])
   })
 
-  it('makes an acknowledgement mismatch inert without refresh or transport retry', async () => {
+  it('makes a sort transport failure inert without refresh or transport retry', async () => {
     const store = createStore()
     setTarget(store, 'sheet-a', 4)
     seedProjection(store, 'sheet-a')
-    const requests: SetFilterSortRequest[] = []
+    const requests: SortRangeRequest[] = []
     const reads: VisibleProjectionRequest[] = []
     const backend = createBackend({
-      async setFilterSort(request) {
+      async sortRange(request) {
         requests.push(request)
-        return { sheetId: 'sheet-b', requestId: request.requestId, revision: 2 }
+        throw new Error('worker transport failed')
       },
       async readVisibleProjection(request) {
         reads.push(request)
@@ -247,9 +265,10 @@ describe('vNext filter/sort entrypoints', () => {
       expect(store.getter(filterSortEntrypointStateAtom).status).toBe('outcome-unknown'),
     )
 
+    // One transport, no projection refresh, and no refresh-retry affordance:
+    // a sort that never confirmed must not pretend the view is stale.
     expect(requests).toHaveLength(1)
     expect(reads).toHaveLength(0)
-    expect(button(container, 'toolbar-btn-sort').disabled).toBe(true)
     expect(
       container
         .querySelector('[data-testid="spreadsheet-toolbar"]')
@@ -259,25 +278,22 @@ describe('vNext filter/sort entrypoints', () => {
     expect(container.querySelector('[data-testid="toolbar-filter-sort-refresh-retry"]')).toBeNull()
     expect(container.querySelector('[data-testid="menu-bar-filter-sort-refresh-retry"]')).toBeNull()
 
-    openDataMenu(container)
-    const menuSort = button(container, 'menu-bar-item-data.sortAsc')
-    expect(menuSort.disabled).toBe(true)
-    fireEvent.click(menuSort)
-    await Promise.resolve()
-    expect(requests).toHaveLength(1)
-    expect(reads).toHaveLength(0)
+    // Unlike the retired display entrypoint (which pinned a non-resendable
+    // ticket), the physical command releases the single lane once the engine
+    // transport itself fails, so the user can retry the data mutation.
+    expect(button(container, 'toolbar-btn-sort').disabled).toBe(false)
   })
 
   it('retries only the captured-sheet projection after an acknowledged refresh failure', async () => {
     const store = createStore()
     setTarget(store, 'sheet-a', 1)
     seedProjection(store, 'sheet-a')
-    const requests: SetFilterSortRequest[] = []
+    const requests: SortRangeRequest[] = []
     const reads: VisibleProjectionRequest[] = []
     const backend = createBackend({
-      async setFilterSort(request) {
+      async sortRange(request) {
         requests.push(request)
-        return { sheetId: request.sheetId, requestId: request.requestId, revision: 2 }
+        return appliedSortResult(request)
       },
       async readVisibleProjection(request) {
         reads.push(request)
@@ -301,9 +317,7 @@ describe('vNext filter/sort entrypoints', () => {
     )
     expect(requests).toHaveLength(1)
     expect(reads.map((read) => read.sheetId)).toEqual(['sheet-a'])
-    expect(store.getter(filterSortStateAtom)['sheet-a']?.directives).toEqual([
-      { colIndex: 1, direction: 'asc' },
-    ])
+    expect(requests[0]!.keys).toEqual([{ col: 1, direction: 'asc' }])
 
     setTarget(store, 'sheet-b', 2)
     const retry = button(container, 'toolbar-filter-sort-refresh-retry')
@@ -314,5 +328,21 @@ describe('vNext filter/sort entrypoints', () => {
     expect(requests).toHaveLength(1)
     expect(reads.map((read) => read.sheetId)).toEqual(['sheet-a', 'sheet-a'])
     expect(button(container, 'toolbar-btn-sort').disabled).toBe(false)
+  })
+
+  it('hides both sort entrypoints when the backend exposes no sortRange port', async () => {
+    const store = createStore()
+    setTarget(store, 'sheet-a', 2)
+    const backend = createBackend({ sortRange: undefined, resolveDataEdge: undefined })
+    const { container } = renderEntrypoints(store, backend)
+    await waitFor(() => expect(button(container, 'toolbar-btn-filter').disabled).toBe(false))
+
+    // Fail-closed (#24): no physical-sort port → no sort entry anywhere.
+    expect(container.querySelector('[data-testid="toolbar-btn-sort"]')).toBeNull()
+    openDataMenu(container)
+    expect(container.querySelector('[data-testid="menu-bar-item-data.sortAsc"]')).toBeNull()
+    expect(container.querySelector('[data-testid="menu-bar-item-data.sortDesc"]')).toBeNull()
+    expect(button(container, 'menu-bar-item-data.filter').disabled).toBe(false)
+    expect(store.getter(physicalSortDiagnosticAtom)).toBeNull()
   })
 })

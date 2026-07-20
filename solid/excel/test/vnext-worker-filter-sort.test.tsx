@@ -275,7 +275,6 @@ describe('worker adapter setFilterSort projection', () => {
       kind: 'set-filter-sort',
       sheetId: 'sheet-1',
       rules: [{ kind: 'equals', colIndex: 0, value: 'Alpha' }],
-      directives: [],
       requestId: 7,
     })
     expect(ack).toMatchObject({ sheetId: 'sheet-1', requestId: 7 })
@@ -293,22 +292,22 @@ describe('worker adapter setFilterSort projection', () => {
     expect(result.cells.some((cell) => cell.row >= 3)).toBe(false)
   })
 
-  it('sorts as a display permutation without touching engine data', async () => {
+  it('never reorders rows and never touches engine data (sort branch retired)', async () => {
     const { client, backend } = createFilterBackend()
     seedPeople(client)
 
     await backend.setFilterSort!({
       kind: 'set-filter-sort',
       sheetId: 'sheet-1',
-      rules: [],
-      directives: [{ colIndex: 1, direction: 'desc' }],
+      rules: [{ kind: 'equals', colIndex: 0, value: 'Alpha' }],
     })
 
+    // Row ORDER is always source order — `setFilterSort` carries no sort
+    // payload any more (#24 retired the display permutation for sort).
     const result = await readWindow(backend)
-    expect(cellAt(result, 1, 1)).toMatchObject({ displayValue: '3', originalRow: 2 })
+    expect(cellAt(result, 1, 1)).toMatchObject({ displayValue: '1', originalRow: 1 })
     expect(cellAt(result, 2, 1)).toMatchObject({ displayValue: '2', originalRow: 3 })
-    expect(cellAt(result, 3, 1)).toMatchObject({ displayValue: '1', originalRow: 1 })
-    // Display-only permutation: no engine writes of any kind happened.
+    // Visibility-only permutation: no engine writes of any kind happened.
     expect(client.calls.setCell).toHaveLength(0)
 
     // Clearing restores the identity projection with no originalRow facts.
@@ -317,7 +316,6 @@ describe('worker adapter setFilterSort projection', () => {
       kind: 'set-filter-sort',
       sheetId: 'sheet-1',
       rules: [],
-      directives: [],
     })
     // Clearing never runs the predicate scan, so it cannot be blocked by the cap.
     expect(client.calls.listNonEmpty).toBe(scans)
@@ -338,7 +336,6 @@ describe('worker adapter setFilterSort projection', () => {
         kind: 'set-filter-sort',
         sheetId: 'sheet-1',
         rules: [{ kind: 'equals', colIndex: 0, value: 'Alpha' }],
-        directives: [],
       }),
     ).rejects.toMatchObject({ code: FILTER_SORT_SOURCE_TOO_LARGE })
 
@@ -356,7 +353,6 @@ describe('worker adapter setFilterSort projection', () => {
       kind: 'set-filter-sort',
       sheetId: 'sheet-1',
       rules: [{ kind: 'equals', colIndex: 0, value: 'Alpha' }],
-      directives: [],
     })
     expect(client.calls.listNonEmpty).toBe(1)
 
@@ -419,7 +415,6 @@ describe('worker path filter/sort UI integration', () => {
       kind: 'set-filter-sort',
       sheetId: 'sheet-1',
       rules: [{ kind: 'equals', colIndex: 0, value: 'Alpha' }],
-      directives: [],
     })
 
     const store = createStore()

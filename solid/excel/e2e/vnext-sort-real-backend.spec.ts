@@ -14,31 +14,28 @@ import {
  * worker demos — real-backend evidence.
  *
  * The toolbar Sort button dispatches ONE physical-sort command
- * (`runPhysicalSortAtom`). The capability split is transparent to the UI:
+ * (`runPhysicalSortAtom`). Physical reorder is the ONLY sort mechanism since
+ * task #24 retired the display permutation, so the capability split is now a
+ * presence/absence split:
  *
  *   - WASM worker  → exposes the `sortRange` port → the Rust engine PHYSICALLY
  *     reorders the workbook rows (a backend data mutation, host-orchestrated
  *     undo, `kind: 'range.sort'` history entry).
- *   - TS worker    → declares `sortRange: false` (fail-closed) → the command
- *     delegates to the display-permutation fallback (a pure VIEW fact — the
- *     engine data never moves and NO `range.sort` history entry is recorded).
+ *   - TS worker    → declares `sortRange: false` (fail-closed) → there is NO
+ *     sort at all: the toolbar Sort button, the Data → Sort menu entries, and
+ *     the filter-dropdown sort section are all withheld.
  *
- * PHYSICAL vs DISPLAY-PERMUTATION discriminator
- * ---------------------------------------------
+ * PHYSICAL-SORT discriminator
+ * ---------------------------
  * Note that "an adjacent column moves with the sorted rows" does NOT by itself
- * prove a physical sort: the display permutation reorders whole VISIBLE rows
- * too, so column A appears reordered under both paths. The airtight, code-
- * backed distinguisher is the HISTORY channel:
+ * prove a physical sort. The airtight, code-backed distinguisher is the HISTORY
+ * channel: `runPhysicalSortAtom` → engine pushes a `range.sort` entry into the
+ * host history with a numeric backend revision, and undo/redo move the actual
+ * engine data (`recordCellMutation({ kind: 'range.sort' })` in
+ * `worker-workbook-backend.ts`).
  *
- *   - Physical (`runPhysicalSortAtom` → engine): pushes a `range.sort` entry
- *     into the host history with a numeric backend revision, and undo/redo
- *     move the actual engine data (`recordCellMutation({ kind: 'range.sort' })`
- *     in `worker-workbook-backend.ts`).
- *   - Display fallback (`runFilterSortEntrypointAtom`): pushes NO history
- *     entry at all — it is a view directive, not a data mutation.
- *
- * So the presence/absence of a `range.sort` history entry (plus, on WASM, that
- * undo physically restores the data and heals the cross-sheet chain) is the
+ * So the presence of a `range.sort` history entry (plus, on WASM, that undo
+ * physically restores the data and heals the cross-sheet chain) is the
  * criterion this suite pins. Column-A lockstep movement is kept only as
  * supporting visual evidence of a whole-row move.
  *
@@ -176,8 +173,7 @@ test.describe('vNext engine physical sort real-backend evidence', () => {
     await expect(cellDisplay(page, 'A4')).toHaveText('cell1')
 
     // DISCRIMINATOR: a physical sort is a backend data mutation → exactly one
-    // `range.sort` history entry with a numeric backend revision. (The display
-    // fallback would record none — see the TS test.)
+    // `range.sort` history entry with a numeric backend revision.
     await expect(sortHistoryEntry(page)).toHaveCount(1)
     await expect(sortHistoryEntry(page)).toContainText(/rev \d+/)
 
@@ -219,9 +215,9 @@ test.describe('vNext engine physical sort real-backend evidence', () => {
     await expect(cellDisplay(page, 'E3')).toHaveText('2')
     await expect(cellDisplay(page, 'E4')).toHaveText('4')
 
-    // Sort ascending by column E. The sheet has an active filter — previously
-    // this routed to the display permutation; now it sorts PHYSICALLY with the
-    // filtered-out row carried in excludedRows (design-engine-sort S6 / #29).
+    // Sort ascending by column E. The sheet has an active filter and still
+    // sorts PHYSICALLY, with the filtered-out row carried in excludedRows
+    // (design-engine-sort S6 / #29).
     await selectGridCell(page, 'E2')
     const sortButton = page.getByTestId('toolbar-btn-sort')
     await expect(sortButton).toBeEnabled()
@@ -275,8 +271,7 @@ test.describe('vNext engine physical sort real-backend evidence', () => {
     await page.getByTestId('filter-sort-asc').click()
 
     // Excel closes the AutoFilter menu on sort; the engine physically reorders
-    // and records one range.sort history entry (a display directive records
-    // none — see the TS fail-closed test above).
+    // and records one range.sort history entry.
     await expect(workerFilterDropdown(page)).toBeHidden()
     await expect(cellDisplay(page, 'E2')).toHaveText('1')
     await expect(cellDisplay(page, 'E3')).toHaveText('2')
@@ -285,25 +280,39 @@ test.describe('vNext engine physical sort real-backend evidence', () => {
     await expect(sortHistoryEntry(page)).toHaveCount(1)
   })
 
-  test('TS worker fail-closes to the display permutation — the view reorders with NO range.sort data mutation', async ({
+  test('TS worker fail-closes: every sort entrypoint is withheld and no data moves', async ({
     page,
   }) => {
-    test.skip(activeProjectIsWasm(), 'TS worker declares sortRange:false → display fallback path')
+    test.skip(activeProjectIsWasm(), 'TS worker declares sortRange:false → sort is unavailable')
     await gotoWorkerDemo(page)
     await seedCleanSortColumn(page)
+    await selectGridCell(page, 'E4')
 
-    await sortAscendingFromColumnE(page)
+    // #24: the display permutation is retired, so a host that cannot physically
+    // reorder data has NO sort at all. The toolbar Sort button is gone...
+    await expect(page.getByTestId('toolbar-btn-sort')).toHaveCount(0)
 
-    // The sort entry is usable and the view reorders (display layer): column E
-    // shows ascending in the visible window, same visual outcome as physical.
-    await expect(cellDisplay(page, 'E2')).toHaveText('1')
-    await expect(cellDisplay(page, 'E3')).toHaveText('2')
-    await expect(cellDisplay(page, 'E4')).toHaveText('3')
+    // ...and so are both Data menu sort entries (filter stays, it is a view
+    // fact the TS worker does support).
+    await page.getByTestId('menu-bar-button-data').click()
+    await expect(page.getByTestId('menu-bar-item-data.filter')).toBeVisible()
+    await expect(page.getByTestId('menu-bar-item-data.sortAsc')).toHaveCount(0)
+    await expect(page.getByTestId('menu-bar-item-data.sortDesc')).toHaveCount(0)
+    await page.keyboard.press('Escape')
 
-    // DISCRIMINATOR: no `sortRange` port → the command fail-closes to the
-    // display permutation, a pure VIEW fact. It records NO `range.sort` history
-    // entry (the only entries are the three seed cell edits). Per design the TS
-    // path is a development fallback, so no physical/undo assertions are made.
+    // ...and the filter dropdown offers no sort section either.
+    const filterButton = page.getByTestId('toolbar-btn-filter')
+    await expect(filterButton).toBeEnabled()
+    await filterButton.click()
+    await expect(workerFilterDropdown(page)).toBeVisible()
+    await expect(page.getByTestId('filter-sort-section')).toHaveCount(0)
+    await expect(page.getByTestId('filter-sort-asc')).toHaveCount(0)
+    await page.getByTestId('filter-close').click()
+
+    // The seeded data is untouched and no sort history entry exists at all.
+    await expect(cellDisplay(page, 'E2')).toHaveText('3')
+    await expect(cellDisplay(page, 'E3')).toHaveText('1')
+    await expect(cellDisplay(page, 'E4')).toHaveText('2')
     await expect(sortHistoryEntry(page)).toHaveCount(0)
     await expect(page.locator('.history-timeline-entry[data-kind="cell.set-input"]')).toHaveCount(3)
   })

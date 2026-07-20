@@ -34,10 +34,7 @@ import {
   type DisplayCell,
 } from '@einfach/spreadsheet-ui-core'
 
-import {
-  installWorkerRuntimeTs,
-  type WorkerContext,
-} from '../src-vnext/adapter/worker-runtime-ts'
+import { installWorkerRuntimeTs, type WorkerContext } from '../src-vnext/adapter/worker-runtime-ts'
 import { createWorkerWorkbookSpreadsheetBackend } from '../src-vnext/adapter'
 import type { WorkerLike, WorkerWorkbookSpreadsheetBackend } from '../src-vnext/adapter'
 import type {
@@ -303,7 +300,6 @@ describe('worker adapter merge overlay — real in-process TS runtime', () => {
       kind: 'set-filter-sort',
       sheetId: SHEET,
       rules: [{ kind: 'equals', colIndex: 0, value: 'keep' }],
-      directives: [],
     })
     const filtered = await readCells(backend, WINDOW)
     // The permuted display rows really apply (source row 3 renders at
@@ -317,7 +313,6 @@ describe('worker adapter merge overlay — real in-process TS runtime', () => {
       kind: 'set-filter-sort',
       sheetId: SHEET,
       rules: [],
-      directives: [],
     })
     const restored = await readCells(backend, WINDOW)
     expect(cellAt(restored, 1, 1)?.mergedSpan).toEqual({ rows: 2, cols: 2 })
@@ -330,9 +325,7 @@ describe('worker adapter merge overlay — real in-process TS runtime', () => {
       { id: 'sheet-2', name: 'Sheet2' },
     ])
     await backend.mergeRange!({ kind: 'merge-range', sheetId: 'sheet-2', range: B2_C3 })
-    expect(
-      mergeMetadata(await readCells(backend, WINDOW, 'sheet-2')).length,
-    ).toBeGreaterThan(0)
+    expect(mergeMetadata(await readCells(backend, WINDOW, 'sheet-2')).length).toBeGreaterThan(0)
 
     await backend.deleteSheet!({ kind: 'delete-sheet', sheetId: 'sheet-2' })
     // The next added sheet re-issues the positional id 'sheet-2'; it
