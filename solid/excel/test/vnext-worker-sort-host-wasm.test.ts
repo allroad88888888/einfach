@@ -239,6 +239,14 @@ describe('worker adapter engine physical sort port — real WASM engine + real d
     expect(result.movedRows).toBe(0)
     expect(result.rowPermutation).toEqual([])
     expect(await readCol(backend, 0, 3)).toEqual(['1', '2', '3'])
+
+    // No undo record was pushed for the no-op: a single undo pops the LAST
+    // set edit (row 2 → '') directly, with no identity sort record in
+    // between that would skew the host↔UI-core stack alignment (design §7).
+    const undoAck = await backend.undoTransaction!(undoRequest('noop-last-set'))
+    expect(undoAck.applied).not.toBe(false)
+    expect(await disp(backend, 2, 0)).toBe('')
+    expect(await disp(backend, 1, 0)).toBe('2')
     backend.dispose()
   })
 

@@ -1322,6 +1322,13 @@ export function createWorkerWorkbookSpreadsheetBackend(
     captureFormats: boolean
     missingRangeDiagnostic?: string
     execute: () => Promise<T>
+    /**
+     * Post-execute predicate: return false to record NOTHING (the mutation
+     * turned out to be an identity no-op, so an undo entry here would skew
+     * the host↔worker stack alignment — UI-core pushes no history entry for
+     * a no-op either). Nothing was mutated, so there is no cleanup to do.
+     */
+    shouldRecord?: (result: T) => boolean
   }): Promise<T> {
     if (spec.range === null) {
       const result = await spec.execute()
@@ -1362,6 +1369,11 @@ export function createWorkerWorkbookSpreadsheetBackend(
       }`
     }
     const result = await spec.execute()
+    if (spec.shouldRecord && !spec.shouldRecord(result)) {
+      // Identity no-op: nothing changed, so record nothing (regardless of
+      // whether the before-image was captured — there is nothing to undo).
+      return result
+    }
     if (before === null) {
       pushTransactionRecord(notUndoableRecord(spec.kind, spec.sheet.idx, spec.range, diagnostic))
       return result
@@ -2787,6 +2799,10 @@ export function createWorkerWorkbookSpreadsheetBackend(
         range,
         captureValues: true,
         captureFormats: true,
+        // A no-op sort (movedRows 0) writes nothing and pushes no undo
+        // record — UI-core pushes no history entry for it either, so
+        // recording here would skew the host↔worker stack (design §7).
+        shouldRecord: (report) => report.movedRows > 0,
         execute: async () => {
           const result = await client.sortRange(sheet.idx, payload)
           appliedRevision = bumpRevision()
