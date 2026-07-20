@@ -44,6 +44,10 @@ import type {
   SetRowHeightRequest,
   SetValidationRuleRequest,
   SheetMutationResult,
+  SortRangeKey,
+  SortRangeRejectionCode,
+  SortRangeRequest,
+  SortRangeResult,
   SpreadsheetBackend,
   SpreadsheetCellFormat,
   SpreadsheetSheetMetadata,
@@ -122,6 +126,12 @@ import {
   pasteRangeGeometry,
   pasteSourceCoord,
 } from './paste-range-plan'
+import {
+  MAX_SORT_SOURCE_CELLS,
+  planPhysicalSort,
+  type ResolvedSortKey,
+  type SortValue,
+} from './sort-order'
 
 function isObject(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null
@@ -1224,8 +1234,15 @@ function buildFilterSortDisplayRows(
   state: FilterSortState | undefined,
 ): number[] | null {
   const maxRow = getMaxSourceRow(sheetCells)
+  // Physical sort (#29) is the sole sort authority for the static backend now:
+  // the toolbar / menu sort entrypoints reorder engine data through `sortRange`.
+  // The display-permutation path here keeps ONLY filter visibility (`rules`);
+  // the `directives` sort branch is retired so a stray sort directive can never
+  // double-sort on top of the physical reorder (design-engine-sort §2.1 / #19).
+  const filterOnly: FilterSortState | undefined =
+    state === undefined ? undefined : { rules: state.rules, directives: [] }
   return buildFilterSortDisplayRowsShared(
-    state,
+    filterOnly,
     { headerRow: 0, startRow: 1, endRow: maxRow + 1 },
     (row, col) => readFilterSortValue(sheetCells, lookup, row, col),
   )
@@ -2987,6 +3004,331 @@ export function matrixToRangeProjectionResult(
   return buildProjectionResult(request, buildState(matrixToCells(matrix), revision ?? 0)) as RangeProjectionResult
 }
 
+// === Engine physical sort (design-engine-sort §3-§6, parity #29) ============
+//
+// The static backend is an in-memory reference engine, so it implements the
+// `sortRange` port by PHYSICALLY reordering its cells (values / formula text
+// verbatim, per-cell formats riding along) through the shared comparator in
+// `sort-order.ts` — the exact TS mirror of the Rust `sort_cmp` / slot machine.
+// Structured rejections and the applied ACK match the worker adapter so the
+// two backends are interchangeable behind the same UI-core command.
+
+const SORT_EXCEL_MAX_ROWS = 1_048_576
+const SORT_EXCEL_MAX_COLS = 16_384
+
+function isMalformedSortRange(range: CellRange | undefined): boolean {
+  return (
+    !range ||
+    typeof range !== 'object' ||
+    !Number.isInteger(range.rowStart) ||
+    !Number.isInteger(range.rowEnd) ||
+    !Number.isInteger(range.colStart) ||
+    !Number.isInteger(range.colEnd)
+  )
+}
+
+function toResolvedSortKeys(keys: readonly SortRangeKey[]): ResolvedSortKey[] {
+  return keys.map((key) => ({
+    col: key.col,
+    direction: key.direction ?? 'asc',
+    caseSensitive: key.caseSensitive ?? false,
+  }))
+}
+
+/**
+ * Project a static `DisplayCell` onto the five Excel sort classes, matching the
+ * engine `Value` the WASM path sees (parity golden fixture): formulas sort by
+ * their evaluated result, `#…` results are the error class, a missing / blank
+ * cell is empty. This keeps a static-host sort cell-for-cell identical with the
+ * engine sort for the same data.
+ */
+function cellToSortValue(cell: DisplayCell | undefined, lookup: EvalCellLookup): SortValue {
+  if (!cell) return { kind: 'empty' }
+  if (cell.formula) {
+    const result = evaluateFormula(cell.formula, lookup)
+    if (typeof result === 'number') return { kind: 'number', value: result }
+    // A string result beginning with '#' is an error code; anything else is text.
+    return result.startsWith('#') ? { kind: 'error' } : { kind: 'text', value: result }
+  }
+  switch (cell.valueKind) {
+    case 'number': {
+      const value = Number.isFinite(cell.numericValue)
+        ? cell.numericValue!
+        : Number(cell.displayValue)
+      return { kind: 'number', value }
+    }
+    case 'boolean':
+      return { kind: 'boolean', value: cell.displayValue === 'TRUE' }
+    case 'error':
+      return { kind: 'error' }
+    case 'blank':
+      return { kind: 'empty' }
+    default:
+      return cell.displayValue === '' ? { kind: 'empty' } : { kind: 'text', value: cell.displayValue }
+  }
+}
+
+/** Intersection of two normalized, intersecting rectangles. */
+function intersectSortRange(a: CellRange, b: CellRange): CellRange {
+  return {
+    rowStart: Math.max(a.rowStart, b.rowStart),
+    rowEnd: Math.min(a.rowEnd, b.rowEnd),
+    colStart: Math.max(a.colStart, b.colStart),
+    colEnd: Math.min(a.colEnd, b.colEnd),
+  }
+}
+
+/**
+ * Geometric subtraction `a \ b` for normalized, intersecting rectangles: up to
+ * four disjoint pieces (top band, bottom band, left/middle, right/middle) that
+ * tile `a` minus `b` exactly. Mirrors Rust `subtract_range` (design §5.3).
+ */
+function subtractSortRange(a: CellRange, b: CellRange): CellRange[] {
+  const out: CellRange[] = []
+  if (a.rowStart < b.rowStart) {
+    out.push({ rowStart: a.rowStart, rowEnd: b.rowStart - 1, colStart: a.colStart, colEnd: a.colEnd })
+  }
+  if (a.rowEnd > b.rowEnd) {
+    out.push({ rowStart: b.rowEnd + 1, rowEnd: a.rowEnd, colStart: a.colStart, colEnd: a.colEnd })
+  }
+  const midR0 = Math.max(a.rowStart, b.rowStart)
+  const midR1 = Math.min(a.rowEnd, b.rowEnd)
+  if (midR0 <= midR1) {
+    if (a.colStart < b.colStart) {
+      out.push({ rowStart: midR0, rowEnd: midR1, colStart: a.colStart, colEnd: b.colStart - 1 })
+    }
+    if (a.colEnd > b.colEnd) {
+      out.push({ rowStart: midR0, rowEnd: midR1, colStart: b.colEnd + 1, colEnd: a.colEnd })
+    }
+  }
+  return out
+}
+
+/**
+ * Format-layer preprocessing (design §5.3): materialize the effective format of
+ * every layer-covered cell inside `range` as a per-cell entry, then cut every
+ * intersecting layer so no layer overlaps `range`. Afterwards "default = no
+ * entry" holds inside the range and moving per-cell formats with their rows is
+ * the complete, correct format-follows-row semantics.
+ */
+function materializeAndCutSortFormatLayers(
+  cellFormats: Map<string, SpreadsheetCellFormat>,
+  rangeFormats: RangeFormatLayer[],
+  range: CellRange,
+): void {
+  const intersecting = rangeFormats.filter((layer) => rangesIntersect(layer.range, range))
+  if (intersecting.length === 0) return
+
+  const seen = new Set<string>()
+  for (const layer of intersecting) {
+    const region = intersectSortRange(normalizeRange(layer.range), range)
+    for (let row = region.rowStart; row <= region.rowEnd; row += 1) {
+      for (let col = region.colStart; col <= region.colEnd; col += 1) {
+        const key = keyFor(row, col)
+        if (seen.has(key)) continue
+        seen.add(key)
+        if (cellFormats.has(key)) continue
+        // `getEffectiveFormat` resolves per-cell > topmost covering layer and
+        // returns undefined for a default effective format (which stays absent).
+        const effective = getEffectiveFormat(row, col, cellFormats, rangeFormats)
+        if (effective) cellFormats.set(key, effective)
+      }
+    }
+  }
+
+  const next: RangeFormatLayer[] = []
+  for (const layer of rangeFormats) {
+    if (!rangesIntersect(layer.range, range)) {
+      next.push(layer)
+      continue
+    }
+    for (const piece of subtractSortRange(normalizeRange(layer.range), range)) {
+      next.push({ range: piece, format: cloneFormat(layer.format) })
+    }
+  }
+  rangeFormats.length = 0
+  for (const layer of next) rangeFormats.push(layer)
+}
+
+/**
+ * Physically relocate cells and per-cell formats under the row permutation
+ * (`rowMap`: source row → slot row, changed rows only), restricted to the
+ * range's columns. The map is a bijection on the changed rows, so snapshotting
+ * every source position, clearing them, then writing them at their slot rows
+ * cannot collide. Returns the count of non-empty cells that moved.
+ */
+function relocateSortedCells(
+  cells: Map<string, DisplayCell>,
+  cellFormats: Map<string, SpreadsheetCellFormat>,
+  range: CellRange,
+  rowMap: ReadonlyMap<number, number>,
+): number {
+  const movingCells: Array<{ cell: DisplayCell; col: number; slot: number }> = []
+  const movingFormats: Array<{ format: SpreadsheetCellFormat; col: number; slot: number }> = []
+
+  for (const [sourceRow, slotRow] of rowMap) {
+    for (let col = range.colStart; col <= range.colEnd; col += 1) {
+      const key = keyFor(sourceRow, col)
+      const cell = cells.get(key)
+      if (cell) movingCells.push({ cell, col, slot: slotRow })
+      const format = cellFormats.get(key)
+      if (format) movingFormats.push({ format, col, slot: slotRow })
+    }
+  }
+
+  // Clear all source positions before writing slots (bijection → no residue).
+  for (const [sourceRow] of rowMap) {
+    for (let col = range.colStart; col <= range.colEnd; col += 1) {
+      const key = keyFor(sourceRow, col)
+      cells.delete(key)
+      cellFormats.delete(key)
+    }
+  }
+
+  for (const { cell, col, slot } of movingCells) {
+    cells.set(keyFor(slot, col), { ...cell, row: slot })
+  }
+  for (const { format, col, slot } of movingFormats) {
+    cellFormats.set(keyFor(slot, col), format)
+  }
+  return movingCells.length
+}
+
+function sortRejectedResult(
+  request: SortRangeRequest,
+  revision: ProjectionRevision,
+  code: SortRangeRejectionCode,
+  message: string,
+): SortRangeResult {
+  return {
+    kind: 'sort-range-not-applied',
+    sheetId: request.sheetId,
+    applied: false,
+    code,
+    message,
+    requestId: request.requestId,
+    // A rejected sort never bumps: echo the current (un-bumped) witness.
+    revision: request.revision ?? revision,
+  }
+}
+
+/**
+ * Static reference implementation of the engine physical sort. Runs the same
+ * gate order as the worker adapter (payload → source-size → key-in-range →
+ * merge authority), reorders the cells through the shared slot algorithm, and
+ * records ONE backend-side undo entry (range cells + formats) so the sort is
+ * reversible exactly like the worker path (design §7).
+ */
+function applyStaticSortRange(
+  state: StaticBackendState,
+  request: SortRangeRequest,
+): SortRangeResult {
+  const revisionBefore = state.revision
+
+  if (isMalformedSortRange(request.range)) {
+    return sortRejectedResult(request, revisionBefore, 'invalid-payload', 'the sort request is missing a valid range')
+  }
+  if (!Array.isArray(request.keys) || request.keys.length === 0) {
+    return sortRejectedResult(request, revisionBefore, 'empty-keys', 'no sort key was provided')
+  }
+
+  const range = normalizeRange(request.range)
+  if (
+    range.rowStart < 0 ||
+    range.colStart < 0 ||
+    range.rowEnd >= SORT_EXCEL_MAX_ROWS ||
+    range.colEnd >= SORT_EXCEL_MAX_COLS
+  ) {
+    return sortRejectedResult(request, revisionBefore, 'invalid-range', 'the sort range is invalid')
+  }
+
+  const rangeArea = (range.rowEnd - range.rowStart + 1) * (range.colEnd - range.colStart + 1)
+  if (rangeArea > MAX_SORT_SOURCE_CELLS) {
+    return sortRejectedResult(
+      request,
+      revisionBefore,
+      'source-too-large',
+      `sort range spans ${rangeArea} cells but the cap is ${MAX_SORT_SOURCE_CELLS}`,
+    )
+  }
+
+  if (request.keys.some((key) => key.col < range.colStart || key.col > range.colEnd)) {
+    return sortRejectedResult(request, revisionBefore, 'key-out-of-range', 'a sort key column is outside the sorted range')
+  }
+
+  // Merge authority gate (design §5.2): the engine models no merge, so the
+  // adapter — sole holder of the registry — rejects a sort touching a merge.
+  const merges = state.mergeRangesBySheetId.get(request.sheetId) ?? []
+  if (merges.some((merge) => rangesIntersect(merge, range))) {
+    return sortRejectedResult(
+      request,
+      revisionBefore,
+      'merge-in-range',
+      'the sort range intersects a merged range; unmerge before sorting',
+    )
+  }
+  // Spill gate (design §5.1): the static engine models no dynamic-array spill,
+  // so there is nothing to intersect. TODO: add a spill gate here if the static
+  // backend ever grows a spill model.
+
+  const sheetCells = getOrCreateSheetCells(state, request.sheetId)
+  const lookup: EvalCellLookup = {
+    get(row, col) {
+      return sheetCells.get(keyFor(row, col))
+    },
+  }
+  const keys = toResolvedSortKeys(request.keys)
+  const plan = planPhysicalSort(
+    range.rowStart,
+    range.rowEnd,
+    request.excludedRows ?? [],
+    keys,
+    (row, col) => cellToSortValue(sheetCells.get(keyFor(row, col)), lookup),
+  )
+
+  // No-op sort (identity permutation): resolves applied with movedRows 0, writes
+  // nothing, records no undo entry, and does NOT bump the revision (design §7).
+  if (plan.rowMap.size === 0) {
+    return {
+      kind: 'sort-range',
+      sheetId: request.sheetId,
+      applied: true,
+      movedRows: 0,
+      movedCells: 0,
+      affectedRange: cloneRange(range),
+      rowPermutation: [],
+      requestId: request.requestId,
+      revision: request.revision ?? revisionBefore,
+    }
+  }
+
+  // A physical sort permutes the range's occupied/blank footprint (blanks and
+  // non-blanks swap rows), so a granular before-image scoped to pre-existing
+  // cells cannot clear positions that GAIN content on undo. Use the labeled
+  // O(one-sheet) capture — the same fallback static's structural ops
+  // (insert/delete rows, removeRows) use for whole-sheet rewrites.
+  beginUndoableMutation(state)
+  recordFullSheetBefore(state, request.sheetId)
+
+  const cellFormats = getOrCreateCellFormats(state, request.sheetId)
+  const rangeFormats = getOrCreateRangeFormats(state, request.sheetId)
+  materializeAndCutSortFormatLayers(cellFormats, rangeFormats, range)
+  const movedCells = relocateSortedCells(sheetCells, cellFormats, range, plan.rowMap)
+  state.revision = bumpRevision(state.revision)
+
+  return {
+    kind: 'sort-range',
+    sheetId: request.sheetId,
+    applied: true,
+    movedRows: plan.rowPermutation.length,
+    movedCells,
+    affectedRange: cloneRange(range),
+    rowPermutation: plan.rowPermutation,
+    requestId: request.requestId,
+    revision: request.revision ?? state.revision,
+  }
+}
+
 export function sparseCellsToVisibleProjectionResult(
   cells: StaticSeedCells,
   request: VisibleProjectionRequest,
@@ -3697,6 +4039,9 @@ export function createStaticSpreadsheetBackend(
       }
       state.revision = nextRevision
       return mutationResult(request, state.revision)
+    },
+    async sortRange(request: SortRangeRequest): Promise<SortRangeResult> {
+      return applyStaticSortRange(state, request)
     },
     async mergeRange(request) {
       beginUndoableMutation(state)

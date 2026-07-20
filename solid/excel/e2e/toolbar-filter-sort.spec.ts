@@ -164,6 +164,14 @@ test.describe('Wave 5 toolbar — filter and sort', () => {
   test('sort-asc / sort-desc actions close dropdown and reorder visible rows', async ({
     page,
   }) => {
+    // The static Wave 5 backend now exposes the `sortRange` port, so the toolbar
+    // sort PHYSICALLY reorders engine data (design-engine-sort #29) instead of
+    // the old display permutation. The seeded "Total" row sits inside the sorted
+    // data region and — unlike a real Excel Table total — is NOT auto-excluded
+    // (summary-row exclusion is a documented v1 UI-core gap, design §6.1), so it
+    // sorts with the data. That is the physical-vs-display discriminator here:
+    // descending, Total's 870 is the max and moves to the TOP, whereas the old
+    // display permutation pinned it at the bottom.
     await gotoWave5(page)
     await columnHeader(page, 1).click()
     await expect(columnHeader(page, 1)).toHaveAttribute('data-selected', 'true')
@@ -181,8 +189,9 @@ test.describe('Wave 5 toolbar — filter and sort', () => {
     await sortDesc(page).click()
     await expect(sortDropdown(page)).toBeHidden()
 
+    // Physical sort: Total (870) is the descending max and rides to the top.
     const afterDesc = await readColumnTexts(page, 'A', 2, 8)
-    expect(afterDesc).toEqual(['East', 'Pacific', 'West', 'North', 'Central', 'South', 'Mountain'])
+    expect(afterDesc).toEqual(['Total', 'East', 'Pacific', 'West', 'North', 'Central', 'South'])
 
     await columnHeader(page, 2).click()
     await expect(columnHeader(page, 2)).toHaveAttribute('data-selected', 'true')

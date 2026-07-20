@@ -133,12 +133,11 @@ test.describe('audit: structural ops on the Wave 5 demo', () => {
     await expect(menu).toContainText(/delete|删除/i)
   })
 
-  // Skipped: the menu dispatch + dispatchSortAtom path wires correctly and
-  // backend.setFilterSort is called, but the static demo backend does NOT
-  // implement setFilterSort — it does not reorder cells in the projection.
-  // Tracked as a Wave 7 backend feature; the menu glue here is verified by
-  // the menu-bar unit suite, this test waits for the backend to land.
-  test.skip('8. Data → Sort A→Z reorders rows by the active column', async ({ page }) => {
+  // The static Wave 5 backend now exposes the `sortRange` port, so the Data
+  // menu sort PHYSICALLY reorders engine data (design-engine-sort #29 / #19).
+  // Un-skipped from its former state (static backend used to have no reorder
+  // path); asserts a real physical row move by the active column.
+  test('8. Data → Sort A→Z reorders rows by the active column', async ({ page }) => {
     await gotoWave5(page)
     // A2..A8 starts as: North, South, East, West, Central, Mountain, Pacific
     await cell(page, 'A2').click()

@@ -1044,7 +1044,7 @@ describe('vnext adapter', () => {
     expect(afterRemove?.rules).toHaveLength(0)
   })
 
-  it('applies static backend sort directives to visible projections', async () => {
+  it('physically reorders the static backend through the sortRange port (sort directives are inert)', async () => {
     const backend = createStaticSpreadsheetBackend({
       revision: 1,
       matrix: [
@@ -1056,21 +1056,50 @@ describe('vnext adapter', () => {
       ],
     })
 
+    // Physical sort (#29) is now the sole sort authority for the static backend.
+    // A stray display-permutation sort directive is INERT — it must NOT reorder
+    // the projection (filter visibility, tested separately, is unaffected).
     await backend.setFilterSort?.({
       kind: 'set-filter-sort',
       sheetId: 'sheet-1',
       rules: [],
       directives: [{ colIndex: 1, direction: 'desc' }],
     })
+    const beforeSort = await backend.readVisibleProjection(
+      createVisibleProjectionRequest({
+        sheetId: 'sheet-1',
+        requestId: 24,
+        window: { rowStart: 0, rowEnd: 4, colStart: 0, colEnd: 1 },
+      }),
+    )
+    expect(
+      beforeSort.cells.filter((cell) => cell.col === 0).map((cell) => cell.displayValue),
+    ).toEqual(['Region', 'North', 'South', 'East', 'West'])
+    expect(beforeSort.cells.find((cell) => cell.row === 1 && cell.col === 0)?.originalRow).toBeUndefined()
+
+    // Physically sort the data region (rows 1..4, header row 0 excluded) by Q1
+    // descending — this moves engine data, not a display permutation.
+    const result = await backend.sortRange!({
+      kind: 'sort-range',
+      sheetId: 'sheet-1',
+      range: { rowStart: 1, rowEnd: 4, colStart: 0, colEnd: 1 },
+      keys: [{ col: 1, direction: 'desc' }],
+      requestId: 25,
+    })
+    expect(result.applied).toBe(true)
+    if (result.applied) {
+      expect(result.movedRows).toBeGreaterThan(0)
+      expect(result.affectedRange).toEqual({ rowStart: 1, rowEnd: 4, colStart: 0, colEnd: 1 })
+    }
 
     const projected = await backend.readVisibleProjection(
       createVisibleProjectionRequest({
         sheetId: 'sheet-1',
-        requestId: 25,
+        requestId: 26,
         window: { rowStart: 0, rowEnd: 4, colStart: 0, colEnd: 1 },
       }),
     )
-
+    // Data physically moved: Q1 desc → East(200), West(140), North(120), South(80).
     expect(projected.cells.filter((cell) => cell.col === 0).map((cell) => cell.displayValue)).toEqual([
       'Region',
       'East',
@@ -1078,7 +1107,8 @@ describe('vnext adapter', () => {
       'North',
       'South',
     ])
-    expect(projected.cells.find((cell) => cell.row === 1 && cell.col === 0)?.originalRow).toBe(3)
+    // A physical move never stamps originalRow (that is a display-permutation fact).
+    expect(projected.cells.find((cell) => cell.row === 1 && cell.col === 0)?.originalRow).toBeUndefined()
   })
 
   it('applies static backend filter rules to visible projections', async () => {
