@@ -1,11 +1,14 @@
 import { atom } from '@einfach/core'
 import type { Atom } from '@einfach/core'
-import type { CellRange } from '../shared'
+import { parseA1Range } from '../name-box'
+import type { CellCoord, CellRange } from '../shared'
 import type {
   CreateTableResult,
   ListTablesResult,
   SpreadsheetTableDescriptor,
   TableMutationRejectionCode,
+  TableMutationResult,
+  TableTotalsFunction,
   TablesControllerPort,
 } from './types'
 
@@ -29,6 +32,12 @@ export const TABLE_INVALID_SELECTION_ERROR =
 export const TABLE_CAPABILITY_ERROR =
   'Tables are unavailable because this workbook does not provide createTable.'
 
+export const TABLE_TOTALS_CAPABILITY_ERROR =
+  'The totals row is unavailable because this workbook does not provide setTableTotalsRow.'
+
+export const TABLE_NO_TABLE_AT_SELECTION_ERROR =
+  'The active cell is not inside a table. Select a cell within a table to toggle its totals row.'
+
 /** Structured-reject code → user-readable prompt (design §4/§10). */
 export const TABLE_REJECTION_MESSAGES: Readonly<Record<TableMutationRejectionCode, string>> =
   Object.freeze({
@@ -47,12 +56,17 @@ export const TABLE_REJECTION_MESSAGES: Readonly<Record<TableMutationRejectionCod
     'invalid-column-name': 'Table operation failed: the column name is invalid.',
     'mutation-during-custom-call':
       'Table operation failed: a custom formula is still running. Try again.',
+    'totals-row-blocked':
+      'Totals row failed: the row below the table is occupied. Clear it and try again.',
+    'no-totals-row': 'Totals function failed: enable the totals row first.',
+    'invalid-totals-function': 'Totals function failed: that aggregate is not recognized.',
     'invalid-payload': 'Table operation failed: the request was malformed.',
   })
 
 export type TableDiagnosticCode =
   | TableMutationRejectionCode
   | 'invalid-selection'
+  | 'no-table-at-selection'
   | 'capability'
   | 'outcome-unknown'
 
@@ -129,6 +143,53 @@ function readListTablesPort(source: TablesControllerPort): TablesControllerPort[
   }
 }
 
+function readSetTotalsRowPort(
+  source: TablesControllerPort,
+): TablesControllerPort['setTableTotalsRow'] {
+  try {
+    const port = source?.setTableTotalsRow
+    return typeof port === 'function' ? port : undefined
+  } catch {
+    return undefined
+  }
+}
+
+function readSetTotalFunctionPort(
+  source: TablesControllerPort,
+): TablesControllerPort['setTableTotalFunction'] {
+  try {
+    const port = source?.setTableTotalFunction
+    return typeof port === 'function' ? port : undefined
+  } catch {
+    return undefined
+  }
+}
+
+/**
+ * The first table in `tables` whose A1 range contains `coord` (unparseable
+ * ranges are skipped). MVP tables never overlap, so the first hit is the
+ * unique owner. Framework-neutral selection→table resolution reused by the
+ * totals-row UI entry and its unit tests.
+ */
+export function findTableForCell(
+  tables: readonly SpreadsheetTableDescriptor[],
+  coord: CellCoord,
+): SpreadsheetTableDescriptor | undefined {
+  for (const table of tables) {
+    const range = parseA1Range(table.range)
+    if (range === null) continue
+    if (
+      coord.row >= range.rowStart &&
+      coord.row <= range.rowEnd &&
+      coord.col >= range.colStart &&
+      coord.col <= range.colEnd
+    ) {
+      return table
+    }
+  }
+  return undefined
+}
+
 // --- catalog (source, bounded cache) ---------------------------------------
 
 const EMPTY_TABLE_CATALOG: readonly SpreadsheetTableDescriptor[] = Object.freeze([])
@@ -170,9 +231,19 @@ export const createTableSupportedAtom: Atom<boolean> = atom((get) =>
 )
 createTableSupportedAtom.debugLabel = 'spreadsheet.tables.createSupported'
 
-/** Captures the `createTable` capability witness without dispatching. */
+const toggleTotalsCapabilityBackingAtom = atom<boolean>(false)
+toggleTotalsCapabilityBackingAtom.debugLabel = 'spreadsheet.tables.totalsCapabilityBacking'
+
+/** Read-only witness of the `setTableTotalsRow` port — gates the totals-row UI. */
+export const toggleTableTotalsSupportedAtom: Atom<boolean> = atom((get) =>
+  get(toggleTotalsCapabilityBackingAtom),
+)
+toggleTableTotalsSupportedAtom.debugLabel = 'spreadsheet.tables.totalsSupported'
+
+/** Captures the `createTable` + `setTableTotalsRow` capability witnesses without dispatching. */
 export const captureTableCapabilityAtom = atom(null, (_get, set, source: TablesControllerPort) => {
   set(createTableCapabilityBackingAtom, readCreateTablePort(source) !== undefined)
+  set(toggleTotalsCapabilityBackingAtom, readSetTotalsRowPort(source) !== undefined)
 })
 captureTableCapabilityAtom.debugLabel = 'spreadsheet.tables.captureCapability'
 
@@ -343,3 +414,276 @@ export const runCreateTableAtom = atom(
   },
 )
 runCreateTableAtom.debugLabel = 'spreadsheet.tables.runCreate'
+
+// --- totals row (design §7, parity #32 T6) ---------------------------------
+
+const activeToggleTotalsAtom = atom<boolean>(false)
+activeToggleTotalsAtom.debugLabel = 'spreadsheet.tables.activeToggleTotals'
+
+const lastToggledTableTotalsBackingAtom = atom<{ name: string; hasTotals: boolean } | null>(null)
+lastToggledTableTotalsBackingAtom.debugLabel = 'spreadsheet.tables.lastToggledTotalsBacking'
+
+/**
+ * Read-only witness of the most recent applied totals-row toggle
+ * (`{ name, hasTotals }`). The host surfaces `hasTotals` as a visible badge.
+ */
+export const lastToggledTableTotalsAtom: Atom<{ name: string; hasTotals: boolean } | null> = atom(
+  (get) => get(lastToggledTableTotalsBackingAtom),
+)
+lastToggledTableTotalsAtom.debugLabel = 'spreadsheet.tables.lastToggledTotals'
+
+export interface RunToggleTableTotalsInput {
+  readonly source: TablesControllerPort
+  /** Canonical table name to toggle. */
+  readonly name: string
+  /** Target state: `true` grows a totals row, `false` removes it. */
+  readonly enabled: boolean
+  /** Sheet id passed to `refreshProjection` after the totals cells land. */
+  readonly sheetId?: string
+  /** Optional post-apply projection refresh (the SUBTOTAL write is a new cell). */
+  readonly refreshProjection?: (sheetId?: string) => Promise<unknown> | unknown
+}
+
+/**
+ * Toggle a named table's totals row through `setTableTotalsRow`.
+ * Capability-gated: when the host omits the port the command surfaces a
+ * capability diagnostic and never touches the engine. On an applied result
+ * the bounded catalog is refreshed (so the descriptor's `hasTotals` and
+ * grown range become canonical) and a visible witness is published; a
+ * structured reject (`totals-row-blocked` / `not-found` / …) maps to a
+ * user-readable diagnostic without a thrown promise.
+ */
+export const runToggleTableTotalsAtom = atom(
+  null,
+  async (get, set, input: RunToggleTableTotalsInput): Promise<void> => {
+    if (get(activeToggleTotalsAtom)) return
+
+    const port = readSetTotalsRowPort(input.source)
+    set(toggleTotalsCapabilityBackingAtom, port !== undefined)
+    if (port === undefined) {
+      set(
+        tableDiagnosticBackingAtom,
+        Object.freeze({ code: 'capability', message: TABLE_TOTALS_CAPABILITY_ERROR }),
+      )
+      return
+    }
+
+    const name = typeof input.name === 'string' ? input.name.trim() : ''
+    if (name.length === 0) {
+      set(
+        tableDiagnosticBackingAtom,
+        Object.freeze({
+          code: 'invalid-payload',
+          message: tableRejectionMessage('invalid-payload'),
+        }),
+      )
+      return
+    }
+
+    const requestId = nextRequestId(get(tableRequestIdBackingAtom))
+    set(tableRequestIdBackingAtom, requestId)
+    set(activeToggleTotalsAtom, true)
+    set(tableDiagnosticBackingAtom, null)
+
+    let result: TableMutationResult
+    try {
+      result = await port.call(input.source, {
+        kind: 'set-table-totals-row',
+        name,
+        enabled: input.enabled,
+        requestId,
+      })
+    } catch (error) {
+      set(activeToggleTotalsAtom, false)
+      set(
+        tableDiagnosticBackingAtom,
+        Object.freeze({
+          code: 'outcome-unknown',
+          message: `Totals row result is unknown: ${errorMessage(error)}`,
+        }),
+      )
+      return
+    }
+
+    // Structured rejection: nothing was written, no catalog change.
+    if (!result || result.applied === false) {
+      const code: TableMutationRejectionCode = result ? result.code : 'invalid-payload'
+      set(activeToggleTotalsAtom, false)
+      set(
+        tableDiagnosticBackingAtom,
+        Object.freeze({ code, message: tableRejectionMessage(code, result?.message) }),
+      )
+      return
+    }
+
+    // Applied — refresh the bounded cache (hasTotals + grown range) and
+    // publish the visible witness.
+    set(
+      lastToggledTableTotalsBackingAtom,
+      Object.freeze({ name: result.name, hasTotals: input.enabled }),
+    )
+    await set(refreshTableCatalogAtom, input.source)
+    if (typeof input.refreshProjection === 'function') {
+      try {
+        await input.refreshProjection(input.sheetId)
+      } catch {
+        // Projection refresh failure is non-fatal; the totals write landed.
+      }
+    }
+    set(activeToggleTotalsAtom, false)
+    set(tableDiagnosticBackingAtom, null)
+  },
+)
+runToggleTableTotalsAtom.debugLabel = 'spreadsheet.tables.runToggleTotals'
+
+export interface RunToggleTableTotalsAtSelectionInput {
+  readonly source: TablesControllerPort
+  readonly sheetId: string
+  /** Active cell used to resolve the owning table. */
+  readonly cell: CellCoord
+  readonly refreshProjection?: (sheetId?: string) => Promise<unknown> | unknown
+}
+
+/**
+ * Resolve the table containing `cell` (refreshing the catalog first so the
+ * geometry is canonical) and toggle its totals row to the opposite state.
+ * When the active cell is not inside any table on `sheetId`, a
+ * `no-table-at-selection` diagnostic is surfaced and no engine call runs.
+ * This is the selection-resolving UI entry; the explicit dispatch lives in
+ * {@link runToggleTableTotalsAtom}.
+ */
+export const runToggleTableTotalsAtSelectionAtom = atom(
+  null,
+  async (get, set, input: RunToggleTableTotalsAtSelectionInput): Promise<void> => {
+    const port = readSetTotalsRowPort(input.source)
+    set(toggleTotalsCapabilityBackingAtom, port !== undefined)
+    if (port === undefined) {
+      set(
+        tableDiagnosticBackingAtom,
+        Object.freeze({ code: 'capability', message: TABLE_TOTALS_CAPABILITY_ERROR }),
+      )
+      return
+    }
+    if (!input.sheetId) {
+      set(
+        tableDiagnosticBackingAtom,
+        Object.freeze({
+          code: 'no-table-at-selection',
+          message: TABLE_NO_TABLE_AT_SELECTION_ERROR,
+        }),
+      )
+      return
+    }
+
+    // Refresh the catalog so geometry / hasTotals are fresh before resolving.
+    await set(refreshTableCatalogAtom, input.source)
+    const tables = get(tableCatalogBackingAtom).filter((table) => table.sheetId === input.sheetId)
+    const target = findTableForCell(tables, input.cell)
+    if (target === undefined) {
+      set(
+        tableDiagnosticBackingAtom,
+        Object.freeze({
+          code: 'no-table-at-selection',
+          message: TABLE_NO_TABLE_AT_SELECTION_ERROR,
+        }),
+      )
+      return
+    }
+
+    await set(runToggleTableTotalsAtom, {
+      source: input.source,
+      name: target.name,
+      enabled: !target.hasTotals,
+      sheetId: input.sheetId,
+      refreshProjection: input.refreshProjection,
+    })
+  },
+)
+runToggleTableTotalsAtSelectionAtom.debugLabel = 'spreadsheet.tables.runToggleTotalsAtSelection'
+
+export interface RunSetTableTotalFunctionInput {
+  readonly source: TablesControllerPort
+  readonly name: string
+  readonly column: string
+  readonly func: TableTotalsFunction
+  readonly sheetId?: string
+  readonly refreshProjection?: (sheetId?: string) => Promise<unknown> | unknown
+}
+
+/**
+ * Set one totals-row column's aggregate through `setTableTotalFunction`.
+ * Capability-gated (reuses the totals port witness). On apply the catalog is
+ * refreshed and the projection optionally re-read; a structured reject
+ * (`no-totals-row` / `invalid-totals-function` / `column-not-found` / …)
+ * maps to a user-readable diagnostic.
+ */
+export const runSetTableTotalFunctionAtom = atom(
+  null,
+  async (get, set, input: RunSetTableTotalFunctionInput): Promise<void> => {
+    const port = readSetTotalFunctionPort(input.source)
+    if (port === undefined) {
+      set(
+        tableDiagnosticBackingAtom,
+        Object.freeze({ code: 'capability', message: TABLE_TOTALS_CAPABILITY_ERROR }),
+      )
+      return
+    }
+
+    const name = typeof input.name === 'string' ? input.name.trim() : ''
+    const column = typeof input.column === 'string' ? input.column.trim() : ''
+    if (name.length === 0 || column.length === 0) {
+      set(
+        tableDiagnosticBackingAtom,
+        Object.freeze({
+          code: 'invalid-payload',
+          message: tableRejectionMessage('invalid-payload'),
+        }),
+      )
+      return
+    }
+
+    const requestId = nextRequestId(get(tableRequestIdBackingAtom))
+    set(tableRequestIdBackingAtom, requestId)
+    set(tableDiagnosticBackingAtom, null)
+
+    let result: TableMutationResult
+    try {
+      result = await port.call(input.source, {
+        kind: 'set-table-total-function',
+        name,
+        column,
+        func: input.func,
+        requestId,
+      })
+    } catch (error) {
+      set(
+        tableDiagnosticBackingAtom,
+        Object.freeze({
+          code: 'outcome-unknown',
+          message: `Totals function result is unknown: ${errorMessage(error)}`,
+        }),
+      )
+      return
+    }
+
+    if (!result || result.applied === false) {
+      const code: TableMutationRejectionCode = result ? result.code : 'invalid-payload'
+      set(
+        tableDiagnosticBackingAtom,
+        Object.freeze({ code, message: tableRejectionMessage(code, result?.message) }),
+      )
+      return
+    }
+
+    await set(refreshTableCatalogAtom, input.source)
+    if (typeof input.refreshProjection === 'function') {
+      try {
+        await input.refreshProjection(input.sheetId)
+      } catch {
+        // Projection refresh failure is non-fatal; the totals write landed.
+      }
+    }
+    set(tableDiagnosticBackingAtom, null)
+  },
+)
+runSetTableTotalFunctionAtom.debugLabel = 'spreadsheet.tables.runSetTotalFunction'

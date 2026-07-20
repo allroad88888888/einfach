@@ -173,6 +173,14 @@ type WasmWorkbookRuntime = {
   deleteTable?: (name: string) => void
   listTables?: () => TableJSONWire[]
   getTable?: (name: string) => TableJSONWire | null
+  /**
+   * Totals row (#32 T6). Both THROW a `TableError` string on a structured
+   * reject; `setTableTotalFunction` additionally throws
+   * `"invalid-totals-function"` for an unrecognized aggregate id. Optional so
+   * pre-T6 wasm-pkg builds keep compiling; `assertMethod` guards the call.
+   */
+  setTableTotalsRow?: (name: string, enabled: boolean) => void
+  setTableTotalFunction?: (name: string, column: string, func: string) => void
   snapshot_persistence_v1?: () => WorkbookPersistenceSnapshotWire
   restore_persistence_v1?: (
     snapshot: WorkbookPersistenceSnapshotWire,
@@ -1292,6 +1300,9 @@ const TABLE_REJECTION_CODES = new Set<TableRejectCode>([
   'duplicate-column',
   'invalid-column-name',
   'mutation-during-custom-call',
+  'totals-row-blocked',
+  'no-totals-row',
+  'invalid-totals-function',
 ])
 
 function tableRejectionCode(err: unknown): TableRejectCode | null {
@@ -1580,6 +1591,29 @@ export function installWorkerRuntime() {
           {
             const getTable = assertMethod(wb, 'getTable')
             dispatchTable(msg.id, () => getTable.call(wb, String(msg.name)))
+          }
+          break
+        case 'setTableTotalsRow':
+          {
+            const setTableTotalsRow = assertMethod(wb, 'setTableTotalsRow')
+            dispatchTable(msg.id, () => {
+              setTableTotalsRow.call(wb, String(msg.name), Boolean(msg.enabled))
+              return true
+            })
+          }
+          break
+        case 'setTableTotalFunction':
+          {
+            const setTableTotalFunction = assertMethod(wb, 'setTableTotalFunction')
+            dispatchTable(msg.id, () => {
+              setTableTotalFunction.call(
+                wb,
+                String(msg.name),
+                String(msg.column),
+                String(msg.func),
+              )
+              return true
+            })
           }
           break
         case 'setFormatRange':

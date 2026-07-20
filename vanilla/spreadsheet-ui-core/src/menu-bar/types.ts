@@ -26,6 +26,9 @@ export interface MenuItemDescriptor {
    * - `'removeRows'` → `backend.removeRows != null` (Remove Duplicates)
    * - `'createTable'` → `backend.createTable != null` (Data → Create table;
    *   host resolves it through `createTableSupportedAtom`)
+   * - `'toggleTableTotals'` → `backend.setTableTotalsRow != null` (Data →
+   *   Toggle totals row; host resolves it through
+   *   `toggleTableTotalsSupportedAtom`)
    * - `'insertRows'` → `backend.insertRows != null` (structural row edits;
    *   read PER menu open — worker backends may withhold the port only
    *   after their async capability witness resolves)
@@ -77,6 +80,7 @@ export type MenuItemDispatch =
   | { kind: 'open-text-to-columns' }
   | { kind: 'open-remove-duplicates' }
   | { kind: 'create-table' }
+  | { kind: 'toggle-table-totals' }
   | { kind: 'open-format-cells' }
   | { kind: 'open-filter-dropdown' }
   | { kind: 'insert-row-above' }

@@ -284,6 +284,12 @@ export type TableRejectCode =
   | 'duplicate-column'
   | 'invalid-column-name'
   | 'mutation-during-custom-call'
+  // Totals-row gates (parity #32 T6). `invalid-totals-function` is thrown by
+  // the WASM binding (not a `TableError`) but rides the same bare-string
+  // path, so it recognizes here alongside the engine reasons.
+  | 'totals-row-blocked'
+  | 'no-totals-row'
+  | 'invalid-totals-function'
 
 export interface TableRejectWire {
   code: TableRejectCode
@@ -459,6 +465,15 @@ export interface WorkerWorkbookClient {
   deleteTable?(name: string): Promise<void>
   listTables?(): Promise<TableJSONWire[]>
   getTable?(name: string): Promise<TableJSONWire | null>
+  /**
+   * Totals row (#32 T6). `setTableTotalsRow` grows / removes a totals row;
+   * `setTableTotalFunction` sets one column's aggregate. Both resolve `void`;
+   * a structured engine reject (`totals-row-blocked` / `no-totals-row` /
+   * `invalid-totals-function` / `not-found`) surfaces as a `TABLE_REJECTED`
+   * RPC error carrying a `TableRejectWire` — same convention as CRUD.
+   */
+  setTableTotalsRow?(name: string, enabled: boolean): Promise<void>
+  setTableTotalFunction?(name: string, column: string, func: string): Promise<void>
   beginImport(
     sessionIdOrOptions?: number | BeginImportOptionsWire,
     options?: BeginImportOptionsWire,
@@ -782,6 +797,12 @@ export function createWorkerWorkbook(opts: WorkerWorkbookOptions): WorkerWorkboo
     },
     getTable(name) {
       return request<TableJSONWire | null>('getTable', { name })
+    },
+    setTableTotalsRow(name, enabled) {
+      return request<void>('setTableTotalsRow', { name, enabled })
+    },
+    setTableTotalFunction(name, column, func) {
+      return request<void>('setTableTotalFunction', { name, column, func })
     },
     beginImport(sessionIdOrOptions, options) {
       const sessionId =

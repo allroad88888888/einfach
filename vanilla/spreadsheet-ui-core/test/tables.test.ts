@@ -4,25 +4,36 @@ import {
   MAX_TABLE_CATALOG_ENTRIES,
   TABLE_CAPABILITY_ERROR,
   TABLE_INVALID_SELECTION_ERROR,
+  TABLE_NO_TABLE_AT_SELECTION_ERROR,
   TABLE_REJECTION_MESSAGES,
+  TABLE_TOTALS_CAPABILITY_ERROR,
   allTablesAtom,
   captureTableCapabilityAtom,
   clearTableDiagnosticAtom,
   createTableSupportedAtom,
+  findTableForCell,
   isValidCreateTableRange,
   lastCreatedTableNameAtom,
+  lastToggledTableTotalsAtom,
   refreshTableCatalogAtom,
   runCreateTableAtom,
+  runSetTableTotalFunctionAtom,
+  runToggleTableTotalsAtom,
+  runToggleTableTotalsAtSelectionAtom,
   tableDiagnosticAtom,
   tableRejectionMessage,
   tablesForSheetAtom,
+  toggleTableTotalsSupportedAtom,
 } from '../src'
 import type {
   CreateTableRequest,
   CreateTableResult,
   ListTablesResult,
+  SetTableTotalFunctionRequest,
+  SetTableTotalsRowRequest,
   SpreadsheetTableDescriptor,
   TableMutationRejectionCode,
+  TableMutationResult,
   TablesControllerPort,
 } from '../src'
 
@@ -285,5 +296,249 @@ describe('tables — message helper', () => {
     expect(tableRejectionMessage('name-conflict', 'custom')).toBe(
       TABLE_REJECTION_MESSAGES['name-conflict'],
     )
+  })
+})
+
+// --- totals row (parity #32 T6) ---------------------------------------------
+
+interface TotalsSourceOptions {
+  totalsResult?: (request: SetTableTotalsRowRequest) => TableMutationResult
+  functionResult?: (request: SetTableTotalFunctionRequest) => TableMutationResult
+  withoutTotals?: boolean
+  withoutFunction?: boolean
+  tables?: () => readonly SpreadsheetTableDescriptor[]
+}
+
+function makeTotalsSource(options: TotalsSourceOptions = {}) {
+  const totalsRequests: SetTableTotalsRowRequest[] = []
+  const functionRequests: SetTableTotalFunctionRequest[] = []
+  const source: TablesControllerPort = {}
+  if (!options.withoutTotals) {
+    source.setTableTotalsRow = async (request): Promise<TableMutationResult> => {
+      totalsRequests.push(request)
+      if (options.totalsResult) return options.totalsResult(request)
+      return {
+        kind: 'table-mutation',
+        applied: true,
+        name: request.name,
+        requestId: request.requestId,
+        revision: 2,
+      }
+    }
+  }
+  if (!options.withoutFunction) {
+    source.setTableTotalFunction = async (request): Promise<TableMutationResult> => {
+      functionRequests.push(request)
+      if (options.functionResult) return options.functionResult(request)
+      return {
+        kind: 'table-mutation',
+        applied: true,
+        name: request.name,
+        requestId: request.requestId,
+        revision: 2,
+      }
+    }
+  }
+  source.listTables = async (): Promise<ListTablesResult> => ({
+    tables: [...(options.tables?.() ?? [])],
+  })
+  return { source, totalsRequests, functionRequests }
+}
+
+describe('tables — totals capability', () => {
+  test('captureTableCapabilityAtom reflects setTableTotalsRow port presence', () => {
+    const store = makeStore()
+    expect(store.getter(toggleTableTotalsSupportedAtom)).toBe(false)
+
+    store.setter(captureTableCapabilityAtom, makeTotalsSource().source)
+    expect(store.getter(toggleTableTotalsSupportedAtom)).toBe(true)
+
+    store.setter(captureTableCapabilityAtom, makeTotalsSource({ withoutTotals: true }).source)
+    expect(store.getter(toggleTableTotalsSupportedAtom)).toBe(false)
+  })
+
+  test('runToggleTableTotalsAtom with no port surfaces a capability diagnostic', async () => {
+    const store = makeStore()
+    const { source, totalsRequests } = makeTotalsSource({ withoutTotals: true })
+
+    await store.setter(runToggleTableTotalsAtom, { source, name: 'Table1', enabled: true })
+
+    expect(totalsRequests).toHaveLength(0)
+    expect(store.getter(toggleTableTotalsSupportedAtom)).toBe(false)
+    expect(store.getter(tableDiagnosticAtom)).toEqual({
+      code: 'capability',
+      message: TABLE_TOTALS_CAPABILITY_ERROR,
+    })
+  })
+})
+
+describe('tables — runToggleTableTotalsAtom', () => {
+  test('applied dispatches, refreshes hasTotals, and publishes the witness', async () => {
+    const store = makeStore()
+    let hasTotals = false
+    const harness = makeTotalsSource({
+      totalsResult: (request) => {
+        hasTotals = request.enabled
+        return {
+          kind: 'table-mutation',
+          applied: true,
+          name: request.name,
+          requestId: request.requestId,
+          revision: 2,
+        }
+      },
+      tables: () => [{ ...descriptor('Table1', 'sheet-1', 'A1:C5'), hasTotals }],
+    })
+
+    let refreshedSheet: string | undefined
+    await store.setter(runToggleTableTotalsAtom, {
+      source: harness.source,
+      name: 'Table1',
+      enabled: true,
+      sheetId: 'sheet-1',
+      refreshProjection: (sheetId?: string) => {
+        refreshedSheet = sheetId
+      },
+    })
+
+    expect(harness.totalsRequests).toHaveLength(1)
+    expect(harness.totalsRequests[0]).toMatchObject({
+      kind: 'set-table-totals-row',
+      name: 'Table1',
+      enabled: true,
+    })
+    expect(store.getter(allTablesAtom)[0]?.hasTotals).toBe(true)
+    expect(store.getter(lastToggledTableTotalsAtom)).toEqual({ name: 'Table1', hasTotals: true })
+    expect(refreshedSheet).toBe('sheet-1')
+    expect(store.getter(tableDiagnosticAtom)).toBeNull()
+  })
+
+  test('a totals-row-blocked reject maps to a diagnostic (no catalog change)', async () => {
+    const store = makeStore()
+    const { source, totalsRequests } = makeTotalsSource({
+      totalsResult: (request) => ({
+        kind: 'table-mutation-not-applied',
+        applied: false,
+        code: 'totals-row-blocked',
+        requestId: request.requestId,
+        revision: 3,
+      }),
+      tables: () => [descriptor('Table1', 'sheet-1')],
+    })
+
+    await store.setter(runToggleTableTotalsAtom, { source, name: 'Table1', enabled: true })
+
+    expect(totalsRequests).toHaveLength(1)
+    // A structured reject never refreshes the catalog — it stays empty.
+    expect(store.getter(allTablesAtom)).toEqual([])
+    expect(store.getter(lastToggledTableTotalsAtom)).toBeNull()
+    expect(store.getter(tableDiagnosticAtom)).toEqual({
+      code: 'totals-row-blocked',
+      message: TABLE_REJECTION_MESSAGES['totals-row-blocked'],
+    })
+  })
+
+  test('a thrown backend promise becomes an outcome-unknown diagnostic', async () => {
+    const store = makeStore()
+    const source: TablesControllerPort = {
+      setTableTotalsRow: async () => {
+        throw new Error('worker died')
+      },
+    }
+
+    await store.setter(runToggleTableTotalsAtom, { source, name: 'Table1', enabled: true })
+
+    const diagnostic = store.getter(tableDiagnosticAtom)
+    expect(diagnostic?.code).toBe('outcome-unknown')
+    expect(diagnostic?.message).toContain('worker died')
+  })
+})
+
+describe('tables — runToggleTableTotalsAtSelectionAtom', () => {
+  test('resolves the table at the active cell and flips its totals row', async () => {
+    const store = makeStore()
+    const harness = makeTotalsSource({ tables: () => [descriptor('Table1', 'sheet-1', 'A1:C5')] })
+
+    await store.setter(runToggleTableTotalsAtSelectionAtom, {
+      source: harness.source,
+      sheetId: 'sheet-1',
+      cell: { row: 2, col: 1 },
+    })
+
+    expect(harness.totalsRequests).toHaveLength(1)
+    // The seeded descriptor has hasTotals:false → the toggle requests enable.
+    expect(harness.totalsRequests[0]).toMatchObject({ name: 'Table1', enabled: true })
+  })
+
+  test('surfaces no-table-at-selection when the active cell is outside every table', async () => {
+    const store = makeStore()
+    const harness = makeTotalsSource({ tables: () => [descriptor('Table1', 'sheet-1', 'A1:C5')] })
+
+    await store.setter(runToggleTableTotalsAtSelectionAtom, {
+      source: harness.source,
+      sheetId: 'sheet-1',
+      cell: { row: 20, col: 20 },
+    })
+
+    expect(harness.totalsRequests).toHaveLength(0)
+    expect(store.getter(tableDiagnosticAtom)).toEqual({
+      code: 'no-table-at-selection',
+      message: TABLE_NO_TABLE_AT_SELECTION_ERROR,
+    })
+  })
+})
+
+describe('tables — findTableForCell', () => {
+  test('returns the table whose A1 range contains the coord', () => {
+    const t1 = descriptor('Table1', 'sheet-1', 'A1:C5')
+    const t2: SpreadsheetTableDescriptor = {
+      ...descriptor('Table2', 'sheet-1', 'E1:F4'),
+      columns: ['X', 'Y'],
+    }
+    expect(findTableForCell([t1, t2], { row: 2, col: 1 })?.name).toBe('Table1')
+    expect(findTableForCell([t1, t2], { row: 0, col: 4 })?.name).toBe('Table2')
+    expect(findTableForCell([t1, t2], { row: 10, col: 10 })).toBeUndefined()
+  })
+})
+
+describe('tables — runSetTableTotalFunctionAtom', () => {
+  test('dispatches the aggregate on apply and maps a no-totals-row reject', async () => {
+    const store = makeStore()
+    const harness = makeTotalsSource({ tables: () => [descriptor('Table1', 'sheet-1')] })
+
+    await store.setter(runSetTableTotalFunctionAtom, {
+      source: harness.source,
+      name: 'Table1',
+      column: 'Age',
+      func: 'average',
+    })
+    expect(harness.functionRequests).toHaveLength(1)
+    expect(harness.functionRequests[0]).toMatchObject({
+      kind: 'set-table-total-function',
+      name: 'Table1',
+      column: 'Age',
+      func: 'average',
+    })
+    expect(store.getter(tableDiagnosticAtom)).toBeNull()
+
+    const rejectHarness = makeTotalsSource({
+      functionResult: (request) => ({
+        kind: 'table-mutation-not-applied',
+        applied: false,
+        code: 'no-totals-row',
+        requestId: request.requestId,
+        revision: 3,
+      }),
+    })
+    await store.setter(runSetTableTotalFunctionAtom, {
+      source: rejectHarness.source,
+      name: 'Table1',
+      column: 'Age',
+      func: 'sum',
+    })
+    expect(store.getter(tableDiagnosticAtom)).toEqual({
+      code: 'no-totals-row',
+      message: TABLE_REJECTION_MESSAGES['no-totals-row'],
+    })
   })
 })

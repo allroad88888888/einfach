@@ -32,6 +32,22 @@ worker adapter) is implemented in `solid/excel/src-vnext/adapter`.
   local invalid-selection gate + catalog refresh on apply),
   `clearTableDiagnosticAtom`.
 
+Totals row (parity #32 T6) — `setTableTotalsRow` / `setTableTotalFunction`
+backend ports gated by the same `structuredTables` witness:
+
+- **derived** — `toggleTableTotalsSupportedAtom` (`setTableTotalsRow` port
+  presence, gates the Data-menu totals entry), `lastToggledTableTotalsAtom`
+  (`{ name, hasTotals }` visible-badge witness).
+- **command** — `runToggleTableTotalsAtom` (`{ source, name, enabled }`:
+  capability split + dispatch + catalog refresh on apply with the grown
+  range + `hasTotals` + structured-reject mapping for `totals-row-blocked` /
+  `no-totals-row` / `invalid-totals-function`),
+  `runToggleTableTotalsAtSelectionAtom` (resolves the table under the active
+  cell via `findTableForCell`, else a `no-table-at-selection` diagnostic),
+  `runSetTableTotalFunctionAtom` (per-column aggregate).
+- **helper** — `findTableForCell(tables, coord)` (framework-neutral A1-range
+  containment used by the totals UI entry).
+
 Feature degradation: when the host backend omits these ports the Data-menu
 "Create table" entry hides through the standard method-presence contract —
 the TS worker runtime declares `structuredTables: false` (fail-closed) and
@@ -40,9 +56,11 @@ surface (`createTableSupportedAtom` reads `false`).
 
 ## Not here yet (later slices, design §9 / §13)
 
-- Totals-row toggle / totals-function dropdown, table rename / delete UI,
-  the create-table dialog (this slice creates on the current selection with
-  an engine-auto name; a name field is a later dialog slice).
+- Table rename / delete UI, the create-table dialog (this slice creates on
+  the current selection with an engine-auto name; a name field is a later
+  dialog slice). The totals-function dropdown is backed by
+  `runSetTableTotalFunctionAtom` but has no dedicated UI surface yet — the
+  Data-menu entry toggles the row only (default SUM aggregate).
 - Name Manager read-only "Tables" section (design §9). Deferred:
   `allTablesAtom` + `refreshTableCatalogAtom` are exported, but wiring a
   refresh-on-open into `SpreadsheetNameManagerDialog` plus a read-only

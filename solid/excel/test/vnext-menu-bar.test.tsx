@@ -12,6 +12,8 @@ import {
   filterSortStateAtom,
   findReplaceOpenAtom,
   lastCreatedTableNameAtom,
+  lastToggledTableTotalsAtom,
+  toggleTableTotalsSupportedAtom,
   tableDiagnosticAtom,
   helpOverlayAtom,
   hideColumnsAtom,
@@ -63,6 +65,8 @@ import {
   type RangeProjectionResult,
   type RemoveDuplicatesControllerPort,
   type SetSheetProtectionRequest,
+  type SetTableTotalsRowRequest,
+  type TableMutationResult,
   type SpreadsheetBackend,
   type SpreadsheetSheetMetadata,
   type UnhideColumnsRequest,
@@ -1483,6 +1487,138 @@ describe('SpreadsheetMenuBar', () => {
     })
     expect(store.getter(allTablesAtom)).toEqual([])
     expect(store.getter(lastCreatedTableNameAtom)).toBeNull()
+  })
+
+  interface TotalsBackendOptions {
+    hasTotals?: boolean
+    totalsResult?: (request: SetTableTotalsRowRequest) => TableMutationResult
+  }
+
+  function createTotalsCapableBackend(options: TotalsBackendOptions = {}): {
+    backend: SpreadsheetBackend
+    totalsRequests: SetTableTotalsRowRequest[]
+  } {
+    const totalsRequests: SetTableTotalsRowRequest[] = []
+    const backend: SpreadsheetBackend = {
+      ...createBaseBackend(),
+      async readVisibleProjection(request) {
+        return {
+          kind: 'visible-window',
+          sheetId: request.sheetId,
+          window: request.window,
+          requestId: request.requestId,
+          revision: 1,
+          cells: [],
+        }
+      },
+      async listTables(): Promise<ListTablesResult> {
+        return {
+          tables: [{ ...tableDescriptor('Table1'), hasTotals: options.hasTotals ?? false }],
+        }
+      },
+      async setTableTotalsRow(request) {
+        totalsRequests.push(request)
+        if (options.totalsResult) return options.totalsResult(request)
+        return {
+          kind: 'table-mutation',
+          applied: true,
+          name: request.name,
+          requestId: request.requestId,
+          revision: 2,
+        }
+      },
+    }
+    return { backend, totalsRequests }
+  }
+
+  it('Data > Toggle totals row hides when the backend has no setTableTotalsRow port', () => {
+    const store = createStore()
+    setupTableSelection(store)
+    // A create-only backend (no totals port) → the entry hides.
+    const { backend } = createTableCapableBackend()
+
+    const { container } = render(() => (
+      <SpreadsheetUiProvider backend={backend} store={store}>
+        <SpreadsheetMenuBar />
+      </SpreadsheetUiProvider>
+    ))
+
+    expect(store.getter(toggleTableTotalsSupportedAtom)).toBe(false)
+    fireEvent.click(container.querySelector('[data-testid="menu-bar-button-data"]')!)
+    expect(container.querySelector('[data-testid="menu-bar-item-data.toggleTotals"]')).toBeNull()
+  })
+
+  it('Data > Toggle totals row flips the totals row of the table under the active cell', async () => {
+    const store = createStore()
+    // Active cell (0,0) sits inside the Table1 range A1:C4.
+    store.setter(setWorkspaceActiveSheetAtom, { sheetId: 'sheet-1' })
+    store.setter(selectionAtom, {
+      kind: 'cell',
+      sheetId: 'sheet-1',
+      anchor: { row: 0, col: 0 },
+      focus: { row: 0, col: 0 },
+    })
+    const { backend, totalsRequests } = createTotalsCapableBackend()
+
+    const { container } = render(() => (
+      <SpreadsheetUiProvider backend={backend} store={store}>
+        <SpreadsheetMenuBar />
+      </SpreadsheetUiProvider>
+    ))
+
+    expect(store.getter(toggleTableTotalsSupportedAtom)).toBe(true)
+    fireEvent.click(container.querySelector('[data-testid="menu-bar-button-data"]')!)
+    const item = container.querySelector('[data-testid="menu-bar-item-data.toggleTotals"]')
+    expect(item).not.toBeNull()
+    fireEvent.click(item!)
+
+    await waitFor(() => expect(totalsRequests).toHaveLength(1))
+    // hasTotals:false in the catalog → the toggle requests enable.
+    expect(totalsRequests[0]).toMatchObject({
+      kind: 'set-table-totals-row',
+      name: 'Table1',
+      enabled: true,
+    })
+    // Visible success badge reflects the new totals state.
+    await waitFor(() => {
+      expect(
+        container
+          .querySelector('[data-testid="menu-bar-toggle-totals-status"]')
+          ?.getAttribute('data-has-totals'),
+      ).toBe('true')
+    })
+    expect(store.getter(lastToggledTableTotalsAtom)).toEqual({ name: 'Table1', hasTotals: true })
+    expect(store.getter(topMenuOpenAtom)).toEqual({ kind: 'idle' })
+  })
+
+  it('Data > Toggle totals row surfaces a no-table diagnostic when the active cell is outside every table', async () => {
+    const store = createStore()
+    store.setter(setWorkspaceActiveSheetAtom, { sheetId: 'sheet-1' })
+    store.setter(selectionAtom, {
+      kind: 'cell',
+      sheetId: 'sheet-1',
+      anchor: { row: 20, col: 20 },
+      focus: { row: 20, col: 20 },
+    })
+    const { backend, totalsRequests } = createTotalsCapableBackend()
+
+    const { container } = render(() => (
+      <SpreadsheetUiProvider backend={backend} store={store}>
+        <SpreadsheetMenuBar />
+      </SpreadsheetUiProvider>
+    ))
+
+    fireEvent.click(container.querySelector('[data-testid="menu-bar-button-data"]')!)
+    fireEvent.click(container.querySelector('[data-testid="menu-bar-item-data.toggleTotals"]')!)
+
+    await waitFor(() => {
+      expect(
+        container
+          .querySelector('[data-testid="menu-bar-create-table-error"]')
+          ?.getAttribute('data-table-diagnostic-code'),
+      ).toBe('no-table-at-selection')
+    })
+    expect(totalsRequests).toHaveLength(0)
   })
 
   it('View > Show Gridlines toggles the atom and mirrors aria-checked', () => {

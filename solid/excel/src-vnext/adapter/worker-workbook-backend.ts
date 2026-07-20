@@ -65,6 +65,8 @@ import type {
   ListTablesResult,
   RenameTableColumnRequest,
   RenameTableRequest,
+  SetTableTotalFunctionRequest,
+  SetTableTotalsRowRequest,
   SpreadsheetTableDescriptor,
   TableMutationRejectedResult,
   TableMutationRejectionCode,
@@ -2894,6 +2896,9 @@ export function createWorkerWorkbookSpreadsheetBackend(
     'duplicate-column',
     'invalid-column-name',
     'mutation-during-custom-call',
+    'totals-row-blocked',
+    'no-totals-row',
+    'invalid-totals-function',
   ])
 
   function normalizeTableRejectionCode(code: unknown): TableMutationRejectionCode {
@@ -2909,6 +2914,8 @@ export function createWorkerWorkbookSpreadsheetBackend(
     | 'deleteTable'
     | 'listTables'
     | 'getTable'
+    | 'setTableTotalsRow'
+    | 'setTableTotalFunction'
 
   function requireTableClient<K extends TableClientMethod>(
     method: K,
@@ -3060,6 +3067,48 @@ export function createWorkerWorkbookSpreadsheetBackend(
       requestId: request.requestId,
       revision,
       table: wire ? toTableDescriptor(wire) : null,
+    }
+  }
+
+  async function setTableTotalsRowThroughWorker(
+    request: SetTableTotalsRowRequest,
+  ): Promise<TableMutationResult> {
+    await readyPromise
+    try {
+      await requireTableClient('setTableTotalsRow')(request.name, request.enabled)
+      const nextRevision = bumpRevision()
+      return {
+        kind: 'table-mutation',
+        applied: true,
+        name: request.name,
+        requestId: request.requestId,
+        revision: request.revision ?? nextRevision,
+      }
+    } catch (error) {
+      const rejection = tableRejectionFromError(request, error)
+      if (rejection !== null) return rejection
+      throw error
+    }
+  }
+
+  async function setTableTotalFunctionThroughWorker(
+    request: SetTableTotalFunctionRequest,
+  ): Promise<TableMutationResult> {
+    await readyPromise
+    try {
+      await requireTableClient('setTableTotalFunction')(request.name, request.column, request.func)
+      const nextRevision = bumpRevision()
+      return {
+        kind: 'table-mutation',
+        applied: true,
+        name: request.name,
+        requestId: request.requestId,
+        revision: request.revision ?? nextRevision,
+      }
+    } catch (error) {
+      const rejection = tableRejectionFromError(request, error)
+      if (rejection !== null) return rejection
+      throw error
     }
   }
 
@@ -3781,6 +3830,12 @@ export function createWorkerWorkbookSpreadsheetBackend(
     },
     get getTable() {
       return runtimeSupports('structuredTables') ? getTableThroughWorker : undefined
+    },
+    get setTableTotalsRow() {
+      return runtimeSupports('structuredTables') ? setTableTotalsRowThroughWorker : undefined
+    },
+    get setTableTotalFunction() {
+      return runtimeSupports('structuredTables') ? setTableTotalFunctionThroughWorker : undefined
     },
 
     /**

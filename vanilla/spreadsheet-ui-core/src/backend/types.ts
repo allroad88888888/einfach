@@ -51,7 +51,10 @@ import type {
   ListTablesResult,
   RenameTableColumnRequest,
   RenameTableRequest,
+  SetTableTotalFunctionRequest,
+  SetTableTotalsRowRequest,
   TableMutationResult,
+  TableTotalsFunction,
 } from '../tables/types'
 
 // --- tables (Excel Table CRUD — parity #32) ---
@@ -65,7 +68,10 @@ export type {
   ListTablesResult,
   RenameTableColumnRequest,
   RenameTableRequest,
+  SetTableTotalFunctionRequest,
+  SetTableTotalsRowRequest,
   TableMutationResult,
+  TableTotalsFunction,
 }
 
 export type {
@@ -1076,6 +1082,20 @@ export interface SpreadsheetBackend {
   deleteTable?(request: DeleteTableRequest): Promise<TableMutationResult>
   listTables?(request: ListTablesRequest): Promise<ListTablesResult>
   getTable?(request: GetTableRequest): Promise<GetTableResult>
+  // Totals row (parity #32 T6, design-excel-table.md §7). Optional
+  // subdivision of the Table capability family — the same
+  // `structuredTables` witness gates them, so a backend whose engine has no
+  // Table model omits them alongside the CRUD ports and UI core hides the
+  // totals toggle through the standard method-presence contract. Both
+  // resolve the shared applied-or-structured-reject convention: a gated
+  // request (row-below occupied → `totals-row-blocked`, function before the
+  // row is enabled → `no-totals-row`, unknown aggregate id →
+  // `invalid-totals-function`) resolves a `TableMutationRejectedResult`
+  // rather than rejecting the promise. Not undoable in this slice (design
+  // §11/§12 known gap; the SUBTOTAL cell writes are covered by the existing
+  // cell snapshots, the registry geometry change is not).
+  setTableTotalsRow?(request: SetTableTotalsRowRequest): Promise<TableMutationResult>
+  setTableTotalFunction?(request: SetTableTotalFunctionRequest): Promise<TableMutationResult>
   // content-change push — Wave 8.2. Optional capability: backends whose
   // engine can change cell content OUTSIDE a UI-initiated mutation
   // (async custom-formula settles, collaborative edits) invoke the

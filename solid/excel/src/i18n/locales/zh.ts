@@ -139,6 +139,7 @@ export const messages: Record<string, string> = {
   'menuBar.data.textToColumns': '文本分列…',
   'menuBar.data.removeDuplicates': '删除重复项…',
   'menuBar.data.createTable': '创建表格',
+  'menuBar.data.toggleTotals': '切换汇总行',
   'menuBar.data.groupRows': '组合行',
   'menuBar.data.ungroupRows': '取消组合行',
   'menuBar.data.groupCols': '组合列',

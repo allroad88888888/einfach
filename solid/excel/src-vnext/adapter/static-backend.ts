@@ -5051,5 +5051,15 @@ export function createStaticSpreadsheetBackend(
         table: entry ? tableDescriptor(state, entry) : null,
       }
     },
+    // TODO(#32 T6 totals): `setTableTotalsRow` / `setTableTotalFunction` are
+    // deliberately NOT exposed on the static backend. A faithful totals row
+    // needs the static evaluator to (a) grow the table geometry by one row,
+    // (b) write + evaluate `=SUBTOTAL(1xx, Table[Col])` (the static
+    // structured-reference resolver returns `#REF!` for `[#Totals]` today and
+    // does not model SUBTOTAL 101-111), and (c) reflect `hasTotals` back
+    // through `listTables`. That is a substantial slice, not a low-cost add.
+    // Omitting the ports keeps them `undefined`, so UI core hides the totals
+    // toggle on the static host through the standard degradation contract —
+    // WASM remains the only real totals path (design-excel-table.md §1/§7).
   }
 }

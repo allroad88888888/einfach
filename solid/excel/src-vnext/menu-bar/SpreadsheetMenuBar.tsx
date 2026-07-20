@@ -43,10 +43,13 @@ import {
   retryFilterSortRefreshAtom,
   removeDuplicatesCapabilityAtom,
   runCreateTableAtom,
+  runToggleTableTotalsAtSelectionAtom,
   runPhysicalSortAtom,
   runStructureOperationAtom,
   tableDiagnosticAtom,
   lastCreatedTableNameAtom,
+  lastToggledTableTotalsAtom,
+  toggleTableTotalsSupportedAtom,
   unhideViewportSelectionAtom,
   runTextToColumnsEntrypointAtom,
   selectAllAtom,
@@ -101,8 +104,10 @@ export function SpreadsheetMenuBar(props: SpreadsheetMenuBarProps) {
   const textToColumnsSupported = useAtomValue(textToColumnsSupportedAtom)
   const removeDuplicatesCapability = useAtomValue(removeDuplicatesCapabilityAtom)
   const createTableSupported = useAtomValue(createTableSupportedAtom)
+  const toggleTableTotalsSupported = useAtomValue(toggleTableTotalsSupportedAtom)
   const tableDiagnostic = useAtomValue(tableDiagnosticAtom)
   const lastCreatedTableName = useAtomValue(lastCreatedTableNameAtom)
+  const lastToggledTableTotals = useAtomValue(lastToggledTableTotalsAtom)
   const filterSortEntrypoint = useAtomValue(filterSortEntrypointProjectionAtom)
   const textToColumnsEntrypoint = useAtomValue(textToColumnsEntrypointProjectionAtom)
   let rootRef: HTMLDivElement | undefined
@@ -185,6 +190,8 @@ export function SpreadsheetMenuBar(props: SpreadsheetMenuBarProps) {
         return removeDuplicatesCapability().canRead && removeDuplicatesCapability().canRemove
       case 'createTable':
         return createTableSupported()
+      case 'toggleTableTotals':
+        return toggleTableTotalsSupported()
       case 'insertRows':
         return backend.insertRows != null
       case 'insertColumns':
@@ -380,6 +387,23 @@ export function SpreadsheetMenuBar(props: SpreadsheetMenuBarProps) {
           sheetId,
           range: snap.range,
           refreshProjection: (target: string) => refreshVisibleProjection(store, backend, target),
+        })
+        return
+      }
+      case 'toggle-table-totals': {
+        const snap = store.getter(selectionSnapshotAtom)
+        const sheetId = snap.activeCell.sheetId || getActiveSheetId() || ''
+        if (!sheetId) return
+        // Resolve the table under the active cell and flip its totals row.
+        // Selection→table resolution + the "no table here" diagnostic live in
+        // `runToggleTableTotalsAtSelectionAtom`; the write refreshes the
+        // visible projection so the SUBTOTAL cell renders.
+        void store.setter(runToggleTableTotalsAtSelectionAtom, {
+          source: backend,
+          sheetId,
+          cell: { row: snap.activeCell.row, col: snap.activeCell.col },
+          refreshProjection: (target?: string) =>
+            refreshVisibleProjection(store, backend, target ?? sheetId),
         })
         return
       }
@@ -683,6 +707,18 @@ export function SpreadsheetMenuBar(props: SpreadsheetMenuBarProps) {
             data-table-name={name()}
           >
             {name()}
+          </span>
+        )}
+      </Show>
+      <Show when={lastToggledTableTotals()}>
+        {(totals) => (
+          <span
+            role="status"
+            data-testid="menu-bar-toggle-totals-status"
+            data-table-name={totals().name}
+            data-has-totals={totals().hasTotals ? 'true' : 'false'}
+          >
+            {totals().name}
           </span>
         )}
       </Show>

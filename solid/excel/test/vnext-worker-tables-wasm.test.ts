@@ -21,7 +21,11 @@
  */
 
 import { beforeAll, describe, expect, jest, test } from '@jest/globals'
-import type { BackendMutationResult } from '@einfach/spreadsheet-ui-core'
+import type {
+  BackendMutationResult,
+  DisplayCell,
+  TableTotalsFunction,
+} from '@einfach/spreadsheet-ui-core'
 
 import type { WorkerLike, WorkerWorkbookSpreadsheetBackend } from '../src-vnext/adapter'
 
@@ -121,6 +125,21 @@ async function seedTableData(backend: WorkerWorkbookSpreadsheetBackend): Promise
   await set(backend, 3, 0, 'Cy')
   await set(backend, 3, 1, '40')
   await set(backend, 3, 2, 'SF')
+}
+
+async function readCell(
+  backend: WorkerWorkbookSpreadsheetBackend,
+  row: number,
+  col: number,
+): Promise<DisplayCell | undefined> {
+  const result = await backend.readRangeProjection({
+    kind: 'range',
+    sheetId: SHEET,
+    requestId: setRequestId++,
+    reason: 'test',
+    range: { rowStart: row, rowEnd: row, colStart: col, colEnd: col },
+  })
+  return result.cells.find((c) => c.row === row && c.col === col)
 }
 
 const A1_C4 = { rowStart: 0, rowEnd: 3, colStart: 0, colEnd: 2 }
@@ -289,6 +308,124 @@ describe('worker adapter Excel Table CRUD port — real WASM engine + real dispa
     expect(typeof backend.deleteTable).toBe('function')
     expect(typeof backend.listTables).toBe('function')
     expect(typeof backend.getTable).toBe('function')
+    backend.dispose()
+  })
+})
+
+describe('worker adapter Excel Table totals row — real WASM engine + real dispatcher', () => {
+  test('toggle grows the range + hasTotals; a column aggregate evaluates and recomputes on edit', async () => {
+    const backend = await createBackend()
+    await seedTableData(backend)
+    await backend.createTable!({ kind: 'create-table', sheetId: SHEET, range: A1_C4 })
+
+    // Enable the totals row: range grows by one row, hasTotals flips.
+    const toggled = await backend.setTableTotalsRow!({
+      kind: 'set-table-totals-row',
+      name: 'Table1',
+      enabled: true,
+      requestId: 60,
+    })
+    expect(toggled.applied).toBe(true)
+    if (!toggled.applied) throw new Error('expected an applied totals toggle')
+    expect(toggled.kind).toBe('table-mutation')
+    expect(toggled.name).toBe('Table1')
+
+    let listed = await backend.listTables!({ kind: 'list-tables' })
+    expect(listed.tables[0].hasTotals).toBe(true)
+    expect(listed.tables[0].range).toBe('A1:C5')
+
+    // Set the Age column's totals aggregate to SUM → SUBTOTAL(109, Table1[Age]).
+    const fn = await backend.setTableTotalFunction!({
+      kind: 'set-table-total-function',
+      name: 'Table1',
+      column: 'Age',
+      func: 'sum',
+      requestId: 61,
+    })
+    expect(fn.applied).toBe(true)
+
+    // The totals cell sits at the last (5th) row, Age column (B5 = row 4, col 1).
+    const total = await readCell(backend, 4, 1)
+    expect(total?.displayValue).toBe('95') // 30 + 25 + 40
+
+    // Editing a data cell recomputes the SUBTOTAL total live.
+    await set(backend, 1, 1, '100') // Ann's Age 30 → 100
+    const recomputed = await readCell(backend, 4, 1)
+    expect(recomputed?.displayValue).toBe('165') // 100 + 25 + 40
+
+    // Disabling shrinks the range back and clears hasTotals.
+    const off = await backend.setTableTotalsRow!({
+      kind: 'set-table-totals-row',
+      name: 'Table1',
+      enabled: false,
+      requestId: 62,
+    })
+    expect(off.applied).toBe(true)
+    listed = await backend.listTables!({ kind: 'list-tables' })
+    expect(listed.tables[0].hasTotals).toBe(false)
+    expect(listed.tables[0].range).toBe('A1:C4')
+    backend.dispose()
+  })
+
+  test('enabling the totals row is rejected structurally when the row below is occupied', async () => {
+    const backend = await createBackend()
+    await seedTableData(backend)
+    await backend.createTable!({ kind: 'create-table', sheetId: SHEET, range: A1_C4 })
+    // Occupy A5 — the row the totals row would grow into.
+    await set(backend, 4, 0, 'blocker')
+
+    const rejected = await backend.setTableTotalsRow!({
+      kind: 'set-table-totals-row',
+      name: 'Table1',
+      enabled: true,
+      requestId: 70,
+    })
+    expect(rejected.applied).toBe(false)
+    if (rejected.applied) throw new Error('expected a rejected totals toggle')
+    expect(rejected.kind).toBe('table-mutation-not-applied')
+    expect(rejected.code).toBe('totals-row-blocked')
+
+    // No geometry change — the table stays A1:C4 without a totals row.
+    const listed = await backend.listTables!({ kind: 'list-tables' })
+    expect(listed.tables[0].hasTotals).toBe(false)
+    expect(listed.tables[0].range).toBe('A1:C4')
+    backend.dispose()
+  })
+
+  test('setTableTotalFunction rejects no-totals-row before enable and invalid-totals-function for an unknown id', async () => {
+    const backend = await createBackend()
+    await seedTableData(backend)
+    await backend.createTable!({ kind: 'create-table', sheetId: SHEET, range: A1_C4 })
+
+    const noRow = await backend.setTableTotalFunction!({
+      kind: 'set-table-total-function',
+      name: 'Table1',
+      column: 'Age',
+      func: 'sum',
+      requestId: 80,
+    })
+    expect(noRow.applied).toBe(false)
+    if (noRow.applied) throw new Error('expected a rejected totals function')
+    expect(noRow.code).toBe('no-totals-row')
+
+    await backend.setTableTotalsRow!({ kind: 'set-table-totals-row', name: 'Table1', enabled: true })
+    const badFunc = await backend.setTableTotalFunction!({
+      kind: 'set-table-total-function',
+      name: 'Table1',
+      column: 'Age',
+      func: 'bogus' as unknown as TableTotalsFunction,
+      requestId: 81,
+    })
+    expect(badFunc.applied).toBe(false)
+    if (badFunc.applied) throw new Error('expected a rejected totals function')
+    expect(badFunc.code).toBe('invalid-totals-function')
+    backend.dispose()
+  })
+
+  test('capability: the WASM null witness exposes the totals ports', async () => {
+    const backend = await createBackend()
+    expect(typeof backend.setTableTotalsRow).toBe('function')
+    expect(typeof backend.setTableTotalFunction).toBe('function')
     backend.dispose()
   })
 })

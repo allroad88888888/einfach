@@ -154,6 +154,7 @@ export const messages: Record<string, string> = {
   'menuBar.data.textToColumns': 'Text to Columns…',
   'menuBar.data.removeDuplicates': 'Remove Duplicates…',
   'menuBar.data.createTable': 'Create table',
+  'menuBar.data.toggleTotals': 'Toggle totals row',
   'menuBar.data.groupRows': 'Group Rows',
   'menuBar.data.ungroupRows': 'Ungroup Rows',
   'menuBar.data.groupCols': 'Group Columns',

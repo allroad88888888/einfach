@@ -449,6 +449,16 @@ const DATA_ITEMS: readonly MenuBarEntry[] = [
     isAvailable: 'capability',
     capabilityKey: 'createTable',
   },
+  {
+    id: 'data.toggleTotals',
+    label: 'menuBar.data.toggleTotals',
+    dispatch: { kind: 'toggle-table-totals' },
+    // Hides when the host engine cannot toggle a totals row
+    // (`backend.setTableTotalsRow` absent — same `structuredTables` witness
+    // as create-table). Excel Table totals row, parity #32 T6.
+    isAvailable: 'capability',
+    capabilityKey: 'toggleTableTotals',
+  },
   { kind: 'separator', id: 'data.sep-2' },
   // Outline grouping is UI-core canonical (#07): the commands commit
   // locally (collapse visibility reuses the hidden canonical sets), so
