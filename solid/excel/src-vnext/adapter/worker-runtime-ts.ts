@@ -117,6 +117,12 @@ export const TS_WORKER_RUNTIME_CAPABILITIES: WorkerRuntimeCapabilitiesWire = Obj
   // relocate + verbatim carry + spill gate). Declaring `false` withholds
   // the host sort port; a real implementation is the optional S7 slice.
   sortRange: false,
+  // The TS core has no hidden-row eval input for SUBTOTAL 101-111 (parity
+  // #23). Declaring `false` withholds the host `setEvalHiddenRows` port, so
+  // the provider silently skips the push and SUBTOTAL 101-111 degrades to
+  // "does not exclude" on the TS backend (acceptable — TS SUBTOTAL never
+  // excluded hidden rows).
+  evalHiddenRows: false,
   // The TS core (`@einfach/excel-core-ts`) has no Excel Table registry —
   // no structured-reference parser, no table geometry. Declaring `false`
   // withholds the six table CRUD ports (fail-closed); WASM is the only
@@ -1500,6 +1506,12 @@ export function createWorkerRuntimeTs(events?: WorkerRuntimeTsEvents): ExcelCore
         // refusal is structured and honest (never a success-shaped reply
         // that would leave the host believing data moved).
         return unsupported('sortRange (engine physical sort)')
+      case 'setEvalHiddenRows':
+        // Fail-closed: the TS core has no hidden-row eval input for
+        // SUBTOTAL 101-111. The `evalHiddenRows: false` witness withholds
+        // the host port, so a compliant adapter never sends this; if one
+        // does, refuse honestly rather than fake an ACK.
+        return unsupported('setEvalHiddenRows (engine hidden-row eval input)')
       case 'createTable':
       case 'renameTable':
       case 'renameTableColumn':

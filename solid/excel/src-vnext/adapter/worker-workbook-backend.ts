@@ -45,6 +45,7 @@ import type {
   SetCellInputRequest,
   SetColumnWidthRequest,
   SetConditionalFormatRuleRequest,
+  SetEvalHiddenRowsRequest,
   SetFilterSortRequest,
   SetFormatRangeRequest,
   SetNamedRangeRequest,
@@ -2841,6 +2842,28 @@ export function createWorkerWorkbookSpreadsheetBackend(
     }
   }
 
+  /**
+   * Engine hidden-row eval input (parity #23). Whole-set REPLACE of the
+   * hidden-row set the SUBTOTAL 101-111 variants exclude for the request's
+   * sheet. NOT a mutation — no exact ACK, no undo record, no revision bump
+   * of its own: the engine's paired `hidden_epoch` bump marks the affected
+   * 101-111 formulas dirty, and the worker forwards the resulting recompute
+   * as `cellsDirty` (the standard content-change path). The push is
+   * idempotent (repeated identical sets are safe) and resolves once the
+   * worker ACKs so the provider can order a follow-up projection read after
+   * the epoch bump has applied.
+   */
+  async function setEvalHiddenRowsThroughWorker(
+    request: SetEvalHiddenRowsRequest,
+  ): Promise<void> {
+    const sheet = await resolveSheet(request.sheetId)
+    const rows: number[] = []
+    for (const value of request.rows) {
+      if (Number.isSafeInteger(value) && value >= 0) rows.push(value)
+    }
+    await client.setEvalHiddenRows(sheet.idx, rows)
+  }
+
   // --- Excel Table CRUD (design-excel-table.md §10, parity #32) ---------
   //
   // The engine registry is canonical (CANONICAL_OWNERSHIP §3 #32): these
@@ -3719,6 +3742,18 @@ export function createWorkerWorkbookSpreadsheetBackend(
      */
     get sortRange() {
       return runtimeSupports('sortRange') ? sortRangeThroughWorker : undefined
+    },
+
+    /**
+     * Engine hidden-row eval input (parity #23). Capability-gated by
+     * `evalHiddenRows`: the TS worker declares it `false` so this port
+     * reads `undefined` and the provider silently skips the push (SUBTOTAL
+     * 101-111 degrades to "does not exclude"); the WASM runtime's null
+     * witness keeps it exposed (full trust). See
+     * `setEvalHiddenRowsThroughWorker` for the whole-set-replace semantics.
+     */
+    get setEvalHiddenRows() {
+      return runtimeSupports('evalHiddenRows') ? setEvalHiddenRowsThroughWorker : undefined
     },
 
     /**

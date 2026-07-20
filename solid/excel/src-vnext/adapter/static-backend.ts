@@ -3714,6 +3714,14 @@ export function createStaticSpreadsheetBackend(
         revision: state.revision,
       }
     },
+    // parity #23 — `setEvalHiddenRows` is deliberately NOT implemented here.
+    // This in-memory backend's formula evaluator has no SUBTOTAL 101-111
+    // variant to feed a hidden-row eval input, so omitting the optional port
+    // lets UI core silently skip the push (the standard degradation).
+    // TODO(einfach-static-subtotal): if the static evaluator ever grows the
+    // 101-111 SUBTOTAL family, implement this port to exclude
+    // `hiddenRowsBySheetId` at eval time; until then static-host SUBTOTAL
+    // 101-111 does not exclude hidden rows.
     async setFormatRange(request: SetFormatRangeRequest) {
       beginUndoableMutation(state)
       recordCellFormatsBeforeInRange(state, request.sheetId, request.range)

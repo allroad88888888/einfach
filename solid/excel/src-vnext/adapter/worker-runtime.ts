@@ -133,6 +133,15 @@ type WasmWorkbookRuntime = {
   set_row_height?: (sheetIdx: number, rowIndex: number, heightPx: number) => boolean
   set_col_width?: (sheetIdx: number, colIndex: number, widthPx: number) => boolean
   /**
+   * Engine hidden-row eval input (parity #23). Whole-set REPLACE of the
+   * hidden-row set the SUBTOTAL 101-111 variants exclude for `sheetIdx`
+   * (an empty array clears it); the paired engine epoch bump re-derives
+   * only the 101-111 formulas that consumed it. Optional so pre-#23
+   * wasm-pkg builds and test mocks keep compiling; `assertMethod` guards
+   * the call at dispatch time.
+   */
+  setEvalHiddenRows?: (sheetIdx: number, rows: Uint32Array | number[]) => void
+  /**
    * Engine physical sort (design-engine-sort S2). Reorders the range's
    * data rows in place and returns EITHER the success report
    * `{ ok: true, movedRows, movedCells, rowPermutation }` OR a structured
@@ -1481,6 +1490,27 @@ export function installWorkerRuntime() {
                 rowPermutation: report.rowPermutation,
               })
             }
+          }
+          break
+        case 'setEvalHiddenRows':
+          {
+            const sheet = normalizeStructuralIndex(msg.sheet, 'sheet index')
+            // NOTE: no `assertSheet` — the engine treats an out-of-range
+            // sheet as a silent no-op (workbook.rs `set_eval_hidden_rows`),
+            // and this fire-and-forget eval-input push mirrors that tolerant
+            // whole-set-replace contract rather than throwing.
+            // Whole-set replace: coerce to a sanitized u32 list (drop
+            // non-integers / negatives). The engine models no hidden state
+            // — it consumes this purely as eval input and the paired epoch
+            // bump re-derives only the 101-111 SUBTOTAL formulas.
+            const rawRows = Array.isArray(msg.rows) ? (msg.rows as unknown[]) : []
+            const rows: number[] = []
+            for (const value of rawRows) {
+              const index = Number(value)
+              if (Number.isInteger(index) && index >= 0) rows.push(index)
+            }
+            assertMethod(wb, 'setEvalHiddenRows').call(wb, sheet, rows)
+            postResponse(msg.id, true)
           }
           break
         case 'createTable':

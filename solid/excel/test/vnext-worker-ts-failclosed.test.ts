@@ -146,6 +146,7 @@ describe('TS worker runtime — structured UNSUPPORTED instead of success-shaped
       tsvChunkExport: false,
       persistenceFormats: false,
       sortRange: false,
+      evalHiddenRows: false,
       structuredTables: false,
     }
     expect(expectOk(await raw({ cmd: 'describeCapabilities' }))).toEqual(witness)
@@ -205,6 +206,16 @@ describe('TS worker runtime — structured UNSUPPORTED instead of success-shaped
       }),
     ) as Array<{ display: string }>
     expect(cells.map((c) => c.display)).toEqual(['3', '1'])
+  })
+
+  test('setEvalHiddenRows refuses with UNSUPPORTED (no hidden-row eval input on the TS core)', async () => {
+    const { raw } = makeRpc()
+    await raw({ cmd: 'initWorkbook', sheets: ['Sheet1'] })
+
+    // The TS core has no SUBTOTAL 101-111 hidden-row eval input — never a
+    // success-shaped fake ACK that would leave the host believing rows are
+    // excluded.
+    expectUnsupported(await raw({ cmd: 'setEvalHiddenRows', sheet: 0, rows: [1, 3] }))
   })
 
   test('structural commands refuse with UNSUPPORTED and leave the workbook untouched', async () => {
@@ -358,6 +369,9 @@ describe('TS worker backend — the capability handshake withholds unimplemented
     // Engine physical sort: the TS runtime declares `sortRange: false`, so
     // the port is withheld and UI-core hides the physical-sort entry.
     expect(backend.sortRange).toBeUndefined()
+    // Hidden-row eval input: the TS runtime declares `evalHiddenRows: false`,
+    // so the port is withheld and the provider skips the SUBTOTAL push.
+    expect(backend.setEvalHiddenRows).toBeUndefined()
     // Excel Table CRUD: the TS runtime declares `structuredTables: false`,
     // so all six ports are withheld and UI-core hides the Table entries.
     expect(backend.createTable).toBeUndefined()

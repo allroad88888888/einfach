@@ -343,6 +343,13 @@ export interface WorkerRuntimeCapabilitiesWire {
   /** sortRange physically reorders workbook data (engine physical sort). */
   sortRange: boolean
   /**
+   * setEvalHiddenRows really pushes a hidden-row eval input the engine's
+   * SUBTOTAL 101-111 variants consume (parity #23). The TS runtime has no
+   * such model and declares this `false`; the WASM runtime's null witness
+   * keeps the family trusted.
+   */
+  evalHiddenRows: boolean
+  /**
    * createTable / renameTable / renameTableColumn / deleteTable /
    * listTables / getTable are backed by a real engine Table registry
    * (Excel Table CRUD — #32). The TS runtime has no Table model and
@@ -426,6 +433,17 @@ export interface WorkerWorkbookClient {
    * handshake, so a compliant caller never reaches this on that runtime.
    */
   sortRange(sheet: number, payload: SortRangePayloadWire): Promise<SortRangeReportWire>
+  /**
+   * Engine hidden-row eval input (parity #23). Whole-set REPLACE of the
+   * hidden-row set the engine's SUBTOTAL 101-111 variants exclude for
+   * `sheet` (an empty `rows` clears it). Fire-and-forget: resolves once the
+   * worker ACKs so callers can order a follow-up projection read after the
+   * paired engine epoch bump. A runtime that declares `evalHiddenRows:
+   * false` (the TS runtime) rejects with `UNSUPPORTED`; the host adapter
+   * withholds the port entirely through the capability handshake, so a
+   * compliant caller never reaches this on that runtime.
+   */
+  setEvalHiddenRows(sheet: number, rows: readonly number[]): Promise<void>
   /**
    * Excel Table CRUD (#32, design-excel-table.md §10). Optional so
    * hand-rolled client doubles (tests) keep compiling; the WASM runtime
@@ -739,6 +757,9 @@ export function createWorkerWorkbook(opts: WorkerWorkbookOptions): WorkerWorkboo
     },
     sortRange(sheet, payload) {
       return request<SortRangeReportWire>('sortRange', { sheet, payload })
+    },
+    setEvalHiddenRows(sheet, rows) {
+      return request<void>('setEvalHiddenRows', { sheet, rows: [...rows] })
     },
     createTable(sheet, bounds, name) {
       return request<string>('createTable', {

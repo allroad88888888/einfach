@@ -338,6 +338,9 @@ function makeFakeWorkerWorkbookClient(
     async sortRange() {
       throw new Error('not used')
     },
+    async setEvalHiddenRows() {
+      throw new Error('not used')
+    },
     async snapshotViewportSizes(range) {
       calls.snapshotViewportSizes.push({
         sheet: range.sheet,
