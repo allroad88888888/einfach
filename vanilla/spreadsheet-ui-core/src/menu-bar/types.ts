@@ -24,6 +24,8 @@ export interface MenuItemDescriptor {
    * - `'pasteSpecial'` → `backend.pasteRange != null`
    * - `'textToColumns'` → `backend.importCellChunks != null`
    * - `'removeRows'` → `backend.removeRows != null` (Remove Duplicates)
+   * - `'createTable'` → `backend.createTable != null` (Data → Create table;
+   *   host resolves it through `createTableSupportedAtom`)
    * - `'insertRows'` → `backend.insertRows != null` (structural row edits;
    *   read PER menu open — worker backends may withhold the port only
    *   after their async capability witness resolves)
@@ -74,6 +76,7 @@ export type MenuItemDispatch =
   | { kind: 'open-data-validation' }
   | { kind: 'open-text-to-columns' }
   | { kind: 'open-remove-duplicates' }
+  | { kind: 'create-table' }
   | { kind: 'open-format-cells' }
   | { kind: 'open-filter-dropdown' }
   | { kind: 'insert-row-above' }

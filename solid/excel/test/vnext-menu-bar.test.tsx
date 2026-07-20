@@ -6,9 +6,13 @@ import { afterEach, describe, expect, it } from '@jest/globals'
 import { createStore } from '@einfach/core'
 import { cleanup, fireEvent, render, waitFor } from '@solidjs/testing-library'
 import {
+  allTablesAtom,
   commentSessionAtom,
+  createTableSupportedAtom,
   filterSortStateAtom,
   findReplaceOpenAtom,
+  lastCreatedTableNameAtom,
+  tableDiagnosticAtom,
   helpOverlayAtom,
   hideColumnsAtom,
   hideRowsAtom,
@@ -46,8 +50,12 @@ import {
   viewportHiddenAtom,
   workspaceSessionAtom,
   type AddSheetRequest,
+  type CreateTableRequest,
+  type CreateTableResult,
   type DisplayCell,
   type HideColumnsRequest,
+  type ListTablesResult,
+  type SpreadsheetTableDescriptor,
   type HideRowsRequest,
   type InsertColumnsRequest,
   type InsertRowsRequest,
@@ -1304,6 +1312,177 @@ describe('SpreadsheetMenuBar', () => {
       expect(state).toBeDefined()
       expect(state!.directives).toEqual([{ colIndex: 1, direction: 'desc' }])
     })
+  })
+
+  function tableDescriptor(name: string): SpreadsheetTableDescriptor {
+    return {
+      name,
+      sheetId: 'sheet-1',
+      sheetName: 'Sheet1',
+      sheetIndex: 0,
+      range: 'A1:C4',
+      hasHeaders: true,
+      hasTotals: false,
+      columns: ['Name', 'Age', 'City'],
+    }
+  }
+
+  interface TableBackendOptions {
+    createResult?: (request: CreateTableRequest) => CreateTableResult
+  }
+
+  function createTableCapableBackend(options: TableBackendOptions = {}): {
+    backend: SpreadsheetBackend
+    createRequests: CreateTableRequest[]
+  } {
+    const createRequests: CreateTableRequest[] = []
+    let created = false
+    const backend: SpreadsheetBackend = {
+      ...createBaseBackend(),
+      async createTable(request) {
+        createRequests.push(request)
+        if (options.createResult) {
+          const result = options.createResult(request)
+          if (result.applied) created = true
+          return result
+        }
+        created = true
+        return {
+          kind: 'create-table',
+          applied: true,
+          name: request.name ?? 'Table1',
+          requestId: request.requestId,
+          revision: 1,
+        }
+      },
+      async listTables(): Promise<ListTablesResult> {
+        return { tables: created ? [tableDescriptor('Table1')] : [] }
+      },
+    }
+    return { backend, createRequests }
+  }
+
+  function setupTableSelection(store: ReturnType<typeof createStore>) {
+    store.setter(setWorkspaceActiveSheetAtom, { sheetId: 'sheet-1' })
+    store.setter(selectionAtom, {
+      kind: 'range',
+      sheetId: 'sheet-1',
+      anchor: { row: 0, col: 0 },
+      focus: { row: 3, col: 2 },
+    })
+  }
+
+  it('Data > Create table hides when the backend has no createTable port', () => {
+    const store = createStore()
+    setupTableSelection(store)
+
+    const { container } = render(() => (
+      <SpreadsheetUiProvider backend={createBaseBackend()} store={store}>
+        <SpreadsheetMenuBar />
+      </SpreadsheetUiProvider>
+    ))
+
+    expect(store.getter(createTableSupportedAtom)).toBe(false)
+    fireEvent.click(container.querySelector('[data-testid="menu-bar-button-data"]')!)
+    expect(container.querySelector('[data-testid="menu-bar-item-data.createTable"]')).toBeNull()
+  })
+
+  it('Data > Create table is visible with a createTable backend and dispatches on the selection', async () => {
+    const store = createStore()
+    setupTableSelection(store)
+    const { backend, createRequests } = createTableCapableBackend()
+
+    const { container } = render(() => (
+      <SpreadsheetUiProvider backend={backend} store={store}>
+        <SpreadsheetMenuBar />
+      </SpreadsheetUiProvider>
+    ))
+
+    expect(store.getter(createTableSupportedAtom)).toBe(true)
+    fireEvent.click(container.querySelector('[data-testid="menu-bar-button-data"]')!)
+    const item = container.querySelector('[data-testid="menu-bar-item-data.createTable"]')
+    expect(item).not.toBeNull()
+    fireEvent.click(item!)
+
+    await waitFor(() => {
+      expect(store.getter(lastCreatedTableNameAtom)).toBe('Table1')
+    })
+    expect(createRequests).toHaveLength(1)
+    expect(createRequests[0]).toMatchObject({
+      kind: 'create-table',
+      sheetId: 'sheet-1',
+      range: { rowStart: 0, rowEnd: 3, colStart: 0, colEnd: 2 },
+    })
+    expect(store.getter(allTablesAtom).map((t) => t.name)).toEqual(['Table1'])
+    // Visible success feedback: the status span carries the canonical name.
+    await waitFor(() => {
+      expect(
+        container.querySelector('[data-testid="menu-bar-create-table-status"]')?.textContent,
+      ).toBe('Table1')
+    })
+    expect(store.getter(topMenuOpenAtom)).toEqual({ kind: 'idle' })
+  })
+
+  it('Data > Create table on a single-cell selection surfaces an invalid-selection diagnostic', async () => {
+    const store = createStore()
+    store.setter(setWorkspaceActiveSheetAtom, { sheetId: 'sheet-1' })
+    store.setter(selectionAtom, {
+      kind: 'cell',
+      sheetId: 'sheet-1',
+      anchor: { row: 2, col: 1 },
+      focus: { row: 2, col: 1 },
+    })
+    const { backend, createRequests } = createTableCapableBackend()
+
+    const { container } = render(() => (
+      <SpreadsheetUiProvider backend={backend} store={store}>
+        <SpreadsheetMenuBar />
+      </SpreadsheetUiProvider>
+    ))
+
+    fireEvent.click(container.querySelector('[data-testid="menu-bar-button-data"]')!)
+    fireEvent.click(container.querySelector('[data-testid="menu-bar-item-data.createTable"]')!)
+
+    await waitFor(() => {
+      const errorSpan = container.querySelector('[data-testid="menu-bar-create-table-error"]')
+      expect(errorSpan?.getAttribute('data-table-diagnostic-code')).toBe('invalid-selection')
+    })
+    // No backend call for a locally-rejected selection.
+    expect(createRequests).toHaveLength(0)
+    expect(store.getter(tableDiagnosticAtom)?.code).toBe('invalid-selection')
+  })
+
+  it('Data > Create table maps a structured range-overlap reject to a diagnostic', async () => {
+    const store = createStore()
+    setupTableSelection(store)
+    const { backend } = createTableCapableBackend({
+      createResult: (request) => ({
+        kind: 'table-mutation-not-applied',
+        applied: false,
+        code: 'range-overlap',
+        requestId: request.requestId,
+        revision: 1,
+      }),
+    })
+
+    const { container } = render(() => (
+      <SpreadsheetUiProvider backend={backend} store={store}>
+        <SpreadsheetMenuBar />
+      </SpreadsheetUiProvider>
+    ))
+
+    fireEvent.click(container.querySelector('[data-testid="menu-bar-button-data"]')!)
+    fireEvent.click(container.querySelector('[data-testid="menu-bar-item-data.createTable"]')!)
+
+    await waitFor(() => {
+      expect(
+        container
+          .querySelector('[data-testid="menu-bar-create-table-error"]')
+          ?.getAttribute('data-table-diagnostic-code'),
+      ).toBe('range-overlap')
+    })
+    expect(store.getter(allTablesAtom)).toEqual([])
+    expect(store.getter(lastCreatedTableNameAtom)).toBeNull()
   })
 
   it('View > Show Gridlines toggles the atom and mirrors aria-checked', () => {

@@ -153,6 +153,7 @@ export const messages: Record<string, string> = {
   'menuBar.data.filter': 'Filter…',
   'menuBar.data.textToColumns': 'Text to Columns…',
   'menuBar.data.removeDuplicates': 'Remove Duplicates…',
+  'menuBar.data.createTable': 'Create table',
   'menuBar.data.groupRows': 'Group Rows',
   'menuBar.data.ungroupRows': 'Ungroup Rows',
   'menuBar.data.groupCols': 'Group Columns',

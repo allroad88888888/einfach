@@ -438,6 +438,17 @@ const DATA_ITEMS: readonly MenuBarEntry[] = [
     isAvailable: 'capability',
     capabilityKey: 'removeRows',
   },
+  {
+    id: 'data.createTable',
+    label: 'menuBar.data.createTable',
+    accessKey: 'T',
+    dispatch: { kind: 'create-table' },
+    // Hides when the host engine has no Table model (`backend.createTable`
+    // absent — the TS worker declares structuredTables: false and the
+    // static backend implements none). Excel Table CRUD, parity #32.
+    isAvailable: 'capability',
+    capabilityKey: 'createTable',
+  },
   { kind: 'separator', id: 'data.sep-2' },
   // Outline grouping is UI-core canonical (#07): the commands commit
   // locally (collapse visibility reuses the hidden canonical sets), so

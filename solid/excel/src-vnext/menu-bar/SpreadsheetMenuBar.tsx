@@ -9,8 +9,10 @@ import {
   copyClipboardAtom,
   captureFilterSortCapabilityAtom,
   captureRemoveDuplicatesCapabilityAtom,
+  captureTableCapabilityAtom,
   createInsertColumnsOperation,
   createInsertRowsOperation,
+  createTableSupportedAtom,
   cutClipboardAtom,
   dispatchToolbarFormatCommandAtom,
   filterSortEntrypointProjectionAtom,
@@ -40,8 +42,11 @@ import {
   reportCopyAsStatusAtom,
   retryFilterSortRefreshAtom,
   removeDuplicatesCapabilityAtom,
+  runCreateTableAtom,
   runPhysicalSortAtom,
   runStructureOperationAtom,
+  tableDiagnosticAtom,
+  lastCreatedTableNameAtom,
   unhideViewportSelectionAtom,
   runTextToColumnsEntrypointAtom,
   selectAllAtom,
@@ -95,6 +100,9 @@ export function SpreadsheetMenuBar(props: SpreadsheetMenuBarProps) {
   const pasteSpecialCapability = useAtomValue(pasteSpecialCapabilityAtom)
   const textToColumnsSupported = useAtomValue(textToColumnsSupportedAtom)
   const removeDuplicatesCapability = useAtomValue(removeDuplicatesCapabilityAtom)
+  const createTableSupported = useAtomValue(createTableSupportedAtom)
+  const tableDiagnostic = useAtomValue(tableDiagnosticAtom)
+  const lastCreatedTableName = useAtomValue(lastCreatedTableNameAtom)
   const filterSortEntrypoint = useAtomValue(filterSortEntrypointProjectionAtom)
   const textToColumnsEntrypoint = useAtomValue(textToColumnsEntrypointProjectionAtom)
   let rootRef: HTMLDivElement | undefined
@@ -102,6 +110,7 @@ export function SpreadsheetMenuBar(props: SpreadsheetMenuBarProps) {
   createEffect(() => {
     store.setter(captureFilterSortCapabilityAtom, backend)
     store.setter(captureRemoveDuplicatesCapabilityAtom, backend)
+    store.setter(captureTableCapabilityAtom, backend)
   })
 
   // Worker backends resolve their fail-closed runtime capability witness
@@ -117,6 +126,7 @@ export function SpreadsheetMenuBar(props: SpreadsheetMenuBarProps) {
       .then(() => {
         store.setter(captureFilterSortCapabilityAtom, backend)
         store.setter(captureRemoveDuplicatesCapabilityAtom, backend)
+        store.setter(captureTableCapabilityAtom, backend)
       })
       .catch(() => {})
   })
@@ -173,6 +183,8 @@ export function SpreadsheetMenuBar(props: SpreadsheetMenuBarProps) {
         return textToColumnsSupported()
       case 'removeRows':
         return removeDuplicatesCapability().canRead && removeDuplicatesCapability().canRemove
+      case 'createTable':
+        return createTableSupported()
       case 'insertRows':
         return backend.insertRows != null
       case 'insertColumns':
@@ -354,6 +366,21 @@ export function SpreadsheetMenuBar(props: SpreadsheetMenuBarProps) {
       }
       case 'open-remove-duplicates': {
         runRemoveDuplicatesEntrypoint()
+        return
+      }
+      case 'create-table': {
+        const snap = store.getter(selectionSnapshotAtom)
+        const sheetId = snap.activeCell.sheetId || getActiveSheetId() || ''
+        if (!sheetId) return
+        // Create over the current selection with an engine-auto name.
+        // Capability split + structured-reject mapping lives in
+        // `runCreateTableAtom`; the diagnostic surfaces via the status row.
+        void store.setter(runCreateTableAtom, {
+          source: backend,
+          sheetId,
+          range: snap.range,
+          refreshProjection: (target: string) => refreshVisibleProjection(store, backend, target),
+        })
         return
       }
       case 'open-format-cells': {
@@ -647,6 +674,28 @@ export function SpreadsheetMenuBar(props: SpreadsheetMenuBarProps) {
         >
           ↻
         </button>
+      </Show>
+      <Show when={lastCreatedTableName()}>
+        {(name) => (
+          <span
+            role="status"
+            data-testid="menu-bar-create-table-status"
+            data-table-name={name()}
+          >
+            {name()}
+          </span>
+        )}
+      </Show>
+      <Show when={tableDiagnostic()}>
+        {(diagnostic) => (
+          <span
+            role="status"
+            data-testid="menu-bar-create-table-error"
+            data-table-diagnostic-code={diagnostic().code}
+          >
+            {diagnostic().message}
+          </span>
+        )}
       </Show>
       <HelpOverlayDialog kind={helpOverlay()} onClose={() => store.setter(closeHelpOverlayAtom)} />
     </>

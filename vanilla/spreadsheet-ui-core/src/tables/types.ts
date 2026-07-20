@@ -154,3 +154,20 @@ export interface GetTableResult {
   revision?: number | string
   table: SpreadsheetTableDescriptor | null
 }
+
+/**
+ * Structural subset of `SpreadsheetBackend` the UI-core table commands
+ * consume. Declared here (rather than importing `SpreadsheetBackend`) to
+ * keep the tables module free of a back-edge into `backend/types` — the
+ * host passes its full backend, which satisfies this shape by structural
+ * typing. Every port is optional: a host whose engine has no table model
+ * omits them and the commands degrade (capability atom reads `false`).
+ */
+export interface TablesControllerPort {
+  createTable?(request: CreateTableRequest): Promise<CreateTableResult>
+  renameTable?(request: RenameTableRequest): Promise<TableMutationResult>
+  renameTableColumn?(request: RenameTableColumnRequest): Promise<TableMutationResult>
+  deleteTable?(request: DeleteTableRequest): Promise<TableMutationResult>
+  listTables?(request: ListTablesRequest): Promise<ListTablesResult>
+  getTable?(request: GetTableRequest): Promise<GetTableResult>
+}
