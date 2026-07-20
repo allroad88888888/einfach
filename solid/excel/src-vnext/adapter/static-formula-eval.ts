@@ -31,7 +31,34 @@ export type EvalResult =
 export interface EvalCellLookup {
   /** Returns the parsed cell (formula + displayValue) for the active sheet, or undefined. */
   get(row: number, col: number): DisplayCell | undefined
+  /**
+   * Resolve an Excel Table structured reference (`Table1[Col]`, `#special`,
+   * multi-column) to a concrete range — or a structured error — so the
+   * existing range machinery can aggregate over it (#32, design-excel-table
+   * §5.3). Optional: when omitted, any `Table[...]` token fails the tokenizer
+   * and the formula surfaces `#ERROR!` (an honest "not supported here", never
+   * a faked value). See `makeStructuredRefResolver` in static-backend.ts.
+   */
+  resolveStructuredRef?: StructuredRefResolver
 }
+
+/**
+ * Outcome of resolving one structured reference. `null` means the syntax is
+ * not resolvable in the single-sheet static evaluator (bare `[Col]`,
+ * `[@Col]`, `#This Row`, combined specs, cross-sheet) — the tokenizer treats
+ * it as a hard failure (`#ERROR!`) rather than inventing a value. An `error`
+ * result is a resolvable reference that legitimately evaluates to an Excel
+ * error (`#NAME?` unknown table, `#REF!` unknown column / missing totals row).
+ */
+export type StructuredRefResolution =
+  | { readonly kind: 'range'; readonly ref: RangeRef }
+  | { readonly kind: 'error'; readonly code: string }
+  | null
+
+export type StructuredRefResolver = (
+  tableName: string | null,
+  inner: string,
+) => StructuredRefResolution
 
 function columnLabelToIndex(label: string): number {
   let result = 0
@@ -51,7 +78,7 @@ function parseCellRef(token: string): { row: number; col: number } | null {
   return { row, col }
 }
 
-interface RangeRef {
+export interface RangeRef {
   rowStart: number
   rowEnd: number
   colStart: number
@@ -80,6 +107,7 @@ type Token =
   | { kind: 'func'; name: string }
   | { kind: 'op'; op: string }
   | { kind: 'cmp'; op: '=' | '<>' | '<' | '<=' | '>' | '>=' }
+  | { kind: 'error'; code: string }
   | { kind: 'lparen' }
   | { kind: 'rparen' }
   | { kind: 'comma' }
@@ -114,7 +142,43 @@ const BARE_LITERALS: Record<string, number> = {
   FALSE: 0,
 }
 
-function tokenize(input: string): Token[] | null {
+/**
+ * Scan a balanced `[...]` structured-reference suffix starting at
+ * `bracketIndex` (which must point at the opening `[`). Handles one level of
+ * nesting (`[[ColA]:[ColB]]`). Returns the table name preceding the bracket,
+ * the raw inner text, and the index just past the closing `]`; `null` on an
+ * unbalanced suffix.
+ */
+function scanStructuredRef(
+  input: string,
+  identStart: number,
+  bracketIndex: number,
+): { tableName: string; inner: string; endIndex: number } | null {
+  let depth = 0
+  let j = bracketIndex
+  for (; j < input.length; j += 1) {
+    const c = input[j]
+    if (c === '[') depth += 1
+    else if (c === ']') {
+      depth -= 1
+      if (depth === 0) {
+        j += 1
+        break
+      }
+    }
+  }
+  if (depth !== 0) return null
+  return {
+    tableName: input.slice(identStart, bracketIndex),
+    inner: input.slice(bracketIndex + 1, j - 1),
+    endIndex: j,
+  }
+}
+
+function tokenize(
+  input: string,
+  resolveStructuredRef?: StructuredRefResolver,
+): Token[] | null {
   const tokens: Token[] = []
   let i = 0
   while (i < input.length) {
@@ -206,6 +270,23 @@ function tokenize(input: string): Token[] | null {
         const range = parseRangeRef(input.slice(start, i))
         if (!range) return null
         tokens.push({ kind: 'range', ref: range })
+        continue
+      }
+      // Structured reference: IDENT '[' ... ']' (Excel Table, #32). The bare
+      // `[Col]`, `[@Col]`, `#This Row`, combined and cross-sheet variants are
+      // not resolvable in the single-sheet static evaluator — they fall
+      // through to an honest `#ERROR!` (via `null`) instead of a faked value.
+      if (input[i] === '[') {
+        const scanned = scanStructuredRef(input, start, i)
+        if (!scanned || !resolveStructuredRef) return null
+        const resolution = resolveStructuredRef(scanned.tableName, scanned.inner)
+        if (!resolution) return null
+        if (resolution.kind === 'range') {
+          tokens.push({ kind: 'range', ref: resolution.ref })
+        } else {
+          tokens.push({ kind: 'error', code: resolution.code })
+        }
+        i = scanned.endIndex
         continue
       }
       const text = input.slice(start, i).toUpperCase()
@@ -327,6 +408,12 @@ class Parser {
     if (tok.kind === 'string') {
       this.pos += 1
       return tok.value
+    }
+    if (tok.kind === 'error') {
+      // A resolvable structured reference that evaluates to an Excel error
+      // (`#NAME?` unknown table, `#REF!` unknown column / missing totals row).
+      this.pos += 1
+      return tok.code
     }
     if (tok.kind === 'lparen') {
       this.pos += 1
@@ -769,7 +856,7 @@ export function evaluateFormula(
   stack: Set<string> = new Set(),
 ): Value {
   const body = formula.startsWith('=') ? formula.slice(1) : formula
-  const tokens = tokenize(body)
+  const tokens = tokenize(body, lookup.resolveStructuredRef)
   if (!tokens) return '#ERROR!'
   const parser = new Parser(tokens, (row, col) => resolveCellValue(lookup, row, col, stack))
   return parser.parse()
@@ -812,4 +899,92 @@ export function formatEvalResult(result: Value): { display: string; isError: boo
     return { display: String(rounded), isError: false }
   }
   return { display: String(result), isError: false }
+}
+
+/**
+ * Structured-reference formula-text rewrite spec for a Table rename or a
+ * Table-column rename (#32, design-excel-table §4.3). `fromUpper` /
+ * `tableUpper` are uppercased match keys; `to` keeps its display casing.
+ */
+export type StructuredRefRewriteSpec =
+  | { readonly kind: 'rename-table'; readonly fromUpper: string; readonly to: string }
+  | {
+      readonly kind: 'rename-column'
+      readonly tableUpper: string
+      readonly fromUpper: string
+      readonly to: string
+    }
+
+function isRewriteIdentStart(ch: string): boolean {
+  return (ch >= 'A' && ch <= 'Z') || (ch >= 'a' && ch <= 'z')
+}
+
+function isRewriteIdentChar(ch: string): boolean {
+  return /[A-Za-z0-9$]/.test(ch)
+}
+
+/** Rewrite a column token inside a structured-ref's inner text. */
+function rewriteColumnInInner(inner: string, fromUpper: string, to: string): string {
+  if (inner.includes('[')) {
+    // Bracketed column segments (`[Col]`, `[[A]:[B]]`). `#special` and `@`
+    // segments never match a column key, so they pass through untouched.
+    return inner.replace(/\[([^[\]]*)\]/g, (match, seg: string) =>
+      seg.trim().toUpperCase() === fromUpper ? `[${to}]` : match,
+    )
+  }
+  const trimmed = inner.trim()
+  if (trimmed.startsWith('#') || trimmed.startsWith('@')) return inner
+  return trimmed.toUpperCase() === fromUpper ? to : inner
+}
+
+/**
+ * Rewrite `Table[...]` structured references in one formula string per `spec`
+ * (design-excel-table §4.3) — the static mirror of the engine's cross-sheet
+ * formula-text rewrite. String literals are copied verbatim so a Table name
+ * inside `"..."` is never touched. Only the bracket-form `Table[...]` is
+ * rewritten (the bare `Table` name is a cell-ref-shaped token the static
+ * tokenizer never treats as a Table).
+ */
+export function rewriteStructuredRefsInFormula(
+  formula: string,
+  spec: StructuredRefRewriteSpec,
+): string {
+  let out = ''
+  let i = 0
+  while (i < formula.length) {
+    const ch = formula[i]
+    if (ch === '"') {
+      const start = i
+      i += 1
+      while (i < formula.length && formula[i] !== '"') i += 1
+      if (i < formula.length) i += 1 // include the closing quote
+      out += formula.slice(start, i)
+      continue
+    }
+    if (isRewriteIdentStart(ch)) {
+      const start = i
+      i += 1
+      while (i < formula.length && isRewriteIdentChar(formula[i])) i += 1
+      const ident = formula.slice(start, i)
+      if (formula[i] === '[') {
+        const scanned = scanStructuredRef(formula, start, i)
+        if (scanned) {
+          if (spec.kind === 'rename-table' && ident.toUpperCase() === spec.fromUpper) {
+            out += `${spec.to}[${scanned.inner}]`
+          } else if (spec.kind === 'rename-column' && ident.toUpperCase() === spec.tableUpper) {
+            out += `${ident}[${rewriteColumnInInner(scanned.inner, spec.fromUpper, spec.to)}]`
+          } else {
+            out += formula.slice(start, scanned.endIndex)
+          }
+          i = scanned.endIndex
+          continue
+        }
+      }
+      out += ident
+      continue
+    }
+    out += ch
+    i += 1
+  }
+  return out
 }

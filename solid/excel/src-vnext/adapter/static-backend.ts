@@ -24,6 +24,19 @@ import type {
   RangeTsvExportRequest,
   RangeTsvExportResult,
   ClearRangeRequest,
+  CreateTableRequest,
+  CreateTableResult,
+  DeleteTableRequest,
+  GetTableRequest,
+  GetTableResult,
+  ListTablesRequest,
+  ListTablesResult,
+  RenameTableColumnRequest,
+  RenameTableRequest,
+  SpreadsheetTableDescriptor,
+  TableMutationRejectedResult,
+  TableMutationRejectionCode,
+  TableMutationResult,
   ReorderSheetRequest,
   RemoveConditionalFormatRuleRequest,
   ResolveDataEdgeRequest,
@@ -109,6 +122,7 @@ import {
   type RangeFormatLayer,
   getEffectiveFormat,
   buildFilterSortDisplayRows as buildFilterSortDisplayRowsShared,
+  ENGINE_BUILTIN_FORMULA_NAMES,
 } from '@einfach/spreadsheet-ui-core'
 import type {
   StaticProjectionRequest,
@@ -119,7 +133,16 @@ import type {
   StaticSpreadsheetSeedInput,
   StaticSpreadsheetSheetInput,
 } from './types'
-import { evaluateFormula, formatEvalResult, type EvalCellLookup } from './static-formula-eval'
+import {
+  evaluateFormula,
+  formatEvalResult,
+  rewriteStructuredRefsInFormula,
+  type EvalCellLookup,
+  type RangeRef,
+  type StructuredRefResolution,
+  type StructuredRefResolver,
+  type StructuredRefRewriteSpec,
+} from './static-formula-eval'
 import {
   applyPasteArithmetic,
   isPasteSourceBlank,
@@ -271,6 +294,29 @@ function sparseCellsToTsv(cells: SparseTsvCell[], range: CellRange): string {
   return rows.join('\n')
 }
 
+/**
+ * Bounded per-workbook Table cap (#32). Mirrors the engine `MAX_TABLES`
+ * and the UI-core `MAX_TABLE_CATALOG_ENTRIES` so all three layers agree on
+ * the ceiling.
+ */
+const MAX_STATIC_TABLES = 256
+
+/** One registered Excel Table in the static backend (mirror of the engine `TableEntry`). */
+interface StaticTableEntry {
+  /** Display-cased name the user supplied / the engine auto-generated. */
+  canonicalName: string
+  /** UI-core stable sheet id the Table is anchored to. */
+  sheetId: string
+  /** Normalized rectangle: header row + data rows (+ totals row when shown). */
+  range: CellRange
+  /** MVP invariant: always `true` (row 0 of the range is the header). */
+  hasHeaders: boolean
+  /** Whether a totals row is currently shown (MVP: always `false`). */
+  hasTotals: boolean
+  /** Column display names, left→right (index 0 == `range.colStart`). */
+  columns: string[]
+}
+
 interface StaticBackendState {
   cellsBySheet: Map<string, Map<string, DisplayCell>>
   cellFormatsBySheetId: Map<string, Map<string, SpreadsheetCellFormat>>
@@ -278,6 +324,17 @@ interface StaticBackendState {
   conditionalFormatRulesBySheetId: Map<string, ConditionalFormatRuleEntry[]>
   filterSortBySheetId: Map<string, FilterSortState>
   namedRanges: NamedRange[]
+  /**
+   * Excel Table registry (#32, design-excel-table §4). Workbook-level,
+   * keyed by the uppercased Table name (case-insensitive lookup;
+   * `canonicalName` keeps the display casing). The registry is the single
+   * source of truth for a Table's geometry — structured references resolve
+   * against it at eval time and `listTables` / `getTable` project it. Bounded
+   * to {@link MAX_STATIC_TABLES}. NOT captured by the undo delta (parity with
+   * the worker/engine: table-definition mutations are out of the undo
+   * timeline — design §11/§12).
+   */
+  tablesByKey: Map<string, StaticTableEntry>
   mergeRangesBySheetId: Map<string, CellRange[]>
   rowHeightsBySheetId: Map<string, Map<number, number>>
   colWidthsBySheetId: Map<string, Map<number, number>>
@@ -862,6 +919,7 @@ function buildState(
     conditionalFormatRulesBySheetId: new Map(),
     filterSortBySheetId: new Map(),
     namedRanges: [],
+    tablesByKey: new Map(),
     mergeRangesBySheetId,
     rowHeightsBySheetId: new Map(),
     colWidthsBySheetId: new Map(),
@@ -1513,6 +1571,7 @@ function buildProjectionResult(
     get(row: number, col: number) {
       return sheetCells.get(keyFor(row, col))
     },
+    resolveStructuredRef: makeStructuredRefResolver(state, request.sheetId),
   }
   const displayRows = buildFilterSortDisplayRows(sheetCells, lookup, filterSortState)
   const filterSortActive = displayRows !== null
@@ -2713,6 +2772,7 @@ function applyStaticRowsRemoval(
     if (hiddenRows) shiftHiddenIndexSet(hiddenRows, rowIndex, 1, -1)
     shiftMergeRanges(state, sheetId, 'row', rowIndex, 1, -1)
     shiftFreezeConfig(state, sheetId, 'row', rowIndex, 1, -1)
+    applyTableShift(state, sheetId, 'row', rowIndex, 1, -1)
   }
   if (hiddenRows?.size === 0) state.hiddenRowsBySheetId.delete(sheetId)
 
@@ -3276,6 +3336,7 @@ function applyStaticSortRange(
     get(row, col) {
       return sheetCells.get(keyFor(row, col))
     },
+    resolveStructuredRef: makeStructuredRefResolver(state, request.sheetId),
   }
   const keys = toResolvedSortKeys(request.keys)
   const plan = planPhysicalSort(
@@ -3343,6 +3404,422 @@ export function sparseCellsToRangeProjectionResult(
   revision?: ProjectionRevision,
 ): RangeProjectionResult {
   return buildProjectionResult(request, buildState(sparseCellsToCells(cells), revision ?? 0)) as RangeProjectionResult
+}
+
+// === Excel Table registry (design-excel-table.md §4-§5, parity #32) =========
+//
+// The static backend is an in-memory reference engine, so it owns the Table
+// registry directly (workbook-level, name-unique, structural-follow) and
+// resolves structured references at eval time. Cross-layer parity with the
+// engine `TableEntry` / `TableError` keeps the two backends interchangeable
+// behind the same UI-core command + capability contract.
+//
+// Structured-reference SUPPORT LEVEL (honest boundary — no faked values):
+//   - Resolved (as function args, e.g. `=SUM(Table1[Q1])`): `Table1[Col]`,
+//     `Table1[[ColA]:[ColB]]`, `Table1[#All|#Data|#Headers|#Totals]`.
+//   - Unknown table → `#NAME?`; unknown column / missing totals row / empty
+//     data region → `#REF!`.
+//   - NOT supported (fall to `#ERROR!`, never a faked value): bare `Table1`
+//     (the static tokenizer reads it as a cell ref), bare `[Col]`, `[@Col]` /
+//     `[#This Row]`, combined `[[#Data],[Col]]`, cross-sheet Table refs, and a
+//     standalone `=Table1[Col]` in value context (the static engine has no
+//     spill). See TODO(einfach-static-structured-refs).
+
+const TABLE_RESERVED_NAMES: ReadonlySet<string> = new Set(ENGINE_BUILTIN_FORMULA_NAMES)
+
+const GRID_MAX_COL = 16_383
+const GRID_MAX_ROW = 1_048_575
+
+function tableColumnLabelToIndex(label: string): number {
+  let result = 0
+  for (let i = 0; i < label.length; i += 1) {
+    result = result * 26 + (label.charCodeAt(i) - 64)
+  }
+  return result - 1
+}
+
+/**
+ * Is `name` an in-grid A1 cell reference (`AB12`)? Grid-bounded so an
+ * out-of-grid pseudo-ref like `Table1` (column `TABLE`, past `XFD`) is NOT
+ * treated as a cell reference — mirrors the engine `name_is_cell_ref_like`.
+ */
+function looksLikeCellRef(name: string): boolean {
+  const match = /^([A-Za-z]+)([0-9]+)$/.exec(name)
+  if (!match) return false
+  const col = tableColumnLabelToIndex(match[1].toUpperCase())
+  const row = Number(match[2]) - 1
+  return col >= 0 && col <= GRID_MAX_COL && row >= 0 && row <= GRID_MAX_ROW
+}
+
+function namedRangeKeyExists(state: StaticBackendState, key: string): boolean {
+  return state.namedRanges.some((entry) => entry.name.toUpperCase() === key)
+}
+
+/**
+ * Full Table name mutex (design §4.2). Returns a structured rejection code or
+ * `null` when the name is admissible. `excludeKey` is the uppercased key of a
+ * Table being renamed (so a case-only rename never collides with itself).
+ */
+function validateTableName(
+  state: StaticBackendState,
+  name: string,
+  excludeKey: string | null,
+): TableMutationRejectionCode | null {
+  if (name.length < 1 || name.length > 255 || !/^[A-Za-z_][A-Za-z0-9_]*$/.test(name)) {
+    return 'invalid-name'
+  }
+  const key = name.toUpperCase()
+  if (TABLE_RESERVED_NAMES.has(key)) return 'reserved-name'
+  if (looksLikeCellRef(name)) return 'name-like-cell-ref'
+  const collidesTable = excludeKey
+    ? key !== excludeKey && state.tablesByKey.has(key)
+    : state.tablesByKey.has(key)
+  if (collidesTable) return 'name-conflict'
+  // Shared workbook namespace with defined names (design §4.2).
+  if (namedRangeKeyExists(state, key)) return 'name-conflict'
+  return null
+}
+
+/** First free `Table1`, `Table2`, … not used by a Table or a defined name. */
+function nextAutoTableName(state: StaticBackendState): string {
+  let n = 1
+  for (;;) {
+    const candidate = `Table${n}`
+    const key = candidate.toUpperCase()
+    if (!state.tablesByKey.has(key) && !namedRangeKeyExists(state, key)) return candidate
+    n += 1
+  }
+}
+
+/** Next `ColumnN` not already present in `used` (uppercased keys). */
+function nextAutoColumnName(used: ReadonlySet<string>): string {
+  let n = 1
+  for (;;) {
+    const candidate = `Column${n}`
+    if (!used.has(candidate.toUpperCase())) return candidate
+    n += 1
+  }
+}
+
+function tableHeaderText(
+  state: StaticBackendState,
+  sheetId: string,
+  row: number,
+  col: number,
+): string {
+  const sheetCells = state.cellsBySheet.get(sheetId)
+  const cell = sheetCells?.get(keyFor(row, col))
+  if (!cell) return ''
+  if (cell.formula) {
+    const result = evaluateFormula(cell.formula, {
+      get: (r, c) => sheetCells?.get(keyFor(r, c)),
+      resolveStructuredRef: makeStructuredRefResolver(state, sheetId),
+    })
+    const formatted = formatEvalResult(result)
+    return formatted.isError ? '' : formatted.display
+  }
+  return cell.displayValue
+}
+
+/** Read the header row's cell text into column names, disambiguating blanks / duplicates. */
+function deriveTableColumnNames(
+  state: StaticBackendState,
+  sheetId: string,
+  range: CellRange,
+): string[] {
+  const headerRow = range.rowStart
+  const names: string[] = []
+  const used = new Set<string>()
+  for (let col = range.colStart; col <= range.colEnd; col += 1) {
+    const raw = tableHeaderText(state, sheetId, headerRow, col).trim()
+    const name = raw === '' || used.has(raw.toUpperCase()) ? nextAutoColumnName(used) : raw
+    used.add(name.toUpperCase())
+    names.push(name)
+  }
+  return names
+}
+
+function tableDescriptor(
+  state: StaticBackendState,
+  entry: StaticTableEntry,
+): SpreadsheetTableDescriptor {
+  const sheetIndex = state.sheets.findIndex((sheet) => sheet.id === entry.sheetId)
+  const sheet = sheetIndex >= 0 ? state.sheets[sheetIndex] : undefined
+  return {
+    name: entry.canonicalName,
+    sheetId: entry.sheetId,
+    sheetName: sheet?.name ?? '',
+    sheetIndex,
+    range: `${toA1(entry.range.rowStart, entry.range.colStart)}:${toA1(
+      entry.range.rowEnd,
+      entry.range.colEnd,
+    )}`,
+    hasHeaders: entry.hasHeaders,
+    hasTotals: entry.hasTotals,
+    columns: [...entry.columns],
+  }
+}
+
+function tableRejected(
+  state: StaticBackendState,
+  request: { requestId?: number; revision?: ProjectionRevision },
+  code: TableMutationRejectionCode,
+  message?: string,
+): TableMutationRejectedResult {
+  return {
+    kind: 'table-mutation-not-applied',
+    applied: false,
+    code,
+    ...(message ? { message } : {}),
+    requestId: request.requestId,
+    // A rejected mutation never bumps: echo the current (un-bumped) witness.
+    revision: request.revision ?? state.revision,
+  }
+}
+
+type StructuredInnerSpec =
+  | { readonly kind: 'area'; readonly area: 'all' | 'data' | 'headers' | 'totals' }
+  | { readonly kind: 'columns'; readonly from: string; readonly to: string }
+
+/** Parse the inner text of a `Table[inner]` reference, or `null` when unsupported. */
+function parseStructuredInner(inner: string): StructuredInnerSpec | null {
+  const trimmed = inner.trim()
+  if (trimmed === '') return null
+  if (trimmed.startsWith('#')) {
+    switch (trimmed.toUpperCase()) {
+      case '#ALL':
+        return { kind: 'area', area: 'all' }
+      case '#DATA':
+        return { kind: 'area', area: 'data' }
+      case '#HEADERS':
+        return { kind: 'area', area: 'headers' }
+      case '#TOTALS':
+        return { kind: 'area', area: 'totals' }
+      default:
+        return null // `#This Row` and friends are unsupported in static
+    }
+  }
+  if (trimmed.startsWith('@')) return null // this-row needs current-cell context
+  if (trimmed.includes(',')) return null // combined `[[#Data],[Col]]` unsupported
+  if (trimmed.includes('[')) {
+    const multi = /^\[([^[\]]*)\]\s*:\s*\[([^[\]]*)\]$/.exec(trimmed)
+    if (multi) return { kind: 'columns', from: multi[1].trim(), to: multi[2].trim() }
+    const single = /^\[([^[\]]*)\]$/.exec(trimmed)
+    if (single) {
+      const col = single[1].trim()
+      return { kind: 'columns', from: col, to: col }
+    }
+    return null
+  }
+  return { kind: 'columns', from: trimmed, to: trimmed }
+}
+
+function resolveStructuredRefForTable(
+  state: StaticBackendState,
+  sheetId: string,
+  tableName: string | null,
+  inner: string,
+): StructuredRefResolution {
+  if (!tableName) return null // bare `[Col]` needs current-table context
+  const entry = state.tablesByKey.get(tableName.toUpperCase())
+  if (!entry) return { kind: 'error', code: '#NAME?' }
+  // The static evaluator reads a single sheet, so a cross-sheet Table ref is
+  // an honest "not supported here" (→ `#ERROR!`), not a wrong value.
+  if (entry.sheetId !== sheetId) return null
+  const spec = parseStructuredInner(inner)
+  if (!spec) return null
+
+  const { range } = entry
+  const dataStart = range.rowStart + (entry.hasHeaders ? 1 : 0)
+  const dataEnd = range.rowEnd - (entry.hasTotals ? 1 : 0)
+  const asRange = (ref: RangeRef): StructuredRefResolution => ({ kind: 'range', ref })
+  const refError = (code: string): StructuredRefResolution => ({ kind: 'error', code })
+
+  if (spec.kind === 'area') {
+    switch (spec.area) {
+      case 'all':
+        return asRange({
+          rowStart: range.rowStart,
+          rowEnd: range.rowEnd,
+          colStart: range.colStart,
+          colEnd: range.colEnd,
+        })
+      case 'headers':
+        if (!entry.hasHeaders) return refError('#REF!')
+        return asRange({
+          rowStart: range.rowStart,
+          rowEnd: range.rowStart,
+          colStart: range.colStart,
+          colEnd: range.colEnd,
+        })
+      case 'totals':
+        if (!entry.hasTotals) return refError('#REF!')
+        return asRange({
+          rowStart: range.rowEnd,
+          rowEnd: range.rowEnd,
+          colStart: range.colStart,
+          colEnd: range.colEnd,
+        })
+      case 'data':
+        if (dataStart > dataEnd) return refError('#REF!')
+        return asRange({
+          rowStart: dataStart,
+          rowEnd: dataEnd,
+          colStart: range.colStart,
+          colEnd: range.colEnd,
+        })
+    }
+  }
+
+  const fromIdx = entry.columns.findIndex((c) => c.toLowerCase() === spec.from.toLowerCase())
+  const toIdx = entry.columns.findIndex((c) => c.toLowerCase() === spec.to.toLowerCase())
+  if (fromIdx < 0 || toIdx < 0) return refError('#REF!')
+  if (dataStart > dataEnd) return refError('#REF!')
+  return asRange({
+    rowStart: dataStart,
+    rowEnd: dataEnd,
+    colStart: range.colStart + Math.min(fromIdx, toIdx),
+    colEnd: range.colStart + Math.max(fromIdx, toIdx),
+  })
+}
+
+function makeStructuredRefResolver(
+  state: StaticBackendState,
+  sheetId: string,
+): StructuredRefResolver {
+  return (tableName, inner) => resolveStructuredRefForTable(state, sheetId, tableName, inner)
+}
+
+/** Shrink `[lo, hi]` by the deletion of `[d0, d1]`; `null` when fully deleted. */
+function shrinkTableInterval(
+  lo: number,
+  hi: number,
+  d0: number,
+  d1: number,
+): [number, number] | null {
+  if (d0 <= lo && hi <= d1) return null
+  const count = d1 - d0 + 1
+  const newLo = lo < d0 ? lo : lo > d1 ? lo - count : d0
+  const ovLo = Math.max(d0, lo)
+  const ovHi = Math.min(d1, hi)
+  const deleted = ovHi >= ovLo ? ovHi - ovLo + 1 : 0
+  const len = hi - lo + 1 - deleted
+  return [newLo, newLo + len - 1]
+}
+
+type TableRemap = 'keep' | 'delete' | { readonly range: CellRange; readonly columns: string[] }
+
+/**
+ * Follow one Table through a structural edit — the TS mirror of the engine
+ * `remap_table_geometry` §4.3 follow matrix. `direction` is `1` (insert) /
+ * `-1` (delete); `at` is the first affected row/column index.
+ */
+function remapTableGeometry(
+  range: CellRange,
+  columns: readonly string[],
+  axis: 'row' | 'column',
+  at: number,
+  count: number,
+  direction: 1 | -1,
+): TableRemap {
+  const { rowStart: sR, rowEnd: eR, colStart: sC, colEnd: eC } = range
+
+  if (axis === 'row') {
+    if (direction === 1) {
+      const nsR = sR >= at ? sR + count : sR
+      const neR = eR >= at ? eR + count : eR
+      if (nsR === sR && neR === eR) return 'keep'
+      return { range: { rowStart: nsR, rowEnd: neR, colStart: sC, colEnd: eC }, columns: [...columns] }
+    }
+    const d0 = at
+    const d1 = at + count - 1
+    if (d0 <= sR && sR <= d1) return 'delete' // header row swallowed → drop the Table
+    const shrunk = shrinkTableInterval(sR, eR, d0, d1)
+    if (!shrunk) return 'delete'
+    const [nsR, neR] = shrunk
+    if (nsR === sR && neR === eR) return 'keep'
+    return { range: { rowStart: nsR, rowEnd: neR, colStart: sC, colEnd: eC }, columns: [...columns] }
+  }
+
+  if (direction === 1) {
+    const nsC = sC >= at ? sC + count : sC
+    const neC = eC >= at ? eC + count : eC
+    const cols = [...columns]
+    // Widening (insert strictly inside the column span): splice auto-named columns.
+    if (sC < at && at <= eC) {
+      const idx = at - sC
+      const used = new Set(cols.map((c) => c.toUpperCase()))
+      for (let offset = 0; offset < count; offset += 1) {
+        const name = nextAutoColumnName(used)
+        used.add(name.toUpperCase())
+        cols.splice(idx + offset, 0, name)
+      }
+    }
+    if (nsC === sC && neC === eC && cols.length === columns.length) return 'keep'
+    return { range: { rowStart: sR, rowEnd: eR, colStart: nsC, colEnd: neC }, columns: cols }
+  }
+
+  const d0 = at
+  const d1 = at + count - 1
+  const shrunk = shrinkTableInterval(sC, eC, d0, d1)
+  if (!shrunk) return 'delete' // every column deleted
+  const [nsC, neC] = shrunk
+  const cols = [...columns]
+  const ovLo = Math.max(d0, sC)
+  const ovHi = Math.min(d1, eC)
+  if (ovHi >= ovLo) {
+    cols.splice(ovLo - sC, ovHi - ovLo + 1)
+  }
+  if (nsC === sC && neC === eC && cols.length === columns.length) return 'keep'
+  return { range: { rowStart: sR, rowEnd: eR, colStart: nsC, colEnd: neC }, columns: cols }
+}
+
+/**
+ * Follow every Table anchored to `sheetId` through a structural edit. Runs
+ * inside the existing structural-op handlers, after the cell/format/dimension
+ * shifts. NOT recorded in the undo delta — the same known gap as the worker
+ * (design §11/§12): undoing a structural op restores cells but not the Table
+ * geometry drift.
+ */
+function applyTableShift(
+  state: StaticBackendState,
+  sheetId: string,
+  axis: 'row' | 'column',
+  at: number,
+  count: number,
+  direction: 1 | -1,
+): void {
+  if (state.tablesByKey.size === 0) return
+  for (const [key, entry] of [...state.tablesByKey]) {
+    if (entry.sheetId !== sheetId) continue
+    const outcome = remapTableGeometry(entry.range, entry.columns, axis, at, count, direction)
+    if (outcome === 'keep') continue
+    if (outcome === 'delete') {
+      state.tablesByKey.delete(key)
+      continue
+    }
+    entry.range = outcome.range
+    entry.columns = outcome.columns
+  }
+}
+
+/** Rewrite `Table[...]` structured references across every sheet's formulas. */
+function rewriteTableRefsAcrossWorkbook(
+  state: StaticBackendState,
+  spec: StructuredRefRewriteSpec,
+): void {
+  for (const cells of state.cellsBySheet.values()) {
+    for (const cell of cells.values()) {
+      if (cell.formula === undefined) continue
+      const next = rewriteStructuredRefsInFormula(cell.formula, spec)
+      if (next !== cell.formula) {
+        cell.formula = next
+        // The projection re-derives the display at read time; keep the parked
+        // placeholder in sync so a pre-projection read shows the new text.
+        cell.displayValue = next
+      }
+    }
+  }
 }
 
 export interface StaticSpreadsheetBackend extends SpreadsheetBackend {
@@ -3589,6 +4066,7 @@ export function createStaticSpreadsheetBackend(
       if (hiddenRows) shiftHiddenIndexSet(hiddenRows, request.rowIndex, request.count, 1)
       shiftMergeRanges(state, request.sheetId, 'row', request.rowIndex, request.count, 1)
       shiftFreezeConfig(state, request.sheetId, 'row', request.rowIndex, request.count, 1)
+      applyTableShift(state, request.sheetId, 'row', request.rowIndex, request.count, 1)
       state.revision = bumpRevision(state.revision)
       return structuralMutationResult(request, state.revision)
     },
@@ -3616,6 +4094,7 @@ export function createStaticSpreadsheetBackend(
       }
       shiftMergeRanges(state, request.sheetId, 'row', request.rowIndex, request.count, -1)
       shiftFreezeConfig(state, request.sheetId, 'row', request.rowIndex, request.count, -1)
+      applyTableShift(state, request.sheetId, 'row', request.rowIndex, request.count, -1)
       state.revision = bumpRevision(state.revision)
       return structuralMutationResult(request, state.revision)
     },
@@ -3640,6 +4119,7 @@ export function createStaticSpreadsheetBackend(
       if (hiddenCols) shiftHiddenIndexSet(hiddenCols, request.colIndex, request.count, 1)
       shiftMergeRanges(state, request.sheetId, 'column', request.colIndex, request.count, 1)
       shiftFreezeConfig(state, request.sheetId, 'column', request.colIndex, request.count, 1)
+      applyTableShift(state, request.sheetId, 'column', request.colIndex, request.count, 1)
       state.revision = bumpRevision(state.revision)
       return structuralMutationResult(request, state.revision)
     },
@@ -3667,6 +4147,7 @@ export function createStaticSpreadsheetBackend(
       }
       shiftMergeRanges(state, request.sheetId, 'column', request.colIndex, request.count, -1)
       shiftFreezeConfig(state, request.sheetId, 'column', request.colIndex, request.count, -1)
+      applyTableShift(state, request.sheetId, 'column', request.colIndex, request.count, -1)
       state.revision = bumpRevision(state.revision)
       return structuralMutationResult(request, state.revision)
     },
@@ -4350,6 +4831,11 @@ export function createStaticSpreadsheetBackend(
       state.hiddenRowsBySheetId.delete(request.sheetId)
       state.hiddenColsBySheetId.delete(request.sheetId)
       state.freezeBySheetId.delete(request.sheetId)
+      // Drop every Table anchored to the deleted sheet (design §4.4). Not
+      // captured by the undo delta — the registry is outside the timeline.
+      for (const [tableKey, tableEntry] of [...state.tablesByKey]) {
+        if (tableEntry.sheetId === request.sheetId) state.tablesByKey.delete(tableKey)
+      }
       state.revision = bumpRevision(state.revision)
       const activeSheetId = state.sheets[Math.min(deleteIndex, state.sheets.length - 1)]?.id ?? null
 
@@ -4414,6 +4900,155 @@ export function createStaticSpreadsheetBackend(
         transactionId: request.transactionId,
         requestId: request.requestId,
         revision: state.revision,
+      }
+    },
+    // --- Excel Table CRUD (design-excel-table.md §4/§10, parity #32) -------
+    //
+    // The static backend owns the Table registry directly. These six ports
+    // present the Table geometry canonically; UI core stores no second copy.
+    // Structured rejections (name conflict / range overlap / cap 256 / …)
+    // resolve as `TableMutationRejectedResult` rather than throwing.
+    //
+    // TODO(#32 undo, design §11/§12): table-definition mutations are NOT
+    // wrapped in an undo transaction — the undo delta does not carry the
+    // registry, so a Ctrl+Z cannot replay create / rename / delete of the
+    // Table itself. Create / rename / delete bump the revision so the next
+    // projection reflects any referencing-formula recompute.
+    async createTable(request: CreateTableRequest): Promise<CreateTableResult> {
+      if (!state.sheets.some((sheet) => sheet.id === request.sheetId)) {
+        return tableRejected(state, request, 'sheet-not-found')
+      }
+      const range = normalizeRange(request.range)
+      for (const entry of state.tablesByKey.values()) {
+        if (entry.sheetId === request.sheetId && rangesIntersect(entry.range, range)) {
+          return tableRejected(state, request, 'range-overlap')
+        }
+      }
+      // Cap check before name resolution so a rejected 257th table never
+      // perturbs the auto-name counter (design §4.1).
+      if (state.tablesByKey.size >= MAX_STATIC_TABLES) {
+        return tableRejected(state, request, 'too-many-tables')
+      }
+
+      let canonicalName: string
+      if (typeof request.name === 'string' && request.name.trim().length > 0) {
+        const proposed = request.name.trim()
+        const code = validateTableName(state, proposed, null)
+        if (code) return tableRejected(state, request, code)
+        canonicalName = proposed
+      } else {
+        canonicalName = nextAutoTableName(state)
+      }
+
+      const columns = deriveTableColumnNames(state, request.sheetId, range)
+      state.tablesByKey.set(canonicalName.toUpperCase(), {
+        canonicalName,
+        sheetId: request.sheetId,
+        range: cloneRange(range),
+        hasHeaders: true,
+        hasTotals: false,
+        columns,
+      })
+      state.revision = bumpRevision(state.revision)
+      return {
+        kind: 'create-table',
+        applied: true,
+        name: canonicalName,
+        requestId: request.requestId,
+        revision: request.revision ?? state.revision,
+      }
+    },
+    async renameTable(request: RenameTableRequest): Promise<TableMutationResult> {
+      const oldKey = request.name.toUpperCase()
+      const entry = state.tablesByKey.get(oldKey)
+      if (!entry) return tableRejected(state, request, 'not-found')
+      const newName = request.newName.trim()
+      const code = validateTableName(state, newName, oldKey)
+      if (code) return tableRejected(state, request, code)
+
+      entry.canonicalName = newName
+      state.tablesByKey.delete(oldKey)
+      state.tablesByKey.set(newName.toUpperCase(), entry)
+      // Rewrite `OldName[...]` → `NewName[...]` across every sheet so existing
+      // structured references keep resolving (design §4.3).
+      rewriteTableRefsAcrossWorkbook(state, { kind: 'rename-table', fromUpper: oldKey, to: newName })
+      state.revision = bumpRevision(state.revision)
+      return {
+        kind: 'table-mutation',
+        applied: true,
+        name: newName,
+        requestId: request.requestId,
+        revision: request.revision ?? state.revision,
+      }
+    },
+    async renameTableColumn(
+      request: RenameTableColumnRequest,
+    ): Promise<TableMutationResult> {
+      if (request.newColumn.trim().length === 0) {
+        return tableRejected(state, request, 'invalid-column-name')
+      }
+      const key = request.name.toUpperCase()
+      const entry = state.tablesByKey.get(key)
+      if (!entry) return tableRejected(state, request, 'not-found')
+      const idx = entry.columns.findIndex(
+        (c) => c.toLowerCase() === request.oldColumn.toLowerCase(),
+      )
+      if (idx < 0) return tableRejected(state, request, 'column-not-found')
+      if (
+        entry.columns.some(
+          (c, i) => i !== idx && c.toLowerCase() === request.newColumn.toLowerCase(),
+        )
+      ) {
+        return tableRejected(state, request, 'duplicate-column')
+      }
+      const oldColumn = entry.columns[idx]
+      entry.columns[idx] = request.newColumn
+      rewriteTableRefsAcrossWorkbook(state, {
+        kind: 'rename-column',
+        tableUpper: key,
+        fromUpper: oldColumn.toUpperCase(),
+        to: request.newColumn,
+      })
+      state.revision = bumpRevision(state.revision)
+      return {
+        kind: 'table-mutation',
+        applied: true,
+        name: entry.canonicalName,
+        requestId: request.requestId,
+        revision: request.revision ?? state.revision,
+      }
+    },
+    async deleteTable(request: DeleteTableRequest): Promise<TableMutationResult> {
+      // "Convert to range": remove the registry entry only; cell values,
+      // formulas, and formats are left in place (design §4.1).
+      if (!state.tablesByKey.delete(request.name.toUpperCase())) {
+        return tableRejected(state, request, 'not-found')
+      }
+      state.revision = bumpRevision(state.revision)
+      return {
+        kind: 'table-mutation',
+        applied: true,
+        name: request.name,
+        requestId: request.requestId,
+        revision: request.revision ?? state.revision,
+      }
+    },
+    async listTables(request: ListTablesRequest): Promise<ListTablesResult> {
+      const tables = [...state.tablesByKey.entries()]
+        .sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0))
+        .map(([, entry]) => tableDescriptor(state, entry))
+      return {
+        requestId: request.requestId,
+        revision: request.revision ?? state.revision,
+        tables,
+      }
+    },
+    async getTable(request: GetTableRequest): Promise<GetTableResult> {
+      const entry = state.tablesByKey.get(request.name.toUpperCase())
+      return {
+        requestId: request.requestId,
+        revision: request.revision ?? state.revision,
+        table: entry ? tableDescriptor(state, entry) : null,
       }
     },
   }
