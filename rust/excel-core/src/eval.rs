@@ -1,5 +1,6 @@
 use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet};
+use std::rc::Rc;
 use std::sync::Arc;
 
 use einfach_core::{ArrayData, AtomId, LambdaValue, Value, ValueError};
@@ -952,6 +953,24 @@ pub trait EvalProvider {
     /// in T3 — cell-CONTENT edges already register through the facade reads
     /// the resolved range performs, so ordinary recalculation is unaffected.
     fn lookup_table(&self, _name: Option<&str>) -> Option<ResolvedTable> {
+        None
+    }
+
+    /// Host-pushed per-sheet hidden-row set consumed by SUBTOTAL 101-111
+    /// (design doc #32 §6, CANONICAL_OWNERSHIP §7-1). `sheet_index` is the
+    /// sheet OWNING the aggregated cells — cross-sheet refs pass the
+    /// *referenced* sheet's index so each argument excludes its own sheet's
+    /// hidden rows. Returns `None` when the host pushed no hidden rows for
+    /// that sheet (or `sheet_index` is `None`). The engine never models
+    /// hidden state or infers its source (manual vs filter); this is pure
+    /// read-only evaluation input.
+    ///
+    /// Workbook-backed live providers do a *tracked* read of the
+    /// `hidden_epoch` atom inside this method, so a `set_eval_hidden_rows`
+    /// push precisely re-derives the 101-111 formulas that consumed it.
+    /// Function numbers 1-11 never call this, hold no such edge, and are
+    /// therefore left undisturbed by a hidden-set change.
+    fn hidden_rows(&self, _sheet_index: Option<usize>) -> Option<Rc<HashSet<u32>>> {
         None
     }
 
@@ -19643,10 +19662,69 @@ fn stat_phi(args: &[Expr], provider: &dyn EvalProvider) -> Value {
     stat_finite((-0.5 * x * x).exp() / two_pi.sqrt())
 }
 
+/// Hidden-row set a single SUBTOTAL 101-111 data argument must exclude
+/// (design doc #32 §6.2). Resolves the argument's referenced sheet ONCE:
+/// a cross-sheet ref (`Sheet2!A1:A10`, a cross-sheet `Table`) consults the
+/// referenced sheet's set; a bare ref consults the current sheet. `None`
+/// for 1-11 (`ignore_hidden == false`, never filters) or when the host
+/// pushed no hidden rows for that sheet. Registering the arg's sheet edge
+/// only in the 101-111 branch is what keeps 1-11 formulas from holding a
+/// hidden dependency and thus undisturbed by a hidden-set change.
+fn subtotal_hidden_for_arg(
+    arg: &Expr,
+    provider: &dyn EvalProvider,
+    ignore_hidden: bool,
+) -> Option<Rc<HashSet<u32>>> {
+    if !ignore_hidden {
+        return None;
+    }
+    let sheet_index = match runtime_ref_from_expr(arg, provider) {
+        Ok(r) => match r.sheet {
+            Some(name) => provider.sheet_index_of(&name),
+            None => provider.current_sheet_index(),
+        },
+        // A scalar / literal arg has no cell rows to hide — fall back to the
+        // current sheet; `for_each_arg_value` yields `addr == None` for it so
+        // no row is ever filtered regardless.
+        Err(_) => provider.current_sheet_index(),
+    };
+    provider.hidden_rows(sheet_index)
+}
+
+/// Stream one SUBTOTAL data argument through `for_each_arg_value`, dropping
+/// any cell whose row is in `hidden` (the 101-111 exclusion). Delegates to
+/// the shared streaming path so materialization / cross-sheet / spill
+/// semantics stay byte-for-byte identical to 1-11; only the row filter is
+/// layered on top. The callback is value-only because every SUBTOTAL
+/// accumulator ignores the address.
+fn for_each_subtotal_value(
+    arg: &Expr,
+    provider: &dyn EvalProvider,
+    hidden: Option<&Rc<HashSet<u32>>>,
+    f: &mut dyn FnMut(Value),
+) {
+    for_each_arg_value(arg, provider, &mut |addr, v| {
+        if let (Some(hidden), Some(addr)) = (hidden, addr) {
+            if hidden.contains(&addr.row) {
+                return;
+            }
+        }
+        f(v);
+    });
+}
+
 /// Shared body for SUBTOTAL function_num ∈ 1..=11. Walks every
-/// `data_args` element via `for_each_arg_value` so streaming numeric
-/// accumulators match the standalone SUM/AVERAGE/etc. arms.
-fn run_subtotal(fn_num: u32, data_args: &[Expr], provider: &dyn EvalProvider) -> Value {
+/// `data_args` element via `for_each_subtotal_value` so streaming numeric
+/// accumulators match the standalone SUM/AVERAGE/etc. arms. When
+/// `ignore_hidden` (the caller normalized a 101-111 function number), each
+/// argument additionally excludes its sheet's host-pushed hidden rows
+/// (design doc #32 §6); 1-11 pass `false` and behave exactly as before.
+fn run_subtotal(
+    fn_num: u32,
+    data_args: &[Expr],
+    provider: &dyn EvalProvider,
+    ignore_hidden: bool,
+) -> Value {
     match fn_num {
         // 1: AVERAGE
         1 => {
@@ -19657,7 +19735,8 @@ fn run_subtotal(fn_num: u32, data_args: &[Expr], provider: &dyn EvalProvider) ->
                 if err.is_some() {
                     break;
                 }
-                for_each_arg_value(arg, provider, &mut |_addr, v| {
+                let hidden = subtotal_hidden_for_arg(arg, provider, ignore_hidden);
+                for_each_subtotal_value(arg, provider, hidden.as_ref(), &mut |v| {
                     if err.is_some() {
                         return;
                     }
@@ -19683,7 +19762,8 @@ fn run_subtotal(fn_num: u32, data_args: &[Expr], provider: &dyn EvalProvider) ->
         2 => {
             let mut count = 0u64;
             for arg in data_args {
-                for_each_arg_value(arg, provider, &mut |_addr, v| {
+                let hidden = subtotal_hidden_for_arg(arg, provider, ignore_hidden);
+                for_each_subtotal_value(arg, provider, hidden.as_ref(), &mut |v| {
                     if matches!(v, Value::Number(_)) {
                         count += 1;
                     }
@@ -19695,7 +19775,8 @@ fn run_subtotal(fn_num: u32, data_args: &[Expr], provider: &dyn EvalProvider) ->
         3 => {
             let mut count = 0u64;
             for arg in data_args {
-                for_each_arg_value(arg, provider, &mut |_addr, v| {
+                let hidden = subtotal_hidden_for_arg(arg, provider, ignore_hidden);
+                for_each_subtotal_value(arg, provider, hidden.as_ref(), &mut |v| {
                     if !matches!(v, Value::Null) {
                         count += 1;
                     }
@@ -19711,7 +19792,8 @@ fn run_subtotal(fn_num: u32, data_args: &[Expr], provider: &dyn EvalProvider) ->
                 if err.is_some() {
                     break;
                 }
-                for_each_arg_value(arg, provider, &mut |_addr, v| {
+                let hidden = subtotal_hidden_for_arg(arg, provider, ignore_hidden);
+                for_each_subtotal_value(arg, provider, hidden.as_ref(), &mut |v| {
                     if err.is_some() {
                         return;
                     }
@@ -19737,7 +19819,8 @@ fn run_subtotal(fn_num: u32, data_args: &[Expr], provider: &dyn EvalProvider) ->
                 if err.is_some() {
                     break;
                 }
-                for_each_arg_value(arg, provider, &mut |_addr, v| {
+                let hidden = subtotal_hidden_for_arg(arg, provider, ignore_hidden);
+                for_each_subtotal_value(arg, provider, hidden.as_ref(), &mut |v| {
                     if err.is_some() {
                         return;
                     }
@@ -19764,7 +19847,8 @@ fn run_subtotal(fn_num: u32, data_args: &[Expr], provider: &dyn EvalProvider) ->
                 if err.is_some() {
                     break;
                 }
-                for_each_arg_value(arg, provider, &mut |_addr, v| {
+                let hidden = subtotal_hidden_for_arg(arg, provider, ignore_hidden);
+                for_each_subtotal_value(arg, provider, hidden.as_ref(), &mut |v| {
                     if err.is_some() {
                         return;
                     }
@@ -19788,7 +19872,18 @@ fn run_subtotal(fn_num: u32, data_args: &[Expr], provider: &dyn EvalProvider) ->
         }
         // 7: STDEV / 8: STDEVP / 10: VAR / 11: VARP
         7 | 8 | 10 | 11 => {
-            let nums = collect_numbers(data_args, provider);
+            // Inline the numeric collection (rather than `collect_numbers`) so
+            // the 101-111 hidden-row exclusion layers onto the same streaming
+            // path; 1-11 pass `ignore_hidden == false` and collect everything.
+            let mut nums = Vec::new();
+            for arg in data_args {
+                let hidden = subtotal_hidden_for_arg(arg, provider, ignore_hidden);
+                for_each_subtotal_value(arg, provider, hidden.as_ref(), &mut |v| {
+                    if let Value::Number(n) = v {
+                        nums.push(n);
+                    }
+                });
+            }
             let is_sample = matches!(fn_num, 7 | 10);
             let min_n = if is_sample { 2 } else { 1 };
             if nums.len() < min_n {
@@ -19812,7 +19907,8 @@ fn run_subtotal(fn_num: u32, data_args: &[Expr], provider: &dyn EvalProvider) ->
                 if err.is_some() {
                     break;
                 }
-                for_each_arg_value(arg, provider, &mut |_addr, v| {
+                let hidden = subtotal_hidden_for_arg(arg, provider, ignore_hidden);
+                for_each_subtotal_value(arg, provider, hidden.as_ref(), &mut |v| {
                     if err.is_some() {
                         return;
                     }
@@ -19849,14 +19945,18 @@ fn fn_subtotal(args: &[Expr], provider: &dyn EvalProvider) -> Value {
         return Value::Error(ValueError::InvalidValue);
     }
     let fn_int = fn_raw.trunc() as i64;
-    let fn_norm = if (1..=11).contains(&fn_int) {
-        fn_int as u32
+    // 1-11 aggregate every referenced cell; 101-111 share the same
+    // accumulators but exclude the host-pushed hidden rows of each argument's
+    // sheet (design doc #32 §6). The engine reads that hidden set purely as
+    // evaluation input — it models no hidden state of its own.
+    let (fn_norm, ignore_hidden) = if (1..=11).contains(&fn_int) {
+        (fn_int as u32, false)
     } else if (101..=111).contains(&fn_int) {
-        (fn_int - 100) as u32
+        ((fn_int - 100) as u32, true)
     } else {
         return Value::Error(ValueError::InvalidValue);
     };
-    run_subtotal(fn_norm, &args[1..], provider)
+    run_subtotal(fn_norm, &args[1..], provider, ignore_hidden)
 }
 
 /// AGGREGATE(function_num, options, ref1, [ref2…]).
@@ -19927,7 +20027,13 @@ fn fn_aggregate(args: &[Expr], provider: &dyn EvalProvider) -> Value {
     match fn_int {
         1..=11 => {
             if !ignore_errors {
-                return run_subtotal(fn_int as u32, data_args, provider);
+                // AGGREGATE's ignore-hidden lives in its `options` bit
+                // (1/3/5/7), NOT the 100+ SUBTOTAL convention — so hidden
+                // exclusion stays off here (`ignore_hidden = false`).
+                // TODO(#32 §6.3): options 1/3/5/7 can reuse the SUBTOTAL
+                // `subtotal_hidden_for_arg` seam; explicitly out of the T4
+                // acceptance scope (design §3.2).
+                return run_subtotal(fn_int as u32, data_args, provider, false);
             }
             let nums = match collect_nums_skip_errors(data_args) {
                 Ok(v) => v,

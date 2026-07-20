@@ -2370,6 +2370,18 @@ impl WasmWorkbook {
         }
     }
 
+    /// Push the host's per-sheet hidden-row set as read-only SUBTOTAL 101-111
+    /// evaluation input (design doc #32 §6, CANONICAL_OWNERSHIP §7-1). `rows`
+    /// is a `number[]` of 0-based hidden row indices; full-replace semantics
+    /// (an empty array clears the sheet's set). The engine models no hidden
+    /// state — it consumes this purely as evaluation input, and the paired
+    /// epoch bump re-derives only the 101-111 formulas that read it.
+    #[wasm_bindgen(js_name = "setEvalHiddenRows")]
+    pub fn set_eval_hidden_rows(&mut self, sheet_idx: u32, rows: Vec<u32>) {
+        self.workbook
+            .set_eval_hidden_rows(sheet_idx as usize, &rows);
+    }
+
     pub fn clear_cell(&mut self, sheet_idx: u32, addr: &str) {
         self.workbook.clear_cell(sheet_idx as usize, addr);
     }

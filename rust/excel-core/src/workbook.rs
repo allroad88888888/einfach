@@ -1947,6 +1947,29 @@ impl Workbook {
         self.tables.len()
     }
 
+    /// Push the host's per-sheet hidden-row set as read-only evaluation input
+    /// for SUBTOTAL 101-111 (design doc #32 §6, CANONICAL_OWNERSHIP §7-1).
+    ///
+    /// The engine models NO hidden state and never infers the source (manual
+    /// hide vs filter — the host merges them into one set). Semantics are
+    /// full-replace (idempotent whole-set push): `rows` becomes the complete
+    /// hidden set for `sheet_index`; an empty slice clears it. The paired
+    /// `hidden_epoch` bump re-derives precisely the 101-111 formulas that
+    /// consumed the referenced sheet's set, leaving 1-11 and every unrelated
+    /// formula undisturbed.
+    ///
+    /// No-op when `sheet_index` is out of range, or during a host
+    /// custom-formula callback (a `store.set` there would mutate the
+    /// dependency graph mid-derivation, exactly what the re-entrancy guard
+    /// forbids for every other mutation entry point).
+    pub fn set_eval_hidden_rows(&mut self, sheet_index: usize, rows: &[u32]) {
+        if self.is_inside_custom_call() || sheet_index >= self.sheets.len() {
+            return;
+        }
+        let set: HashSet<u32> = rows.iter().copied().collect();
+        self.atom_context.set_eval_hidden_rows(sheet_index, set);
+    }
+
     /// Current value of the Table invalidation broadcast counter (design
     /// doc §8 seam). Bumped by every registry mutation. T3 additionally
     /// pushes each bump into the per-sheet `tables_epoch` Store atom so
@@ -2781,6 +2804,14 @@ impl<'a> EvalProvider for WorkbookEvalProvider<'a> {
 
     fn sheet_index_of(&self, name: &str) -> Option<usize> {
         self.wb.by_name.get(name).copied()
+    }
+
+    fn hidden_rows(&self, sheet_index: Option<usize>) -> Option<Rc<HashSet<u32>>> {
+        // Eager provider (define_name / non-formula get_cell eval): read the
+        // host-pushed hidden set untracked (this path holds no reactive edge,
+        // design doc #32 §6.2). The live formula-inner path is
+        // `AtomFormulaProvider::hidden_rows`.
+        self.wb.atom_context.hidden_rows_untracked(sheet_index?)
     }
 
     fn sheet_count(&self) -> usize {
