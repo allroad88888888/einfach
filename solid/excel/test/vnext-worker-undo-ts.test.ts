@@ -20,7 +20,7 @@
  *    undone cell, and redo re-converges (Wave 8.2 interplay).
  */
 
-import { describe, expect, test } from '@jest/globals'
+import { afterEach, describe, expect, test } from '@jest/globals'
 import { createStore } from '@einfach/core'
 import {
   HISTORY_NOT_APPLIED_ERROR,
@@ -46,6 +46,15 @@ import { createWorkerWorkbookSpreadsheetBackend } from '../src-vnext/adapter'
 import type { WorkerLike, WorkerWorkbookSpreadsheetBackend } from '../src-vnext/adapter'
 
 const SHEET = 'sheet-1'
+
+// The async-custom-formula test parks a gate promise on globalThis so the
+// worker-local callback can await it. Delete it unconditionally after every
+// test — an assertion throw mid-test must not strand a resolved-promise
+// global into a later test's process (exception-safe cleanup).
+const UNDO_ASYNC_LATCH_KEY = '__einfachUndoTestLatch'
+afterEach(() => {
+  delete (globalThis as Record<string, unknown>)[UNDO_ASYNC_LATCH_KEY]
+})
 
 /** Duplex in-process worker over the real TS runtime (failclosed-suite shape). */
 function createInProcessTsWorker(): { worker: WorkerLike; runtime: ExcelCoreTsWorkerRuntime } {
@@ -494,7 +503,7 @@ describe('worker adapter host-orchestrated undo — TS runtime, real in-process 
       return { promise, resolve: release }
     }
     const latch = makeLatch()
-    ;(globalThis as Record<string, unknown>).__einfachUndoTestLatch = latch.promise
+    ;(globalThis as Record<string, unknown>)[UNDO_ASYNC_LATCH_KEY] = latch.promise
 
     await backend.registerCustomFormula!(
       'SLOWX10',
@@ -529,7 +538,6 @@ describe('worker adapter host-orchestrated undo — TS runtime, real in-process 
       display = await settle()
     }
     expect(display).toBe('50')
-    delete (globalThis as Record<string, unknown>).__einfachUndoTestLatch
     backend.dispose()
   })
 })
