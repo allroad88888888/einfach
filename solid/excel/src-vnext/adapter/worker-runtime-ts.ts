@@ -123,6 +123,12 @@ export const TS_WORKER_RUNTIME_CAPABILITIES: WorkerRuntimeCapabilitiesWire = Obj
   // "does not exclude" on the TS backend (acceptable — TS SUBTOTAL never
   // excluded hidden rows).
   evalHiddenRows: false,
+  // The TS core has no FILTER-hidden eval input either
+  // (`design-filter-hidden-rows` §6.5, tier 3). Declaring `false` withholds
+  // the push entirely, so on this runtime SUBTOTAL 1-11 and 101-111 both keep
+  // today's behaviour (neither excludes filtered-out rows) instead of the
+  // adapter believing a push landed. Fail-closed, never a fake ACK.
+  evalFilterHiddenRows: false,
   // The TS core (`@einfach/excel-core-ts`) has no Excel Table registry —
   // no structured-reference parser, no table geometry. Declaring `false`
   // withholds the six table CRUD ports (fail-closed); WASM is the only
@@ -1512,6 +1518,13 @@ export function createWorkerRuntimeTs(events?: WorkerRuntimeTsEvents): ExcelCore
         // the host port, so a compliant adapter never sends this; if one
         // does, refuse honestly rather than fake an ACK.
         return unsupported('setEvalHiddenRows (engine hidden-row eval input)')
+      case 'setEvalFilterHiddenRows':
+        // Fail-closed twin: no FILTER-hidden eval input either. A fake ACK
+        // here would be worse than for its manual sibling — the adapter would
+        // believe SUBTOTAL 1-11 now excludes filtered-out rows and stop
+        // reporting the degradation, so the honest refusal is what keeps the
+        // three-tier contract (`design-filter-hidden-rows` §6.5) truthful.
+        return unsupported('setEvalFilterHiddenRows (engine filter-hidden eval input)')
       case 'createTable':
       case 'renameTable':
       case 'renameTableColumn':

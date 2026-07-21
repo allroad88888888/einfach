@@ -379,6 +379,17 @@ export interface WorkerRuntimeCapabilitiesWire {
    */
   evalHiddenRows: boolean
   /**
+   * setEvalFilterHiddenRows really pushes the FILTER-hidden row set the
+   * engine's SUBTOTAL 1-11 AND 101-111 variants consume
+   * (`design-filter-hidden-rows` §6.5). Additive twin of `evalHiddenRows`,
+   * declared separately because the two sets are independently addressable —
+   * a runtime can have one without the other. The TS runtime has neither and
+   * declares this `false`; the WASM runtime's null witness keeps the family
+   * trusted (and a wasm-pkg predating the export degrades at dispatch, see
+   * `setEvalFilterHiddenRows` on the client).
+   */
+  evalFilterHiddenRows: boolean
+  /**
    * createTable / renameTable / renameTableColumn / deleteTable /
    * listTables / getTable are backed by a real engine Table registry
    * (Excel Table CRUD — #32). The TS runtime has no Table model and
@@ -473,6 +484,20 @@ export interface WorkerWorkbookClient {
    * compliant caller never reaches this on that runtime.
    */
   setEvalHiddenRows(sheet: number, rows: readonly number[]): Promise<void>
+  /**
+   * Engine FILTER-hidden row eval input (`design-filter-hidden-rows` §6.5).
+   * Whole-set REPLACE of the row set an ACTIVE FILTER hides on `sheet` (an
+   * empty `rows` clears it). Unlike `setEvalHiddenRows` this set is consumed
+   * by BOTH SUBTOTAL bands — 1-11 excludes filter-hidden rows too, which is
+   * exactly the Excel rule one merged set could never express.
+   *
+   * OPTIONAL, unlike its twin, and deliberately so: hand-rolled client
+   * doubles keep compiling, and the caller must treat both "method absent"
+   * and a structured `UNSUPPORTED` / `WASM_METHOD_UNAVAILABLE` rejection as
+   * the documented tier-2 degradation (filter still applies to the VIEW, the
+   * engine simply never learns about it) rather than as a failed filter.
+   */
+  setEvalFilterHiddenRows?(sheet: number, rows: readonly number[]): Promise<void>
   /**
    * Excel Table CRUD (#32, design-excel-table.md §10). Optional so
    * hand-rolled client doubles (tests) keep compiling; the WASM runtime
@@ -814,6 +839,9 @@ export function createWorkerWorkbook(opts: WorkerWorkbookOptions): WorkerWorkboo
     },
     setEvalHiddenRows(sheet, rows) {
       return request<void>('setEvalHiddenRows', { sheet, rows: [...rows] })
+    },
+    setEvalFilterHiddenRows(sheet, rows) {
+      return request<void>('setEvalFilterHiddenRows', { sheet, rows: [...rows] })
     },
     createTable(sheet, bounds, name) {
       return request<string>('createTable', {

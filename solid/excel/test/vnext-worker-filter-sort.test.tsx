@@ -70,6 +70,7 @@ type FilterFakeClient = WorkerWorkbookClient & {
     readSparseRange: SparseRangeWire[]
     readCells: CellRefWire[][]
     setCell: Array<{ sheet: number; addr: string; value: CellWire }>
+    setEvalFilterHiddenRows: Array<{ sheet: number; rows: number[] }>
   }
   seedCell(row: number, col: number, value: string | number): void
   emitDirty(): void
@@ -81,7 +82,9 @@ type FilterFakeClient = WorkerWorkbookClient & {
  * `readSparseRange`, `readCells`, `snapshotFormatRange`, the setCell
  * family, dirty events); everything else throws.
  */
-function createFilterFakeClient(): FilterFakeClient {
+function createFilterFakeClient(
+  evalFilterHiddenRows: 'record' | 'unsupported' = 'record',
+): FilterFakeClient {
   const cells = new Map<string, CellSnapshotWire>()
   const dirtyListeners = new Set<(refs: CellRefWire[]) => void>()
   const calls: FilterFakeClient['calls'] = {
@@ -89,6 +92,7 @@ function createFilterFakeClient(): FilterFakeClient {
     readSparseRange: [],
     readCells: [],
     setCell: [],
+    setEvalFilterHiddenRows: [],
   }
 
   function key(sheet: number, addr: string) {
@@ -196,6 +200,19 @@ function createFilterFakeClient(): FilterFakeClient {
     async setFormulaDetailed() {
       return { ok: true as const }
     },
+    // #27 S4: applying (or clearing) the rules also hands the engine the
+    // FILTER-hidden row set. Recorded rather than stubbed so the payload
+    // itself is assertable — the whole point of the slice.
+    async setEvalFilterHiddenRows(sheet, rows) {
+      calls.setEvalFilterHiddenRows.push({ sheet, rows: [...rows] })
+      if (evalFilterHiddenRows === 'unsupported') {
+        // What a wasm-pkg predating the export makes the dispatcher answer
+        // (design §6.5 tier 2).
+        throw Object.assign(new Error('setEvalFilterHiddenRows is not available'), {
+          code: 'UNSUPPORTED',
+        })
+      }
+    },
     onCellsDirty(callback) {
       dirtyListeners.add(callback)
       return () => dirtyListeners.delete(callback)
@@ -227,8 +244,10 @@ function createFilterFakeClient(): FilterFakeClient {
   })
 }
 
-function createFilterBackend() {
-  const client = createFilterFakeClient()
+function createFilterBackend(
+  evalFilterHiddenRows: 'record' | 'unsupported' = 'record',
+) {
+  const client = createFilterFakeClient(evalFilterHiddenRows)
   const backend = createWorkerWorkbookSpreadsheetBackend({
     client,
     sheets: ['Sheet1'],
@@ -290,6 +309,71 @@ describe('worker adapter setFilterSort projection', () => {
     // The Beta row is filtered out and nothing renders past the data.
     expect(result.cells.some((cell) => cell.displayValue === 'Beta')).toBe(false)
     expect(result.cells.some((cell) => cell.row >= 3)).toBe(false)
+  })
+
+  // #27 S4 — the OTHER projection of the same scan. The engine cannot see the
+  // filter, so without this push `SUBTOTAL(1-11)` keeps summing Beta.
+  it('hands the engine the filter-hidden source rows when the rules are applied', async () => {
+    const { client, backend } = createFilterBackend()
+    seedPeople(client)
+
+    await backend.setFilterSort!({
+      kind: 'set-filter-sort',
+      sheetId: 'sheet-1',
+      rules: [{ kind: 'equals', colIndex: 0, value: 'Alpha' }],
+      requestId: 7,
+    })
+
+    // SOURCE rows, not display slots: Beta sits at source row 2. The header
+    // (row 0) and the matching rows 1 / 3 must never appear.
+    expect(client.calls.setEvalFilterHiddenRows).toEqual([{ sheet: 0, rows: [2] }])
+
+    // The set is derived from the SAME scan that built the permutation, so it
+    // is exactly the complement of what the projection shows.
+    const result = await readWindow(backend)
+    const visibleSourceRows = new Set(result.cells.map((cell) => cell.originalRow ?? cell.row))
+    expect(visibleSourceRows.has(2)).toBe(false)
+    expect([...visibleSourceRows].sort()).toEqual([0, 1, 3])
+
+    // Clearing the rules clears the engine set — whole-set replace, empty
+    // clears. A stale set would keep excluding rows that are visible again.
+    await backend.setFilterSort!({ kind: 'set-filter-sort', sheetId: 'sheet-1', rules: [] })
+    expect(client.calls.setEvalFilterHiddenRows).toEqual([
+      { sheet: 0, rows: [2] },
+      { sheet: 0, rows: [] },
+    ])
+  })
+
+  // #27 S4, design §6.5 tier 2: a wasm-pkg predating the export answers a
+  // structured UNSUPPORTED. The user's filter must still apply — the VIEW is
+  // correct and only the engine stays uninformed ("not excluded" is
+  // conservative, never a wrong number). A rethrow here would turn an old
+  // wasm build into a completely broken filter.
+  it('still applies the filter when the engine cannot accept the push', async () => {
+    const { client, backend } = createFilterBackend('unsupported')
+    seedPeople(client)
+
+    const ack = await backend.setFilterSort!({
+      kind: 'set-filter-sort',
+      sheetId: 'sheet-1',
+      rules: [{ kind: 'equals', colIndex: 0, value: 'Alpha' }],
+      requestId: 11,
+    })
+    expect(ack).toMatchObject({ sheetId: 'sheet-1', requestId: 11 })
+
+    // The view is filtered exactly as on a capable engine.
+    const result = await readWindow(backend)
+    expect(result.cells.some((cell) => cell.displayValue === 'Beta')).toBe(false)
+
+    // Attempted once, then latched off — a refusal is a property of the build,
+    // not of the payload, so re-asking every time would be pure noise.
+    expect(client.calls.setEvalFilterHiddenRows).toHaveLength(1)
+    await backend.setFilterSort!({
+      kind: 'set-filter-sort',
+      sheetId: 'sheet-1',
+      rules: [{ kind: 'equals', colIndex: 0, value: 'Beta' }],
+    })
+    expect(client.calls.setEvalFilterHiddenRows).toHaveLength(1)
   })
 
   it('never reorders rows and never touches engine data (sort branch retired)', async () => {

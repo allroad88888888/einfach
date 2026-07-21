@@ -147,6 +147,7 @@ describe('TS worker runtime — structured UNSUPPORTED instead of success-shaped
       persistenceFormats: false,
       sortRange: false,
       evalHiddenRows: false,
+      evalFilterHiddenRows: false,
       structuredTables: false,
     }
     expect(expectOk(await raw({ cmd: 'describeCapabilities' }))).toEqual(witness)
@@ -227,6 +228,16 @@ describe('TS worker runtime — structured UNSUPPORTED instead of success-shaped
     // success-shaped fake ACK that would leave the host believing rows are
     // excluded.
     expectUnsupported(await raw({ cmd: 'setEvalHiddenRows', sheet: 0, rows: [1, 3] }))
+  })
+
+  test('setEvalFilterHiddenRows refuses with UNSUPPORTED (#27 S4, tier-3 degradation)', async () => {
+    const { raw } = makeRpc()
+    await raw({ cmd: 'initWorkbook', sheets: ['Sheet1'] })
+
+    // A fake ACK here is worse than for the manual twin: the adapter would
+    // believe SUBTOTAL 1-11 now excludes filtered-out rows and stop reporting
+    // the degradation. Refuse honestly — the host keeps today's behaviour.
+    expectUnsupported(await raw({ cmd: 'setEvalFilterHiddenRows', sheet: 0, rows: [1, 3] }))
   })
 
   test('structural commands refuse with UNSUPPORTED and leave the workbook untouched', async () => {

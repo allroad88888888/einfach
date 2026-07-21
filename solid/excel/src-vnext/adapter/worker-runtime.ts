@@ -143,6 +143,17 @@ type WasmWorkbookRuntime = {
    */
   setEvalHiddenRows?: (sheetIdx: number, rows: Uint32Array | number[]) => void
   /**
+   * Engine FILTER-hidden row eval input (`design-filter-hidden-rows` §6.5).
+   * Whole-set REPLACE of the rows an active filter hides on `sheetIdx` (an
+   * empty array clears it). Consumed by BOTH SUBTOTAL bands, unlike its
+   * manual twin above. Optional so a wasm-pkg predating the export and test
+   * mocks keep compiling — the dispatcher answers a structured `UNSUPPORTED`
+   * when it is absent instead of throwing, which is what makes the design's
+   * tier-2 degradation ("filter applies to the view, the engine never hears
+   * about it") silent rather than a broken filter.
+   */
+  setEvalFilterHiddenRows?: (sheetIdx: number, rows: Uint32Array | number[]) => void
+  /**
    * Engine physical sort (design-engine-sort S2). Reorders the range's
    * data rows in place and returns EITHER the success report
    * `{ ok: true, movedRows, movedCells, rowPermutation }` OR a structured
@@ -1536,6 +1547,35 @@ export function installWorkerRuntime() {
               if (Number.isInteger(index) && index >= 0) rows.push(index)
             }
             assertMethod(wb, 'setEvalHiddenRows').call(wb, sheet, rows)
+            postResponse(msg.id, true)
+          }
+          break
+        case 'setEvalFilterHiddenRows':
+          {
+            const sheet = normalizeStructuralIndex(msg.sheet, 'sheet index')
+            // Same tolerant whole-set-replace contract as its manual twin:
+            // no `assertSheet` (the engine no-ops an unknown sheet index),
+            // and the row list is re-sanitized defensively.
+            const rawRows = Array.isArray(msg.rows) ? (msg.rows as unknown[]) : []
+            const rows: number[] = []
+            for (const value of rawRows) {
+              const index = Number(value)
+              if (Number.isInteger(index) && index >= 0) rows.push(index)
+            }
+            // NOT `assertMethod`: a wasm-pkg built before the export exists
+            // must degrade, not fail the filter that triggered this push. An
+            // explicit UNSUPPORTED is the honest answer — never a fake ACK,
+            // and the host adapter stops pushing after seeing it.
+            const push = wb.setEvalFilterHiddenRows
+            if (typeof push !== 'function') {
+              postError(msg.id, {
+                code: 'UNSUPPORTED',
+                message:
+                  'WasmWorkbook.setEvalFilterHiddenRows is not available in this wasm build',
+              })
+              break
+            }
+            push.call(wb, sheet, rows)
             postResponse(msg.id, true)
           }
           break

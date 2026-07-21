@@ -159,6 +159,7 @@ import {
   type ResolvedSortKey,
   type SortValue,
 } from './sort-order'
+import { filterHiddenRowsFromDisplayRows } from './filter-hidden-rows'
 
 function isObject(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null
@@ -355,6 +356,20 @@ interface StaticBackendState {
    * insert/delete (the host re-pushes), never inferring a row's source.
    */
   evalHiddenRowsBySheetId: Map<string, Set<number>>
+  /**
+   * FILTER-hidden rows derived by THIS backend when `setFilterSort` applied
+   * the rules (`design-filter-hidden-rows` §4.2, slice S4) — the static
+   * counterpart of what the worker adapter pushes into the engine through
+   * `setEvalFilterHiddenRows`.
+   *
+   * Independent of `evalHiddenRowsBySheetId` on purpose, and NEVER merged with
+   * it: Excel's `SUBTOTAL(1-11)` excludes filter-hidden rows while INCLUDING
+   * manually hidden ones, a rule one merged set cannot express (design §3
+   * constraint 1). Snapshot semantics — computed when the rules are applied,
+   * not re-derived on every read, matching Excel's `Data → Reapply` model and
+   * the worker's push point exactly.
+   */
+  filterHiddenRowsBySheetId: Map<string, Set<number>>
   freezeBySheetId: Map<string, ViewportFreezeConfig>
   sheets: SpreadsheetSheetMetadata[]
   revision: ProjectionRevision
@@ -935,6 +950,7 @@ function buildState(
     hiddenRowsBySheetId: new Map(),
     hiddenColsBySheetId: new Map(),
     evalHiddenRowsBySheetId: new Map(),
+    filterHiddenRowsBySheetId: new Map(),
     freezeBySheetId: new Map(sheets.map((sheet) => [sheet.id, { rows: 0, cols: 0 }])),
     sheets,
     revision,
@@ -1201,13 +1217,15 @@ function shiftHiddenIndexSet(
  * static callers only lane 1. Unioning lets either lane alone be sufficient,
  * so both hosts observe the same exclusion.
  *
- * Filter-hidden rows are deliberately NOT merged in. They are not part of the
- * pushed set on the worker/WASM side either — design §6.1 pins the MVP push
- * source to `viewportHiddenAtom` (manual rows only) and defers filter
- * visibility to the #29 filter-canonical flip, so merging them here would
- * CREATE a static⇄WASM divergence rather than close one. The filter rules stay
- * the UI-core canonical view fact and never become an evaluation truth source.
- * Covered by the `filterHidden` phase of vnext-table-totals-static-wasm-parity.
+ * Filter-hidden rows are deliberately NOT merged in, and this is now a load
+ * bearing separation rather than a deferral. Excel's rule
+ * (`design-filter-hidden-rows` §2/§3) is that `SUBTOTAL(1-11)` excludes
+ * FILTER-hidden rows but INCLUDES manually hidden ones, while 101-111 excludes
+ * both — merging the two sets destroys the source information that rule is
+ * stated in. The filter side lives in `filterHiddenRowsForSheet` below and the
+ * engine keeps them apart the same way (`eval_hidden_rows` vs
+ * `eval_filter_hidden_rows`). Both halves are covered by the `filterHidden`
+ * phase of vnext-table-totals-static-wasm-parity.
  */
 function evalHiddenRowsForSheet(
   state: StaticBackendState,
@@ -1222,6 +1240,25 @@ function evalHiddenRowsForSheet(
   const union = new Set<number>(manual)
   for (const row of pushed) union.add(row)
   return union
+}
+
+/**
+ * The row set an ACTIVE FILTER hides on `sheetId` — excluded by BOTH SUBTOTAL
+ * bands (`design-filter-hidden-rows` §6.3), which is what distinguishes it
+ * from `evalHiddenRowsForSheet` above.
+ *
+ * Single lane by construction: this backend computes the set itself in
+ * `setFilterSort` (it owns the cell values the predicate reads), so there is
+ * no host-pushed second source to union with. The worker adapter reaches the
+ * same engine state by pushing `setEvalFilterHiddenRows` instead — same fact,
+ * same snapshot point, different transport.
+ */
+function filterHiddenRowsForSheet(
+  state: StaticBackendState,
+  sheetId: string,
+): ReadonlySet<number> | undefined {
+  const rows = state.filterHiddenRowsBySheetId.get(sheetId)
+  return rows?.size ? rows : undefined
 }
 
 function getDimensionMap(
@@ -1622,6 +1659,7 @@ function buildProjectionResult(
     },
     resolveStructuredRef: makeStructuredRefResolver(state, request.sheetId),
     hiddenRows: evalHiddenRowsForSheet(state, request.sheetId),
+    filterHiddenRows: filterHiddenRowsForSheet(state, request.sheetId),
   }
   const displayRows = buildFilterSortDisplayRows(sheetCells, lookup, filterSortState)
   const filterSortActive = displayRows !== null
@@ -3395,6 +3433,7 @@ function applyStaticSortRange(
     },
     resolveStructuredRef: makeStructuredRefResolver(state, request.sheetId),
     hiddenRows: evalHiddenRowsForSheet(state, request.sheetId),
+    filterHiddenRows: filterHiddenRowsForSheet(state, request.sheetId),
   }
   const keys = toResolvedSortKeys(request.keys)
   const plan = planPhysicalSort(
@@ -3606,6 +3645,7 @@ function tableHeaderText(
         get: (r, c) => sheetCells?.get(keyFor(r, c)),
         resolveStructuredRef: makeStructuredRefResolver(state, sheetId),
         hiddenRows: evalHiddenRowsForSheet(state, sheetId),
+        filterHiddenRows: filterHiddenRowsForSheet(state, sheetId),
       },
       new Set(),
       { row, col },
@@ -4785,13 +4825,53 @@ export function createStaticSpreadsheetBackend(
       state.revision = bumpRevision(state.revision)
       return mutationResult(request, state.revision)
     },
+    /**
+     * Applying the rules also SNAPSHOTS the filter-hidden row set
+     * (`design-filter-hidden-rows` §4.2, slice S4). That set is what makes
+     * `SUBTOTAL(1-11)` and `SUBTOTAL(101-111)` stop counting filtered-out rows
+     * — Excel's behaviour, and previously impossible here because the
+     * evaluator had no idea a filter existed.
+     *
+     * The scan is the SAME one the projection already runs
+     * (`buildFilterSortDisplayRows` over the full sheet extent); the hidden
+     * set is its complement, so the two can never disagree about which rows a
+     * rule removed. Snapshot, not live: taken here and not re-derived per
+     * read, which is both Excel's model (`Data → Reapply`) and the worker
+     * adapter's push point, so the two hosts stay observationally identical.
+     */
     async setFilterSort(request: SetFilterSortRequest): Promise<BackendMutationResult> {
       const nextRevision = nextRevisionOrThrow(state.revision)
       const next = cloneFilterSortState({ rules: request.rules })
       if (filterSortHasEffect(next)) {
         state.filterSortBySheetId.set(request.sheetId, next)
+        const sheetCells = getOrCreateSheetCells(state, request.sheetId)
+        const lookup: EvalCellLookup = {
+          get(row: number, col: number) {
+            return sheetCells.get(keyFor(row, col))
+          },
+          resolveStructuredRef: makeStructuredRefResolver(state, request.sheetId),
+          hiddenRows: evalHiddenRowsForSheet(state, request.sheetId),
+          // Deliberately the PREVIOUS filter set, exactly like the worker
+          // (whose engine still holds the old set while the new scan runs):
+          // a predicate column holding a SUBTOTAL reads the pre-apply value,
+          // which keeps the derivation non-circular on both hosts.
+          filterHiddenRows: filterHiddenRowsForSheet(state, request.sheetId),
+        }
+        const displayRows = buildFilterSortDisplayRows(sheetCells, lookup, next)
+        const hidden = filterHiddenRowsFromDisplayRows(
+          displayRows,
+          getMaxSourceRow(sheetCells) + 1,
+        )
+        if (hidden.length > 0) {
+          state.filterHiddenRowsBySheetId.set(request.sheetId, new Set(hidden))
+        } else {
+          state.filterHiddenRowsBySheetId.delete(request.sheetId)
+        }
       } else {
         state.filterSortBySheetId.delete(request.sheetId)
+        // Clearing the rules must clear the derived set too, or SUBTOTAL would
+        // keep excluding rows that are visible again.
+        state.filterHiddenRowsBySheetId.delete(request.sheetId)
       }
       state.revision = nextRevision
       return mutationResult(request, state.revision)

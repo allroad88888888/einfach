@@ -49,6 +49,17 @@ export interface EvalCellLookup {
    * 1-11 agree.
    */
   hiddenRows?: ReadonlySet<number>
+  /**
+   * Rows an ACTIVE FILTER hides on the evaluated sheet — the second,
+   * independently addressable evaluation input (`design-filter-hidden-rows`
+   * §6.2, engine parity with `Workbook::set_eval_filter_hidden_rows`).
+   *
+   * Consumed by BOTH SUBTOTAL bands, which is the whole point of keeping it
+   * apart from `hiddenRows`: Excel's 1-11 excludes filter-hidden rows while
+   * still including manually hidden ones. Omitted / empty means "no filter
+   * hides anything".
+   */
+  filterHiddenRows?: ReadonlySet<number>
 }
 
 /** The cell whose formula is being evaluated — the `[@Col]` / `[Col]` anchor. */
@@ -385,8 +396,10 @@ class Parser {
      * and skips it, so a blank must not sink MIN or inflate COUNT).
      */
     private readonly isBlank: (row: number, col: number) => boolean = () => false,
-    /** Host-hidden rows consumed by SUBTOTAL 101-111 only. */
+    /** MANUALLY hidden rows — consumed by SUBTOTAL 101-111 only. */
     private readonly hiddenRows: ReadonlySet<number> | undefined = undefined,
+    /** FILTER-hidden rows — consumed by SUBTOTAL 1-11 AND 101-111. */
+    private readonly filterHiddenRows: ReadonlySet<number> | undefined = undefined,
   ) {}
 
   parse(): Value {
@@ -663,7 +676,13 @@ class Parser {
       case 'VLOOKUP':
         return applyVlookup(args, this.resolve)
       case 'SUBTOTAL':
-        return applySubtotal(args, this.resolve, this.isBlank, this.hiddenRows)
+        return applySubtotal(
+          args,
+          this.resolve,
+          this.isBlank,
+          this.hiddenRows,
+          this.filterHiddenRows,
+        )
       // SUM-like aggregations fall through.
       default:
         return aggregateNumeric(name, args, this.resolve)
@@ -892,26 +911,28 @@ function applyVlookup(
  * (2/3) and the deviation family (7/8/10/11) only pattern-match the value
  * kinds they care about and therefore ignore errors.
  *
- * `hiddenRows` carries MANUALLY hidden rows only — rows hidden by an active
- * filter live in the filter/sort projection and are deliberately absent. That
- * matches the engine exactly: design-excel-table §6.1 pins the MVP push source
- * to `viewportHiddenAtom` (manual rows) and defers filter visibility to the
- * #29 filter-canonical flip, so the worker host does NOT merge filter-hidden
- * rows into `set_eval_hidden_rows` either. Excluding them here would make the
- * static host the odd one out. Both hosts are pinned to this by the
- * `filterHidden` phase of vnext-table-totals-static-wasm-parity.
+ * TWO hidden-row inputs, never merged, mirroring the engine's
+ * `eval_hidden_rows` / `eval_filter_hidden_rows` split
+ * (`design-filter-hidden-rows` §6.2-§6.3):
  *
- * Known conformance boundary (design §6.3, shared with the engine): real Excel
- * drops filter-hidden rows from 1-11 as well as 101-111. Under the single
- * merged set neither engine can tell the two sources apart, so 1-11 never
- * filters. When the #29 flip lands, filter visibility joins the SAME pushed
- * set on both hosts and the port shape does not change.
+ *  - `hiddenRows` — MANUALLY hidden rows. Excluded by 101-111 only; 1-11
+ *    deliberately INCLUDE them, which is Excel's rule and the reason a single
+ *    merged set cannot express this function.
+ *  - `filterHiddenRows` — rows removed by an ACTIVE FILTER. Excluded by BOTH
+ *    bands. Until this input existed, `SUBTOTAL(1-11)` summed filtered-out
+ *    rows and diverged from Excel; that was a bug, not a deferral.
+ *
+ * A row in both sets is skipped once (membership tests, not a union
+ * allocation — same streaming shape as the engine's `for_each_subtotal_value`).
+ * Both hosts are pinned to this matrix by the `filterHidden` phase of
+ * vnext-table-totals-static-wasm-parity.
  */
 function applySubtotal(
   args: Array<Value | RangeRef>,
   resolve: (row: number, col: number) => Value,
   isBlank: (row: number, col: number) => boolean,
   hiddenRows: ReadonlySet<number> | undefined,
+  filterHiddenRows: ReadonlySet<number> | undefined,
 ): Value {
   if (args.length < 2) return '#ARGS!'
   const rawFn = args[0]
@@ -921,19 +942,23 @@ function applySubtotal(
   if (!Number.isFinite(asNumber)) return '#TYPE!'
   const code = Math.trunc(asNumber)
   let mode: number
-  let ignoreHidden: boolean
+  // Both bands exclude FILTER-hidden rows; only 101-111 additionally exclude
+  // MANUALLY hidden ones. Named for what it now decides, since the filter set
+  // is no longer conditional on the band.
+  let alsoIgnoreManualHidden: boolean
   if (code >= 1 && code <= 11) {
     mode = code
-    ignoreHidden = false
+    alsoIgnoreManualHidden = false
   } else if (code >= 101 && code <= 111) {
     mode = code - 100
-    ignoreHidden = true
+    alsoIgnoreManualHidden = true
   } else {
     return '#VALUE!'
   }
 
   // Stream every data argument once, skipping blanks (the engine's
-  // `Value::Null`) and — for 101-111 — the host's hidden rows.
+  // `Value::Null`), filter-hidden rows, and — for 101-111 — manually hidden
+  // rows as well.
   const walk = (visit: (v: Value) => void): void => {
     for (const arg of args.slice(1)) {
       if (typeof arg !== 'object') {
@@ -941,7 +966,8 @@ function applySubtotal(
         continue
       }
       for (let row = arg.rowStart; row <= arg.rowEnd; row += 1) {
-        if (ignoreHidden && hiddenRows?.has(row)) continue
+        if (filterHiddenRows?.has(row)) continue
+        if (alsoIgnoreManualHidden && hiddenRows?.has(row)) continue
         for (let col = arg.colStart; col <= arg.colEnd; col += 1) {
           if (isBlank(row, col)) continue
           visit(resolve(row, col))
@@ -1072,6 +1098,7 @@ export function evaluateFormula(
     (row, col) => resolveCellValue(lookup, row, col, stack),
     (row, col) => isBlankCell(lookup, row, col),
     lookup.hiddenRows,
+    lookup.filterHiddenRows,
   )
   return parser.parse()
 }

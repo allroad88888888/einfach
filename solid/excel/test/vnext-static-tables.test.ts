@@ -752,20 +752,60 @@ describe('static backend — SUBTOTAL semantics', () => {
     expect(await evalAt(backend, '=SUBTOTAL(109,A1:A6)')).toBe('100')
   })
 
-  // Conformance boundary shared with the engine (design-excel-table §6.1/§6.3):
-  // the MVP push source is `viewportHiddenAtom` (MANUAL rows), and filter
-  // visibility joins the same set only after the #29 filter-canonical flip.
-  // Excluding filter-hidden rows here would make the static host diverge from
-  // WASM, so an active filter must move NEITHER band.
-  it('does not treat filter-hidden rows as an evaluation truth source', async () => {
+  // MIGRATED from `does not treat filter-hidden rows as an evaluation truth
+  // source` (#27 S4). That test pinned the OLD, non-Excel behaviour: it
+  // asserted 100 for both bands under an active filter, i.e. the evaluator
+  // summing rows the filter had removed. Excel excludes filter-hidden rows
+  // from BOTH bands (`design-filter-hidden-rows` §2), so the old assertion
+  // was pinning a bug — the deferral it cited ("filter visibility joins the
+  // manual set after the #29 flip") was itself the wrong shape, since the two
+  // sources must stay separate to express the 1-11 rule at all.
+  it('excludes filter-hidden rows from BOTH SUBTOTAL bands', async () => {
+    const backend = subtotalBackend()
+    // Control: no filter, nothing excluded — the counter-value that made the
+    // assertion below meaningful rather than trivially true.
+    expect(await evalAt(backend, '=SUBTOTAL(9,A1:A6)')).toBe('100')
+
+    // `>= 30` keeps source rows 3 (30) and 5 (40); rows 1 (20), 2 ('text') and
+    // 4 (blank) are filtered out. Row 0 is the header and is never filtered.
+    await backend.setFilterSort!({
+      kind: 'set-filter-sort',
+      sheetId: SHEET,
+      rules: [{ kind: 'range', colIndex: 0, min: 30 }],
+    })
+    expect(await evalAt(backend, '=SUBTOTAL(9,A1:A6)')).toBe('80') // 10 + 30 + 40
+    expect(await evalAt(backend, '=SUBTOTAL(109,A1:A6)')).toBe('80')
+    expect(await evalAt(backend, '=SUBTOTAL(2,A1:A6)')).toBe('3')
+    expect(await evalAt(backend, '=SUBTOTAL(5,A1:A6)')).toBe('10')
+
+    // Clearing the rules restores the full aggregate — the derived set is
+    // dropped, not left stale.
+    await backend.setFilterSort!({ kind: 'set-filter-sort', sheetId: SHEET, rules: [] })
+    expect(await evalAt(backend, '=SUBTOTAL(9,A1:A6)')).toBe('100')
+    expect(await evalAt(backend, '=SUBTOTAL(109,A1:A6)')).toBe('100')
+  })
+
+  // The two-layer rule, which is the entire reason the sets are not merged:
+  // a manually hidden row stays IN 1-11 while a filter-hidden row leaves both.
+  it('keeps manual and filter exclusion independent (Excel two-layer rule)', async () => {
     const backend = subtotalBackend()
     await backend.setFilterSort!({
       kind: 'set-filter-sort',
       sheetId: SHEET,
       rules: [{ kind: 'range', colIndex: 0, min: 30 }],
     })
-    expect(await evalAt(backend, '=SUBTOTAL(9,A1:A6)')).toBe('100')
-    expect(await evalAt(backend, '=SUBTOTAL(109,A1:A6)')).toBe('100')
+    // Additionally hide source row 5 (A6 = 40) BY HAND.
+    await backend.hideRows!({ kind: 'hide-rows', sheetId: SHEET, rowIndices: [5] })
+
+    // 1-11: filter rows gone, the manual row still counted.
+    expect(await evalAt(backend, '=SUBTOTAL(9,A1:A6)')).toBe('80') // 10 + 30 + 40
+    // 101-111: both sources gone.
+    expect(await evalAt(backend, '=SUBTOTAL(109,A1:A6)')).toBe('40') // 10 + 30
+
+    // A row in BOTH sets is skipped once, not twice (membership, not counting).
+    await backend.hideRows!({ kind: 'hide-rows', sheetId: SHEET, rowIndices: [1] })
+    expect(await evalAt(backend, '=SUBTOTAL(9,A1:A6)')).toBe('80')
+    expect(await evalAt(backend, '=SUBTOTAL(109,A1:A6)')).toBe('40')
   })
 
   it('rejects out-of-band function numbers and short arg lists', async () => {

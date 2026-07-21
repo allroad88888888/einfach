@@ -146,6 +146,7 @@ import {
   pasteRangeGeometry,
   pasteSourceCoord,
 } from './paste-range-plan'
+import { filterHiddenRowsFromDisplayRows } from './filter-hidden-rows'
 
 export interface WorkerWorkbookBackendSheetInput {
   id?: string
@@ -207,6 +208,19 @@ const MAX_IMPORT_CELLS_PER_CHUNK = 10_000
  */
 export const MAX_FILTER_SORT_PREDICATE_CELLS = 50_000
 export const FILTER_SORT_SOURCE_TOO_LARGE = 'FILTER_SORT_SOURCE_TOO_LARGE'
+
+/**
+ * The two projections of ONE predicate scan. `displayRows` is the sparse
+ * `display -> source` permutation the projection reads through (compression
+ * semantics, retired in S5); `hiddenRows` is its complement over the scanned
+ * extent — the FILTER-hidden set the engine consumes for SUBTOTAL
+ * (`design-filter-hidden-rows` §4.2). Kept together so they can never be
+ * derived from different scans.
+ */
+interface FilterSortScan {
+  readonly displayRows: number[]
+  readonly hiddenRows: number[]
+}
 
 /**
  * Fail-closed source-size cap for engine physical sort (design-engine-sort
@@ -2129,7 +2143,7 @@ export function createWorkerWorkbookSpreadsheetBackend(
   async function computeFilterSortDisplayRows(
     sheet: WorkerWorkbookBackendSheet,
     state: FilterSortState,
-  ): Promise<number[]> {
+  ): Promise<FilterSortScan> {
     const cols = filterSortPredicateColumns(state)
     const refs = await client.listNonEmpty()
     let maxRow = -1
@@ -2168,13 +2182,17 @@ export function createWorkerWorkbookSpreadsheetBackend(
       )
     }
 
-    return (
+    const displayRows =
       buildFilterSortDisplayRows(
         state,
         { headerRow: 0, startRow: 1, endRow: rowCount },
         (row, col) => values.get(keyFor(row, col)) ?? '',
       ) ?? []
-    )
+    // Same scan, second projection: the rows the predicate judged and did not
+    // display are exactly the FILTER-hidden set the engine needs
+    // (`design-filter-hidden-rows` §4.2). No extra reads, no second predicate
+    // pass, and it cannot disagree with what the projection shows.
+    return { displayRows, hiddenRows: filterHiddenRowsFromDisplayRows(displayRows, rowCount) }
   }
 
   /** `null` when no filter/sort is active for the sheet; cached permutation otherwise. */
@@ -2186,9 +2204,52 @@ export function createWorkerWorkbookSpreadsheetBackend(
     if (!state) return null
     const cached = filterSortDisplayRowsBySheetId.get(sheetId)
     if (cached) return cached
-    const displayRows = await computeFilterSortDisplayRows(sheet, state)
+    const { displayRows } = await computeFilterSortDisplayRows(sheet, state)
     filterSortDisplayRowsBySheetId.set(sheetId, displayRows)
     return displayRows
+  }
+
+  /**
+   * Push the FILTER-hidden row set to the engine (`design-filter-hidden-rows`
+   * §4.2/§6.5). Whole-set REPLACE, per sheet, empty clears — the same contract
+   * as the manual twin, and like it NOT a mutation: no exact ACK, no undo
+   * record, no revision bump of its own. The engine's `filter_hidden_epoch`
+   * bump dirties the SUBTOTAL formulas that read the set and the recompute
+   * arrives on the normal `cellsDirty` path.
+   *
+   * Awaited before `setFilterSort` acknowledges, so the projection refresh the
+   * host runs off that ACK already observes the re-derived aggregates.
+   *
+   * Degradation is silent but never a lie (design §6.5 tiers 2 and 3): a
+   * runtime that declares `evalFilterHiddenRows: false` (the TS worker) is
+   * never asked, and a WASM runtime whose wasm-pkg predates the export answers
+   * a structured `UNSUPPORTED`, which is latched so the RPC is attempted once
+   * and never again. Either way the filter still applies to the VIEW and the
+   * engine simply keeps today's SUBTOTAL behaviour — "not excluded" is
+   * conservative, never a wrong number.
+   */
+  let evalFilterHiddenRowsUnavailable = false
+  async function pushEvalFilterHiddenRows(
+    sheet: WorkerWorkbookBackendSheet,
+    rows: readonly number[],
+  ): Promise<void> {
+    if (evalFilterHiddenRowsUnavailable) return
+    if (!runtimeSupports('evalFilterHiddenRows')) return
+    const push = client.setEvalFilterHiddenRows
+    if (!push) {
+      evalFilterHiddenRowsUnavailable = true
+      return
+    }
+    try {
+      await push.call(client, sheet.idx, rows)
+    } catch (error) {
+      const code = (error as Error & { code?: string }).code
+      if (code === 'UNSUPPORTED' || code === 'UNKNOWN_COMMAND') {
+        evalFilterHiddenRowsUnavailable = true
+        return
+      }
+      throw error
+    }
   }
 
   /**
@@ -4070,6 +4131,13 @@ export function createWorkerWorkbookSpreadsheetBackend(
      * fail-closed, no silent truncation. Clearing (a no-effect payload)
      * never scans and therefore always succeeds, so an over-cap state
      * can always be exited.
+     *
+     * The same scan also feeds the engine (`design-filter-hidden-rows` §4.2,
+     * slice S4): its complement is the FILTER-hidden row set, pushed through
+     * `pushEvalFilterHiddenRows` before this ACK resolves so SUBTOTAL 1-11 and
+     * 101-111 both stop counting filtered-out rows. That push is the ONLY new
+     * side effect here — the visibility permutation and the compression path
+     * are untouched (they retire in S5).
      */
     async setFilterSort(request: SetFilterSortRequest): Promise<BackendMutationResult> {
       const sheet = await resolveSheet(request.sheetId)
@@ -4078,6 +4146,9 @@ export function createWorkerWorkbookSpreadsheetBackend(
       if (!filterSortHasEffect(next)) {
         filterSortStateBySheetId.delete(request.sheetId)
         const nextRevision = bumpRevision()
+        // Clearing the filter must clear the engine's set too, or SUBTOTAL
+        // would keep excluding rows that are visible again.
+        await pushEvalFilterHiddenRows(sheet, [])
         return {
           sheetId: request.sheetId,
           requestId: request.requestId,
@@ -4085,12 +4156,17 @@ export function createWorkerWorkbookSpreadsheetBackend(
         }
       }
 
-      const displayRows = await computeFilterSortDisplayRows(sheet, next)
+      const { displayRows, hiddenRows } = await computeFilterSortDisplayRows(sheet, next)
       filterSortStateBySheetId.set(request.sheetId, next)
       // bumpRevision clears the whole display-row cache; store the fresh
       // permutation after it so the first projection read reuses it.
       const nextRevision = bumpRevision()
       filterSortDisplayRowsBySheetId.set(request.sheetId, displayRows)
+      // Unconditional whole-set replace rather than a diff against a local
+      // ledger: the push is idempotent, a filter application is a user-paced
+      // action (never a hot path), and a ledger would go stale against engine
+      // state the adapter does not own (snapshot restore, workbook reload).
+      await pushEvalFilterHiddenRows(sheet, hiddenRows)
       return {
         sheetId: request.sheetId,
         requestId: request.requestId,

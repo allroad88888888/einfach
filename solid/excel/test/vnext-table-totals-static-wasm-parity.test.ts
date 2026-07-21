@@ -591,8 +591,9 @@ async function runHiddenScript(backend: TableBackend): Promise<Observation[]> {
   await declareHiddenRows(backend, [])
 
   // Filter-hidden rows: keep only North, which filters OUT source rows 2 and 3.
-  // Per design §6.1 this is NOT yet part of the pushed eval-hidden set, so both
-  // engines must read exactly their baseline values here.
+  // Since #27 S4 both adapters derive that set when the rules are applied and
+  // hand it to their engine as a SECOND, independent eval input, so BOTH
+  // SUBTOTAL bands drop those rows (`design-filter-hidden-rows` §2/§6.3).
   await backend.setFilterSort?.({
     kind: 'set-filter-sort',
     sheetId: SHEET,
@@ -600,6 +601,13 @@ async function runHiddenScript(backend: TableBackend): Promise<Observation[]> {
     requestId: probeRequestId++,
   })
   await probeAll('filterHidden')
+
+  // Both layers at once — the sharpest statement of the rule the two separate
+  // sets exist for: North (row 1) is manually hidden while rows 2 and 3 are
+  // filter-hidden, so 1-11 sees ONLY North and 101-111 sees nothing at all.
+  await declareHiddenRows(backend, [1])
+  await probeAll('filterPlusManualHidden')
+  await declareHiddenRows(backend, [])
 
   await backend.setFilterSort?.({
     kind: 'set-filter-sort',
@@ -777,10 +785,28 @@ describe('static ⇄ WASM Table totals + structured-reference parity', () => {
     expect(value('evalLaneOnly =SUBTOTAL(9,Table1[Q1])')).toBe('400')
     expect(value('evalLaneOnly totalsCell')).toBe('320')
 
-    // Filter-hidden rows are NOT in the pushed eval set yet (design §6.1), so
-    // an active filter moves neither 1-11 nor 101-111 on EITHER engine.
-    expect(value('filterHidden =SUBTOTAL(9,Table1[Q1])')).toBe('400')
-    expect(value('filterHidden =SUBTOTAL(109,Table1[Q1])')).toBe('400')
+    // MIGRATED (#27 S4). These three lines previously read '400' / '400' —
+    // they pinned an active filter moving NEITHER band, which is the engine
+    // not knowing a filter existed and therefore summing rows the user had
+    // filtered away. Excel excludes filter-hidden rows from both bands, so the
+    // old numbers pinned a divergence, not a contract.
+    //
+    // Only North (Q1 = 120) survives `= 'North'`; rows 2 (80) and 3 (200) are
+    // filter-hidden. BOTH bands drop them, which is why these two agree.
+    expect(value('filterHidden =SUBTOTAL(9,Table1[Q1])')).toBe('120')
+    expect(value('filterHidden =SUBTOTAL(109,Table1[Q1])')).toBe('120')
+    // …and unlike the manual set, a filter-hidden row is invisible to 1-11
+    // through a plain A1 range too, not just through the structured form.
+    expect(value('filterHidden =SUBTOTAL(9,B2:B4)')).toBe('120')
+
+    // The two-layer rule end to end: manual hiding North on TOP of the filter
+    // leaves 1-11 with North only (manual rows still count) while 101-111 has
+    // nothing left. If these two ever agree again, the sets have been merged.
+    expect(value('filterPlusManualHidden =SUBTOTAL(9,Table1[Q1])')).toBe('120')
+    expect(value('filterPlusManualHidden =SUBTOTAL(109,Table1[Q1])')).toBe('0')
+
+    // Clearing the rules clears the derived set on both hosts — no staleness.
+    expect(value('afterFilterClear =SUBTOTAL(9,Table1[Q1])')).toBe('400')
     expect(value('afterFilterClear =SUBTOTAL(109,Table1[Q1])')).toBe('400')
   })
 })
