@@ -106,13 +106,11 @@ export interface RemoveDuplicatesScanResult {
    * Source-row indices marked for removal — i.e. the rows
    * `backend.removeRows` should target. Sorted ascending.
    *
-   * When the input projection carries `DisplayCell.originalRow` (filter
-   * or sort active), the value reported here is that `originalRow`, NOT
-   * the visual iteration index. When the projection lacks `originalRow`
-   * (no filter/sort), source row and visual row coincide and the value
-   * is the plain `cell.row`. Either way, callers can hand
-   * `duplicateRows` straight to `backend.removeRows({ rows })` without
-   * remapping.
+   * Filtering hides rows instead of compacting them (#27), so the
+   * projected row IS the source row and the scan index needs no
+   * translation. Callers hand `duplicateRows` straight to
+   * `backend.removeRows({ rows })`. Rows listed in `input.hiddenRows`
+   * never appear here at all — see `hiddenRows` above.
    */
   duplicateRows: readonly number[]
   /** Total rows scanned (excluding the header row when

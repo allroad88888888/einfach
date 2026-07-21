@@ -162,9 +162,10 @@ function scanBlanks(context: GoToScanContext): GoToScanResult {
  * Visible-cells-only: walk the search rect, emit every coord whose row is
  * not in `hiddenRows` and whose col is not in `hiddenCols`. Includes blanks
  * — Excel selects ALL visible cells in the source range, hidden ones drop
- * out. The `originalRow !== row` filter-hidden heuristic in the old impl
- * was unreliable; this version uses the backend's hidden-state ports
- * directly.
+ * out. Visibility is a property of the hidden ROW/COLUMN state alone: the
+ * old impl inferred it per cell from a source-row echo in the payload,
+ * which was unreliable, and this version reads the backend's hidden-state
+ * ports directly. Never reintroduce a payload-driven heuristic here.
  */
 function scanVisibleCellsOnly(context: GoToScanContext): GoToScanResult {
   const rect = context.searchRect

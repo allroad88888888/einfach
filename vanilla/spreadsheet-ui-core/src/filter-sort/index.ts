@@ -1380,10 +1380,11 @@ function sheetHasActiveFilterRules(get: Getter, sheetId: string): boolean {
  *   2. filter-hidden rows (`viewportFilterHiddenAtom`).
  *
  * Both are now READ, not inferred. The predecessor derived the filter half by
- * looking for gaps in the projected `originalRow` values, which could only ever
- * judge the rows the current viewport happened to cover — a filtered row below
- * the fold stayed in the reorder set and moved when Excel would have pinned it
- * (the documented v1 bounded-window gap). The host's whole-column scan now
+ * looking for gaps in the source-row echoes the compacted projection carried,
+ * which could only ever judge the rows the current viewport happened to cover
+ * — a filtered row below the fold stayed in the reorder set and moved when
+ * Excel would have pinned it (the documented v1 bounded-window gap). The
+ * host's whole-column scan now
  * answers for the whole extent, so that gap is closed rather than narrowed, and
  * the two halves are finally the same shape.
  *

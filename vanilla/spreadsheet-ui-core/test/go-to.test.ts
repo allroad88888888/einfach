@@ -1354,17 +1354,24 @@ describe('go-to locator engine', () => {
     expect(scan.totalMatchCount).toBe(9)
   })
 
-  test('visible-cells-only ignores stale originalRow echo', () => {
-    // Old impl filtered cells with `originalRow !== row` — but originalRow is
-    // not always populated and shouldn't drive visibility. With no hidden
-    // ports set, every coord in the rect should match (16 cells).
-    const cells = sparseFixture().map((c) => (c.row === 0 ? { ...c, originalRow: 99 } : c))
-    const scan = runGoToSpecialScan(
+  test('visible-cells-only is driven by the hidden ports alone, never by cell payload', () => {
+    // Regression nail against reviving a payload-driven visibility heuristic.
+    // The old impl decided per cell, comparing a source-row echo the compacted
+    // projection carried against the cell's own row; that echo was not always
+    // populated and never belonged in this decision. Visibility is a property
+    // of the hidden ROW/COLUMN state, so the scan must be invariant under any
+    // change to the cell list — including an empty one, since blanks count.
+    const withCells = runGoToSpecialScan(
       { kind: 'visible-cells-only' },
-      makeScanContext(cells, { searchRect: FIXTURE_RECT }),
+      makeScanContext(sparseFixture(), { searchRect: FIXTURE_RECT }),
     )
-    // 4×4 rect, no hidden rows/cols → all 16 coords visible.
-    expect(scan.totalMatchCount).toBe(16)
+    const withoutCells = runGoToSpecialScan(
+      { kind: 'visible-cells-only' },
+      makeScanContext([], { searchRect: FIXTURE_RECT }),
+    )
+    // 4×4 rect, no hidden rows/cols → all 16 coords visible, either way.
+    expect(withCells.totalMatchCount).toBe(16)
+    expect(withoutCells.totalMatchCount).toBe(16)
   })
 
   test('row-differences scopes to the current selection rect (not used range)', () => {

@@ -10,14 +10,9 @@ import type {
   FillSeriesRequest,
   SetCellInputRequest,
   SpreadsheetBackend,
-  VisibleProjectionRequest,
   VisibleProjectionResult,
 } from '@einfach/spreadsheet-ui-core'
-import {
-  clipboardStateAtom,
-  selectionAtom,
-  setSheetProtectionAtom,
-} from '@einfach/spreadsheet-ui-core'
+import { clipboardStateAtom, setSheetProtectionAtom } from '@einfach/spreadsheet-ui-core'
 import { SpreadsheetGrid } from '../src-vnext/grid'
 import { SpreadsheetUiProvider } from '../src-vnext/provider'
 
@@ -44,27 +39,7 @@ function dispatchPointerEvent(
   )
 }
 
-/** Display rows 0..3 backed by source rows 0, 5, 3, 7 (filter/sort permutation). */
-const DISPLAY_TO_SOURCE_ROW: Record<number, number> = { 0: 0, 1: 5, 2: 3, 3: 7 }
-
-function filteredCells(window: VisibleProjectionRequest['window']): DisplayCell[] {
-  const cells: DisplayCell[] = []
-  for (let row = window.rowStart; row <= window.rowEnd; row += 1) {
-    const sourceRow = DISPLAY_TO_SOURCE_ROW[row]
-    if (sourceRow === undefined) continue
-    for (let col = window.colStart; col <= window.colEnd; col += 1) {
-      cells.push({
-        row,
-        col,
-        displayValue: `s${sourceRow},${col}`,
-        originalRow: sourceRow,
-      })
-    }
-  }
-  return cells
-}
-
-function createGatewayBackend(options: { filtered?: boolean } = {}) {
+function createGatewayBackend() {
   const setCellInputRequests: SetCellInputRequest[] = []
   const clearRangeRequests: ClearRangeRequest[] = []
   const fillRangeRequests: FillRangeRequest[] = []
@@ -72,7 +47,7 @@ function createGatewayBackend(options: { filtered?: boolean } = {}) {
 
   const backend: SpreadsheetBackend = {
     async readVisibleProjection(request) {
-      const cells = options.filtered === true ? filteredCells(request.window) : []
+      const cells: DisplayCell[] = []
       const result: VisibleProjectionResult = {
         kind: 'visible-window',
         sheetId: request.sheetId,
@@ -90,7 +65,7 @@ function createGatewayBackend(options: { filtered?: boolean } = {}) {
         requestId: request.requestId,
         revision: 21,
         range: { ...request.range },
-        cells: options.filtered === true ? filteredCells(request.range) : [],
+        cells: [] as DisplayCell[],
       }
     },
     async setCellInput(request) {
@@ -148,57 +123,6 @@ async function waitForGrid(container: HTMLElement, cellCount = 16) {
 }
 
 describe('vNext mutation gateway — grid paths', () => {
-  it('Delete under an active filter clears the mapped source rows, split per row run', async () => {
-    const store = createStore()
-    const { backend, clearRangeRequests, setCellInputRequests } = createGatewayBackend({
-      filtered: true,
-    })
-
-    const { container } = renderGrid(backend, store)
-    await waitForGrid(container)
-
-    // A2:B3 = display rows 1..2, cols 0..1 → source rows 5 and 3.
-    fireEvent.click(container.querySelector('[data-cell-addr="A2"] .spreadsheet-grid-cell-button')!)
-    fireEvent.click(container.querySelector('[data-cell-addr="B3"] .spreadsheet-grid-cell-button')!, {
-      shiftKey: true,
-    })
-    expect(store.getter(selectionAtom)).toMatchObject({
-      anchor: { row: 1, col: 0 },
-      focus: { row: 2, col: 1 },
-    })
-
-    fireEvent.keyDown(container.querySelector('[data-testid="grid"]')!, { key: 'Delete' })
-
-    await waitFor(() => {
-      expect(clearRangeRequests).toHaveLength(2)
-    })
-    expect(clearRangeRequests.map((request) => request.range)).toEqual([
-      { rowStart: 5, rowEnd: 5, colStart: 0, colEnd: 1 },
-      { rowStart: 3, rowEnd: 3, colStart: 0, colEnd: 1 },
-    ])
-    expect(setCellInputRequests).toHaveLength(0)
-  })
-
-  it('single-cell Delete under an active filter clears the mapped source cell', async () => {
-    const store = createStore()
-    const { backend, clearRangeRequests, setCellInputRequests } = createGatewayBackend({
-      filtered: true,
-    })
-
-    const { container } = renderGrid(backend, store)
-    await waitForGrid(container)
-
-    // A2 = display row 1 → source row 5.
-    fireEvent.click(container.querySelector('[data-cell-addr="A2"] .spreadsheet-grid-cell-button')!)
-    fireEvent.keyDown(container.querySelector('[data-testid="grid"]')!, { key: 'Delete' })
-
-    await waitFor(() => {
-      expect(setCellInputRequests).toHaveLength(1)
-    })
-    expect(setCellInputRequests[0]).toMatchObject({ row: 5, col: 0, input: '' })
-    expect(clearRangeRequests).toHaveLength(0)
-  })
-
   it('Delete on a protected sheet is blocked with zero transport', async () => {
     const store = createStore()
     const { backend, clearRangeRequests, setCellInputRequests } = createGatewayBackend()
@@ -219,57 +143,6 @@ describe('vNext mutation gateway — grid paths', () => {
     await flushMicrotasks()
     expect(clearRangeRequests).toHaveLength(0)
     expect(setCellInputRequests).toHaveLength(0)
-  })
-
-  it('in-cell edit commit under an active filter writes to the mapped source row', async () => {
-    const store = createStore()
-    const { backend, setCellInputRequests } = createGatewayBackend({ filtered: true })
-
-    const { container } = renderGrid(backend, store)
-    await waitForGrid(container)
-
-    // A2 = display row 1 → source row 5.
-    fireEvent.click(container.querySelector('[data-cell-addr="A2"] .spreadsheet-grid-cell-button')!)
-    fireEvent.dblClick(container.querySelector('[data-cell-addr="A2"]')!)
-
-    const editor = (await waitFor(() => {
-      const input = container.querySelector('input.cell-input')
-      expect(input).not.toBeNull()
-      return input
-    })) as HTMLInputElement
-
-    fireEvent.input(editor, { target: { value: '42' } })
-    fireEvent.keyDown(editor, { key: 'Enter' })
-
-    await waitFor(() => {
-      expect(setCellInputRequests).toHaveLength(1)
-    })
-    expect(setCellInputRequests[0]).toMatchObject({ row: 5, col: 0, input: '42' })
-  })
-
-  it('paste under an active filter writes to the mapped source row', async () => {
-    const store = createStore()
-    const { backend, setCellInputRequests } = createGatewayBackend({ filtered: true })
-
-    Object.defineProperty(navigator, 'clipboard', {
-      configurable: true,
-      value: {
-        readText: jest.fn<() => Promise<string>>().mockResolvedValue('pasted'),
-      },
-    })
-
-    const { container } = renderGrid(backend, store)
-    await waitForGrid(container)
-
-    // B2 = display { row: 1, col: 1 } → source row 5.
-    fireEvent.click(container.querySelector('[data-cell-addr="B2"] .spreadsheet-grid-cell-button')!)
-    fireEvent.keyDown(container.querySelector('[data-testid="grid"]')!, { key: 'v', ctrlKey: true })
-
-    await waitFor(() => {
-      expect(setCellInputRequests).toHaveLength(1)
-    })
-    expect(setCellInputRequests[0]).toMatchObject({ row: 5, col: 1, input: 'pasted' })
-    expect(store.getter(clipboardStateAtom).status).toBe('ready')
   })
 
   it('paste on a protected sheet is blocked with zero transport and a clipboard error', async () => {
@@ -300,53 +173,6 @@ describe('vNext mutation gateway — grid paths', () => {
     expect(store.getter(clipboardStateAtom).error).toMatchObject({
       code: 'MUTATION_BLOCKED_LOCKED',
     })
-  })
-
-  it('fill under an active filter falls back to per-cell writes on the mapped source rows', async () => {
-    const store = createStore()
-    const {
-      backend,
-      setCellInputRequests,
-      fillRangeRequests,
-      fillSeriesRequests,
-    } = createGatewayBackend({ filtered: true })
-
-    const { container, getByTestId } = renderGrid(backend, store)
-    await waitForGrid(container)
-
-    // Fill from A1 (display row 0 → source row 0) down to A3: write rows are
-    // display 1..2 → source rows 5 and 3.
-    fireEvent.click(container.querySelector('[data-cell-addr="A1"] .spreadsheet-grid-cell-button')!)
-
-    const targetCell = container.querySelector('[data-cell-addr="A3"]') as HTMLElement
-    const originalElementFromPoint = document.elementFromPoint
-    Object.defineProperty(document, 'elementFromPoint', {
-      configurable: true,
-      value: () => targetCell,
-    })
-
-    try {
-      dispatchPointerEvent(getByTestId('fill-handle-A1'), 'pointerdown', { clientX: 1, clientY: 1 })
-      dispatchPointerEvent(window, 'pointermove', { clientX: 1, clientY: 3 })
-      dispatchPointerEvent(window, 'pointerup', { clientX: 1, clientY: 3 })
-
-      await waitFor(() => {
-        expect(setCellInputRequests).toHaveLength(2)
-      })
-    } finally {
-      Object.defineProperty(document, 'elementFromPoint', {
-        configurable: true,
-        value: originalElementFromPoint,
-      })
-    }
-
-    expect(setCellInputRequests.map((request) => ({ row: request.row, col: request.col }))).toEqual([
-      { row: 5, col: 0 },
-      { row: 3, col: 0 },
-    ])
-    // The contiguous transports must not fire while rows are permuted.
-    expect(fillRangeRequests).toHaveLength(0)
-    expect(fillSeriesRequests).toHaveLength(0)
   })
 
   it('fill onto locked cells is blocked with zero transport', async () => {

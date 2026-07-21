@@ -713,21 +713,18 @@ describe('SpreadsheetFormatCellsDialog', () => {
   )
 
   it.each<TestDialogKind>(['format-cells', 'number-format'])(
-    '%s save under an active filter writes formats to the mapped source rows, split per run',
+    '%s save under an active filter writes one format range over the selection',
     async (kind) => {
       const store = createStore()
       const { backend, setFormatRangeRequests } = createFakeBackend()
-      // Display rows 0..2 backed by source rows 0, 5, 3 (filter/sort permutation).
-      const displayToSourceRow: Record<number, number> = { 0: 0, 1: 5, 2: 3 }
+      // A filter withheld row 1; rows 0 and 2 keep their own indices (#27 —
+      // hidden, not compacted). Under the retired compaction this produced
+      // three transports on source rows 0, 5 and 3.
       const cells: DisplayCell[] = []
       for (let row = RANGE.rowStart; row <= RANGE.rowEnd; row += 1) {
+        if (row === 1) continue
         for (let col = RANGE.colStart; col <= RANGE.colEnd; col += 1) {
-          cells.push({
-            row,
-            col,
-            displayValue: `s${displayToSourceRow[row]},${col}`,
-            originalRow: displayToSourceRow[row],
-          })
+          cells.push({ row, col, displayValue: `s${row},${col}` })
         }
       }
       seedReadyVisibleProjection(store, {
@@ -747,15 +744,11 @@ describe('SpreadsheetFormatCellsDialog', () => {
       fireEvent.click(getByTestId(saveTestId))
 
       await waitFor(() => {
-        expect(setFormatRangeRequests).toHaveLength(3)
+        expect(setFormatRangeRequests).toHaveLength(1)
       })
       expect(
         setFormatRangeRequests.map((request) => (request as SetFormatRangeRequest).range),
-      ).toEqual([
-        { rowStart: 0, rowEnd: 0, colStart: 0, colEnd: 2 },
-        { rowStart: 5, rowEnd: 5, colStart: 0, colEnd: 2 },
-        { rowStart: 3, rowEnd: 3, colStart: 0, colEnd: 2 },
-      ])
+      ).toEqual([{ ...RANGE }])
       await waitFor(() => {
         expect(readTestDialogState(store, kind).status).toBe('closed')
       })

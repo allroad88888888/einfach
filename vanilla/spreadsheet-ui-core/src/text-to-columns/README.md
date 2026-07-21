@@ -72,15 +72,13 @@ step. No new backend method.
 ## Mutation gateway gate
 
 `runTextToColumnsFinishAtom` resolves the commit target through
-`resolveContentMutationAtom` (`kind: 'import-cell-chunks'`,
-`requireIdentityMapping: true`) before allocating a request id. A
-protection block or an active display→source row remap fails closed:
-lifecycle goes `blocked`, the gateway's structured diagnostic
-(`MUTATION_BLOCKED_LOCKED` / `MUTATION_UNMAPPED_ROW`) is recorded, its
-message becomes `textToColumnsErrorAtom`, and zero transport is
-launched. Identity mapping is required because the frozen commit plan
-carries source rows captured under an identity mapping and the single
-`importCellChunks` request cannot express a permuted remap.
+`resolveContentMutationAtom` (`kind: 'import-cell-chunks'`) before
+allocating a request id. A protection block fails closed: lifecycle goes
+`blocked`, the gateway's structured diagnostic (`MUTATION_BLOCKED_LOCKED`)
+is recorded, its message becomes `textToColumnsErrorAtom`, and zero
+transport is launched. The commit plan's rows are source rows already —
+filtering hides rows instead of compacting them (#27) — so the single
+`importCellChunks` request can always express the target.
 
 ## Scale
 

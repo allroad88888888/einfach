@@ -23,20 +23,21 @@ Owns cell editor draft, source, commit, and cancel UI state.
 
 Single choke point for content mutations (`set-cell-input`, `clear-range`,
 `fill-range`, `fill-series`, `paste-range`, `import-cell-chunks`) and format
-writes (`set-format-range`): remaps display rows to source rows via the
-visible projection's `DisplayCell.originalRow` (identity when filter/sort is
-inactive; fail-closed when a row cannot be mapped) and enforces the UI-side
-protection gate (`isRangeFullyUnlocked` over the mapped source ranges) before
-any transport. `set-format-range` gates like content (Excel semantics: locked
-cells on a protected sheet cannot be reformatted); consumers are the toolbar
-format commands, the borders/clear-format/decimal paths, and the
+writes (`set-format-range`): validates the target coordinates and enforces
+the UI-side protection gate (`isRangeFullyUnlocked` over the target ranges)
+before any transport. `set-format-range` gates like content (Excel semantics:
+locked cells on a protected sheet cannot be reformatted); consumers are the
+toolbar format commands, the borders/clear-format/decimal paths, and the
 format-painter apply port.
 
-`requireIdentityMapping: true` serves transports whose frozen request shape
-can only express the original contiguous display range (paste-special
-`pasteRange` sessions, text-to-columns `importCellChunks` commit plans): an
-otherwise-allowed resolution that would move or split any row fails closed as
-`unmapped-row` instead of returning ranges the caller cannot forward.
+Mutation targets are source coordinates on arrival. Filtering hides rows
+rather than compacting them (#27), so display row IS source row: the gateway's
+display→source remap half (the per-cell source-row echo, the run-splitting
+range mapper, the unmappable-row block reason, and the identity-mapping
+fail-closed door that served frozen paste-special / text-to-columns request
+shapes) was retired with the compaction it existed to undo. `ranges` is always
+the single input range and stays a list only so looping callers stay unchanged;
+the only block reasons left are `locked` and `invalid-target`.
 
 - Source atoms:
   - `contentMutationLastBlockBackingAtom` (private) —
@@ -51,6 +52,6 @@ otherwise-allowed resolution that would move or split any row fails closed as
   - `clearContentMutationBlockAtom` — `spreadsheet.mutationGateway.clearBlock`.
 - Scale bound: one recorded block; resolution work is bounded by the visible
   window row count.
-- `protectionGate: false` skips the lock gate but still remaps rows (fill
-  sources, format-only clears).
+- `protectionGate: false` skips the lock gate but still validates the target
+  (fill sources, format-only clears).
 - Tests: `test/mutation-gateway.test.ts`.

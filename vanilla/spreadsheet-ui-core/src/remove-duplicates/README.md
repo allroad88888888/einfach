@@ -80,10 +80,9 @@ Behaviour:
    === 'blank'` both contribute the empty string — two all-blank rows
    ARE duplicates of each other.
 5. First occurrence wins; later rows with the same tuple land in
-   `duplicateRows` (sorted ascending). When the projection carries
-   `DisplayCell.originalRow` (filter/sort active), the source-row
-   index is reported there so callers can hand the result straight to
-   `backend.removeRows` without remapping.
+   `duplicateRows` (sorted ascending). Filtering hides rows instead of
+   compacting them (#27), so the projected row IS the source row and the
+   result goes straight to `backend.removeRows` with nothing to remap.
 
 6. `input.hiddenRows` lists sheet-absolute rows the scan skips outright:
    not compared, not counted in `scannedRows`, never the first-seen
@@ -181,8 +180,8 @@ warn (UI-level) before scanning very large ranges.
   preview share the same shape — neither throws).
 - Embedded control chars (U+001F, newlines, null bytes, surrogate
   pairs) do not produce spurious cross-row collisions.
-- Filter/sort projection: `DisplayCell.originalRow` surfaces in
-  `duplicateRows`.
+- Filter-hidden rows never reach `duplicateRows` (they arrive in
+  `input.hiddenRows` and are skipped before comparison).
 - `openRemoveDuplicatesAtom` seeds range + cells + defaults key
   columns; `toggleKeyColumnAtom` flips membership;
   `deselectAllKeyColumnsAtom` makes preview report `noKeyColumns`.

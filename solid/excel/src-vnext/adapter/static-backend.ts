@@ -1716,8 +1716,8 @@ function buildProjectionResult(
   // Excel hidden-row semantics: display row IS source row. A filter no longer
   // compacts survivors into consecutive slots; it withholds the hidden rows and
   // leaves every other row at its own index, which is what makes the row header
-  // skip (1, 4, 5) and what removes the second coordinate system that
-  // `originalRow` existed to translate between.
+  // skip (1, 4, 5) and what removed the second coordinate system the retired
+  // per-cell source-row echo existed to translate between.
   for (const cell of sheetCells.values()) {
     if (!isCellInsideRange(cell, range)) continue
     if (filterHiddenRows?.has(cell.row)) continue

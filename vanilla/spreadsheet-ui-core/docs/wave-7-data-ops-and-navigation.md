@@ -383,7 +383,8 @@ registered named range, rejects invalid syntax with a typed error;
 `selectByCriterionAtom('blanks')` selects only blank cells in used range;
 `selectByCriterionAtom('constants.numbers')` excludes formula-resulting
 numbers; `selectByCriterionAtom('visible-cells-only')` excludes filter-hidden
-rows via `originalRow`; cross-sheet navigation sequences sheet switch →
+rows via the backend hidden-row state; cross-sheet navigation sequences sheet
+switch →
 bounds → selection → scroll.
 
 ### Risks (precedents/dependents need engine integration)

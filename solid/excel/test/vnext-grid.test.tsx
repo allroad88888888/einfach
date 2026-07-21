@@ -2802,19 +2802,19 @@ describe('vNext SpreadsheetGrid', () => {
     expect(store.getter(historyStackAtom).entries).toHaveLength(0)
   })
 
-  it('Ctrl+B under an active filter writes formats to the mapped source rows, split per run', async () => {
+  it('Ctrl+B under an active filter writes one format range over the selection', async () => {
     const store = createStore()
     const setFormatRangeRequests: SetFormatRangeRequest[] = []
-    // Display rows 0..3 backed by source rows 0, 5, 3, 7 (filter/sort permutation).
-    const displayToSourceRow: Record<number, number> = { 0: 0, 1: 5, 2: 3, 3: 7 }
+    // A filter withheld row 2; every other row keeps its own index (#27 —
+    // hidden, not compacted). Under the retired compaction this split into two
+    // transports on source rows 5 and 3.
     const { backend } = createFakeBackend({
       cells: (window) => {
         const cells: DisplayCell[] = []
         for (let row = window.rowStart; row <= window.rowEnd; row += 1) {
-          const sourceRow = displayToSourceRow[row]
-          if (sourceRow === undefined) continue
+          if (row === 2) continue
           for (let col = window.colStart; col <= window.colEnd; col += 1) {
-            cells.push({ row, col, displayValue: `s${sourceRow},${col}`, originalRow: sourceRow })
+            cells.push({ row, col, displayValue: `s${row},${col}` })
           }
         }
         return cells
@@ -2846,7 +2846,8 @@ describe('vNext SpreadsheetGrid', () => {
       expect(container.querySelectorAll('td.spreadsheet-grid-cell')).toHaveLength(16)
     })
 
-    // A2:B3 = display rows 1..2, cols 0..1 → source rows 5 and 3.
+    // A2:B3 = rows 1..2, cols 0..1. Row 2 is filtered away but stays inside
+    // the range: Excel formats through a filtered view, it does not skip rows.
     fireEvent.click(container.querySelector('[data-cell-addr="A2"] .spreadsheet-grid-cell-button')!)
     fireEvent.click(
       container.querySelector('[data-cell-addr="B3"] .spreadsheet-grid-cell-button')!,
@@ -2860,16 +2861,15 @@ describe('vNext SpreadsheetGrid', () => {
     })
 
     await waitFor(() => {
-      expect(setFormatRangeRequests).toHaveLength(2)
+      expect(setFormatRangeRequests).toHaveLength(1)
     })
     expect(setFormatRangeRequests.map((request) => request.range)).toEqual([
-      { rowStart: 5, rowEnd: 5, colStart: 0, colEnd: 1 },
-      { rowStart: 3, rowEnd: 3, colStart: 0, colEnd: 1 },
+      { rowStart: 1, rowEnd: 2, colStart: 0, colEnd: 1 },
     ])
     expect(setFormatRangeRequests.every((request) => request.format?.bold === true)).toBe(true)
     // One UI history entry per transport (N:N with per-mutation adapters).
     const entries = store.getter(historyStackAtom).entries
-    expect(entries).toHaveLength(2)
+    expect(entries).toHaveLength(1)
     expect(entries.every((entry) => entry.kind === 'format.set')).toBe(true)
   })
 

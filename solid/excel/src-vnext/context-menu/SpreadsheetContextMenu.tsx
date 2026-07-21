@@ -172,39 +172,6 @@ function targetToRange(target: MenuTarget): CellRange | null {
   }
 }
 
-/**
- * Display→source row lookup rebuilt from a gateway range resolution. The
- * gateway walks display rows in order (`mapDisplayRangeToSourceRanges`) and
- * emits one source range per contiguous run, so flattening the runs yields
- * exactly the source row for each display row of `range`, in display order.
- */
-function displayToSourceRowMap(
-  range: CellRange,
-  sourceRanges: readonly Readonly<CellRange>[],
-): Map<number, number> {
-  const map = new Map<number, number>()
-  let displayRow = range.rowStart
-  for (const sourceRange of sourceRanges) {
-    for (let row = sourceRange.rowStart; row <= sourceRange.rowEnd; row += 1) {
-      map.set(displayRow, row)
-      displayRow += 1
-    }
-  }
-  return map
-}
-
-function boundingRange(ranges: readonly Readonly<CellRange>[]): CellRange {
-  return ranges.reduce(
-    (acc, range) => ({
-      rowStart: Math.min(acc.rowStart, range.rowStart),
-      rowEnd: Math.max(acc.rowEnd, range.rowEnd),
-      colStart: Math.min(acc.colStart, range.colStart),
-      colEnd: Math.max(acc.colEnd, range.colEnd),
-    }),
-    { ...ranges[0] },
-  )
-}
-
 function dataRangeFromOrigin(origin: CellCoord, rowCount: number, colCount: number): CellRange {
   const rows = Math.max(1, rowCount)
   const cols = Math.max(1, colCount)
@@ -522,9 +489,6 @@ export function SpreadsheetContextMenu(props: SpreadsheetContextMenuProps) {
       })
       return
     }
-    const resolvedRanges = resolution.ranges ?? [pasteRange]
-    const rowMap = resolution.remapped ? displayToSourceRowMap(pasteRange, resolvedRanges) : null
-
     store.setter(pasteClipboardAtom, {
       source: { sheetId, range: sourceRange },
       target: { sheetId, range: pasteRange },
@@ -539,12 +503,10 @@ export function SpreadsheetContextMenu(props: SpreadsheetContextMenuProps) {
         sheetId,
         chunks: (function* () {
           for (const chunk of plan.chunks()) {
-            yield rowMap === null
-              ? chunk.cells
-              : chunk.cells.map((cell) => ({ ...cell, row: rowMap.get(cell.row) ?? cell.row }))
+            yield chunk.cells
           }
         })(),
-        range: rowMap === null ? pasteRange : boundingRange(resolvedRanges),
+        range: pasteRange,
       })
     } else {
       for (const chunk of plan.chunks()) {
@@ -552,7 +514,7 @@ export function SpreadsheetContextMenu(props: SpreadsheetContextMenuProps) {
           await backend.setCellInput({
             kind: 'set-cell-input',
             sheetId,
-            row: rowMap === null ? cell.row : (rowMap.get(cell.row) ?? cell.row),
+            row: cell.row,
             col: cell.col,
             input: cell.input,
           })

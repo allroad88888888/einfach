@@ -678,7 +678,6 @@ function classifyReadAcknowledgement(
     }
     if (!Array.isArray(result.cells)) return 'failed'
     const seenCoordinates = new Set<string>()
-    const originalRowByVisualRow = new Map<number, number>()
     for (const cell of result.cells) {
       if (
         typeof cell !== 'object' ||
@@ -689,20 +688,13 @@ function classifyReadAcknowledgement(
         cell.row > ticket.range.rowEnd ||
         cell.col < ticket.range.colStart ||
         cell.col > ticket.range.colEnd ||
-        typeof cell.displayValue !== 'string' ||
-        (cell.originalRow !== undefined &&
-          (!Number.isSafeInteger(cell.originalRow) || cell.originalRow < 0))
+        typeof cell.displayValue !== 'string'
       ) {
         return 'failed'
       }
       const coordinateKey = `${cell.row}:${cell.col}`
       if (seenCoordinates.has(coordinateKey)) return 'failed'
       seenCoordinates.add(coordinateKey)
-
-      const originalRow = cell.originalRow ?? cell.row
-      const existingOriginalRow = originalRowByVisualRow.get(cell.row)
-      if (existingOriginalRow !== undefined && existingOriginalRow !== originalRow) return 'failed'
-      originalRowByVisualRow.set(cell.row, originalRow)
     }
     return 'exact'
   } catch {

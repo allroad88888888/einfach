@@ -21,8 +21,7 @@ each doc can stay focused on its own decisions.
 - **`DisplayCell` additions** — many features extend `DisplayCell` with
   optional fields populated by the visible-window projection: `mergedSpan`,
   `mergeAnchor`, `validation`, `conditionalFormat`, `noteIndicator`,
-  `commentThreadId`, `locked`, `originalRow`. The cell stays a value type; no
-  atom families.
+  `commentThreadId`, `locked`. The cell stays a value type; no atom families.
 - **Bounded caches** — every cache of backend state declares an explicit cap
   (history 100, named-range list 500, presence cursors 32, find matches 500,
   unlocked ranges 256). Eviction policy is documented per feature.

@@ -483,7 +483,6 @@ describe('audit D-7 · P-A · FLIPPED — worker filter visibility is a bounded 
     expect(after.cells.find((cell) => cell.row === 10 && cell.col === 0)).toMatchObject({
       displayValue: '90',
     })
-    expect(after.cells.every((cell) => cell.originalRow === undefined)).toBe(true)
     // The mutation ACK bumped the revision; the engine rows themselves
     // did not move (clearing the state restores the canonical order).
     expect(after.revision).not.toBe(before.revision)
@@ -497,7 +496,6 @@ describe('audit D-7 · P-A · FLIPPED — worker filter visibility is a bounded 
       createVisibleProjectionRequest({ sheetId: 'sheet-1', requestId: 5, window }),
     )
     expect(cleared.cells.find((cell) => cell.row === 1 && cell.col === 0)?.displayValue).toBe('99')
-    expect(cleared.cells.some((cell) => cell.originalRow !== undefined)).toBe(false)
 
     backend.dispose()
   })

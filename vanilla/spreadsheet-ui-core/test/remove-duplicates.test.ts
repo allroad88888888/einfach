@@ -379,57 +379,27 @@ describe('findDuplicateRows', () => {
     expect(result.duplicateRows).toEqual([5])
   })
 
-  test('filter/sort projection: duplicateRows carries originalRow, not visual row', () => {
-    // Simulates a sorted projection where visual rows 1..3 map to
-    // source rows 42, 7, 19. Two cells share the same value, so the
-    // SECOND-seen visual row is a duplicate — but the reported index
-    // must be its `originalRow` so backend.removeRows deletes the
-    // right source row.
-    const c = (row: number, col: number, value: string, originalRow: number): DisplayCell => ({
-      row,
-      col,
-      displayValue: value,
-      valueKind: 'string',
-      originalRow,
-    })
+  test('filter-active projection: duplicateRows carries the source row it scanned', () => {
+    // A filter hid rows 1 and 2, so they contribute no cell and never reach
+    // the scan. What survives keeps its own index (#27 — hidden, not
+    // compacted), so the duplicate index IS the source row backend.removeRows
+    // must delete. Under the retired compaction the same projection would
+    // have reported visual row 2 for a source row 3.
     const cells: DisplayCell[] = [
-      c(0, 0, 'header', 0),
-      c(1, 0, 'shared', 42),
-      c(2, 0, 'unique', 7),
-      c(3, 0, 'shared', 19),
+      cell(0, 0, 'header'),
+      cell(3, 0, 'shared'),
+      cell(4, 0, 'unique'),
+      cell(5, 0, 'shared'),
     ]
     const result = findDuplicateRows({
       cells,
-      range: range(0, 0, 3, 0),
+      range: range(0, 0, 5, 0),
       keyColumns: new Set([0]),
+      hiddenRows: [1, 2],
     })
-    // Visual row 3 is the duplicate; its source row is 19, NOT 3.
-    expect(result.duplicateRows).toEqual([19])
-  })
-
-  test('projection bug: cells in same visual row report different originalRow → warn once, keep first', () => {
-    const warn = jest.spyOn(console, 'warn').mockImplementation(() => {})
-    try {
-      const cells: DisplayCell[] = [
-        { row: 1, col: 0, displayValue: 'a', valueKind: 'string', originalRow: 10 },
-        // bug: same visual row, conflicting source row
-        { row: 1, col: 1, displayValue: 'x', valueKind: 'string', originalRow: 99 },
-        { row: 2, col: 0, displayValue: 'a', valueKind: 'string', originalRow: 11 },
-        { row: 2, col: 1, displayValue: 'x', valueKind: 'string', originalRow: 11 },
-      ]
-      const result = findDuplicateRows({
-        cells,
-        range: range(1, 0, 2, 1),
-        keyColumns: new Set([0, 1]),
-        excludeHeader: false,
-      })
-      // visual row 2 dupes visual row 1 → reports source row 11.
-      expect(result.duplicateRows).toEqual([11])
-      // and warned, but didn't throw.
-      expect(warn).toHaveBeenCalledTimes(1)
-    } finally {
-      warn.mockRestore()
-    }
+    expect(result.duplicateRows).toEqual([5])
+    // The hidden rows were skipped outright, not scanned as all-blank tuples.
+    expect(result.scannedRows).toBe(3)
   })
 
   test('blank-kind cell normalises to empty string regardless of displayValue', () => {
@@ -674,13 +644,6 @@ describe('remove-duplicates Core lifecycle', () => {
     {
       name: 'duplicate visual coordinate',
       cells: [...SESSION_CELLS, cell(1, 0, 'duplicate-coordinate')],
-    },
-    {
-      name: 'conflicting originalRow values for one visual row',
-      cells: [
-        { ...cell(1, 0, 'North'), originalRow: 10 },
-        { ...cell(1, 1, '100'), originalRow: 11 },
-      ],
     },
   ])('rejects a malformed projection with $name', async ({ cells }) => {
     const store = createStore()

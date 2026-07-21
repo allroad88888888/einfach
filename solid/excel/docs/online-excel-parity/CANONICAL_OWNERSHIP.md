@@ -107,7 +107,7 @@
 | 切片 | 内容                                                                                          | 作用                                           |
 | ---- | --------------------------------------------------------------------------------------------- | ---------------------------------------------- |
 | W1   | TS worker 假 ACK fail-closed                                                                  | 消灭 fail-open 伪成功，TS 正式降级为开发后备   |
-| W2   | 统一 mutation 网关：display→originalRow 回映射 + protection 门禁必经                          | 排序/筛选可见性翻转与 #40 门禁翻转的公共必经点 |
+| W2   | 统一 mutation 网关：坐标合法性 + protection 门禁必经（display→源行回映射半边已随 #27 S6 退役，display 行 ≡ 源行） | 排序/筛选可见性翻转与 #40 门禁翻转的公共必经点 |
 | W3   | 结构位移 remap 合同：`BackendMutationResult.structuralShift` + static merge/freeze remap 修复 | 修复 static 插删行列不平移 merge 的实锤 bug    |
 
 ### 翻转顺序与约束

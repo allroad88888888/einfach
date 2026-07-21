@@ -699,7 +699,7 @@ describe('text-to-columns', () => {
           requests.push(request)
           return matchingEntrypointProjection(request, [
             { row: 2, col: 3, displayValue: 'first,second' },
-            { row: 3, col: 3, displayValue: 'third,fourth', originalRow: 3 },
+            { row: 3, col: 3, displayValue: 'third,fourth' },
             { row: 4, col: 3, displayValue: 'fifth,sixth' },
           ])
         },
@@ -945,20 +945,6 @@ describe('text-to-columns', () => {
               row: request.range.rowStart,
               col: request.range.colStart,
               displayValue: 'duplicate',
-            },
-          ],
-        }),
-      },
-      {
-        label: 'originalRow remapping',
-        mutate: (result, request) => ({
-          ...result,
-          cells: [
-            {
-              row: request.range.rowStart,
-              col: request.range.colStart,
-              displayValue: 'remapped',
-              originalRow: request.range.rowStart + 1,
             },
           ],
         }),

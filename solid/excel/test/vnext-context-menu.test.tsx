@@ -841,12 +841,14 @@ describe('vNext SpreadsheetContextMenu', () => {
     })
   })
 
-  it('clears mapped source rows via the gateway while a filter remap is active', async () => {
+  it('clears the selected rows in one range via the gateway under an active filter', async () => {
     const store = createStore()
     const { backend, clearRangeRequests, setCellInputRequests } = createFakeBackend()
     const window = { rowStart: 0, rowEnd: 4, colStart: 0, colEnd: 4 }
 
-    // Display rows 1..2 backed by source rows 5 and 3 (filter/sort permutation).
+    // A filter withheld rows 0, 3 and 4; rows 1 and 2 survive at their own
+    // indices (#27 — hidden, not compacted). The retired compaction split this
+    // clear into two transports on source rows 5 and 3.
     seedReadyVisibleProjection(store, {
       status: 'ready',
       request: {
@@ -861,8 +863,8 @@ describe('vNext SpreadsheetContextMenu', () => {
         window,
         requestId: 1,
         cells: [
-          { row: 1, col: 0, displayValue: 'beta', originalRow: 5 },
-          { row: 2, col: 0, displayValue: 'gamma', originalRow: 3 },
+          { row: 1, col: 0, displayValue: 'beta' },
+          { row: 2, col: 0, displayValue: 'gamma' },
         ],
       },
     })
@@ -887,8 +889,7 @@ describe('vNext SpreadsheetContextMenu', () => {
 
     await waitFor(() =>
       expect(clearRangeRequests.map((request) => request.range)).toEqual([
-        { rowStart: 5, rowEnd: 5, colStart: 0, colEnd: 1 },
-        { rowStart: 3, rowEnd: 3, colStart: 0, colEnd: 1 },
+        { rowStart: 1, rowEnd: 2, colStart: 0, colEnd: 1 },
       ]),
     )
     expect(setCellInputRequests).toEqual([])

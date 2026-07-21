@@ -325,62 +325,6 @@ describe('SpreadsheetFormatPainter thin-host contract', () => {
     expect(store.getter(formatPainterPendingAtom)).toBe(false)
   })
 
-  it('rejects a logical target that resolves to multiple physical ranges before mutation', async () => {
-    const store = createStore()
-    const { backend, setFormatRangeCalls, readVisibleProjectionCalls } = createRecordingBackend()
-    primeStoreWithProjection(store)
-    seedReadyVisibleProjection(store, {
-      status: 'ready',
-      request: {
-        kind: 'visible-window',
-        sheetId: 'sheet-1',
-        requestId: 2,
-        reason: 'test',
-        window: { rowStart: 0, rowEnd: 9, colStart: 0, colEnd: 9 },
-      },
-      result: {
-        ...makeProjectionResult('sheet-1'),
-        requestId: 2,
-        cells: [
-          {
-            row: 0,
-            col: 0,
-            originalRow: 0,
-            displayValue: 'A1',
-            valueKind: 'string',
-            format: richFormat(),
-          },
-          { row: 1, col: 0, originalRow: 10, displayValue: 'A2', valueKind: 'string', format: {} },
-          { row: 2, col: 0, originalRow: 20, displayValue: 'A3', valueKind: 'string', format: {} },
-        ],
-      },
-      error: undefined,
-    })
-
-    render(() => (
-      <SpreadsheetUiProvider backend={backend} store={store}>
-        <SpreadsheetFormatPainter />
-      </SpreadsheetUiProvider>
-    ))
-
-    store.setter(armFormatPainterAtom, { format: richFormat() })
-    store.setter(setSelectionAtom, {
-      kind: 'range',
-      sheetId: 'sheet-1',
-      anchor: { row: 1, col: 0 },
-      focus: { row: 2, col: 0 },
-    })
-
-    await waitFor(() => {
-      expect(store.getter(formatPainterControllerAtom).error?.code).toBe(
-        'FORMAT_PAINTER_NON_CONTIGUOUS_TARGET',
-      )
-    })
-    expect(setFormatRangeCalls).toHaveLength(0)
-    expect(readVisibleProjectionCalls).toHaveLength(0)
-    expect(store.getter(formatPainterStateAtom)).toBe('armed')
-  })
-
   it('retries the latest sticky selection after the prior ticket fully settles', async () => {
     const store = createStore()
     const firstMutation = deferred<BackendMutationResult>()

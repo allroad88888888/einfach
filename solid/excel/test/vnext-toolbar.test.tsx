@@ -14,7 +14,6 @@ import type {
 } from '@einfach/spreadsheet-ui-core'
 import {
   beginProjectionAtom,
-  diagnosticsAtom,
   findReplaceOpenAtom,
   formatCellsEditorAtom,
   formatPainterStateAtom,
@@ -514,12 +513,15 @@ describe('vNext SpreadsheetToolbar', () => {
     expect(store.getter(historyStackAtom).entries).toHaveLength(0)
   })
 
-  it('maps toolbar number formats from sorted visible rows to source rows', async () => {
+  it('writes a toolbar number format to the selected row under an active filter', async () => {
     const store = createStore()
     const { backend, setFormatRangeCalls } = createRecordingBackend()
 
     store.setter(setWorkspaceActiveSheetAtom, { sheetId: 'sheet-1' })
     store.setter(selectCellAtom, { sheetId: 'sheet-1', coord: { row: 5, col: 4 } })
+    // A filter withheld every other row; row 5 is what the user sees AND the
+    // row the engine must format (#27 — hidden, not compacted). The retired
+    // compaction made this write land on source row 1 instead.
     seedVisibleProjection(store, {
       kind: 'visible-window',
       sheetId: 'sheet-1',
@@ -529,7 +531,6 @@ describe('vNext SpreadsheetToolbar', () => {
         {
           row: 5,
           col: 4,
-          originalRow: 1,
           displayValue: '300',
           valueKind: 'number',
           format: {},
@@ -550,52 +551,9 @@ describe('vNext SpreadsheetToolbar', () => {
       kind: 'set-format-range',
       sheetId: 'sheet-1',
       requestId: expect.any(Number),
-      range: { rowStart: 1, rowEnd: 1, colStart: 4, colEnd: 4 },
+      range: { rowStart: 5, rowEnd: 5, colStart: 4, colEnd: 4 },
       format: { numberFormat: { kind: 'percent', digits: 0 } },
     })
-  })
-
-  it('fails closed on a format command when a filtered row cannot be mapped', async () => {
-    const store = createStore()
-    const { backend, setFormatRangeCalls } = createRecordingBackend()
-
-    store.setter(setWorkspaceActiveSheetAtom, { sheetId: 'sheet-1' })
-    store.setter(selectCellAtom, { sheetId: 'sheet-1', coord: { row: 6, col: 4 } })
-    // The remap is active (originalRow facts exist) but display row 6 carries
-    // no fact — the mutation gateway must block instead of guessing a source
-    // row (the old lenient helper silently fell back to the display row).
-    seedVisibleProjection(store, {
-      kind: 'visible-window',
-      sheetId: 'sheet-1',
-      requestId: 1,
-      window: { rowStart: 0, rowEnd: 8, colStart: 0, colEnd: 5 },
-      cells: [
-        {
-          row: 5,
-          col: 4,
-          originalRow: 1,
-          displayValue: '300',
-          valueKind: 'number',
-          format: {},
-        },
-      ],
-    })
-
-    const { container } = render(() => (
-      <SpreadsheetUiProvider backend={backend} store={store}>
-        <SpreadsheetToolbar />
-      </SpreadsheetUiProvider>
-    ))
-
-    fireEvent.click(getButtons(container).percent)
-
-    await waitFor(() =>
-      expect(
-        store.getter(diagnosticsAtom).items.some((item) => item.code === 'MUTATION_UNMAPPED_ROW'),
-      ).toBe(true),
-    )
-    expect(setFormatRangeCalls).toHaveLength(0)
-    expect(store.getter(toolbarMutationLifecycleAtom).status).toBe('ready')
   })
 
   it('keeps the number-format dropdown clickable through a real mousedown after sorting', async () => {
@@ -612,7 +570,6 @@ describe('vNext SpreadsheetToolbar', () => {
       {
         row: 5,
         col: 4,
-        originalRow: 1,
         displayValue: '300',
         valueKind: 'number' as const,
         format: {},
@@ -721,10 +678,10 @@ describe('vNext SpreadsheetToolbar', () => {
     fireEvent.click(percentItem!)
 
     await waitFor(() => expect(setFormatRangeCalls).toHaveLength(1))
-    // Display row 5 remaps to source row 1 through the mutation gateway.
+    // The write lands on the selected row itself — display row IS source row.
     expect(setFormatRangeCalls[0].range).toEqual({
-      rowStart: 1,
-      rowEnd: 1,
+      rowStart: 5,
+      rowEnd: 5,
       colStart: 4,
       colEnd: 4,
     })

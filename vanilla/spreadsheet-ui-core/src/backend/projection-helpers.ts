@@ -205,7 +205,6 @@ export function cloneCell(cell: DisplayCell): DisplayCell {
   if (cell.richValue) clone.richValue = cloneRichValue(cell.richValue)
   if (cell.mergedSpan) clone.mergedSpan = { ...cell.mergedSpan }
   if (cell.mergeAnchor) clone.mergeAnchor = { ...cell.mergeAnchor }
-  if (cell.originalRow !== undefined) clone.originalRow = cell.originalRow
   return clone
 }
 

@@ -369,51 +369,6 @@ describe('SpreadsheetPasteSpecialDialog thin Core projection', () => {
     expect(store.getter(historyStackAtom).entries).toHaveLength(0)
   })
 
-  it('blocks confirm while a display→source remap is active, zero transport', async () => {
-    const store = createStore()
-    seedPasteContext(store)
-    // Active filter/sort remap: the frozen session target carries display
-    // rows that no longer equal source rows, and the single pasteRange
-    // request cannot express the permutation — fail closed.
-    const request = createVisibleProjectionRequest({
-      sheetId: 'sheet-1',
-      requestId: 0,
-      window: { rowStart: 0, rowEnd: 10, colStart: 0, colEnd: 8 },
-      reason: 'test',
-    })
-    seedReadyVisibleProjection(store, {
-      status: 'ready',
-      request,
-      result: {
-        ...visibleResult(request),
-        cells: [
-          { row: 4, col: 2, displayValue: 'a', originalRow: 7 },
-          { row: 5, col: 2, displayValue: 'b', originalRow: 9 },
-        ],
-      },
-      error: undefined,
-    })
-    const pasteRange = jest.fn(async (pasteRequest: PasteRangeRequest) =>
-      strictPasteResult(pasteRequest),
-    )
-    const backend = createBackend({ pasteRange })
-    store.setter(openPasteSpecialAtom)
-    const { container } = renderDialog(store, backend)
-
-    await waitFor(() => {
-      expect(queryButton(container, 'paste-special-confirm-button').disabled).toBe(false)
-    })
-    fireEvent.click(queryButton(container, 'paste-special-confirm-button'))
-
-    await waitFor(() =>
-      expect(
-        store.getter(diagnosticsAtom).items.some((item) => item.code === 'MUTATION_UNMAPPED_ROW'),
-      ).toBe(true),
-    )
-    expect(pasteRange).not.toHaveBeenCalled()
-    expect(store.getter(pasteSpecialOpenAtom)).toBe(true)
-  })
-
   it('transport rejection remains outcome-unknown and disables duplicate confirm', async () => {
     const store = createStore()
     seedPasteContext(store)

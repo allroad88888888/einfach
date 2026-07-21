@@ -56,10 +56,10 @@ function setActiveCell(
 const RANGE: CellRange = { rowStart: 1, rowEnd: 5, colStart: 0, colEnd: 3 }
 
 /**
- * Seed the visible projection UI core consumes so `buildSortExcludedRows` can
- * derive filter-hidden rows from `DisplayCell.originalRow` gaps. Window covers
- * display rows 0..(cells max row); source rows a filter compresses away simply
- * have no cell here.
+ * Seed the visible projection UI core consumes. `buildSortExcludedRows` no
+ * longer reads it — the excluded set comes from the two hidden-row atoms —
+ * so this exists to give the sort command a realistic bounded window, and to
+ * show that a window narrower than the sort range changes no answer.
  */
 function publishProjection(
   store: ReturnType<typeof makeStore>,
@@ -284,11 +284,12 @@ describe('runPhysicalSortAtom — filter-hidden excluded rows', () => {
       state: { rules: [{ kind: 'equals', colIndex: 0, value: 'x' }] },
     })
     // The bounded-window gap this replaces: excluded rows used to be inferred
-    // from holes in the projected originalRow values, so only rows the viewport
-    // happened to cover could ever be judged. Here the window shows rows 0..1
-    // only, while rows 1, 3 and 5 are filtered out — the old derivation
-    // answered [] for 1 and 5 (outside the observed span) and they moved under
-    // the sort. The host's whole-column answer covers the whole extent.
+    // from holes in the source-row echoes the compacted projection carried, so
+    // only rows the viewport happened to cover could ever be judged. Here the
+    // window shows rows 0..1 only, while rows 1, 3 and 5 are filtered out —
+    // the old derivation answered [] for 1 and 5 (outside the observed span)
+    // and they moved under the sort. The host's whole-column answer covers the
+    // whole extent.
     store.setter(setViewportFilterHiddenRowsAtom, { sheetId: 'sheet-1', rows: [1, 3, 5] })
     publishProjection(
       store,

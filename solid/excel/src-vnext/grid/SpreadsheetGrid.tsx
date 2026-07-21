@@ -2170,10 +2170,10 @@ export function SpreadsheetGrid(props: SpreadsheetGridProps) {
       return
     }
 
-    // Mutation gateway: the write range must clear the protection gate and
-    // resolve to source rows before any transport (fail-closed). The fill
-    // source only needs the remap answer — copying FROM locked cells is
-    // allowed, so the lock gate is skipped for it.
+    // Mutation gateway: the write range must clear the protection gate
+    // before any transport (fail-closed). Copying FROM locked cells is
+    // allowed, so the fill source skips the lock gate and is only checked
+    // for coordinate validity.
     const writeResolution = store.setter(resolveContentMutationAtom, {
       kind: 'fill-range',
       sheetId: intent.sheetId,
@@ -2192,27 +2192,20 @@ export function SpreadsheetGrid(props: SpreadsheetGridProps) {
       return
     }
 
-    if (writeResolution.remapped || sourceResolution.remapped) {
-      // Filter/sort permutes the affected rows: the contiguous
-      // fillSeries/fillRange transports cannot express the write, so use
-      // gateway-mapped per-cell writes instead.
-      await fallbackFillHandle(intent, writeRange)
-    } else {
-      const filledSeries = await tryNumericFillSeries({ ...intent, direction: intent.direction })
+    const filledSeries = await tryNumericFillSeries({ ...intent, direction: intent.direction })
 
-      if (filledSeries) {
-        // Numeric series is a single compact backend mutation.
-      } else if (backend.fillRange) {
-        await backend.fillRange({
-          kind: 'fill-range',
-          sheetId: intent.sheetId,
-          sourceRange: intent.sourceRange,
-          targetRange: intent.targetRange,
-          direction: intent.direction,
-        })
-      } else {
-        await fallbackFillHandle(intent, writeRange)
-      }
+    if (filledSeries) {
+      // Numeric series is a single compact backend mutation.
+    } else if (backend.fillRange) {
+      await backend.fillRange({
+        kind: 'fill-range',
+        sheetId: intent.sheetId,
+        sourceRange: intent.sourceRange,
+        targetRange: intent.targetRange,
+        direction: intent.direction,
+      })
+    } else {
+      await fallbackFillHandle(intent, writeRange)
     }
 
     await loadProjection(requestProjection())

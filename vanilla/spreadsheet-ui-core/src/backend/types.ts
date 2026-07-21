@@ -189,9 +189,6 @@ export interface DisplayCell {
   validation?: ValidationOutcome
   conditionalFormat?: SpreadsheetCellFormat
   richValue?: DisplayCellRichValue
-  /** Backend sets this when filter or sort is active; the renderer keeps using `row` for layout
-   *  while edit round-trips use originalRow. */
-  originalRow?: number
   /** Locked indicator from a protected sheet; gating logic uses unlockedRanges on the UI side. */
   locked?: boolean
 }

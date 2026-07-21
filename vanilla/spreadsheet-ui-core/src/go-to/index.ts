@@ -822,7 +822,6 @@ function toGoToCandidate(cell: RangeProjectionResult['cells'][number]): GoToCand
     commentThreadId: cell.commentThreadId,
     conditionalFormat: cell.conditionalFormat,
     validation: cell.validation,
-    originalRow: cell.originalRow,
   }
 }
 

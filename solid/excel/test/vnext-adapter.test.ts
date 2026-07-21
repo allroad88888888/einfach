@@ -1078,9 +1078,6 @@ describe('vnext adapter', () => {
     expect(
       beforeSort.cells.filter((cell) => cell.col === 0).map((cell) => cell.displayValue),
     ).toEqual(['Region', 'North', 'South', 'East', 'West'])
-    expect(
-      beforeSort.cells.find((cell) => cell.row === 1 && cell.col === 0)?.originalRow,
-    ).toBeUndefined()
 
     // Physically sort the data region (rows 1..4, header row 0 excluded) by Q1
     // descending — this moves engine data, not a display permutation.
@@ -1108,10 +1105,10 @@ describe('vnext adapter', () => {
     expect(
       projected.cells.filter((cell) => cell.col === 0).map((cell) => cell.displayValue),
     ).toEqual(['Region', 'East', 'West', 'North', 'South'])
-    // A physical move never stamps originalRow (that is a display-permutation fact).
-    expect(
-      projected.cells.find((cell) => cell.row === 1 && cell.col === 0)?.originalRow,
-    ).toBeUndefined()
+    // Cells report where they physically live: a moved row is AT its new index.
+    expect(projected.cells.find((cell) => cell.row === 1 && cell.col === 0)?.displayValue).toBe(
+      'East',
+    )
   })
 
   it('applies static backend filter rules to visible projections', async () => {
@@ -1179,7 +1176,6 @@ describe('vnext adapter', () => {
     const east = projected.cells.find((cell) => cell.displayValue === 'East')
     // Source row 3 stays at row 3. Compaction would have reported row 1.
     expect(east?.row).toBe(3)
-    expect(east?.originalRow).toBeUndefined()
     // Rows 1, 2 and 4 are withheld outright, not blanked.
     expect(projected.cells.map((cell) => cell.row).sort()).toEqual([0, 0, 3, 3])
   })
@@ -1302,15 +1298,13 @@ describe('vnext adapter', () => {
     // surviving source rows were scattered; hiding rows removes that need.
     expect(client.calls.readCells).toHaveLength(0)
     expect(projected.revision).toBe(8)
-    // Filtered-out rows are withheld and survivors keep their own index. No
-    // `originalRow`: display row IS source row.
+    // Filtered-out rows are withheld and survivors keep their own index:
+    // display row IS source row, with no second coordinate reported.
     expect(
-      projected.cells
-        .filter((cell) => cell.col === 0)
-        .map((cell) => [cell.displayValue, cell.row, cell.originalRow]),
+      projected.cells.filter((cell) => cell.col === 0).map((cell) => [cell.displayValue, cell.row]),
     ).toEqual([
-      ['Region', 0, undefined],
-      ['North', 1, undefined],
+      ['Region', 0],
+      ['North', 1],
     ])
     // Engine data untouched — no writes were issued.
     expect(client.calls.setCell).toHaveLength(0)
@@ -4778,10 +4772,10 @@ describe('static backend exact row removal', () => {
   }
 
   it('advertises the capability, returns an exact ACK, shifts data, and records one undo entry', async () => {
-    const originalRows = ['header', 'one', 'drop-two', 'three', 'drop-four', 'five', 'six']
+    const seedRows = ['header', 'one', 'drop-two', 'three', 'drop-four', 'five', 'six']
     const backend = createStaticSpreadsheetBackend({
       revision: 7,
-      matrix: originalRows.map((value) => [value]),
+      matrix: seedRows.map((value) => [value]),
     })
 
     expect(typeof backend.removeRowsExact).toBe('function')
@@ -4809,7 +4803,7 @@ describe('static backend exact row removal', () => {
     expect(restored.revision).toBe(9)
     expect(
       restored.cells.filter((cell) => cell.col === 0).map((cell) => cell.displayValue),
-    ).toEqual(originalRows)
+    ).toEqual(seedRows)
     await expect(
       backend.undoTransaction!(undoRequest('remove-rows-exact-second-undo')),
     ).rejects.toThrow('nothing to undo')

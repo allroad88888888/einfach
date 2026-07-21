@@ -790,7 +790,6 @@ function textToColumnsSourceRowsFromResult(
         (row as number) > ticket.target.range.rowEnd ||
         col !== ticket.target.range.colStart ||
         typeof cell.displayValue !== 'string' ||
-        (cell.originalRow !== undefined && cell.originalRow !== row) ||
         byRow.has(row as number)
       ) {
         return null
@@ -1488,16 +1487,15 @@ export const runTextToColumnsFinishAtom = atom(
       return 'blocked'
     }
 
-    // Mutation gateway: the commit plan freezes source rows captured under an
-    // identity display→source mapping, and the single importCellChunks request
-    // cannot express a permuted remap — so any active remap and any protection
-    // block fail closed here, before the transport (zero transport, structured
-    // diagnostic recorded by the gateway).
+    // Mutation gateway: a protection block fails closed here, before the
+    // transport (zero transport, structured diagnostic recorded by the
+    // gateway). The commit plan's rows are source rows already — filtering
+    // hides rather than compacts (#27), so the single importCellChunks
+    // request can always express the target.
     const resolution = set(resolveContentMutationAtom, {
       kind: 'import-cell-chunks',
       sheetId: session.sheetId,
       range: target,
-      requireIdentityMapping: true,
     })
     if (resolution.status === 'blocked') {
       set(textToColumnsErrorStateAtom, resolution.diagnostic.message)

@@ -1,11 +1,9 @@
 import { atom, type Atom, type Setter } from '@einfach/core'
-import type { VisibleProjectionResult } from '../backend/types'
 import {
   appendDiagnosticsAtom,
   createSpreadsheetDiagnostic,
   type SpreadsheetDiagnostic,
 } from '../diagnostics'
-import { projectionSnapshotAtom, type ProjectionResult } from '../projection'
 import { isRangeFullyUnlocked, sheetProtectionAtom } from '../protection'
 import type { CellCoord, CellRange } from '../shared'
 
@@ -17,26 +15,23 @@ import type { CellCoord, CellRange } from '../shared'
  * (set-format-range) resolves through this module before any transport is
  * launched:
  *
- * 1. Display→source row remap. When filter/sort is active the visible
- *    projection carries `DisplayCell.originalRow`; mutation targets arrive
- *    in display coordinates and must be remapped to source rows. Without
- *    an active remap the resolution is the identity. A display row that
- *    cannot be mapped (outside the projected window, or no originalRow
- *    fact) fails closed — the mutation is blocked, never guessed.
- * 2. Protection gate. After remap, if the sheet is protected and the
- *    source-coordinate target is not fully covered by unlocked ranges,
- *    the mutation is blocked before transport (fail-closed). This applies
- *    to `set-format-range` too — Excel semantics: locked cells on a
- *    protected sheet cannot be reformatted. `protectionGate: false` skips
- *    step 2 while still applying the row remap (e.g. reading a fill
- *    source, format-only clears).
+ * 1. Target validity. Coordinates must be safe non-negative integers and
+ *    ranges must be non-inverted, else `invalid-target`.
+ * 2. Protection gate. If the sheet is protected and the target is not
+ *    fully covered by unlocked ranges, the mutation is blocked before
+ *    transport (fail-closed). This applies to `set-format-range` too —
+ *    Excel semantics: locked cells on a protected sheet cannot be
+ *    reformatted. `protectionGate: false` skips step 2 (e.g. reading a
+ *    fill source, format-only clears).
  *
- * `requireIdentityMapping: true` is for transports whose frozen request
- * shape can only express the original contiguous display-coordinate
- * target (paste-special sessions, text-to-columns commit plans): an
- * otherwise-allowed resolution that would move or split any row fails
- * closed as `unmapped-row` instead of returning remapped ranges the
- * caller cannot forward.
+ * Mutation targets are SOURCE coordinates on arrival. Filtering hides rows
+ * rather than compacting them (#27 S5), so display row IS source row and
+ * there is no second coordinate system to translate between. The gateway's
+ * whole display→source remap half — the per-cell source-row echo, the
+ * run-splitting range mapper, the unmappable-row block reason and the
+ * identity-mapping fail-closed door — was retired with the compaction it
+ * existed to undo (#27 S6). `ranges` is therefore always the single input
+ * range; it stays a list only so callers that already loop stay unchanged.
  */
 
 export type ContentMutationKind =
@@ -51,47 +46,41 @@ export type ContentMutationKind =
 export interface ResolveContentMutationCellInput {
   readonly kind: ContentMutationKind
   readonly sheetId: string
-  /** Display-coordinate target cell. */
+  /** Target cell. */
   readonly cell: Readonly<CellCoord>
   readonly range?: undefined
   /** Defaults to true. Pass false for read-side or gate-exempt resolution. */
   readonly protectionGate?: boolean
-  /** Defaults to false. When true, any row remap fails closed as unmapped-row. */
-  readonly requireIdentityMapping?: boolean
 }
 
 export interface ResolveContentMutationRangeInput {
   readonly kind: ContentMutationKind
   readonly sheetId: string
-  /** Display-coordinate target range. */
+  /** Target range. */
   readonly range: Readonly<CellRange>
   readonly cell?: undefined
   /** Defaults to true. Pass false for read-side or gate-exempt resolution. */
   readonly protectionGate?: boolean
-  /** Defaults to false. When true, any row remap fails closed as unmapped-row. */
-  readonly requireIdentityMapping?: boolean
 }
 
 export type ResolveContentMutationInput =
   | ResolveContentMutationCellInput
   | ResolveContentMutationRangeInput
 
-export type ContentMutationBlockReason = 'locked' | 'unmapped-row' | 'invalid-target'
+export type ContentMutationBlockReason = 'locked' | 'invalid-target'
 
 export interface AllowedContentMutation {
   readonly status: 'allowed'
   readonly kind: ContentMutationKind
   readonly sheetId: string
-  /** Source-coordinate cell; present only for cell-target inputs. */
+  /** Target cell; present only for cell-target inputs. */
   readonly cell?: Readonly<CellCoord>
   /**
-   * Source-coordinate ranges; present only for range-target inputs. A
-   * remapped display range splits into one range per contiguous source
-   * row run, so callers must issue one transport per entry.
+   * Target ranges; present only for range-target inputs. Always exactly
+   * one entry (display row IS source row), kept as a list so callers that
+   * already loop stay unchanged.
    */
   readonly ranges?: readonly Readonly<CellRange>[]
-  /** True when the display→source remap moved at least one row. */
-  readonly remapped: boolean
 }
 
 export interface BlockedContentMutation {
@@ -103,18 +92,6 @@ export interface BlockedContentMutation {
 }
 
 export type ContentMutationResolution = AllowedContentMutation | BlockedContentMutation
-
-export type DisplayCellMapping =
-  | { readonly ok: true; readonly cell: Readonly<CellCoord>; readonly remapped: boolean }
-  | { readonly ok: false; readonly reason: 'unmapped-row' | 'invalid-target' }
-
-export type DisplayRangeMapping =
-  | {
-      readonly ok: true
-      readonly ranges: readonly Readonly<CellRange>[]
-      readonly remapped: boolean
-    }
-  | { readonly ok: false; readonly reason: 'unmapped-row' | 'invalid-target' }
 
 function isSafeCoordValue(value: number): boolean {
   return Number.isSafeInteger(value) && value >= 0
@@ -135,117 +112,13 @@ function isValidRange(range: Readonly<CellRange>): boolean {
   )
 }
 
-/**
- * The visible projection result for `sheetId` when it carries an active
- * display→source row remap (`originalRow` facts); null when mutations may
- * pass through untouched.
- */
-export function getActiveRowRemapProjection(
-  result: ProjectionResult | undefined,
-  sheetId: string,
-): VisibleProjectionResult | null {
-  if (result === undefined || result.kind !== 'visible-window' || result.sheetId !== sheetId) {
-    return null
-  }
-  return result.cells.some((cell) => typeof cell.originalRow === 'number') ? result : null
-}
-
-/**
- * Source row for one display row inside an active remap projection.
- * Null when the row is outside the window or has no `originalRow` fact.
- */
-export function mapDisplayRowToSourceRow(
-  visible: VisibleProjectionResult,
-  row: number,
-): number | null {
-  const windowRange = visible.window
-  if (row < windowRange.rowStart || row > windowRange.rowEnd) return null
-  for (const cell of visible.cells) {
-    if (cell.row === row && typeof cell.originalRow === 'number') {
-      return isSafeCoordValue(cell.originalRow) ? cell.originalRow : null
-    }
-  }
-  return null
-}
-
-/** Display→source remap for a single cell. Identity when no remap is active. */
-export function mapDisplayCellToSource(
-  result: ProjectionResult | undefined,
-  sheetId: string,
-  cell: Readonly<CellCoord>,
-): DisplayCellMapping {
-  if (!isValidCell(cell)) {
-    return { ok: false, reason: 'invalid-target' }
-  }
-  const visible = getActiveRowRemapProjection(result, sheetId)
-  if (visible === null) {
-    return { ok: true, cell: { row: cell.row, col: cell.col }, remapped: false }
-  }
-  const sourceRow = mapDisplayRowToSourceRow(visible, cell.row)
-  if (sourceRow === null) {
-    return { ok: false, reason: 'unmapped-row' }
-  }
-  return {
-    ok: true,
-    cell: { row: sourceRow, col: cell.col },
-    remapped: sourceRow !== cell.row,
-  }
-}
-
-/**
- * Display→source remap for a range. Identity when no remap is active.
- * With an active remap every display row must resolve; contiguous source
- * rows collapse into one range, permuted rows split per run.
- */
-export function mapDisplayRangeToSourceRanges(
-  result: ProjectionResult | undefined,
-  sheetId: string,
-  range: Readonly<CellRange>,
-): DisplayRangeMapping {
-  if (!isValidRange(range)) {
-    return { ok: false, reason: 'invalid-target' }
-  }
-  const visible = getActiveRowRemapProjection(result, sheetId)
-  if (visible === null) {
-    return { ok: true, ranges: [{ ...range }], remapped: false }
-  }
-
-  const ranges: CellRange[] = []
-  let remapped = false
-  for (let row = range.rowStart; row <= range.rowEnd; row += 1) {
-    const sourceRow = mapDisplayRowToSourceRow(visible, row)
-    if (sourceRow === null) {
-      return { ok: false, reason: 'unmapped-row' }
-    }
-    remapped ||= sourceRow !== row
-    const previous = ranges[ranges.length - 1]
-    if (previous !== undefined && previous.rowEnd + 1 === sourceRow) {
-      previous.rowEnd = sourceRow
-    } else {
-      ranges.push({
-        rowStart: sourceRow,
-        rowEnd: sourceRow,
-        colStart: range.colStart,
-        colEnd: range.colEnd,
-      })
-    }
-  }
-
-  if (!remapped) {
-    return { ok: true, ranges: [{ ...range }], remapped: false }
-  }
-  return { ok: true, ranges, remapped: true }
-}
-
 const BLOCK_MESSAGES: Record<ContentMutationBlockReason, string> = {
   locked: 'The target cells are locked on a protected sheet.',
-  'unmapped-row': 'The target rows cannot be mapped to source rows while filter or sort is active.',
   'invalid-target': 'The mutation target coordinates are invalid.',
 }
 
 const BLOCK_CODES: Record<ContentMutationBlockReason, string> = {
   locked: 'MUTATION_BLOCKED_LOCKED',
-  'unmapped-row': 'MUTATION_UNMAPPED_ROW',
   'invalid-target': 'MUTATION_INVALID_TARGET',
 }
 
@@ -290,40 +163,30 @@ clearContentMutationBlockAtom.debugLabel = 'spreadsheet.mutationGateway.clearBlo
 
 /**
  * Command: resolve one content-mutation intent. Returns either the
- * source-coordinate target (allowed) or a structured blocked result. A
- * blocked resolution records itself on `contentMutationLastBlockAtom` and
- * appends a diagnostic; the caller MUST NOT launch any transport for it.
+ * validated target (allowed) or a structured blocked result. A blocked
+ * resolution records itself on `contentMutationLastBlockAtom` and appends
+ * a diagnostic; the caller MUST NOT launch any transport for it.
  */
 export const resolveContentMutationAtom = atom(
   null,
   (get, set, input: ResolveContentMutationInput): ContentMutationResolution => {
-    const result = get(projectionSnapshotAtom).result
     const enforceProtection = input.protectionGate !== false
 
     let sourceCell: Readonly<CellCoord> | undefined
     let sourceRanges: readonly Readonly<CellRange>[] | undefined
-    let remapped = false
 
     if (input.cell !== undefined) {
-      const mapping = mapDisplayCellToSource(result, input.sheetId, input.cell)
-      if (!mapping.ok) {
-        return publishBlock(set, createBlockedResolution(input, mapping.reason))
+      if (!isValidCell(input.cell)) {
+        return publishBlock(set, createBlockedResolution(input, 'invalid-target'))
       }
-      sourceCell = Object.freeze({ ...mapping.cell })
-      remapped = mapping.remapped
+      sourceCell = Object.freeze({ row: input.cell.row, col: input.cell.col })
     } else if (input.range !== undefined) {
-      const mapping = mapDisplayRangeToSourceRanges(result, input.sheetId, input.range)
-      if (!mapping.ok) {
-        return publishBlock(set, createBlockedResolution(input, mapping.reason))
+      if (!isValidRange(input.range)) {
+        return publishBlock(set, createBlockedResolution(input, 'invalid-target'))
       }
-      sourceRanges = Object.freeze(mapping.ranges.map((range) => Object.freeze({ ...range })))
-      remapped = mapping.remapped
+      sourceRanges = Object.freeze([Object.freeze({ ...input.range })])
     } else {
       return publishBlock(set, createBlockedResolution(input, 'invalid-target'))
-    }
-
-    if (input.requireIdentityMapping === true && remapped) {
-      return publishBlock(set, createBlockedResolution(input, 'unmapped-row'))
     }
 
     if (enforceProtection) {
@@ -354,7 +217,6 @@ export const resolveContentMutationAtom = atom(
       sheetId: input.sheetId,
       ...(sourceCell !== undefined ? { cell: sourceCell } : {}),
       ...(sourceRanges !== undefined ? { ranges: sourceRanges } : {}),
-      remapped,
     })
   },
 )

@@ -6,7 +6,6 @@ import {
   clearContentMutationBlockAtom,
   contentMutationLastBlockAtom,
   editingCommitLifecycleAtom,
-  mapDisplayRangeToSourceRanges,
   resolveContentMutationAtom,
   runEditingCommitAtom,
   startEditingAtom,
@@ -45,14 +44,16 @@ function publishVisibleProjection(
   }
 }
 
-/** Display rows 0..2 backed by source rows 0, 5, 3; display row 3 has no fact. */
+/**
+ * A projection with a filter active. Rows 1 and 3 were filtered away, so they
+ * contribute no cell at all; every surviving row sits at its own source index
+ * (#27 — hidden, not compacted). Nothing here can move a mutation target.
+ */
 function filteredCells(): DisplayCell[] {
   return [
-    { row: 0, col: 0, displayValue: 'header', originalRow: 0 },
-    { row: 1, col: 0, displayValue: 'beta', originalRow: 5 },
-    { row: 1, col: 1, displayValue: 'beta-b', originalRow: 5 },
-    { row: 2, col: 0, displayValue: 'gamma', originalRow: 3 },
-    { row: 2, col: 1, displayValue: 'gamma-b', originalRow: 3 },
+    { row: 0, col: 0, displayValue: 'header' },
+    { row: 2, col: 0, displayValue: 'beta' },
+    { row: 2, col: 1, displayValue: 'beta-b' },
   ]
 }
 
@@ -70,8 +71,8 @@ function protectSheet(store: ReturnType<typeof createStore>, unlockedRanges: Cel
   })
 }
 
-describe('mutation gateway — display→source remap', () => {
-  test('identity passthrough when no projection has been published', () => {
+describe('mutation gateway — target passthrough', () => {
+  test('passes a target through when no projection has been published', () => {
     const store = createStore()
 
     const resolution = store.setter(resolveContentMutationAtom, {
@@ -80,14 +81,10 @@ describe('mutation gateway — display→source remap', () => {
       cell: { row: 2, col: 1 },
     })
 
-    expect(resolution).toMatchObject({
-      status: 'allowed',
-      cell: { row: 2, col: 1 },
-      remapped: false,
-    })
+    expect(resolution).toMatchObject({ status: 'allowed', cell: { row: 2, col: 1 } })
   })
 
-  test('identity passthrough when the projection has no originalRow facts', () => {
+  test('passes a target through for a published projection', () => {
     const store = createStore()
     publishVisibleProjection(store, plainCells())
 
@@ -102,105 +99,45 @@ describe('mutation gateway — display→source remap', () => {
       range: { rowStart: 0, rowEnd: 2, colStart: 0, colEnd: 1 },
     })
 
-    expect(cellResolution).toMatchObject({
-      status: 'allowed',
-      cell: { row: 1, col: 0 },
-      remapped: false,
-    })
+    expect(cellResolution).toMatchObject({ status: 'allowed', cell: { row: 1, col: 0 } })
     expect(rangeResolution).toMatchObject({
       status: 'allowed',
       ranges: [{ rowStart: 0, rowEnd: 2, colStart: 0, colEnd: 1 }],
-      remapped: false,
     })
   })
 
-  test('maps a display cell onto its source row while filter/sort is active', () => {
+  /**
+   * Regression nail (#27 S6). Filtering hides rows instead of compacting them,
+   * so a mutation target is a source coordinate no matter what the projection
+   * shows. If anyone reintroduces a projection-driven remap, this goes red:
+   * under the retired compaction the same call resolved to source row 5, and a
+   * row the projection did not cover was blocked outright.
+   */
+  test('an active filter never moves or splits a mutation target', () => {
     const store = createStore()
     publishVisibleProjection(store, filteredCells())
 
-    const resolution = store.setter(resolveContentMutationAtom, {
+    const cellResolution = store.setter(resolveContentMutationAtom, {
       kind: 'set-cell-input',
       sheetId: SHEET,
       cell: { row: 1, col: 1 },
     })
-
-    expect(resolution).toMatchObject({
-      status: 'allowed',
-      cell: { row: 5, col: 1 },
-      remapped: true,
-    })
-  })
-
-  test('splits a permuted display range into one source range per row run', () => {
-    const store = createStore()
-    publishVisibleProjection(store, filteredCells())
-
-    const resolution = store.setter(resolveContentMutationAtom, {
+    // Rows 1 and 3 are filtered away — the range still resolves to itself, in
+    // one piece. Excel writes through a filtered view; it does not skip rows.
+    const rangeResolution = store.setter(resolveContentMutationAtom, {
       kind: 'clear-range',
       sheetId: SHEET,
-      range: { rowStart: 1, rowEnd: 2, colStart: 0, colEnd: 1 },
+      range: { rowStart: 1, rowEnd: 3, colStart: 0, colEnd: 1 },
     })
 
-    expect(resolution).toMatchObject({
+    expect(cellResolution).toMatchObject({ status: 'allowed', cell: { row: 1, col: 1 } })
+    expect(rangeResolution).toMatchObject({
       status: 'allowed',
-      remapped: true,
-      ranges: [
-        { rowStart: 5, rowEnd: 5, colStart: 0, colEnd: 1 },
-        { rowStart: 3, rowEnd: 3, colStart: 0, colEnd: 1 },
-      ],
+      ranges: [{ rowStart: 1, rowEnd: 3, colStart: 0, colEnd: 1 }],
     })
   })
 
-  test('merges contiguous source rows back into a single range', () => {
-    const cells: DisplayCell[] = [
-      { row: 0, col: 0, displayValue: 'a', originalRow: 3 },
-      { row: 1, col: 0, displayValue: 'b', originalRow: 4 },
-    ]
-    const result = mapDisplayRangeToSourceRanges(
-      {
-        kind: 'visible-window',
-        sheetId: SHEET,
-        requestId: 1,
-        window: WINDOW,
-        cells,
-      },
-      SHEET,
-      { rowStart: 0, rowEnd: 1, colStart: 0, colEnd: 0 },
-    )
-
-    expect(result).toEqual({
-      ok: true,
-      ranges: [{ rowStart: 3, rowEnd: 4, colStart: 0, colEnd: 0 }],
-      remapped: true,
-    })
-  })
-
-  test('fails closed for a display row without an originalRow fact', () => {
-    const store = createStore()
-    publishVisibleProjection(store, filteredCells())
-
-    const resolution = store.setter(resolveContentMutationAtom, {
-      kind: 'clear-range',
-      sheetId: SHEET,
-      range: { rowStart: 2, rowEnd: 3, colStart: 0, colEnd: 0 },
-    })
-
-    expect(resolution).toMatchObject({ status: 'blocked', reason: 'unmapped-row' })
-    expect(store.getter(contentMutationLastBlockAtom)).toMatchObject({
-      reason: 'unmapped-row',
-      kind: 'clear-range',
-    })
-    expect(
-      store
-        .getter(diagnosticsAtom)
-        .items.some((item) => item.code === 'MUTATION_UNMAPPED_ROW' && item.sheetId === SHEET),
-    ).toBe(true)
-
-    store.setter(clearContentMutationBlockAtom)
-    expect(store.getter(contentMutationLastBlockAtom)).toBeNull()
-  })
-
-  test('fails closed for a display row outside the projected window', () => {
+  test('a target outside the projected window passes through', () => {
     const store = createStore()
     publishVisibleProjection(store, filteredCells())
 
@@ -210,10 +147,13 @@ describe('mutation gateway — display→source remap', () => {
       cell: { row: 10, col: 0 },
     })
 
-    expect(resolution).toMatchObject({ status: 'blocked', reason: 'unmapped-row' })
+    // The projected window bounded the retired remap lookup, so it used to
+    // block here. Coordinates are canonical now: the window is a read-side
+    // fact and says nothing about where a mutation may land.
+    expect(resolution).toMatchObject({ status: 'allowed', cell: { row: 10, col: 0 } })
   })
 
-  test('rejects invalid coordinates', () => {
+  test('rejects invalid coordinates and records a clearable block', () => {
     const store = createStore()
 
     const resolution = store.setter(resolveContentMutationAtom, {
@@ -223,29 +163,54 @@ describe('mutation gateway — display→source remap', () => {
     })
 
     expect(resolution).toMatchObject({ status: 'blocked', reason: 'invalid-target' })
+    expect(store.getter(contentMutationLastBlockAtom)).toMatchObject({
+      reason: 'invalid-target',
+      kind: 'set-cell-input',
+    })
+    expect(
+      store
+        .getter(diagnosticsAtom)
+        .items.some((item) => item.code === 'MUTATION_INVALID_TARGET' && item.sheetId === SHEET),
+    ).toBe(true)
+
+    store.setter(clearContentMutationBlockAtom)
+    expect(store.getter(contentMutationLastBlockAtom)).toBeNull()
+  })
+
+  test('rejects an inverted range', () => {
+    const store = createStore()
+
+    const resolution = store.setter(resolveContentMutationAtom, {
+      kind: 'clear-range',
+      sheetId: SHEET,
+      range: { rowStart: 3, rowEnd: 1, colStart: 0, colEnd: 0 },
+    })
+
+    expect(resolution).toMatchObject({ status: 'blocked', reason: 'invalid-target' })
   })
 })
 
 describe('mutation gateway — protection gate', () => {
-  test('gates with source coordinates after the remap', () => {
+  test('gates per row against the unlocked ranges, filter or no filter', () => {
     const store = createStore()
     publishVisibleProjection(store, filteredCells())
-    // Unlock the SOURCE row 5; the display row 1 stays locked in display terms.
-    protectSheet(store, [{ rowStart: 5, rowEnd: 5, colStart: 0, colEnd: 3 }])
+    // Row 1 is unlocked. It is also one of the rows the filter hid — the
+    // protection answer is about coordinates, not about what is on screen.
+    protectSheet(store, [{ rowStart: 1, rowEnd: 1, colStart: 0, colEnd: 3 }])
 
     const allowed = store.setter(resolveContentMutationAtom, {
       kind: 'set-cell-input',
       sheetId: SHEET,
       cell: { row: 1, col: 0 },
     })
-    // Display row 2 maps to source row 3 which is NOT unlocked.
+    // Row 2 is visible but locked.
     const blocked = store.setter(resolveContentMutationAtom, {
       kind: 'set-cell-input',
       sheetId: SHEET,
       cell: { row: 2, col: 0 },
     })
 
-    expect(allowed).toMatchObject({ status: 'allowed', cell: { row: 5, col: 0 } })
+    expect(allowed).toMatchObject({ status: 'allowed', cell: { row: 1, col: 0 } })
     expect(blocked).toMatchObject({ status: 'blocked', reason: 'locked' })
     expect(
       store.getter(diagnosticsAtom).items.some((item) => item.code === 'MUTATION_BLOCKED_LOCKED'),
@@ -274,43 +239,7 @@ describe('mutation gateway — protection gate', () => {
     }
   })
 
-  test('requireIdentityMapping fails closed when any row would remap', () => {
-    const store = createStore()
-    publishVisibleProjection(store, filteredCells())
-
-    const blocked = store.setter(resolveContentMutationAtom, {
-      kind: 'paste-range',
-      sheetId: SHEET,
-      range: { rowStart: 1, rowEnd: 2, colStart: 0, colEnd: 1 },
-      requireIdentityMapping: true,
-    })
-
-    expect(blocked).toMatchObject({ status: 'blocked', reason: 'unmapped-row' })
-    expect(store.getter(contentMutationLastBlockAtom)).toMatchObject({
-      reason: 'unmapped-row',
-      kind: 'paste-range',
-    })
-  })
-
-  test('requireIdentityMapping passes through untouched targets', () => {
-    const store = createStore()
-    publishVisibleProjection(store, plainCells())
-
-    const resolution = store.setter(resolveContentMutationAtom, {
-      kind: 'import-cell-chunks',
-      sheetId: SHEET,
-      range: { rowStart: 0, rowEnd: 1, colStart: 0, colEnd: 0 },
-      requireIdentityMapping: true,
-    })
-
-    expect(resolution).toMatchObject({
-      status: 'allowed',
-      ranges: [{ rowStart: 0, rowEnd: 1, colStart: 0, colEnd: 0 }],
-      remapped: false,
-    })
-  })
-
-  test('protectionGate: false still remaps but skips the lock gate', () => {
+  test('protectionGate: false skips the lock gate but still validates', () => {
     const store = createStore()
     publishVisibleProjection(store, filteredCells())
     protectSheet(store)
@@ -321,12 +250,18 @@ describe('mutation gateway — protection gate', () => {
       range: { rowStart: 1, rowEnd: 1, colStart: 0, colEnd: 0 },
       protectionGate: false,
     })
+    const invalid = store.setter(resolveContentMutationAtom, {
+      kind: 'fill-range',
+      sheetId: SHEET,
+      cell: { row: 0, col: -2 },
+      protectionGate: false,
+    })
 
     expect(resolution).toMatchObject({
       status: 'allowed',
-      remapped: true,
-      ranges: [{ rowStart: 5, rowEnd: 5, colStart: 0, colEnd: 0 }],
+      ranges: [{ rowStart: 1, rowEnd: 1, colStart: 0, colEnd: 0 }],
     })
+    expect(invalid).toMatchObject({ status: 'blocked', reason: 'invalid-target' })
   })
 })
 
@@ -344,35 +279,14 @@ describe('mutation gateway — set-format-range', () => {
     expect(resolution).toMatchObject({
       status: 'allowed',
       ranges: [{ rowStart: 0, rowEnd: 1, colStart: 0, colEnd: 1 }],
-      remapped: false,
-    })
-  })
-
-  test('maps a format range onto source rows while filter/sort is active', () => {
-    const store = createStore()
-    publishVisibleProjection(store, filteredCells())
-
-    const resolution = store.setter(resolveContentMutationAtom, {
-      kind: 'set-format-range',
-      sheetId: SHEET,
-      range: { rowStart: 1, rowEnd: 2, colStart: 0, colEnd: 1 },
-    })
-
-    expect(resolution).toMatchObject({
-      status: 'allowed',
-      remapped: true,
-      ranges: [
-        { rowStart: 5, rowEnd: 5, colStart: 0, colEnd: 1 },
-        { rowStart: 3, rowEnd: 3, colStart: 0, colEnd: 1 },
-      ],
     })
   })
 
   test('blocks format writes onto locked cells with a structured diagnostic', () => {
     const store = createStore()
     publishVisibleProjection(store, filteredCells())
-    // Unlock the SOURCE row 5 only; display row 2 maps to locked source row 3.
-    protectSheet(store, [{ rowStart: 5, rowEnd: 5, colStart: 0, colEnd: 3 }])
+    // Unlock row 1 only; row 2 stays locked.
+    protectSheet(store, [{ rowStart: 1, rowEnd: 1, colStart: 0, colEnd: 3 }])
 
     const allowed = store.setter(resolveContentMutationAtom, {
       kind: 'set-format-range',
@@ -387,7 +301,7 @@ describe('mutation gateway — set-format-range', () => {
 
     expect(allowed).toMatchObject({
       status: 'allowed',
-      ranges: [{ rowStart: 5, rowEnd: 5, colStart: 0, colEnd: 1 }],
+      ranges: [{ rowStart: 1, rowEnd: 1, colStart: 0, colEnd: 1 }],
     })
     expect(blocked).toMatchObject({ status: 'blocked', reason: 'locked', kind: 'set-format-range' })
     expect(store.getter(contentMutationLastBlockAtom)).toMatchObject({
@@ -403,14 +317,14 @@ describe('mutation gateway — set-format-range', () => {
 })
 
 describe('mutation gateway — editing commit integration', () => {
-  test('editing commit writes to the mapped source row under an active filter', async () => {
+  test('editing commit writes to the row the user sees under an active filter', async () => {
     const store = createStore()
     publishVisibleProjection(store, filteredCells())
     const requests: EditingCommitRequest[] = []
 
     store.setter(startEditingAtom, {
       sheetId: SHEET,
-      cell: { row: 1, col: 0 },
+      cell: { row: 2, col: 0 },
       draft: '42',
       source: 'cell',
     })
@@ -427,7 +341,7 @@ describe('mutation gateway — editing commit integration', () => {
 
     expect(outcome).toBe('completed')
     expect(requests).toHaveLength(1)
-    expect(requests[0]).toMatchObject({ row: 5, col: 0, input: '42' })
+    expect(requests[0]).toMatchObject({ row: 2, col: 0, input: '42' })
   })
 
   test('editing commit is blocked with zero transport on a locked cell', async () => {
@@ -460,30 +374,4 @@ describe('mutation gateway — editing commit integration', () => {
     })
   })
 
-  test('editing commit fails closed when the drafted display row is unmappable', async () => {
-    const store = createStore()
-    publishVisibleProjection(store, filteredCells())
-    const requests: EditingCommitRequest[] = []
-
-    store.setter(startEditingAtom, {
-      sheetId: SHEET,
-      cell: { row: 3, col: 0 },
-      draft: 'lost',
-      source: 'cell',
-    })
-    const outcome = await store.setter(runEditingCommitAtom, {
-      source: {
-        async setCellInput(request) {
-          requests.push(request)
-          return { sheetId: request.sheetId, requestId: request.requestId, revision: 1 }
-        },
-      },
-      commitSource: 'cell',
-      refreshProjection: async () => undefined,
-    })
-
-    expect(outcome).toBe('blocked')
-    expect(requests).toHaveLength(0)
-    expect(store.getter(contentMutationLastBlockAtom)).toMatchObject({ reason: 'unmapped-row' })
-  })
 })

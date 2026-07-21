@@ -6,9 +6,10 @@
  * Excel HIDDEN-ROW semantics (#27 S5): applying the rules runs one whole-column
  * predicate scan in `setFilterSort`, and the rows it rejects are WITHHELD from
  * the projection while every surviving row keeps its own index. Display row IS
- * source row, so `originalRow` is never emitted and row numbers skip (1, 4, 5)
- * exactly as they already did for manually hidden rows. These tests pin:
- *  - identity projection + withheld rows (no compaction, no `originalRow`),
+ * source row and row numbers skip (1, 4, 5) exactly as they already did for
+ * manually hidden rows. These tests pin:
+ *  - identity projection + withheld rows (no compaction, no second
+ *    coordinate system),
  *  - the filter-hidden set handed to the engine and returned on the ACK,
  *  - sort as engine data untouched (the display-permutation sort is retired),
  *  - the structured over-cap rejection (fail-closed, no truncation),
@@ -314,8 +315,6 @@ describe('worker adapter setFilterSort projection', () => {
     // contributing no cell" is the property visible-cell consumers rely on.
     expect(result.cells.some((cell) => cell.row === 2)).toBe(false)
     expect(result.cells.some((cell) => cell.displayValue === 'Beta')).toBe(false)
-    // The second coordinate system is gone, so nothing needs translating back.
-    expect(result.cells.every((cell) => cell.originalRow === undefined)).toBe(true)
   })
 
   // #27 S4 — the OTHER projection of the same scan. The engine cannot see the
@@ -335,10 +334,10 @@ describe('worker adapter setFilterSort projection', () => {
     // (row 0) and the matching rows 1 / 3 must never appear.
     expect(client.calls.setEvalFilterHiddenRows).toEqual([{ sheet: 0, rows: [2] }])
 
-    // The set is derived from the SAME scan that built the permutation, so it
+    // The set is derived from the SAME scan that decides the projection, so it
     // is exactly the complement of what the projection shows.
     const result = await readWindow(backend)
-    const visibleSourceRows = new Set(result.cells.map((cell) => cell.originalRow ?? cell.row))
+    const visibleSourceRows = new Set(result.cells.map((cell) => cell.row))
     expect(visibleSourceRows.has(2)).toBe(false)
     expect([...visibleSourceRows].sort()).toEqual([0, 1, 3])
 
@@ -412,7 +411,6 @@ describe('worker adapter setFilterSort projection', () => {
     expect(client.calls.listNonEmpty).toBe(scans)
     const cleared = await readWindow(backend)
     expect(cellAt(cleared, 2, 1)).toMatchObject({ displayValue: '3' })
-    expect(cleared.cells.every((cell) => cell.originalRow === undefined)).toBe(true)
   })
 
   it('rejects an over-cap source with a structured error and stays unfiltered', async () => {
@@ -430,10 +428,10 @@ describe('worker adapter setFilterSort projection', () => {
       }),
     ).rejects.toMatchObject({ code: FILTER_SORT_SOURCE_TOO_LARGE })
 
-    // The filter never activated: identity projection, no originalRow.
+    // The filter never activated: every row still projects at its own index.
     const result = await readWindow(backend)
     expect(cellAt(result, 2, 0)).toMatchObject({ displayValue: 'Beta' })
-    expect(result.cells.every((cell) => cell.originalRow === undefined)).toBe(true)
+    expect(result.cells.some((cell) => cell.row === 2)).toBe(true)
   })
 
   // Visibility is a SNAPSHOT taken when the rules are applied, matching Excel:

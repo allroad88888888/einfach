@@ -77,11 +77,11 @@ function buildTupleKey(values: readonly string[]): string {
  *    projection, so the dense walk would otherwise read it as an all-blank
  *    tuple and mark it (or its peers) duplicate — deleting rows the user
  *    could not see. See design-filter-hidden-rows.md §8.1.
- * 5. When the projection carries `originalRow` (filter/sort active),
- *    `duplicateRows` contains those source-row indices — NOT the
- *    visual iteration indices. This is what
- *    {@link RemoveDuplicatesScanResult.duplicateRows} promises and
- *    what `backend.removeRows` expects.
+ * 5. `duplicateRows` carries SOURCE row indices, which is what
+ *    {@link RemoveDuplicatesScanResult.duplicateRows} promises and what
+ *    `backend.removeRows` expects. Since filtering hides rows instead of
+ *    compacting them (#27), the scan index already IS the source row —
+ *    the promise is exact rather than translated.
  *
  * When the effective key set is empty (all `keyColumns` fall outside
  * `[startCol..endCol]`), returns a synthetic result with
@@ -145,40 +145,12 @@ export function findDuplicateRows(
   }
 
   // Index relevant cells by row then col. We allocate per-row Maps
-  // lazily so a sparse 100k-row projection stays cheap. We also track
-  // each row's reported `originalRow` so the duplicate indices we emit
-  // match what `backend.removeRows` expects when filter/sort is active.
+  // lazily so a sparse 100k-row projection stays cheap.
   const keyColSet = new Set(inRangeKeyCols)
   const byRow = new Map<number, Map<number, string>>()
-  const originalRowByRow = new Map<number, number>()
-  let warnedOnRowMismatch = false
   for (const cell of cells) {
     if (cell.row < startRow || cell.row > endRow) continue
     if (headerRow !== null && cell.row === headerRow) continue
-    // Track originalRow for every cell in-range (even non-key cols), so
-    // a row whose only in-range cells happen to be non-key still maps
-    // back to its source row.
-    const candidateOriginal = cell.originalRow ?? cell.row
-    const existingOriginal = originalRowByRow.get(cell.row)
-    if (existingOriginal === undefined) {
-      originalRowByRow.set(cell.row, candidateOriginal)
-    } else if (existingOriginal !== candidateOriginal) {
-      // Projection bug: two cells in the same visual row claim
-      // different source rows. Warn once, keep the first one.
-      if (!warnedOnRowMismatch) {
-        warnedOnRowMismatch = true
-        // eslint-disable-next-line no-console
-        console.warn(
-          '[remove-duplicates] DisplayCell rows in visual row ' +
-            String(cell.row) +
-            ' report inconsistent originalRow values (' +
-            String(existingOriginal) +
-            ' vs ' +
-            String(candidateOriginal) +
-            '); using first-seen.',
-        )
-      }
-    }
     if (!keyColSet.has(cell.col)) continue
     let rowMap = byRow.get(cell.row)
     if (!rowMap) {
@@ -213,10 +185,9 @@ export function findDuplicateRows(
     if (firstSeen === undefined) {
       seen.set(tupleKey, row)
     } else {
-      // Report the source-row index. Falls back to visual row when the
-      // projection didn't carry originalRow (filter/sort inactive).
-      const sourceRow = originalRowByRow.get(row) ?? row
-      duplicateRows.push(sourceRow)
+      // Display row IS source row (#27): the scan index is what
+      // `backend.removeRows` expects, with nothing to translate.
+      duplicateRows.push(row)
     }
   }
 

@@ -128,13 +128,13 @@ controls.
 
 - The backend applies rules and directives before serving the next
   `readVisibleProjection` result.
-- `DisplayCell.row` is the **displayed** virtual row index within the
-  post-filter/post-sort sequence, not the physical workbook row.
-- Backends must populate `originalRow?: number` on `DisplayCell` when filter or
-  sort is active. This carries the physical (zero-based) workbook row, enabling
-  round-trips for edit commands (`setCellInput`, `clearRange`, etc.).
-- When no filter or sort is active, `originalRow` may be omitted; consumers fall
-  back to `DisplayCell.row`.
+- `DisplayCell.row` is the physical (zero-based) workbook row, always. A filter
+  WITHHOLDS the rows it hides and leaves every surviving row at its own index
+  (#27) — it does not compact survivors into consecutive slots, so there is no
+  virtual row index and no second coordinate system. Edit commands
+  (`setCellInput`, `clearRange`, …) address rows directly.
+- The per-cell physical-row echo that the retired compaction required was
+  deleted with it; backends must not reintroduce one.
 - `BackendMutationResult.revision` must advance so that the visible-window
   projection is re-requested automatically.
 
@@ -155,7 +155,8 @@ controls.
 - **Keyboard** — Ctrl+A selects the visible (non-filtered) range only. See
   keyboard planning doc.
 - **Operations** — insert/delete row commands near filter boundaries use
-  `originalRow`, not virtual display coordinates. See operations planning doc.
+  physical row coordinates, which is what the projection already reports. See
+  operations planning doc.
 - **Hidden rows** — filter-hidden rows and explicitly hidden rows are separate
   mechanisms; the backend composes both before returning the virtual index space.
   Reference the hidden rows planning doc for the hidden-row state contract.
@@ -168,17 +169,17 @@ controls.
   stable; the UI core cannot enforce it. Unstable sort causes visible row flicker
   between projection refreshes triggered by unrelated edits.
 
-- **Edits inside a filtered view.** Command layer must use `originalRow` for
-  physical coordinates. Absence of `originalRow` when filter/sort is active will
-  silently target the wrong physical row; warn in debug builds.
+- ~~**Edits inside a filtered view.**~~ Closed by #27: display row IS physical
+  row, so an edit inside a filtered view cannot target the wrong row.
 
 - **Undo restoring prior order.** Each `setFilterSort` call should produce a
   `HistoryEntry`. The backend must represent a filter/sort transition as an
   invertible operation in its transaction log. See history planning doc.
 
-- **Interaction with hidden rows.** When both filter and explicit hidden-row state
-  are active, the composed `originalRow` mapping must be defined jointly with the
-  hidden rows feature to avoid ambiguity.
+- **Interaction with hidden rows.** Filter-hidden and manually hidden rows are
+  two separate sets in UI core (`viewportFilterHiddenAtom` /
+  `viewportHiddenAtom`); the grid renders their union via `effectiveHiddenAtom`.
+  No coordinate mapping is composed — both sets are in physical row space.
 
 - **Perf of large filter sets.** `ListFilterRule.values` is unbounded in the
   type; define a cap (e.g. 10 000 items) and reject oversized rules in
@@ -205,5 +206,5 @@ All tests live in `test/filter-sort.test.ts`.
 - Duplicate column indices in sort directives are rejected before dispatch.
 - `NumericRangeFilterRule` with `min > max` is rejected before dispatch.
 - `ListFilterRule` exceeding the max-values cap is rejected before dispatch.
-- `DisplayCell.originalRow` is preferred over `row` for edit round-trips when
-  filter/sort is active (verified via a mock projection result).
+- Edit round-trips address `DisplayCell.row` directly under an active filter
+  (see `test/mutation-gateway.test.ts`).

@@ -1,6 +1,5 @@
 import { describe, expect, test } from '@jest/globals'
 import { createStore } from '@einfach/core'
-import type { DisplayCell } from '../src'
 import {
   FILTER_SORT_ACKNOWLEDGEMENT_ERROR,
   FILTER_SORT_CAPABILITY_ERROR,
@@ -840,23 +839,5 @@ describe('Core-owned filter/sort mutation lifecycle', () => {
     expect(requestsB[0]?.requestId).toBe(1)
     expect(storeA.getter(filterSortStateAtom)['A']?.rules).toEqual([equalsRule(1, 'a')])
     expect(storeB.getter(filterSortStateAtom)['A']?.rules).toEqual([equalsRule(1, 'b')])
-  })
-})
-
-describe('DisplayCell.originalRow', () => {
-  test('accepts originalRow alongside row (type-check)', () => {
-    const cell: DisplayCell = {
-      row: 5,
-      col: 2,
-      displayValue: 'hello',
-      originalRow: 42,
-    }
-    expect(cell.originalRow).toBe(42)
-    expect(cell.row).toBe(5)
-  })
-
-  test('originalRow is optional', () => {
-    const cell: DisplayCell = { row: 0, col: 0, displayValue: '' }
-    expect(cell.originalRow).toBeUndefined()
   })
 })

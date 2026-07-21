@@ -143,8 +143,6 @@ export interface GoToCandidateCell {
   commentThreadId?: string
   conditionalFormat?: unknown
   validation?: unknown
-  /** Filter-driven originalRow echo from the projection. */
-  originalRow?: number
 }
 
 /**

@@ -89,16 +89,15 @@ export function SpreadsheetPasteSpecialDialog(props: SpreadsheetPasteSpecialDial
   async function handleConfirm() {
     const currentSession = session()
     if (currentSession === null) return
-    // Mutation gateway: the frozen Core session can only express its original
-    // contiguous display-coordinate target, so a protection block or any
-    // active display→source row remap fails closed here — zero transport, and
-    // the gateway records the structured diagnostic + lastBlock.
+    // Mutation gateway: a protection block fails closed here — zero
+    // transport, and the gateway records the structured diagnostic +
+    // lastBlock. The frozen Core session's target is already in source
+    // coordinates (filtering hides rows instead of compacting them, #27).
     if (currentSession.sheetId !== null && currentSession.target !== null) {
       const resolution = store.setter(resolveContentMutationAtom, {
         kind: 'paste-range',
         sheetId: currentSession.sheetId,
         range: currentSession.target,
-        requireIdentityMapping: true,
       })
       if (resolution.status === 'blocked') return
     }
