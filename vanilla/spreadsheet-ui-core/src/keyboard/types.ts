@@ -95,6 +95,15 @@ export interface GoToOpenIntent {
   type: 'go-to.open'
 }
 
+/**
+ * Ctrl+Alt+L — Excel's `Data → Reapply`. Re-runs the sheet's committed filter
+ * rules so the view catches up with edits made since they were applied
+ * (filter visibility is a snapshot; see `docs/filter-sort.md`).
+ */
+export interface FilterSortReapplyIntent {
+  type: 'filterSort.reapply'
+}
+
 export interface KeyboardContextMenuOpenIntent {
   type: 'context-menu.open'
   source: 'keyboard'
@@ -130,6 +139,7 @@ export type KeyboardCommandIntent =
   | FormatToggleIntent
   | ClearCellsIntent
   | GoToOpenIntent
+  | FilterSortReapplyIntent
   | KeyboardContextMenuOpenIntent
   | FormulaReferenceArrowPickIntent
   | FormulaReferenceExitIntent

@@ -139,12 +139,42 @@ implementation recomputed the permutation on every revision bump, which made our
 filter *more live than Excel's* — a divergence, not a feature. Both adapters now
 keep the filter-hidden set out of the `bumpRevision()` invalidation path.
 
-> **Known gap: there is no Reapply entrypoint yet.** The design allocated
-> `reapplyFilterAtom` + a `Data → Reapply` menu item + `Ctrl+Alt+L` to slice S7;
-> none of the three landed. Verified 2026-07-21: no `reapplyFilterAtom` export, no
-> menu entry, no keybinding. The only way to recompute today is to re-open the
-> column dropdown and re-confirm the rules, which re-sends `setFilterSort`. This is
-> the largest open item from #27.
+### `Data → Reapply` — the recompute entrypoint
+
+The escape hatch snapshot semantics requires. **Implemented** (#27 S7 remainder,
+closing errata E8): `reapplyFilterAtom` + `reapplyFilterDisabledReasonAtom` in
+`../src/filter-sort/index.ts`, the `data.reapply` menu entry, and `Ctrl+Alt+L`.
+
+**What it does:** re-dispatches `setFilterSort` carrying the sheet's *already
+committed* rules, and writes the fresh ACK through the same
+`setViewportFilterHiddenRowsAtom` sink the dropdown uses. It cannot change what
+is filtered — only which rows currently satisfy it.
+
+**Truth source — the host, not a second evaluator.** Reapply reuses the
+adapter's whole-column scan rather than re-deriving visibility in UI core. A
+UI-core recompute would be a *second predicate evaluator* that could silently
+disagree with the first; it would also be window-bounded (the resurrected
+`deriveFilterHiddenRows` gap) and would sit outside the host's
+`MAX_FILTER_SORT_PREDICATE_CELLS` fail-closed budget. This does not contradict
+CANONICAL_OWNERSHIP #29: UI core still *owns* the fact — the host is an
+executor, exactly as it is for the TSV / image export ports.
+
+**Filters only, not sort.** Excel's Reapply covers sort as well (verified: MS
+"Reapply a filter and sort, or clear a filter"; `Ctrl+Alt+L` is documented as
+reapplying a column sort). Here it is *inexpressible*, not skipped — sort
+stopped being view state with #24, so `FilterSortState` holds `rules` and
+nothing else, and re-running a physical sort would be a data mutation behind a
+visibility command.
+
+**Not in the undo stack.** Applying a filter records no history entry, so a
+Reapply entry would be an undo step with no counterpart. Microsoft documents
+Excel's Reapply/undo interaction *neither way* — this is consistency with Apply,
+**an unverified default rather than verified parity**.
+
+**Disabled, not hidden**, when the host lacks `setFilterSort`, the lane is busy,
+the dropdown is open, there is no active sheet, or — the common case — the sheet
+has no committed rules. `reapplyFilterDisabledReasonAtom` is a pure derivation
+the host reads like any other menu gate.
 
 Structural changes are handled by shifting, not rescanning: insert/delete rows
 remap the filter set through `remapIndexSetAfterStructuralShift`, at three
@@ -169,8 +199,8 @@ called out in release notes:
    *parity fix*: display compaction used to skip filtered rows on paste, which
    diverged from Excel. Users who relied on the old behaviour will notice.
 3. **Filtering is no longer live.** Changing a cell's value does not make its row
-   appear or disappear; see the snapshot section above (and the missing-Reapply
-   gap).
+   appear or disappear; see the snapshot section above. `Data → Reapply`
+   (`Ctrl+Alt+L`) is the explicit recompute, exactly as in Excel.
 4. **Merged cells inside a filtered region render again.** The blanket
    suppression of merge metadata while a filter was active is lifted — merge
    spans are expressible again under hidden semantics.
@@ -285,7 +315,6 @@ these ports are executors.
 
 ## Risks & open questions
 
-- **No `Data → Reapply` entrypoint.** See the snapshot section. Largest open item.
 - **Summary-row pinning in `buildSortExcludedRows`** needs cell reads UI core does
   not own; still a known v1 gap.
 - **`AGGREGATE`'s ignore-hidden option bits** (1/3/5/7) are parsed and validated
@@ -306,6 +335,8 @@ these ports are executors.
 
 - `test/filter-sort.test.ts` — rules, dropdown lifecycle, capability degradation,
   ACK matching.
+- `test/reapply-filter.test.ts` — Reapply: the disabled gate, the re-dispatch,
+  and the counter-example that data changing alone moves nothing.
 - `test/effective-hidden.test.ts` — the two sets, the union, whole-set replace,
   per-sheet isolation, structural shift.
 - `test/physical-sort.test.ts` — `buildSortExcludedRows` unions both sets.
@@ -314,12 +345,15 @@ these ports are executors.
   never reach `removeRows` / are skipped by the dense scan.
 - `test/copy-as.test.ts`, `test/copy-as-image.test.ts`, `test/operations.test.ts`
   — visible-only export and delete planning.
-- Host side: `solid/excel/test/vnext-filter-hidden-rows.test.ts`,
+- Host side: `solid/excel/test/vnext-reapply-filter.test.ts` (Reapply against the
+  real static backend, both counter-example directions),
+  `vnext-reapply-filter-keyboard.test.tsx` (`Ctrl+Alt+L` grid wiring),
+  `solid/excel/test/vnext-filter-hidden-rows.test.ts`,
   `vnext-filter-hidden-export.test.ts`, `vnext-worker-filter-sort.test.tsx`,
   `vnext-worker-filter-subtotal-wasm.test.ts` (real Rust engine, both bands),
   `vnext-structural-remap-static.test.ts`.
 - e2e: `vnext-filter-sort-real-backend.spec.ts`,
   `vnext-filter-structural-shift-real-backend.spec.ts`,
-  `toolbar-filter-sort.spec.ts`.
+  `vnext-reapply-filter-real-backend.spec.ts`, `toolbar-filter-sort.spec.ts`.
 </content>
 </invoke>

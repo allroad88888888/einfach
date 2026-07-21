@@ -305,6 +305,20 @@ function getCommandShortcutIntent(
         type: 'none',
         reason: 'unhandled',
       }
+    case 'l':
+      // Ctrl+Alt+L → Data → Reapply (Excel's binding). Filter visibility is a
+      // snapshot, so this is the explicit recompute. Guarded on Alt because
+      // Ctrl+L is Excel's Create Table and Ctrl+Shift+L its filter toggle —
+      // neither is bound here, and claiming the bare chord would pre-empt them.
+      if (input.altKey && !input.shiftKey) {
+        return {
+          type: 'filterSort.reapply',
+        }
+      }
+      return {
+        type: 'none',
+        reason: 'unhandled',
+      }
     case 'z':
       return {
         type: 'history.undo',

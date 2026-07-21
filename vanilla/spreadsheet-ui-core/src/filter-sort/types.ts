@@ -105,6 +105,23 @@ export interface RunFilterSortEntrypointInput {
   readonly refreshProjection: (sheetId: string) => Promise<void>
 }
 
+/**
+ * `Data → Reapply` (Excel `Ctrl+Alt+L`). Re-runs the sheet's ALREADY COMMITTED
+ * rules through the host's whole-column scan and re-commits the answer, which
+ * is the escape hatch snapshot semantics requires: filter visibility is taken
+ * once when the rules are applied and does NOT follow later cell edits, so
+ * without this the only refresh path is re-opening the column dropdown.
+ *
+ * It carries no rules of its own — that is the point. The rules are read from
+ * `filterSortStateAtom`, so Reapply can never change what is filtered, only
+ * which rows currently satisfy it.
+ */
+export interface ReapplyFilterInput {
+  readonly source: FilterSortControllerPort
+  readonly entrypoint: FilterSortEntrypoint
+  readonly refreshProjection: (sheetId: string) => Promise<void>
+}
+
 export interface RetryFilterSortRefreshInput {
   readonly refreshProjection: (sheetId: string) => Promise<void>
 }

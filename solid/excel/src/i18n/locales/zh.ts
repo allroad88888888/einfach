@@ -136,6 +136,7 @@ export const messages: Record<string, string> = {
   'menuBar.data.sortAsc': '升序排序',
   'menuBar.data.sortDesc': '降序排序',
   'menuBar.data.filter': '筛选…',
+  'menuBar.data.reapply': '重新应用',
   'menuBar.data.textToColumns': '文本分列…',
   'menuBar.data.removeDuplicates': '删除重复项…',
   'menuBar.data.createTable': '创建表格',

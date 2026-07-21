@@ -37,6 +37,8 @@ import {
   pasteSpecialCapabilityAtom,
   pasteClipboardAtom,
   protectSheetAtom,
+  reapplyFilterAtom,
+  reapplyFilterDisabledReasonAtom,
   hideColumnsAtom,
   hideRowsAtom,
   reportCopyAsStatusAtom,
@@ -110,6 +112,7 @@ export function SpreadsheetMenuBar(props: SpreadsheetMenuBarProps) {
   const lastToggledTableTotals = useAtomValue(lastToggledTableTotalsAtom)
   const filterSortEntrypoint = useAtomValue(filterSortEntrypointProjectionAtom)
   const textToColumnsEntrypoint = useAtomValue(textToColumnsEntrypointProjectionAtom)
+  const reapplyDisabledReason = useAtomValue(reapplyFilterDisabledReasonAtom)
   let rootRef: HTMLDivElement | undefined
 
   createEffect(() => {
@@ -157,6 +160,10 @@ export function SpreadsheetMenuBar(props: SpreadsheetMenuBarProps) {
       case 'sort-asc':
       case 'sort-desc':
         return filterSortEntrypoint().disabledReason
+      case 'reapply-filter':
+        // Greys out with "no active filter on this sheet" as well as the
+        // shared capability / busy-lane reasons — a pure UI-core derivation.
+        return reapplyDisabledReason()
       case 'open-text-to-columns':
         return textToColumnsEntrypoint().disabledReason
       default:
@@ -426,6 +433,14 @@ export function SpreadsheetMenuBar(props: SpreadsheetMenuBarProps) {
         store.setter(openFilterDropdownFromEntrypointAtom, {
           source: backend,
           entrypoint: 'menu-bar',
+        })
+        return
+      }
+      case 'reapply-filter': {
+        void store.setter(reapplyFilterAtom, {
+          source: backend,
+          entrypoint: 'menu-bar',
+          refreshProjection: (sheetId) => refreshVisibleProjection(store, backend, sheetId),
         })
         return
       }

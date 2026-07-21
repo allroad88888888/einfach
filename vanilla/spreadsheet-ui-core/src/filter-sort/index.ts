@@ -40,6 +40,7 @@ import type {
   PhysicalSortControllerPort,
   PhysicalSortDiagnostic,
   PhysicalSortDiagnosticCode,
+  ReapplyFilterInput,
   RunFilterSortMutationInput,
   RunPhysicalSortInput,
   RetryFilterSortRefreshInput,
@@ -66,6 +67,8 @@ export const FILTER_SORT_STALE_OPERATION_ERROR =
   'Filter and sort was ignored because the active sheet or selection changed.'
 export const FILTER_SORT_OUTCOME_UNKNOWN_ERROR =
   'Filter and sort result is unknown. Reload or reconcile workbook data before another change.'
+export const FILTER_SORT_REAPPLY_NO_RULES_ERROR =
+  'Reapply needs an active filter on this sheet.'
 
 const EMPTY_FILTER_SORT_STATE: FilterSortState = Object.freeze({
   rules: Object.freeze([]),
@@ -132,7 +135,12 @@ interface FilterSortEntrypointTicket {
   readonly requestId: ProjectionRequestId
   readonly entrypoint: FilterSortEntrypoint
   readonly target: FilterSortEntrypointTarget
-  readonly direction: SortDirection
+  /**
+   * `null` for entrypoints that carry no direction. Reapply is the only one:
+   * it re-runs committed filter rules and never sorts (see `reapplyFilterAtom`
+   * for why the sort half of Excel's Reapply is inexpressible here).
+   */
+  readonly direction: SortDirection | null
   readonly attempt: number
   readonly next: FilterSortState
   readonly selectionWitness: SelectionAuthorityWitness
@@ -433,7 +441,7 @@ function nextEntrypointAttempt(
   previous: FilterSortEntrypointState,
   entrypoint: FilterSortEntrypoint,
   target: FilterSortEntrypointTarget,
-  direction: SortDirection,
+  direction: SortDirection | null,
 ): number {
   if (
     (previous.status === 'error' || previous.status === 'blocked' || previous.status === 'stale') &&
@@ -1151,6 +1159,235 @@ export const runFilterSortMutationAtom = atom(
   },
 )
 runFilterSortMutationAtom.debugLabel = 'spreadsheet.filterSort.runMutation'
+
+// --- Data → Reapply (Excel Ctrl+Alt+L) --------------------------------------
+//
+// Filter visibility is a SNAPSHOT: it is computed once, when the rules are
+// applied, and deliberately survives `bumpRevision()`, so editing a cell never
+// moves its row in or out of view (`design-filter-hidden-rows` §4.3). Excel is
+// the same, which is exactly why Excel ships Reapply. Without it our only
+// refresh path was re-opening the column dropdown and re-confirming the rules.
+//
+// TRUTH SOURCE: Reapply re-dispatches the SAME `setFilterSort` the dropdown
+// dispatches, carrying the sheet's already-committed rules, and commits the
+// ACK through the SAME `setViewportFilterHiddenRowsAtom` sink. It adds no
+// second computer and no second writer of filter visibility.
+//
+// The rejected alternative was a UI-core-local recompute (read the column back
+// through a projection and evaluate `filterRuleMatchesValue` here). Three
+// things are wrong with it, in descending order of severity:
+//   1. It would be a SECOND predicate evaluator. Apply and Reapply could then
+//      disagree on the same rules over the same data — worse than no Reapply,
+//      because the divergence is silent and rule-shape dependent.
+//   2. A projection is a bounded window; a predicate needs the whole column.
+//      This is the resurrected `deriveFilterHiddenRows` gap that #27 deleted:
+//      rows below the fold would stay visible and, once scrolled to, disappear.
+//   3. The whole-column scan budget (`MAX_FILTER_SORT_PREDICATE_CELLS`, with a
+//      fail-closed `FILTER_SORT_SOURCE_TOO_LARGE` rejection) lives in the host.
+//      A UI-core read path has no such guard and would silently truncate where
+//      the host path refuses.
+//
+// This does NOT contradict CANONICAL_OWNERSHIP #29 ("filter visibility is a
+// UI-core view fact; the backend port is an optional hook"). Ownership is about
+// who HOLDS the fact, not who computes it: `viewportFilterHiddenAtom` stays the
+// canonical answer to "is this row painted?", written only on a matched ACK,
+// and the host stays an executor — the same shape as the TSV / image export
+// ports, which take the hidden set as input rather than deriving it.
+
+/**
+ * Why `Data → Reapply` is unavailable right now, or `null` when it can run.
+ *
+ * A pure derivation, so the menu-bar gate needs no dispatch and no probe. The
+ * host reads it exactly like the other menu gates
+ * (`SpreadsheetMenuBar.disabledReasonForDispatch`).
+ *
+ * The load-bearing clause is the last one: with no committed rules on the
+ * sheet there is nothing to re-run, so the entry is DISABLED rather than a
+ * silent no-op.
+ */
+export const reapplyFilterDisabledReasonAtom = atom((get): string | null => {
+  if (!get(filterSortCapabilityAtom)) return FILTER_SORT_CAPABILITY_ERROR
+  if (get(activeFilterSortMutationAtom) !== null || get(activeFilterSortEntrypointAtom) !== null) {
+    return FILTER_SORT_PENDING_ERROR
+  }
+  // The dropdown owns the same backend lane and can commit its own rules.
+  if (get(filterDropdownAtom).status === 'open') return FILTER_SORT_DROPDOWN_OPEN_ERROR
+  const target = resolveFilterSortEntrypointTarget(get)
+  if (target === null) return FILTER_SORT_TARGET_ERROR
+  if (!sheetHasActiveFilterRules(get, target.sheetId)) return FILTER_SORT_REAPPLY_NO_RULES_ERROR
+  return null
+})
+reapplyFilterDisabledReasonAtom.debugLabel = 'spreadsheet.filterSort.reapplyDisabledReason'
+
+/**
+ * Re-run the active sheet's committed filter rules and re-commit the answer.
+ *
+ * NOT in the undo stack, and no `pushHistoryAtom`. Applying a filter records no
+ * history entry here (the rules' own undo is its undo, `filter-sort.md`), so a
+ * Reapply entry would be an undo step whose counterpart the user never got —
+ * Ctrl+Z would restore a hidden set that nothing else in the stack accounts
+ * for. Microsoft documents neither way for Excel's Reapply (checked
+ * 2026-07-21: the official "Reapply a filter and sort, or clear a filter" page
+ * is silent on undo, and the only claims either way are third-party), so this
+ * is CONSISTENCY WITH APPLY, not verified Excel parity. Treat it as an
+ * unverified default that can be revisited if Apply ever becomes undoable.
+ *
+ * FILTER ONLY, despite the name. Excel's Reapply covers sort too — that IS
+ * verified (Microsoft's page is literally titled "Reapply a filter *and sort*",
+ * and Ctrl+Alt+L is documented as reapplying a column sort). It is
+ * inexpressible here rather than skipped: sort stopped being view state with
+ * #24, so there is no sort spec to re-run — `FilterSortState` holds `rules` and
+ * nothing else. Re-running a physical sort would be a DATA MUTATION issued
+ * behind a command the user invoked to refresh visibility, which is strictly
+ * worse than not sorting.
+ *
+ * Pre-flight rejections write NO shared state — they are fully described by
+ * `reapplyFilterDisabledReasonAtom`. Mirroring them into the entrypoint state
+ * would let an inert Ctrl+Alt+L stomp the toolbar's filter/sort error display.
+ * Once in flight the command DOES take the shared entrypoint ticket, because
+ * from there on it genuinely shares the one backend lane.
+ */
+export const reapplyFilterAtom = atom(
+  null,
+  async (get, set, input: ReapplyFilterInput): Promise<void> => {
+    let available = false
+    try {
+      available = typeof input.source?.setFilterSort === 'function'
+    } catch {
+      available = false
+    }
+    set(filterSortCapabilityBackingAtom, available)
+    if (!available) return
+    if (input.entrypoint !== 'toolbar' && input.entrypoint !== 'menu-bar') return
+    if (typeof input.refreshProjection !== 'function') return
+    if (get(reapplyFilterDisabledReasonAtom) !== null) return
+
+    const target = resolveFilterSortEntrypointTarget(get)
+    if (target === null) return
+    const committed = get(filterSortStateAtom)[target.sheetId]
+    if (committed === undefined || committed.rules.length === 0) return
+
+    const operationId = nextFilterSortOperationId(get(filterSortEntrypointOperationIdStateAtom))
+    const requestId = nextFilterSortRequestId(get(filterSortSyncTicketAtom))
+    if (operationId === null || requestId === null) {
+      set(
+        filterSortEntrypointStateBackingAtom,
+        entrypointStateFor('blocked', {
+          entrypoint: input.entrypoint,
+          target,
+          attempt: 1,
+          error: 'Filter and sort command identity space is exhausted.',
+        }),
+      )
+      return
+    }
+
+    const previous = get(filterSortEntrypointStateBackingAtom)
+    const ticket: FilterSortEntrypointTicket = Object.freeze({
+      operationId,
+      requestId,
+      entrypoint: input.entrypoint,
+      target,
+      direction: null,
+      attempt: nextEntrypointAttempt(previous, input.entrypoint, target, null),
+      // Identity: Reapply never changes what is filtered, only which rows
+      // currently satisfy it. The committed rules go out and come back.
+      next: normalizeState(committed),
+      selectionWitness: get(selectionAuthorityWitnessAtom),
+      workspaceWitness: get(workspaceActiveSheetAuthorityWitnessAtom),
+    })
+    set(filterSortEntrypointOperationIdStateAtom, operationId)
+    set(filterSortSyncTicketBackingAtom, requestId)
+    set(activeFilterSortEntrypointAtom, ticket)
+    set(filterSortEntrypointStateBackingAtom, entrypointStateForTicket('pending', ticket))
+
+    const ownsTicket = (): boolean => get(activeFilterSortEntrypointAtom) === ticket
+
+    // Publish the reservation before transport launch so same-tick re-entry is
+    // inert; re-set the owned pending value to flush it (Einfach defers the
+    // first flush of an async write until a post-await setter runs).
+    await Promise.resolve()
+    if (!ownsTicket()) return
+    set(filterSortEntrypointStateBackingAtom, get(filterSortEntrypointStateBackingAtom))
+
+    let acknowledgement: unknown
+    try {
+      acknowledgement = await input.source.setFilterSort!.call(input.source, {
+        kind: 'set-filter-sort',
+        sheetId: target.sheetId,
+        rules: ticket.next.rules,
+        requestId,
+      })
+    } catch (error) {
+      if (!ownsTicket()) return
+      set(activeFilterSortEntrypointAtom, null)
+      set(
+        filterSortEntrypointStateBackingAtom,
+        entrypointStateForTicket(
+          'outcome-unknown',
+          ticket,
+          outcomeUnknownError(errorMessage(error)),
+        ),
+      )
+      return
+    }
+
+    if (!ownsTicket()) return
+    let acknowledgementMatches = false
+    try {
+      acknowledgementMatches =
+        typeof acknowledgement === 'object' &&
+        acknowledgement !== null &&
+        (acknowledgement as { sheetId?: unknown }).sheetId === target.sheetId &&
+        (acknowledgement as { requestId?: unknown }).requestId === requestId
+    } catch {
+      acknowledgementMatches = false
+    }
+    if (!acknowledgementMatches) {
+      set(activeFilterSortEntrypointAtom, null)
+      set(
+        filterSortEntrypointStateBackingAtom,
+        entrypointStateForTicket(
+          'outcome-unknown',
+          ticket,
+          outcomeUnknownError(FILTER_SORT_ACKNOWLEDGEMENT_ERROR),
+        ),
+      )
+      return
+    }
+
+    // The one and only effect: the fresh whole-column answer replaces the
+    // stale snapshot. Same sink, same whole-set-replace, same clear-on-absent
+    // degradation as the dropdown path — Reapply is not a second writer with
+    // its own rules, it is the same writer invoked again.
+    set(setViewportFilterHiddenRowsAtom, {
+      sheetId: target.sheetId,
+      rows: readAckHiddenRowIndices(acknowledgement),
+    })
+    set(
+      filterSortEntrypointStateBackingAtom,
+      entrypointStateForTicket('local-acknowledged', ticket),
+    )
+
+    await Promise.resolve()
+    if (!ownsTicket()) return
+    set(filterSortEntrypointStateBackingAtom, entrypointStateForTicket('refreshing', ticket))
+    try {
+      await input.refreshProjection(target.sheetId)
+    } catch (error) {
+      if (!ownsTicket()) return
+      set(
+        filterSortEntrypointStateBackingAtom,
+        entrypointStateForTicket('refresh-failed', ticket, refreshFailureError(error)),
+      )
+      return
+    }
+    if (!ownsTicket()) return
+    set(activeFilterSortEntrypointAtom, null)
+    set(filterSortEntrypointStateBackingAtom, entrypointStateForTicket('idle', ticket))
+  },
+)
+reapplyFilterAtom.debugLabel = 'spreadsheet.filterSort.reapply'
 
 export const retryFilterSortRefreshAtom = atom(
   null,

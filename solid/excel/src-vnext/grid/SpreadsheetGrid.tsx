@@ -74,6 +74,7 @@ import {
   issueProjectionRequestIdAtom,
   openFindReplaceAtom,
   openGoToAtom,
+  reapplyFilterAtom,
   filterSortStateAtom,
   fillSeriesLocaleAtom,
   openFilterDropdownAtom,
@@ -124,6 +125,7 @@ import {
   dispatchUndo,
   notifyDraftTypedChar,
   readActiveFormulaSuggestion,
+  refreshVisibleProjection,
   runVisibleProjectionTransport,
   spreadsheetProjectionSnapshotAtom,
   syncFormulaReferenceCaret,
@@ -2841,6 +2843,21 @@ export function SpreadsheetGrid(props: SpreadsheetGridProps) {
       case 'go-to.open':
         event.preventDefault()
         store.setter(openGoToAtom)
+        return
+      case 'filterSort.reapply':
+        // Ctrl+Alt+L → Data → Reapply. No host-side gate: unlike Ctrl+Alt+V
+        // this opens no dialog, and `reapplyFilterAtom` is inert (writing no
+        // shared state) whenever `reapplyFilterDisabledReasonAtom` is set —
+        // capability missing, lane busy, dropdown open, or no active filter.
+        // So the "nothing to reapply" press is a silent no-op, which is what
+        // pressing it on an unfiltered sheet should be.
+        event.preventDefault()
+        await store.setter(reapplyFilterAtom, {
+          source: backend,
+          entrypoint: 'menu-bar',
+          refreshProjection: (sheetId) => refreshVisibleProjection(store, backend, sheetId),
+        })
+        bumpRender()
         return
       case 'clipboard.copy':
         event.preventDefault()

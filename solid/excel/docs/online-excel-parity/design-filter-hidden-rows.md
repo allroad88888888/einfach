@@ -27,8 +27,9 @@
 | S5 adapter 原子翻转 | `d123275` | ✅ 已落地 | bridge 双路**有意不做**（见勘误 E6） |
 | S5a 结构位移重映射 | `1a7fae3` | ✅ 已落地 | §10 从未把它派进任何切片（见勘误 E7） |
 | S6 死代码清除 | `50a14e1` | ✅ 已落地 | 顺带改了 `SpreadsheetGrid.tsx` 与 `SpreadsheetContextMenu.tsx`（见勘误 E2） |
-| S7 可见性语义收口 | `5dc7783`（前置）+ `0f9a150`（正式） | ⚠️ **部分落地** | 复制/删除/导出全做；**`Data → Reapply` 入口未做**（见勘误 E8） |
-| S8 文档收口 | 本次 | ✅ 已落地 | `filter-sort.md` 整篇重写；CANONICAL §7-1 勘误；CUTOVER 记账；06 分册订正 |
+| S7 可见性语义收口 | `5dc7783`（前置）+ `0f9a150`（正式）+ `S9`（Reapply 补齐） | ✅ 已落地 | 复制/删除/导出随 `0f9a150`；`Data → Reapply` 入口（原子 + 菜单 + `Ctrl+Alt+L`）随 S9 补齐，见勘误 E8 |
+| S8 文档收口 | `5a08eca` | ✅ 已落地 | `filter-sort.md` 整篇重写；CANONICAL §7-1 勘误；CUTOVER 记账；06 分册订正 |
+| S9 `Data → Reapply` 补齐 | 本次 | ✅ 已落地 | 闭合勘误 E8 —— #27 唯一的**能力缺失**（其余七处都是文档与代码不符）。原子 + 菜单 + 键位 + i18n + 双包单测 + e2e |
 
 **门禁（S8 复跑，2026-07-21）**：ui-core **63 suites / 1583 tests PASS**、
 solid **97 suites / 1455 tests PASS**（1 suite / 6 tests skipped）。与 S6 提交信息记录的
@@ -48,7 +49,7 @@ solid **97 suites / 1455 tests PASS**（1 suite / 6 tests skipped）。与 S6 �
 | **E5** | §7 表 "UI-core 筛选" 行 vs §10 S6 行；§9.2 主控裁定三 修正 2 | S4 实施者 | `buildSortExcludedRows` 换源归 S4（§7）／归 S6（§10）—— 设计稿**自相矛盾** | **定档 S5**。S4 完全不写 `viewportFilterHiddenAtom`（作用域止于 adapter，集合算完直接推给引擎）；换源必须与"原子真正被填值"同切片，否则它读一个恒空集合、排序排除行静默失效 |
 | **E6** | §6.5 表 "bridge" 行；§10 S5 行 | S5 实施者 | `eval-hidden-rows-bridge.ts` 扩为双路推送 | **有意不做，两处作废**。S4 已把筛选集的推送放在两个 adapter 的 `setFilterSort` 内部（ACK **之前** await）；bridge 再加一路会产生**第二个写者**，且比 adapter 内推送晚一拍。真要迁到 bridge，须先加 `SpreadsheetBackend.setEvalFilterHiddenRows` 端口并**同时**撤掉两个 adapter 的内部推送 |
 | **E7** | §3 "共性复用" 首条；§10 切片表 | S5 / S5a 实施者 | 筛选集复用 `remapIndexSetAfterStructuralShift` 随结构位移平移 | §3 要求了，但 **§10 没把它派进任何切片**，S5 派单也不含它 → S5 落地即成实测回归（筛选激活时插入行 → 陈旧索引**指向另一行真实数据**，表头被吞、被筛掉的值重现）。S5a 补齐，落点**三层**（UI-core / 两个 adapter 的本地快照 / 引擎副本），缺任一层复现都不算修好 |
-| **E8 (新，S8 查出)** | §4.3；§7 表 "UI 入口" 行；§10 S7 行；§9.1-2 | S8 实施者 | 新增 `reapplyFilterAtom` + Data 菜单 `Reapply` + `Ctrl+Alt+L`，作为快照语义的显式重算入口 | **三者均未实现**。2026-07-21 全仓核实：`reapplyFilterAtom` 无导出、菜单栏与 i18n 无 Reapply 条目、keyboard 无 `Ctrl+Alt+L`；`Reapply` 一词只出现在 4 处**注释**里。快照语义已经生效（`bumpRevision()` 刻意不失效筛选集），但配套的逃生口没建 —— 用户今天只能重开列下拉重发规则来刷新。**这是 #27 最大的在案缺口** |
+| **E8 (S8 查出 → S9 已闭合)** | §4.3；§7 表 "UI 入口" 行；§10 S7 行；§9.1-2 | S8 实施者提出 / S9 实施者闭合 | 新增 `reapplyFilterAtom` + Data 菜单 `Reapply` + `Ctrl+Alt+L`，作为快照语义的显式重算入口；"端口缺失时按惯例**隐藏**入口" | **S8 时三者均未实现，S9 已补齐**，但形状有两处与设计稿不同：①**不隐藏，改禁用** —— Reapply 的常态不可用原因是"当前无激活筛选"，一个随筛选出现/消失的菜单项比灰掉更像 bug；可用性全部由纯派生的 `reapplyFilterDisabledReasonAtom` 承担，与紧邻的 `data.filter` 一致。②**只重做筛选，不重做排序** —— Excel 的 Reapply 确实涵盖排序（已查证），但 #24 之后排序不再是视图状态，`FilterSortState` 只有 `rules`，没有可重放的排序规格；重跑物理排序会变成一次数据变更。落点：`filter-sort/index.ts`（`reapplyFilterAtom` / `reapplyFilterDisabledReasonAtom`）、`menu-bar/index.ts`（`data.reapply`）、`keyboard/`（`filterSort.reapply`）、`SpreadsheetMenuBar.tsx` + `SpreadsheetGrid.tsx` 宿主接线、en/zh i18n |
 
 > **另有两项计数/强度问题，不算"与代码不符"但同样必须找得到**：
 >
@@ -62,8 +63,10 @@ solid **97 suites / 1455 tests PASS**（1 suite / 6 tests skipped）。与 S6 �
 >   限定词是原稿臆造已删；③"选区完全落在隐藏行内"无任何来源，实现取保守默认
 >   （可见集为空 ⇒ 零下发），**这是未证实的默认选择，不是已验证行为**。
 >
-> **S8 未发现第九处不符。** 逐条回代码核实过的名字见本节 E1–E8 与
-> `vanilla/spreadsheet-ui-core/docs/filter-sort.md`。
+> **S8 未发现第九处不符；S9 亦未发现。** S9 实施者按派单逐条回代码核实了 §4.3 / §7 "UI 入口" 行 /
+> §10 S7 行的每个名字，没有找到 E1–E8 之外的新不符项。E8 由"未实现"改判为"已实现，形状有两处
+> 有意偏离"，偏离本身记在 E8 行内 —— 那是实现裁决，不是设计稿写错。逐条回代码核实过的名字见
+> 本节 E1–E8 与 `vanilla/spreadsheet-ui-core/docs/filter-sort.md`。
 
 ### S8 另行订正的两处叙述（非新增不符，是措辞已过期）
 
@@ -84,7 +87,7 @@ solid **97 suites / 1455 tests PASS**（1 suite / 6 tests skipped）。与 S6 �
 | --- | ------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
 | 1   | 隐藏集分几个       | **两个**：`viewportHiddenAtom`（手动隐藏，不动）+ 新增 `filterHiddenAtom`（筛选隐藏）。理由是三条硬约束而非洁癖：SUBTOTAL 两层规则、复制语义不对称、unhide 不得解筛选。Grid 取**并集**渲染 |
 | 2   | 谁算筛选可见性     | **adapter 在应用筛选规则时（`setFilterSort`）一次性全列扫描**，把完整 filtered-out 源行集随 ACK 回传，UI-core 存进 `filterHiddenAtom`。**不**在投影期算——投影是有界窗口，谓词要全列        |
-| 3   | 复算时机           | 快照语义，不随编辑实时重算（**与 Excel 一致**）；新增 `Data → Reapply` 命令（Excel `Ctrl+Alt+L`）作为显式重算入口                                                                          |
+| 3   | 复算时机           | 快照语义，不随编辑实时重算（**与 Excel 一致**）；新增 `Data → Reapply` 命令（Excel `Ctrl+Alt+L`）作为显式重算入口。**已落地（S9）**，两处形状偏离见勘误 E8                               |
 | 4   | 扫描上限           | 沿用既有 `MAX_FILTER_SORT_PREDICATE_CELLS = 50_000` 与 `FILTER_SORT_SOURCE_TOO_LARGE` 结构化拒绝，零新阈值                                                                                 |
 | 5   | `originalRow`      | display 行 ≡ source 行恒等，**整字段删除**。W2 网关的**回映射半边全删**、**protection 门禁半边全留**；15 个依赖点逐个裁决见 §5                                                             |
 | 6   | 引擎契约           | **新增独立端口 `setEvalFilterHiddenRows`**（不扩展既有 `setEvalHiddenRows` 参数）——INV-4 冻结面按 ADDITIVE 演进，手动隐藏那条已落地的链路零改动                                            |
@@ -298,10 +301,19 @@ setFilterSort?(request: SetFilterSortRequest): Promise<SetFilterSortResult>
 
 配套：
 
-- ~~新增 UI-core 命令 `reapplyFilterAtom`：以当前 `filterSortStateAtom[sheetId]` 重发一次 `setFilterSort`，刷新 `filterHiddenAtom`。挂到 Data 菜单（`Reapply`）与 `Ctrl+Alt+L`。端口缺失时按惯例隐藏入口。~~
-  **⚠️ 未落地 —— 见 §0.0 勘误 E8。** 快照语义本身已生效（两个 adapter 都刻意不在
-  `bumpRevision()` 里失效筛选集），但这条逃生口三个部件（原子 / 菜单项 / 键位）**一个都没建**。
-  今天刷新快照的唯一途径是重开列下拉重发规则。
+- UI-core 命令 `reapplyFilterAtom`：以当前 `filterSortStateAtom[sheetId]` 的**已提交规则**重发一次
+  `setFilterSort`，把 ACK 经**同一个** `setViewportFilterHiddenRowsAtom` 落回筛选集。挂到 Data 菜单
+  （`data.reapply`）与 `Ctrl+Alt+L`。**已落地（S9）**，两处形状偏离设计稿，见 §0.0 勘误 E8：
+  端口缺失时**禁用而非隐藏**；**只重做筛选，不重做排序**。
+  - **真值来源复用 adapter 的整列扫描，不在 UI-core 另起一条。** UI-core 自算会是**第二个谓词求值器**
+    （Apply 与 Reapply 可能对同一规则给出不同答案）、会是**窗口有界**的（即 §4.2 已否掉、S5 已删掉的
+    `deriveFilterHiddenRows` 缺口重现）、且落在宿主的 `MAX_FILTER_SORT_PREDICATE_CELLS` 失败关闭预算之外。
+    这与 CANONICAL_OWNERSHIP #29 不冲突：归属讲的是**谁持有**这条视图事实，不是谁计算它 ——
+    `viewportFilterHiddenAtom` 仍是唯一真值且只在匹配 ACK 上被写，宿主是执行器，与 TSV / 图片导出端口同形。
+  - **不进 undo 栈。** 应用筛选本身不产生 history 条目，Reapply 若产生就会是一条没有对应物的撤销步。
+    微软文档对 Excel 的 Reapply 与 undo 的关系**两侧都未表态**（2026-07-21 核实：官方
+    "Reapply a filter and sort, or clear a filter" 页全文不提 undo），所以这是**与 Apply 保持一致的未证实默认**，
+    不是已验证的 Excel 对齐。
 - 结构变更（插入/删除行）走 `structuralShift` 平移（§3），不触发重扫。
 - 切表：`filterHiddenAtom` 按 sheet 存，切表天然隔离；`notifyActiveSheetChangedAtom`（`filter-sort/index.ts:1208`）的既有语义不变。
 
@@ -459,7 +471,7 @@ if let Some(addr) = addr {
 | runtime        | `worker-runtime.ts`、`worker-runtime-ts.ts`                                      | WASM dispatch case；TS `false` + `unsupported`                                                                                                                                                                                  |
 | 端口           | `vanilla/spreadsheet-ui-core/src/backend/types.ts`                               | `SetEvalFilterHiddenRowsRequest` + 端口；`SetFilterSortResult.hiddenRowIndices`；**删** `DisplayCell.originalRow`                                                                                                               |
 | UI-core 状态   | ~~`vanilla/spreadsheet-ui-core/src/filter-sort/filter-hidden.ts`（新）~~ **⚠️ 作废，见 §0.0 勘误 E1**。实际：`vanilla/spreadsheet-ui-core/src/viewport/effective-hidden.ts` | ~~`filterHiddenAtom` / `setFilterHiddenRowsAtom` / `clearFilterHiddenRowsAtom` / `applyFilterHiddenStructuralShiftAtom` / `effectiveHiddenRowsForSheet`~~ **本行原子名全部作废**。实名：`viewportFilterHiddenAtom`（derived 只读投影，私有 backing `spreadsheet.viewport.filterHiddenBacking`）、`setViewportFilterHiddenRowsAtom` / `clearViewportFilterHiddenRowsAtom` / `applyViewportFilterHiddenStructuralShiftAtom`（command）、`effectiveHiddenAtom`（并集 derived）、`getFilterHiddenRowsForSheet` / `unionHiddenRowsForSheet`（helper）、`VIEWPORT_FILTER_HIDDEN_REPLAY_KEY`。分类见 `viewport/README.md` |
-| UI-core 筛选   | `vanilla/spreadsheet-ui-core/src/filter-sort/index.ts`                           | `runFilterSortMutationAtom` 消费 ACK 的 `hiddenRowIndices`；新增 `reapplyFilterAtom`；**删** `deriveFilterHiddenRows`；`buildSortExcludedRows` 改读两集                                                                         |
+| UI-core 筛选   | `vanilla/spreadsheet-ui-core/src/filter-sort/index.ts`                           | `runFilterSortMutationAtom` 消费 ACK 的 `hiddenRowIndices`；新增 `reapplyFilterAtom` + `reapplyFilterDisabledReasonAtom`（S9）；**删** `deriveFilterHiddenRows`；`buildSortExcludedRows` 改读两集                              |
 | UI-core 网关   | `vanilla/spreadsheet-ui-core/src/editing/mutation-gateway.ts`                    | 回映射半边全删、protection 半边全留（§5）                                                                                                                                                                                       |
 | UI-core 消费者 | `go-to/`、`remove-duplicates/`、`text-to-columns/`、`clipboard/`、`operations/`  | `go-to` 接**并集**；稠密扫描跳过**筛选**隐藏行（§8.1 裁定二）；复制只取可见（§8.2）；删除行只删可见（§8.3）                                                                                                                     |
 | 投影 helper    | `vanilla/spreadsheet-ui-core/src/backend/projection-helpers.ts`                  | `buildFilterSortDisplayRows` → `computeFilterHiddenRows(state, options, readValue): Set<number>`；`cloneCell` 去字段                                                                                                            |
@@ -467,7 +479,7 @@ if let Some(addr) = addr {
 | worker adapter | `solid/excel/src-vnext/adapter/worker-workbook-backend.ts`                       | `readFilteredRange` 与 `MappedDisplayRow` 删除、overlay 去 `?? cell.row`；扫描载荷改隐藏集；`filterSortDisplayRowsBySheetId` 缓存删除；`setEvalFilterHiddenRowsThroughWorker`                                                   |
 | bridge         | `solid/excel/src-vnext/provider/eval-hidden-rows-bridge.ts`                      | 双路推送（§6.5）                                                                                                                                                                                                                |
 | Grid           | `solid/excel/src-vnext/grid/SpreadsheetGrid.tsx`                                 | `getHiddenRowSet()` / `getRows()` / `getRenderedVisibleWindow()` 改读并集派生原子（**唯一渲染改动**；行号跳号免费）                                                                                                             |
-| UI 入口        | `menu-bar/SpreadsheetMenuBar.tsx`、`keyboard/`                                   | ~~`Data → Reapply` 条目 + `Ctrl+Alt+L`；端口缺失按惯例隐藏~~ **⚠️ 未落地，见 §0.0 勘误 E8**                                                                                                                                    |
+| UI 入口        | `menu-bar/index.ts`、`keyboard/`、`SpreadsheetMenuBar.tsx`、`SpreadsheetGrid.tsx` | `Data → Reapply`（`data.reapply` + dispatch `reapply-filter`）+ `Ctrl+Alt+L`（intent `filterSort.reapply`）。**已落地（S9）**；~~端口缺失按惯例隐藏~~ → **改为禁用**，见 §0.0 勘误 E8                                          |
 
 ---
 
@@ -790,7 +802,7 @@ Excel 语义（§2 已核实）：**筛选**隐藏行复制时自动跳过；**�
 | **S4 adapter 算集合并推给引擎**（已落地，见下方"S4 重定义"） | 协议 capability `evalFilterHiddenRows` + client 可选方法；WASM runtime dispatch（缺方法回 `UNSUPPORTED`）；TS runtime `false` + `unsupported`；两个 adapter 在 `setFilterSort` 里由**同一次谓词扫描**取补集得筛选隐藏行集，worker 推 `setEvalFilterHiddenRows`、static 存进自己的求值输入。**投影压缩不动**（那是 S5） | `solid/excel/src-vnext/adapter/filter-hidden-rows.ts`（新）、`worker-workbook-backend.ts`、`static-backend.ts`、`static-formula-eval.ts`、`worker-protocol.ts`、`worker-runtime.ts`、`worker-runtime-ts.ts` | `npx jest solid/excel --no-coverage`；`npm run build:wasm`；定向 e2e。**注意：这是唯一一个有真实行为变化的前置切片** |
 | **S5 adapter 原子翻转**（已落地，见下方"S5 落地记录"） | **一次性切换**：两 adapter 投影塌回恒等、停发 `originalRow`、`setFilterSort` 回传隐藏集（`SetFilterSortResult.hiddenRowIndices`）、UI-core 写入 `viewportFilterHiddenAtom`、`buildSortExcludedRows` 改读两集、Grid 取并集、解除 merge 抑制。~~bridge 双路~~（不做，理由见落地记录）                                              | `static-backend.ts`、`worker-workbook-backend.ts`、`projection-helpers.ts`、`eval-hidden-rows-bridge.ts`、`SpreadsheetGrid.tsx`                     | `npx jest solid/excel --no-coverage` + ui-core：**只允许 §9.2 主控裁定三的 16 例白名单变红，差集非空即停**（§9.2 原表约 43 例属 S6，S5 当天必须全绿）；playwright MCP 手工 smoke（行号跳号） |
 | **S6 死代码清除**（已落地 `50a14e1`） | W2 网关回映射半边、`DisplayCell.originalRow` 字段、~~`deriveFilterHiddenRows`~~（**S5 就删了，见勘误 E5**）、~~`buildSortExcludedRows` 改读两集~~（**同属 S5**）、`requireIdentityMapping` 及其两调用点、`unmapped-row` 全族、`AllowedContentMutation.remapped`。**实际另含**：`SpreadsheetGrid.tsx` 填充柄与 `SpreadsheetContextMenu.tsx` 粘贴路径的两处死分支（读 `remapped`，逐文件表遗漏，见勘误 E2）。**有意不做**：把 `ranges` 塌成单段（§5 派了、§10 没派；改 7 个读点零行为收益） | `editing/mutation-gateway.ts`、`backend/types.ts`、`filter-sort/index.ts`、`go-to/`、`remove-duplicates/`、`text-to-columns/`、`paste-special/`、`grid/`、`context-menu/`     | 双包 jest 全绿（ui-core 63/1583、solid 97/1455+6 skipped）；`grep -r originalRow` 在 `src/` 与 `test/` 零命中（`@types/` 下的过期构建产物不计）                                                      |
-| **S7 可见性语义收口**     | ~~复制只取可见（§8.2）；删除行只删可见（§8.3，先实测 Excel）~~ **已作为前置加固提前落地**（恒等，S5 后生效；§8.3 查证已定稿）。**剩余**：`exportRangeTsv` 分块复制与 `exportRangeAsImage` 两条 adapter 自产内容路径的端口扩参；`Data → Reapply` 入口 + `Ctrl+Alt+L`；粘贴/填充明确不改并加 pin                                                                                      | `clipboard/`、`copy-as/`、`operations/`、`menu-bar/SpreadsheetMenuBar.tsx`、`keyboard/`                                                             | 双包 jest + 定向 e2e；playwright MCP smoke（筛选→复制→粘贴→Reapply）                                        |
+| **S7 可见性语义收口**（已落地）     | ~~复制只取可见（§8.2）；删除行只删可见（§8.3，先实测 Excel）~~ **已作为前置加固提前落地**（恒等，S5 后生效；§8.3 查证已定稿）。`exportRangeTsv` 分块复制与 `exportRangeAsImage` 两条 adapter 自产内容路径的端口扩参、粘贴/填充明确不改并加 pin，随 `0f9a150`。**`Data → Reapply` 入口 + `Ctrl+Alt+L` 随 S9 补齐**（勘误 E8）                                                                                      | `clipboard/`、`copy-as/`、`operations/`、`menu-bar/`、`keyboard/`、`SpreadsheetMenuBar.tsx`、`SpreadsheetGrid.tsx`                                                             | 双包 jest + 定向 e2e；playwright MCP smoke（筛选→复制→粘贴→Reapply）                                        |
 | **S8 文档收口**（已落地）  | `docs/filter-sort.md` **整篇重写**；`filter-sort/README.md`（`buildSortExcludedRows` 的"从投影反推"口径已换源）、`viewport/README.md`（去掉"S3 恒空集、S4 填值"的过期段）、`operations/README.md`（去掉"今天恒等"）、`editing/README.md`（补写"粘贴/填充照写被筛行"的 Excel parity 叙述）、`remove-duplicates/README.md`（补前置约束理由与结构位移）；`CANONICAL_OWNERSHIP.md` #29 行 + §4-4 + §6 判据 + **§7-1"手动/filter 同一集合"勘误**；`CUTOVER_INVENTORY.md` 记账行 + 段落；`06-tables-data-management.md` §3.1-6/7 与 §11 的过期机制描述；**本文 §0.0 勘误索引** | 纯文档（唯一例外：`backend/projection-helpers.ts` 上 `buildFilterSortDisplayRows` 的一段过期**注释**——原文称投影在此压缩被筛行，与 #27 后的代码直接矛盾） | 互链一致性人工核对；每个 API 名 / 路径 / 原子名回代码核实                                                    |
 
 **依赖顺序**：S1 → S2 → S4 → S5；S3 → S5；S5 → S6 → S7 → S8。
@@ -892,9 +904,11 @@ Excel 语义（§2 已核实）：**筛选**隐藏行复制时自动跳过；**�
 3. ⚠️ `AGGREGATE` 的 ignore-hidden 语义与本次双集合的关系——**列为后续**，`eval.rs:20029-20035` 的 TODO(#32 §6.3) 保持，seam 已由 S1 建好。
 4. ~~`vanilla/spreadsheet-ui-core/docs/filter-sort.md` 全文是 `directives` 时代的陈旧口径（"backend 拥有行序"、`originalRow` 契约、`SortDirective` 类型），S8 整篇重写。~~ **已完成（S8，2026-07-21）**：该文现为筛选的**现行契约规范源**，本设计稿降级为历史记录。
 5. 筛选隐藏集是否需要持久化进工作簿文件格式（Excel 的 autoFilter 会存）——超出本次范围。
-6. **⚠️ `Data → Reapply` 入口未落地（S8 查出，勘误 E8）。** 快照语义已生效但没有显式重算入口，
-   这是 #27 收尾后**最大的在案缺口**：`reapplyFilterAtom` + Data 菜单项 + `Ctrl+Alt+L` 三个部件
-   一个都没建。建议作为独立工作项补齐；实现形状 §4.3 已裁决，无需重新设计。
+6. ~~**⚠️ `Data → Reapply` 入口未落地（S8 查出，勘误 E8）。**~~ **已闭合（S9，2026-07-21）**：
+   `reapplyFilterAtom` + `reapplyFilterDisabledReasonAtom` + `data.reapply` 菜单项 + `Ctrl+Alt+L`
+   四个部件全部落地，两处有意偏离设计稿（禁用而非隐藏；只重做筛选不重做排序），理由记在勘误 E8 与 §4.3。
+   **仍未证实**：Reapply 是否应进 undo 栈 —— 微软文档两侧都不表态，现取"与 Apply 一致 = 不进栈"作为
+   **未证实的默认选择**，不是已验证行为。
 7. **E2 暴露的方法论问题**：逐文件影响面表用"搜字段名"判定改动面，会漏掉**一跳之外**读派生量的
    消费者（本次是 `remapped`）。将来做同类删除时，判据应是"从字段出发做一次可达性分析"，
    而不是 `grep` 字段名。

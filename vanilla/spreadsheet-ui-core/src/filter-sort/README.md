@@ -28,19 +28,29 @@ Filtering **hides** rows Excel-style: survivors keep their physical index, row
 numbers skip, and display row ≡ source row. `DisplayCell.originalRow` and the
 whole display→source remap layer were deleted with the compaction they undid.
 
-`runFilterSortMutationAtom` is the **only production writer** of the filter-hidden
-set. On a matched ACK it commits the rules and
-`SetFilterSortResult.hiddenRowIndices` in the same tick, via
+`runFilterSortMutationAtom` and `reapplyFilterAtom` are the **only two production
+writers** of the filter-hidden set, and they share one sink. On a matched ACK each
+commits `SetFilterSortResult.hiddenRowIndices` via
 `setViewportFilterHiddenRowsAtom` → `viewportFilterHiddenAtom` (in
-`../viewport/effective-hidden.ts`). An ACK without `hiddenRowIndices` CLEARS the
+`../viewport/effective-hidden.ts`); the mutation atom additionally commits the
+rules, which Reapply never touches. An ACK without `hiddenRowIndices` CLEARS the
 set rather than keeping a stale one.
 
 The set is a **SNAPSHOT**, not a live derivation: editing a cell does not move its
-row in or out of view. That matches Excel, whose `Data → Reapply` exists for
-exactly this reason — but **no Reapply entrypoint is implemented yet** (no
-`reapplyFilterAtom`, no menu item, no `Ctrl+Alt+L`); re-confirming the column
-dropdown is the only way to recompute. Structural inserts/deletes shift the set
-instead of rescanning it.
+row in or out of view. That matches Excel, whose `Data → Reapply` (`Ctrl+Alt+L`)
+exists for exactly this reason.
+
+- `reapplyFilterAtom` (command) — re-dispatches `setFilterSort` with the sheet's
+  already-committed rules and re-commits the ACK. Reuses the host's whole-column
+  scan rather than re-deriving here: a UI-core evaluator would be a second
+  evaluator, window-bounded, and outside the host's fail-closed scan budget. It
+  pushes NO history entry, and reapplies filters only (sort has not been view
+  state since #24, so there is no sort spec to re-run).
+- `reapplyFilterDisabledReasonAtom` (derived) — why Reapply cannot run, or `null`.
+  Hosts read it as a menu gate; the common case is "no active filter on this
+  sheet", which DISABLES the entry rather than hiding it.
+
+Structural inserts/deletes shift the set instead of rescanning it.
 
 Full contract: `../../docs/filter-sort.md`.
 

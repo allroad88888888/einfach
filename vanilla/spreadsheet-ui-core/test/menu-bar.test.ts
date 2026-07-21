@@ -91,6 +91,27 @@ describe('menu bar state boundary', () => {
     })
   })
 
+  test('registers Data -> Reapply next to Filter, gated by a disabled reason', () => {
+    const data = MENU_BAR_ITEMS.find((menu) => menu.id === 'data')
+    const ids = data?.items.flatMap((item) => ('id' in item ? [item.id] : []))
+
+    expect(data?.items.find((item) => 'id' in item && item.id === 'data.reapply')).toEqual({
+      id: 'data.reapply',
+      label: 'menuBar.data.reapply',
+      accessKey: 'Y',
+      shortcut: 'Ctrl+Alt+L',
+      dispatch: { kind: 'reapply-filter' },
+      // `'always'` rather than `'capability'` on purpose: Reapply's usual
+      // unavailable case is "no filter active right now", and an entry that
+      // appears and vanishes as the user filters would be worse than one that
+      // greys out. Availability is carried entirely by
+      // `reapplyFilterDisabledReasonAtom`, like `data.filter` above it.
+      isAvailable: 'always',
+    })
+    // Reapply belongs with the filter it re-runs, before the first separator.
+    expect(ids?.indexOf('data.reapply')).toBe((ids?.indexOf('data.filter') ?? -1) + 1)
+  })
+
   test('publishes read-only state and rejects reflective writes without mutation', () => {
     const store = createStore()
 

@@ -86,6 +86,7 @@ export type MenuItemDispatch =
   | { kind: 'toggle-table-totals' }
   | { kind: 'open-format-cells' }
   | { kind: 'open-filter-dropdown' }
+  | { kind: 'reapply-filter' }
   | { kind: 'insert-row-above' }
   | { kind: 'insert-row-below' }
   | { kind: 'insert-column-left' }

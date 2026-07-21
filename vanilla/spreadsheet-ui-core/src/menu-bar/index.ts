@@ -425,6 +425,22 @@ const DATA_ITEMS: readonly MenuBarEntry[] = [
     dispatch: { kind: 'open-filter-dropdown' },
     isAvailable: 'always',
   },
+  // Excel's `Data → Reapply` (Ctrl+Alt+L). Filter visibility is a snapshot
+  // taken when the rules are applied (#27 §4.3), so this is the explicit
+  // recompute path. `'always'` + a disabled reason, matching `data.filter`
+  // directly above: the entry stays visible and greys out when the host has
+  // no `setFilterSort` port OR when the sheet has no active filter to re-run
+  // (`reapplyFilterDisabledReasonAtom`). Hiding it on a missing port would be
+  // the other convention, but Reapply's usual unavailable case is "no filter
+  // right now", which must not make the entry appear and vanish.
+  {
+    id: 'data.reapply',
+    label: 'menuBar.data.reapply',
+    accessKey: 'Y',
+    shortcut: 'Ctrl+Alt+L',
+    dispatch: { kind: 'reapply-filter' },
+    isAvailable: 'always',
+  },
   { kind: 'separator', id: 'data.sep-1' },
   {
     id: 'data.textToColumns',

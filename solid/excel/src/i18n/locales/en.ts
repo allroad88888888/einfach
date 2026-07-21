@@ -151,6 +151,7 @@ export const messages: Record<string, string> = {
   'menuBar.data.sortAsc': 'Sort Ascending',
   'menuBar.data.sortDesc': 'Sort Descending',
   'menuBar.data.filter': 'Filter…',
+  'menuBar.data.reapply': 'Reapply',
   'menuBar.data.textToColumns': 'Text to Columns…',
   'menuBar.data.removeDuplicates': 'Remove Duplicates…',
   'menuBar.data.createTable': 'Create table',

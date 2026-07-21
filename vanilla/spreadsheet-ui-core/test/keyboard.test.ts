@@ -668,3 +668,42 @@ function expectMoveIntent(intent: KeyboardCommandIntent, to: { row: number; col:
     target: to,
   })
 }
+
+// Kept out of `describe('keyboard core')` on purpose: that block is already at
+// the 320-line cap, and folding these in would push it over.
+describe('Ctrl+Alt+L reapply shortcut', () => {
+  function dispatch(input: Record<string, unknown>) {
+    const store = createStore()
+    store.setter(setSelectionBoundsAtom, { rowCount: 10, colCount: 5 })
+    store.setter(setSelectionAtom, {
+      kind: 'cell',
+      sheetId: 'Sheet1',
+      anchor: { row: 1, col: 1 },
+      focus: { row: 1, col: 1 },
+    })
+    return store.setter(dispatchKeyboardInputAtom, input)
+  }
+
+  test('Ctrl+Alt+L and Cmd+Alt+L emit the Data > Reapply intent', () => {
+    expect(dispatch({ key: 'l', ctrlKey: true, altKey: true })).toEqual({
+      type: 'filterSort.reapply',
+    })
+    expect(dispatch({ key: 'L', metaKey: true, altKey: true })).toEqual({
+      type: 'filterSort.reapply',
+    })
+  })
+
+  // Alt is load bearing in both directions: bare Ctrl+L is Excel's Create
+  // Table and Ctrl+Shift+L its filter toggle, neither of which is bound here,
+  // so claiming those chords would pre-empt them.
+  test('leaves bare Ctrl+L and Ctrl+Shift+Alt+L unhandled', () => {
+    expect(dispatch({ key: 'l', ctrlKey: true })).toEqual({
+      type: 'none',
+      reason: 'unhandled',
+    })
+    expect(dispatch({ key: 'l', ctrlKey: true, altKey: true, shiftKey: true })).toEqual({
+      type: 'none',
+      reason: 'unhandled',
+    })
+  })
+})

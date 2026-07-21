@@ -10,6 +10,7 @@ import {
   commentSessionAtom,
   createTableSupportedAtom,
   filterSortStateAtom,
+  getFilterHiddenRowsForSheet,
   findReplaceOpenAtom,
   lastCreatedTableNameAtom,
   lastToggledTableTotalsAtom,
@@ -33,6 +34,7 @@ import {
   removeDuplicatesSessionAtom,
   selectionAtom,
   selectionLockedAtom,
+  setFilterSortAtom,
   setWorkspaceActiveSheetAtom,
   sheetProtectionAtom,
   sheetTabsAtom,
@@ -49,6 +51,7 @@ import {
   viewportShowGridlinesAtom,
   viewportShowHeadingsAtom,
   viewportFreezeAtom,
+  viewportFilterHiddenAtom,
   viewportHiddenAtom,
   workspaceSessionAtom,
   type AddSheetRequest,
@@ -64,6 +67,7 @@ import {
   type RangeProjectionRequest,
   type RangeProjectionResult,
   type RemoveDuplicatesControllerPort,
+  type SetFilterSortRequest,
   type SetSheetProtectionRequest,
   type SetTableTotalsRowRequest,
   type TableMutationResult,
@@ -1358,6 +1362,92 @@ describe('SpreadsheetMenuBar', () => {
     })
     expect(container.querySelector('[data-testid="menu-bar-item-data.sortAsc"]')).toBeNull()
     expect(container.querySelector('[data-testid="menu-bar-item-data.sortDesc"]')).toBeNull()
+  })
+
+  // `Data → Reapply` (#27). Unlike the Sort entries above it never HIDES: its
+  // routine unavailable state is "no filter active right now", and an entry
+  // that appears the moment you filter and vanishes the moment you clear
+  // would be worse than one that greys out.
+  it('Data > Reapply is disabled with no active filter and enabled once one exists', async () => {
+    const store = createStore()
+    const setFilterSortRequests: SetFilterSortRequest[] = []
+    const backend: SpreadsheetBackend = {
+      ...createBaseBackend(),
+      async setFilterSort(request) {
+        setFilterSortRequests.push(request)
+        return {
+          sheetId: request.sheetId,
+          requestId: request.requestId,
+          revision: 2,
+          hiddenRowIndices: [3],
+        }
+      },
+    }
+    store.setter(setWorkspaceActiveSheetAtom, { sheetId: 'sheet-1' })
+    setupSelection(store)
+
+    const { container } = render(() => (
+      <SpreadsheetUiProvider backend={backend} store={store}>
+        <SpreadsheetMenuBar />
+      </SpreadsheetUiProvider>
+    ))
+
+    fireEvent.click(container.querySelector('[data-testid="menu-bar-button-data"]')!)
+    const reapply = () =>
+      container.querySelector('[data-testid="menu-bar-item-data.reapply"]') as HTMLButtonElement
+    await waitFor(() => expect(reapply()).not.toBeNull())
+
+    // Counter-example: visible but inert, and clicking it dispatches nothing.
+    expect(reapply().disabled).toBe(true)
+    fireEvent.click(reapply())
+    expect(setFilterSortRequests).toHaveLength(0)
+
+    // Commit rules the way an applied filter leaves them.
+    store.setter(setFilterSortAtom, {
+      sheetId: 'sheet-1',
+      state: { rules: [{ kind: 'equals', colIndex: 0, value: 'Alpha' }] },
+    })
+
+    // The dropdown is still open (a disabled item swallows its own click), so
+    // the entry has to un-grey reactively rather than on the next open.
+    await waitFor(() => expect(reapply().disabled).toBe(false))
+    fireEvent.click(reapply())
+
+    await waitFor(() => expect(setFilterSortRequests).toHaveLength(1))
+    // The committed rules go back out verbatim — Reapply re-answers them, it
+    // never redefines them.
+    expect(setFilterSortRequests[0]).toMatchObject({
+      kind: 'set-filter-sort',
+      sheetId: 'sheet-1',
+      rules: [{ kind: 'equals', colIndex: 0, value: 'Alpha' }],
+    })
+    await waitFor(() =>
+      expect(getFilterHiddenRowsForSheet(store.getter(viewportFilterHiddenAtom), 'sheet-1')).toEqual(
+        [3],
+      ),
+    )
+  })
+
+  it('Data > Reapply stays visible (disabled) when the backend has no setFilterSort port', async () => {
+    const store = createStore()
+    const backend = createBaseBackend()
+    store.setter(setWorkspaceActiveSheetAtom, { sheetId: 'sheet-1' })
+    setupSelection(store)
+
+    const { container } = render(() => (
+      <SpreadsheetUiProvider backend={backend} store={store}>
+        <SpreadsheetMenuBar />
+      </SpreadsheetUiProvider>
+    ))
+
+    fireEvent.click(container.querySelector('[data-testid="menu-bar-button-data"]')!)
+    await waitFor(() => {
+      expect(container.querySelector('[data-testid="menu-bar-item-data.reapply"]')).not.toBeNull()
+    })
+    expect(
+      (container.querySelector('[data-testid="menu-bar-item-data.reapply"]') as HTMLButtonElement)
+        .disabled,
+    ).toBe(true)
   })
 
   function tableDescriptor(name: string): SpreadsheetTableDescriptor {
