@@ -33,7 +33,10 @@ import type {
   ListTablesResult,
   RenameTableColumnRequest,
   RenameTableRequest,
+  SetTableTotalFunctionRequest,
+  SetTableTotalsRowRequest,
   SpreadsheetTableDescriptor,
+  TableTotalsFunction,
   TableMutationRejectedResult,
   TableMutationRejectionCode,
   TableMutationResult,
@@ -138,7 +141,7 @@ import {
   formatEvalResult,
   rewriteStructuredRefsInFormula,
   type EvalCellLookup,
-  type RangeRef,
+  type EvalOrigin,
   type StructuredRefResolution,
   type StructuredRefResolver,
   type StructuredRefRewriteSpec,
@@ -1274,7 +1277,7 @@ function readFilterSortValue(
   if (!cell) return ''
   if (!cell.formula) return cell.displayValue
 
-  const evaluated = evaluateFormula(cell.formula, lookup)
+  const evaluated = evaluateFormula(cell.formula, lookup, new Set(), { row, col })
   return formatEvalResult(evaluated).display
 }
 
@@ -1357,7 +1360,12 @@ function projectSourceCell(
 
   if (clone.formula) {
     delete clone.numericValue
-    const result = evaluateFormula(clone.formula, options.lookup)
+    // Anchor on the SOURCE coordinates: a `[@Col]` must intersect the row the
+    // formula physically lives in, not the (filter-shifted) display row.
+    const result = evaluateFormula(clone.formula, options.lookup, new Set(), {
+      row: options.sourceRow,
+      col: cell.col,
+    })
     const formatted = formatEvalResult(result)
     clone.displayValue = formatted.display
     clone.valueKind = formatted.isError ? 'error' : typeof result === 'number' ? 'number' : 'string'
@@ -1564,6 +1572,7 @@ function buildProjectionResult(
       return sheetCells.get(keyFor(row, col))
     },
     resolveStructuredRef: makeStructuredRefResolver(state, request.sheetId),
+    hiddenRows: state.hiddenRowsBySheetId.get(request.sheetId),
   }
   const displayRows = buildFilterSortDisplayRows(sheetCells, lookup, filterSortState)
   const filterSortActive = displayRows !== null
@@ -3084,7 +3093,10 @@ function toResolvedSortKeys(keys: readonly SortRangeKey[]): ResolvedSortKey[] {
 function cellToSortValue(cell: DisplayCell | undefined, lookup: EvalCellLookup): SortValue {
   if (!cell) return { kind: 'empty' }
   if (cell.formula) {
-    const result = evaluateFormula(cell.formula, lookup)
+    const result = evaluateFormula(cell.formula, lookup, new Set(), {
+      row: cell.row,
+      col: cell.col,
+    })
     if (typeof result === 'number') return { kind: 'number', value: result }
     // A string result beginning with '#' is an error code; anything else is text.
     return result.startsWith('#') ? { kind: 'error' } : { kind: 'text', value: result }
@@ -3333,6 +3345,7 @@ function applyStaticSortRange(
       return sheetCells.get(keyFor(row, col))
     },
     resolveStructuredRef: makeStructuredRefResolver(state, request.sheetId),
+    hiddenRows: state.hiddenRowsBySheetId.get(request.sheetId),
   }
   const keys = toResolvedSortKeys(request.keys)
   const plan = planPhysicalSort(
@@ -3418,14 +3431,25 @@ export function sparseCellsToRangeProjectionResult(
 //
 // Structured-reference SUPPORT LEVEL (honest boundary — no faked values):
 //   - Resolved (as function args, e.g. `=SUM(Table1[Q1])`): `Table1[Col]`,
-//     `Table1[[ColA]:[ColB]]`, `Table1[#All|#Data|#Headers|#Totals]`.
-//   - Unknown table → `#NAME?`; unknown column / missing totals row / empty
-//     data region → `#REF!`.
-//   - NOT supported (fall to `#ERROR!`, never a faked value): bare `Table1`
-//     (the static tokenizer reads it as a cell ref), bare `[Col]`, `[@Col]` /
-//     `[#This Row]`, combined `[[#Data],[Col]]`, cross-sheet Table refs, and a
-//     standalone `=Table1[Col]` in value context (the static engine has no
-//     spill). See TODO(einfach-static-structured-refs).
+//     `Table1[[ColA]:[ColB]]`, `Table1[#All|#Data|#Headers|#Totals]`,
+//     `Table1[#This Row]`, `Table1[@Col]`, `Table1[@]`, and the table-less
+//     `[Col]` / `[@Col]` / `[@]` forms written inside the Table's own cells
+//     (the containing Table is resolved from the anchoring cell).
+//   - Resolved in VALUE context too when the reference is 1×1 — so
+//     `=[@Price]*[@Qty]` works. A wider range in value context needs spill,
+//     which the static engine does not model → `#ERROR!`.
+//   - Unknown table → `#NAME?`; unknown column / missing header-or-totals band
+//     / empty data region → `#REF!`; a this-row form whose anchor sits outside
+//     the data body, or a table-less form outside any Table → `#VALUE!`.
+//   - A bare `Table1` (no brackets) is NOT a structured reference in either
+//     engine: both formula parsers read an A1-shaped token as a cell reference
+//     even past `XFD`, so it evaluates as an empty off-grid cell (`=SUM(Table1)`
+//     → 0). Pinned against WASM in
+//     vnext-table-totals-static-wasm-parity.test.ts.
+//   - NOT supported (fall to `#ERROR!`, never a faked value): combined
+//     qualifiers `[[#Data],[Col]]` (the engine grammar defers them too) and
+//     cross-sheet Table refs (the static evaluator reads a single sheet).
+//     See TODO(einfach-static-structured-refs).
 
 const TABLE_RESERVED_NAMES: ReadonlySet<string> = new Set(ENGINE_BUILTIN_FORMULA_NAMES)
 
@@ -3513,10 +3537,16 @@ function tableHeaderText(
   const cell = sheetCells?.get(keyFor(row, col))
   if (!cell) return ''
   if (cell.formula) {
-    const result = evaluateFormula(cell.formula, {
-      get: (r, c) => sheetCells?.get(keyFor(r, c)),
-      resolveStructuredRef: makeStructuredRefResolver(state, sheetId),
-    })
+    const result = evaluateFormula(
+      cell.formula,
+      {
+        get: (r, c) => sheetCells?.get(keyFor(r, c)),
+        resolveStructuredRef: makeStructuredRefResolver(state, sheetId),
+        hiddenRows: state.hiddenRowsBySheetId.get(sheetId),
+      },
+      new Set(),
+      { row, col },
+    )
     const formatted = formatEvalResult(result)
     return formatted.isError ? '' : formatted.display
   }
@@ -3579,41 +3609,100 @@ function tableRejected(
   }
 }
 
-type StructuredInnerSpec =
-  | { readonly kind: 'area'; readonly area: 'all' | 'data' | 'headers' | 'totals' }
-  | { readonly kind: 'columns'; readonly from: string; readonly to: string }
+/** Horizontal band of a structured reference — mirrors the engine `TableArea`. */
+type StructuredArea = 'all' | 'data' | 'headers' | 'totals' | 'thisRow'
+
+/**
+ * Parsed `Table[inner]` body: which band, and which column span (`null` = the
+ * Table's whole width). Shaped as the engine's `(area, columns)` pair so the
+ * resolution order below can be compared line-for-line with `resolve_table_ref`.
+ */
+interface StructuredInnerSpec {
+  readonly area: StructuredArea
+  readonly columns: { readonly from: string; readonly to: string } | null
+}
+
+/** Column span covering a single name. */
+function oneColumn(name: string): StructuredInnerSpec['columns'] {
+  return { from: name, to: name }
+}
 
 /** Parse the inner text of a `Table[inner]` reference, or `null` when unsupported. */
 function parseStructuredInner(inner: string): StructuredInnerSpec | null {
   const trimmed = inner.trim()
+  // Empty `[]` is deferred by the engine grammar too (design §3.2).
   if (trimmed === '') return null
   if (trimmed.startsWith('#')) {
-    switch (trimmed.toUpperCase()) {
+    switch (trimmed.toUpperCase().replace(/\s+/g, ' ')) {
       case '#ALL':
-        return { kind: 'area', area: 'all' }
+        return { area: 'all', columns: null }
       case '#DATA':
-        return { kind: 'area', area: 'data' }
+        return { area: 'data', columns: null }
       case '#HEADERS':
-        return { kind: 'area', area: 'headers' }
+        return { area: 'headers', columns: null }
       case '#TOTALS':
-        return { kind: 'area', area: 'totals' }
+        return { area: 'totals', columns: null }
+      case '#THIS ROW':
+        return { area: 'thisRow', columns: null }
       default:
-        return null // `#This Row` and friends are unsupported in static
+        return null
     }
   }
-  if (trimmed.startsWith('@')) return null // this-row needs current-cell context
-  if (trimmed.includes(',')) return null // combined `[[#Data],[Col]]` unsupported
+  // `[@]` (whole current row), `[@Col]`, `[@[Col]]`.
+  if (trimmed.startsWith('@')) {
+    const rest = trimmed.slice(1).trim()
+    if (rest === '') return { area: 'thisRow', columns: null }
+    const bracketed = /^\[([^[\]]*)\]$/.exec(rest)
+    if (bracketed) {
+      const col = bracketed[1].trim()
+      return col === '' ? null : { area: 'thisRow', columns: oneColumn(col) }
+    }
+    if (rest.includes('[') || rest.includes(']') || rest.includes(',')) return null
+    return { area: 'thisRow', columns: oneColumn(rest) }
+  }
+  // Combined qualifiers (`[[#Data],[Col]]`) are deferred by the engine
+  // grammar as well (design §3.2) — kept unsupported so both engines agree.
+  if (trimmed.includes(',')) return null
   if (trimmed.includes('[')) {
     const multi = /^\[([^[\]]*)\]\s*:\s*\[([^[\]]*)\]$/.exec(trimmed)
-    if (multi) return { kind: 'columns', from: multi[1].trim(), to: multi[2].trim() }
+    if (multi) {
+      return { area: 'data', columns: { from: multi[1].trim(), to: multi[2].trim() } }
+    }
     const single = /^\[([^[\]]*)\]$/.exec(trimmed)
     if (single) {
       const col = single[1].trim()
-      return { kind: 'columns', from: col, to: col }
+      return col === '' ? null : { area: 'data', columns: oneColumn(col) }
     }
     return null
   }
-  return { kind: 'columns', from: trimmed, to: trimmed }
+  // Bare, unqualified column: the whole DATA column (engine parity — the
+  // engine's `parse_bare_colref` yields `TableArea::Data`, not this-row).
+  return { area: 'data', columns: oneColumn(trimmed) }
+}
+
+/**
+ * The Table anchored to `sheetId` whose range contains `origin` — how a
+ * table-less `[Col]` / `[@Col]` finds its Table (engine
+ * `lookup_table_containing`).
+ */
+function tableContaining(
+  state: StaticBackendState,
+  sheetId: string,
+  origin: EvalOrigin,
+): StaticTableEntry | undefined {
+  for (const entry of state.tablesByKey.values()) {
+    if (entry.sheetId !== sheetId) continue
+    const { range } = entry
+    if (
+      origin.row >= range.rowStart &&
+      origin.row <= range.rowEnd &&
+      origin.col >= range.colStart &&
+      origin.col <= range.colEnd
+    ) {
+      return entry
+    }
+  }
+  return undefined
 }
 
 function resolveStructuredRefForTable(
@@ -3621,75 +3710,99 @@ function resolveStructuredRefForTable(
   sheetId: string,
   tableName: string | null,
   inner: string,
+  origin: EvalOrigin | null,
 ): StructuredRefResolution {
-  if (!tableName) return null // bare `[Col]` needs current-table context
-  const entry = state.tablesByKey.get(tableName.toUpperCase())
-  if (!entry) return { kind: 'error', code: '#NAME?' }
-  // The static evaluator reads a single sheet, so a cross-sheet Table ref is
-  // an honest "not supported here" (→ `#ERROR!`), not a wrong value.
-  if (entry.sheetId !== sheetId) return null
+  const refError = (code: string): StructuredRefResolution => ({ kind: 'error', code })
+
+  let entry: StaticTableEntry | undefined
+  if (tableName) {
+    entry = state.tablesByKey.get(tableName.toUpperCase())
+    // Unknown NAMED table → `#NAME?` (engine `InvalidName`).
+    if (!entry) return refError('#NAME?')
+    // The static evaluator reads a single sheet, so a cross-sheet Table ref is
+    // an honest "not supported here" (→ `#ERROR!`), not a wrong value.
+    // TODO(einfach-static-structured-refs): needs a multi-sheet cell lookup.
+    if (entry.sheetId !== sheetId) return null
+  } else {
+    // Table-less `[Col]` / `[@Col]`: resolve from the anchoring cell. Outside
+    // any Table (or with no anchor at all) → `#VALUE!`, engine parity.
+    if (!origin) return refError('#VALUE!')
+    entry = tableContaining(state, sheetId, origin)
+    if (!entry) return refError('#VALUE!')
+  }
+
   const spec = parseStructuredInner(inner)
   if (!spec) return null
 
   const { range } = entry
   const dataStart = range.rowStart + (entry.hasHeaders ? 1 : 0)
   const dataEnd = range.rowEnd - (entry.hasTotals ? 1 : 0)
-  const asRange = (ref: RangeRef): StructuredRefResolution => ({ kind: 'range', ref })
-  const refError = (code: string): StructuredRefResolution => ({ kind: 'error', code })
 
-  if (spec.kind === 'area') {
-    switch (spec.area) {
-      case 'all':
-        return asRange({
-          rowStart: range.rowStart,
-          rowEnd: range.rowEnd,
-          colStart: range.colStart,
-          colEnd: range.colEnd,
-        })
-      case 'headers':
-        if (!entry.hasHeaders) return refError('#REF!')
-        return asRange({
-          rowStart: range.rowStart,
-          rowEnd: range.rowStart,
-          colStart: range.colStart,
-          colEnd: range.colEnd,
-        })
-      case 'totals':
-        if (!entry.hasTotals) return refError('#REF!')
-        return asRange({
-          rowStart: range.rowEnd,
-          rowEnd: range.rowEnd,
-          colStart: range.colStart,
-          colEnd: range.colEnd,
-        })
-      case 'data':
-        if (dataStart > dataEnd) return refError('#REF!')
-        return asRange({
-          rowStart: dataStart,
-          rowEnd: dataEnd,
-          colStart: range.colStart,
-          colEnd: range.colEnd,
-        })
+  // Rows first, then columns — the engine's order, so the surfaced error code
+  // matches when a reference is bad on both axes at once.
+  let rowStart: number
+  let rowEnd: number
+  switch (spec.area) {
+    case 'all':
+      rowStart = range.rowStart
+      rowEnd = range.rowEnd
+      break
+    case 'headers':
+      if (!entry.hasHeaders) return refError('#REF!')
+      rowStart = range.rowStart
+      rowEnd = range.rowStart
+      break
+    case 'totals':
+      if (!entry.hasTotals) return refError('#REF!')
+      rowStart = range.rowEnd
+      rowEnd = range.rowEnd
+      break
+    case 'data':
+      // Zero data rows → `#REF!` (design §4.1 known divergence from Excel's
+      // "keep one empty data row").
+      if (dataEnd < dataStart) return refError('#REF!')
+      rowStart = dataStart
+      rowEnd = dataEnd
+      break
+    case 'thisRow': {
+      if (!origin || dataEnd < dataStart || origin.row < dataStart || origin.row > dataEnd) {
+        // Current row outside the data body → `#VALUE!` (design §5.3 point 2).
+        return refError('#VALUE!')
+      }
+      rowStart = origin.row
+      rowEnd = origin.row
+      break
     }
   }
 
-  const fromIdx = entry.columns.findIndex((c) => c.toLowerCase() === spec.from.toLowerCase())
-  const toIdx = entry.columns.findIndex((c) => c.toLowerCase() === spec.to.toLowerCase())
+  if (!spec.columns) {
+    return {
+      kind: 'range',
+      ref: { rowStart, rowEnd, colStart: range.colStart, colEnd: range.colEnd },
+    }
+  }
+  const fromIdx = entry.columns.findIndex(
+    (c) => c.toLowerCase() === spec.columns!.from.toLowerCase(),
+  )
+  const toIdx = entry.columns.findIndex((c) => c.toLowerCase() === spec.columns!.to.toLowerCase())
   if (fromIdx < 0 || toIdx < 0) return refError('#REF!')
-  if (dataStart > dataEnd) return refError('#REF!')
-  return asRange({
-    rowStart: dataStart,
-    rowEnd: dataEnd,
-    colStart: range.colStart + Math.min(fromIdx, toIdx),
-    colEnd: range.colStart + Math.max(fromIdx, toIdx),
-  })
+  return {
+    kind: 'range',
+    ref: {
+      rowStart,
+      rowEnd,
+      colStart: range.colStart + Math.min(fromIdx, toIdx),
+      colEnd: range.colStart + Math.max(fromIdx, toIdx),
+    },
+  }
 }
 
 function makeStructuredRefResolver(
   state: StaticBackendState,
   sheetId: string,
 ): StructuredRefResolver {
-  return (tableName, inner) => resolveStructuredRefForTable(state, sheetId, tableName, inner)
+  return (tableName, inner, origin) =>
+    resolveStructuredRefForTable(state, sheetId, tableName, inner, origin)
 }
 
 /** Shrink `[lo, hi]` by the deletion of `[d0, d1]`; `null` when fully deleted. */
@@ -3809,6 +3922,86 @@ function applyTableShift(
     entry.range = outcome.range
     entry.columns = outcome.columns
   }
+}
+
+// --- Totals row (design-excel-table.md §7, parity #32 T6) -------------------
+//
+// The totals row is a Table-INTERNAL behaviour, not a sheet structural op:
+// toggling it grows/shrinks the Table's own range by one row and writes/clears
+// `=SUBTOTAL(1xx, Table[Col])` formulas through the ordinary cell path, so the
+// cell formula IS the fact — there is no second per-column source of truth and
+// a UI reconstructs its dropdown by reading the cell formula back.
+
+/**
+ * Totals aggregate id → SUBTOTAL function number, mirroring the engine
+ * `TotalsFunction::subtotal_code`. Every code sits in the **101-111** band so
+ * a totals aggregate excludes host-hidden rows. `null` means "clear the cell".
+ */
+const TOTALS_SUBTOTAL_CODES: Readonly<Record<TableTotalsFunction, number | null>> = {
+  none: null,
+  average: 101,
+  countNums: 102,
+  count: 103,
+  max: 104,
+  min: 105,
+  stdDev: 107,
+  sum: 109,
+  var: 110,
+}
+
+/** Excel's default aggregate for a freshly enabled totals row: SUM. */
+const TOTALS_DEFAULT_SUBTOTAL_CODE = 109
+
+/**
+ * Canonical totals-cell formula text. Matches the engine's `render_formula`
+ * output byte-for-byte (no space after the comma, bare single-column spec) so
+ * the two backends store the SAME formula string and the rename walkers in
+ * `rewriteStructuredRefsInFormula` match it identically.
+ */
+function totalsSubtotalFormula(table: string, column: string, code: number): string {
+  return `=SUBTOTAL(${code},${table}[${column}])`
+}
+
+/**
+ * Does any cell in `range` hold a formula or a non-empty primitive? The
+ * totals-row occupancy guard — the engine never pushes existing content down
+ * to make room (`range_has_content` / `TableError::TotalsRowBlocked`).
+ */
+function rangeHasContent(state: StaticBackendState, sheetId: string, range: CellRange): boolean {
+  const cells = state.cellsBySheet.get(sheetId)
+  if (!cells) return false
+  for (let row = range.rowStart; row <= range.rowEnd; row += 1) {
+    for (let col = range.colStart; col <= range.colEnd; col += 1) {
+      const cell = cells.get(keyFor(row, col))
+      if (!cell) continue
+      if (cell.formula !== undefined || cell.displayValue !== '') return true
+    }
+  }
+  return false
+}
+
+/** Write (or clear, when `code` is `null`) one totals-row cell. */
+function writeTotalsCell(
+  state: StaticBackendState,
+  entry: StaticTableEntry,
+  columnIndex: number,
+  code: number | null,
+): void {
+  const cells = getOrCreateSheetCells(state, entry.sheetId)
+  const row = entry.range.rowEnd
+  const col = entry.range.colStart + columnIndex
+  recordCellBefore(state, entry.sheetId, keyFor(row, col))
+  if (code === null) {
+    cells.delete(keyFor(row, col))
+    return
+  }
+  updateCell(cells, {
+    kind: 'set-cell-input',
+    sheetId: entry.sheetId,
+    row,
+    col,
+    input: totalsSubtotalFormula(entry.canonicalName, entry.columns[columnIndex], code),
+  })
 }
 
 /** Rewrite `Table[...]` structured references across every sheet's formulas. */
@@ -5044,15 +5237,94 @@ export function createStaticSpreadsheetBackend(
         table: entry ? tableDescriptor(state, entry) : null,
       }
     },
-    // TODO(#32 T6 totals): `setTableTotalsRow` / `setTableTotalFunction` are
-    // deliberately NOT exposed on the static backend. A faithful totals row
-    // needs the static evaluator to (a) grow the table geometry by one row,
-    // (b) write + evaluate `=SUBTOTAL(1xx, Table[Col])` (the static
-    // structured-reference resolver returns `#REF!` for `[#Totals]` today and
-    // does not model SUBTOTAL 101-111), and (c) reflect `hasTotals` back
-    // through `listTables`. That is a substantial slice, not a low-cost add.
-    // Omitting the ports keeps them `undefined`, so UI core hides the totals
-    // toggle on the static host through the standard degradation contract —
-    // WASM remains the only real totals path (design-excel-table.md §1/§7).
+    // --- Totals row (design-excel-table.md §7, parity #32 T6) -------------
+    //
+    // Semantics are the engine's, method for method: enabling grows the range
+    // one row and seeds the LAST column with `=SUBTOTAL(109, Table[Col])`;
+    // the row below must be empty or the call rejects `totals-row-blocked`
+    // with nothing changed; disabling clears every totals cell (including
+    // hand-edited ones) and shrinks back. Both are idempotent per state.
+    //
+    // Unlike the registry CRUD above, the CELL writes here do participate in
+    // the undo timeline (the engine routes them through `set_formula` /
+    // `clear_cell` for the same reason) — but the geometry/`hasTotals` flip
+    // rides on the registry, which the undo delta still does not carry, so an
+    // undo restores the totals cells without restoring the range. Same known
+    // gap as the worker (design §11/§12).
+    async setTableTotalsRow(request: SetTableTotalsRowRequest): Promise<TableMutationResult> {
+      const entry = state.tablesByKey.get(request.name.toUpperCase())
+      if (!entry) return tableRejected(state, request, 'not-found')
+
+      const applied = (): TableMutationResult => ({
+        kind: 'table-mutation',
+        applied: true,
+        name: entry.canonicalName,
+        requestId: request.requestId,
+        revision: request.revision ?? state.revision,
+      })
+      // Idempotent no-op: nothing written, no revision bump.
+      if (entry.hasTotals === request.enabled) return applied()
+
+      if (request.enabled) {
+        const totalsRow = entry.range.rowEnd + 1
+        if (
+          rangeHasContent(state, entry.sheetId, {
+            rowStart: totalsRow,
+            rowEnd: totalsRow,
+            colStart: entry.range.colStart,
+            colEnd: entry.range.colEnd,
+          })
+        ) {
+          return tableRejected(state, request, 'totals-row-blocked')
+        }
+        beginUndoableMutation(state)
+        // Publish the new geometry BEFORE writing the SUBTOTAL so its
+        // `Table[Col]` (the `#Data` band, which now EXCLUDES the totals row)
+        // resolves against current geometry on first evaluation.
+        entry.range = { ...entry.range, rowEnd: totalsRow }
+        entry.hasTotals = true
+        if (entry.columns.length > 0) {
+          writeTotalsCell(state, entry, entry.columns.length - 1, TOTALS_DEFAULT_SUBTOTAL_CODE)
+        }
+      } else {
+        beginUndoableMutation(state)
+        const cells = getOrCreateSheetCells(state, entry.sheetId)
+        const totalsRow = entry.range.rowEnd
+        for (let col = entry.range.colStart; col <= entry.range.colEnd; col += 1) {
+          recordCellBefore(state, entry.sheetId, keyFor(totalsRow, col))
+          cells.delete(keyFor(totalsRow, col))
+        }
+        entry.range = { ...entry.range, rowEnd: totalsRow - 1 }
+        entry.hasTotals = false
+      }
+      state.revision = bumpRevision(state.revision)
+      return applied()
+    },
+    async setTableTotalFunction(
+      request: SetTableTotalFunctionRequest,
+    ): Promise<TableMutationResult> {
+      // Gate order mirrors the WASM binding: the aggregate id is parsed before
+      // the engine call, so an unknown id outranks every other rejection.
+      const code = TOTALS_SUBTOTAL_CODES[request.func]
+      if (code === undefined) return tableRejected(state, request, 'invalid-totals-function')
+      const entry = state.tablesByKey.get(request.name.toUpperCase())
+      if (!entry) return tableRejected(state, request, 'not-found')
+      if (!entry.hasTotals) return tableRejected(state, request, 'no-totals-row')
+      const columnIndex = entry.columns.findIndex(
+        (c) => c.toLowerCase() === request.column.toLowerCase(),
+      )
+      if (columnIndex < 0) return tableRejected(state, request, 'column-not-found')
+
+      beginUndoableMutation(state)
+      writeTotalsCell(state, entry, columnIndex, code)
+      state.revision = bumpRevision(state.revision)
+      return {
+        kind: 'table-mutation',
+        applied: true,
+        name: entry.canonicalName,
+        requestId: request.requestId,
+        revision: request.revision ?? state.revision,
+      }
+    },
   }
 }

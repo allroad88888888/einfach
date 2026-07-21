@@ -7,10 +7,15 @@ import { createStaticSpreadsheetBackend } from '../src-vnext/adapter'
 // Table registry directly and resolves `Table[...]` references at eval time.
 //
 // Structured-reference support in static (honest boundary — no faked values):
-//   supported (as function args): `Table1[Col]`, `Table1[[A]:[B]]`,
-//   `Table1[#All|#Data|#Headers|#Totals]`; unknown table → `#NAME?`, unknown
-//   column / missing totals row → `#REF!`. NOT supported (→ `#ERROR!`): bare
-//   `Table1`, bare `[Col]`, `[@Col]`, combined specs, cross-sheet Table refs.
+//   supported: `Table1[Col]`, `Table1[[A]:[B]]`,
+//   `Table1[#All|#Data|#Headers|#Totals|#This Row]`, `Table1[@Col]`,
+//   `Table1[@]`, and the table-less `[Col]` / `[@Col]` / `[@]` forms inside a
+//   Table's own cells. A 1×1 reference also resolves in VALUE context, so
+//   `=[@Price]*[@Qty]` works. Errors: unknown table → `#NAME?`; unknown column
+//   / missing band → `#REF!`; this-row outside the data body or a table-less
+//   form outside any Table → `#VALUE!`; a bare `Table1` is an unknown workbook
+//   name → `#NAME?`. NOT supported (→ `#ERROR!`): combined `[[#Data],[Col]]`
+//   (the engine grammar defers it too) and cross-sheet Table refs.
 
 const SHEET = 'sheet-1'
 const SHEET2 = 'sheet-2'
@@ -320,11 +325,398 @@ describe('static backend — structured-reference evaluation', () => {
 
   it('does not fake unsupported forms — they surface #ERROR!, never a value', async () => {
     const backend = await withTable()
-    // this-row (@) needs current-cell context the static evaluator lacks.
-    expect(await evalFormula(backend, '=SUM(Table1[@Q1])')).toBe('#ERROR!')
-    // combined `[[#Data],[Col]]` is deferred.
+    // Combined qualifiers are deferred by the engine grammar as well.
     expect(await evalFormula(backend, '=SUM(Table1[[#Data],[Q1]])')).toBe('#ERROR!')
-    // cross-sheet Table refs are out of the single-sheet evaluator's reach.
+    // Cross-sheet Table refs are out of the single-sheet evaluator's reach.
     expect(await evalFormula(backend, '=SUM(Table1[Q1])', SHEET2)).toBe('#ERROR!')
+    // A multi-cell reference in VALUE context needs spill, which static lacks.
+    expect(await evalFormula(backend, '=Table1[Q1]')).toBe('#ERROR!')
+  })
+
+  it('a bare Table name is an off-grid CELL reference, not a structured ref', async () => {
+    const backend = await withTable()
+    // `Table1` is column `TABLE` row 1 — past `XFD`. Both formula parsers read
+    // an A1-shaped token as a cell reference regardless of grid bounds, so it
+    // evaluates as an empty cell. Pinned against WASM in
+    // vnext-table-totals-static-wasm-parity.test.ts, which is what corrected
+    // an earlier guess that this should be `#NAME?`.
+    expect(await evalFormula(backend, '=SUM(Table1)')).toBe('0')
+  })
+
+  it('resolves this-row references from the anchoring cell', async () => {
+    const backend = await withTable()
+    // G2 sits on the North row (row 1): Q1=120, Q2=180.
+    await setFormula(backend, SHEET, 1, 6, '=Table1[@Q1]+Table1[@Q2]')
+    expect((await readCell(backend, SHEET, 1, 6))?.displayValue).toBe('300')
+    // G3 is the South row (row 2): 80 + 160.
+    await setFormula(backend, SHEET, 2, 6, '=Table1[@Q1]+Table1[@Q2]')
+    expect((await readCell(backend, SHEET, 2, 6))?.displayValue).toBe('240')
+    // `[#This Row]` spans every column of that row; SUM skips the text Region.
+    await setFormula(backend, SHEET, 1, 6, '=SUM(Table1[#This Row])')
+    expect((await readCell(backend, SHEET, 1, 6))?.displayValue).toBe('1680')
+    // `[@]` is the same band written the short way.
+    await setFormula(backend, SHEET, 1, 6, '=SUM(Table1[@])')
+    expect((await readCell(backend, SHEET, 1, 6))?.displayValue).toBe('1680')
+  })
+
+  it('this-row outside the data body is #VALUE!, matching the engine', async () => {
+    const backend = await withTable()
+    // H1 is on the header row — outside the data band (and outside the Table).
+    expect(await evalFormula(backend, '=SUM(Table1[@Q1])')).toBe('#VALUE!')
+  })
+
+  it('resolves table-less [Col] / [@Col] from the containing cell', async () => {
+    const backend = await withTable()
+    // F2 is INSIDE the Table (Total column, North row), so the bare forms
+    // resolve their Table from the anchoring cell.
+    await setFormula(backend, SHEET, 1, 5, '=[@Q1]+[@Q2]')
+    expect((await readCell(backend, SHEET, 1, 5))?.displayValue).toBe('300')
+    // A bare (unqualified) column is the whole DATA column, not this row —
+    // engine parity with `parse_bare_colref` yielding `TableArea::Data`.
+    await setFormula(backend, SHEET, 1, 5, '=SUM([Q1])')
+    expect((await readCell(backend, SHEET, 1, 5))?.displayValue).toBe('400')
+  })
+
+  it('a table-less reference outside every Table is #VALUE!', async () => {
+    const backend = await withTable()
+    // H1 belongs to no Table, so there is nothing to resolve `[Q1]` against.
+    expect(await evalFormula(backend, '=SUM([Q1])')).toBe('#VALUE!')
+    expect(await evalFormula(backend, '=[@Q1]')).toBe('#VALUE!')
+  })
+})
+
+// Excel Table totals row on the static backend (design-excel-table.md §7,
+// parity #32 T6). Semantics mirror `Workbook::set_table_totals_row` /
+// `set_table_total_function`: the cell formula IS the fact, so there is no
+// second per-column source of truth to drift.
+describe('static backend — Table totals row', () => {
+  /** The seeded table is A1:F4 — Region/Q1/Q2/Q3/Q4/Total over three data rows. */
+  async function withTable(): Promise<Backend> {
+    const backend = seededBackend()
+    await backend.createTable!({ kind: 'create-table', sheetId: SHEET, range: A1_D4 })
+    return backend
+  }
+
+  async function tableDescriptor(backend: Backend) {
+    const listed = await backend.listTables!({ kind: 'list-tables' })
+    return listed.tables[0]
+  }
+
+  it('exposes the totals ports (capability witness for UI-core degradation)', () => {
+    const backend = seededBackend()
+    expect(typeof backend.setTableTotalsRow).toBe('function')
+    expect(typeof backend.setTableTotalFunction).toBe('function')
+  })
+
+  it('toggling on grows the range, flips hasTotals, and seeds SUM in the last column', async () => {
+    const backend = await withTable()
+    const toggled = await backend.setTableTotalsRow!({
+      kind: 'set-table-totals-row',
+      name: 'Table1',
+      enabled: true,
+      requestId: 42,
+    })
+    expect(toggled.applied).toBe(true)
+    if (!toggled.applied) throw new Error('expected an applied totals toggle')
+    expect(toggled.kind).toBe('table-mutation')
+    expect(toggled.name).toBe('Table1')
+
+    const descriptor = await tableDescriptor(backend)
+    expect(descriptor.hasTotals).toBe(true)
+    expect(descriptor.range).toBe('A1:F5')
+
+    // The default lands in the LAST column (Total) as SUBTOTAL 109 — and the
+    // stored formula text is the engine's canonical rendering.
+    const totalsCell = await readCell(backend, SHEET, 4, 5)
+    expect(totalsCell?.formula).toBe('=SUBTOTAL(109,Table1[Total])')
+    expect(totalsCell?.displayValue).toBe('2140') // 840 + 800 + 500
+    // Every other totals cell stays blank until a host sets its aggregate.
+    expect(await readCell(backend, SHEET, 4, 1)).toBeUndefined()
+  })
+
+  it('the totals row is excluded from [#Data] but is exactly [#Totals]', async () => {
+    const backend = await withTable()
+    await backend.setTableTotalsRow!({ kind: 'set-table-totals-row', name: 'Table1', enabled: true })
+    // Q1 still sums the three DATA rows — the grown range did not swallow the
+    // totals row into the data band.
+    expect(await evalFormula(backend, '=SUM(Table1[Q1])')).toBe('400')
+    // #Data covers data rows only: unchanged from the pre-totals value.
+    expect(await evalFormula(backend, '=SUM(Table1[#Data])')).toBe('4280')
+    // #Totals now resolves (it was #REF! before the toggle) to the totals row.
+    expect(await evalFormula(backend, '=SUM(Table1[#Totals])')).toBe('2140')
+    // #All spans header + data + totals.
+    expect(await evalFormula(backend, '=SUM(Table1[#All])')).toBe('6420')
+  })
+
+  it('setTableTotalFunction writes each aggregate as a 101-111 SUBTOTAL', async () => {
+    const backend = await withTable()
+    await backend.setTableTotalsRow!({ kind: 'set-table-totals-row', name: 'Table1', enabled: true })
+
+    const cases: Array<[string, number, string]> = [
+      ['sum', 109, '400'],
+      ['average', 101, '133.333333'],
+      ['count', 103, '3'],
+      ['countNums', 102, '3'],
+      ['max', 104, '200'],
+      ['min', 105, '80'],
+      ['var', 110, '3733.333333'],
+    ]
+    for (const [func, code, expected] of cases) {
+      const result = await backend.setTableTotalFunction!({
+        kind: 'set-table-total-function',
+        name: 'Table1',
+        column: 'Q1',
+        func: func as never,
+      })
+      expect(result.applied).toBe(true)
+      const cell = await readCell(backend, SHEET, 4, 1)
+      expect(cell?.formula).toBe(`=SUBTOTAL(${code},Table1[Q1])`)
+      expect(cell?.displayValue).toBe(expected)
+    }
+
+    // stdDev is the square root of the sample variance above.
+    await backend.setTableTotalFunction!({
+      kind: 'set-table-total-function',
+      name: 'Table1',
+      column: 'Q1',
+      func: 'stdDev',
+    })
+    const stdDev = await readCell(backend, SHEET, 4, 1)
+    expect(stdDev?.formula).toBe('=SUBTOTAL(107,Table1[Q1])')
+    expect(Number(stdDev?.displayValue)).toBeCloseTo(Math.sqrt(3733.333333), 4)
+
+    // 'none' clears the totals cell entirely.
+    await backend.setTableTotalFunction!({
+      kind: 'set-table-total-function',
+      name: 'Table1',
+      column: 'Q1',
+      func: 'none',
+    })
+    expect(await readCell(backend, SHEET, 4, 1)).toBeUndefined()
+  })
+
+  it('a totals aggregate recomputes when its data changes', async () => {
+    const backend = await withTable()
+    await backend.setTableTotalsRow!({ kind: 'set-table-totals-row', name: 'Table1', enabled: true })
+    await backend.setTableTotalFunction!({
+      kind: 'set-table-total-function',
+      name: 'Table1',
+      column: 'Q1',
+      func: 'sum',
+    })
+    expect((await readCell(backend, SHEET, 4, 1))?.displayValue).toBe('400')
+
+    // North's Q1 120 → 500.
+    await setFormula(backend, SHEET, 1, 1, '500')
+    expect((await readCell(backend, SHEET, 4, 1))?.displayValue).toBe('780')
+  })
+
+  it('toggling off clears every totals cell and shrinks the range back', async () => {
+    const backend = await withTable()
+    await backend.setTableTotalsRow!({ kind: 'set-table-totals-row', name: 'Table1', enabled: true })
+    await backend.setTableTotalFunction!({
+      kind: 'set-table-total-function',
+      name: 'Table1',
+      column: 'Q1',
+      func: 'sum',
+    })
+
+    const off = await backend.setTableTotalsRow!({
+      kind: 'set-table-totals-row',
+      name: 'Table1',
+      enabled: false,
+    })
+    expect(off.applied).toBe(true)
+
+    const descriptor = await tableDescriptor(backend)
+    expect(descriptor.hasTotals).toBe(false)
+    expect(descriptor.range).toBe('A1:F4')
+    // Both the seeded default AND the host-set aggregate are gone.
+    expect(await readCell(backend, SHEET, 4, 1)).toBeUndefined()
+    expect(await readCell(backend, SHEET, 4, 5)).toBeUndefined()
+    // `[#Totals]` is unresolvable again.
+    expect(await evalFormula(backend, '=SUM(Table1[#Totals])')).toBe('#REF!')
+  })
+
+  it('rejects totals-row-blocked when the row below is occupied, changing nothing', async () => {
+    const backend = await withTable()
+    await setFormula(backend, SHEET, 4, 0, 'blocker')
+
+    const rejected = await backend.setTableTotalsRow!({
+      kind: 'set-table-totals-row',
+      name: 'Table1',
+      enabled: true,
+      requestId: 7,
+    })
+    expect(rejected.applied).toBe(false)
+    if (rejected.applied) throw new Error('expected a rejected totals toggle')
+    expect(rejected.kind).toBe('table-mutation-not-applied')
+    expect(rejected.code).toBe('totals-row-blocked')
+
+    const descriptor = await tableDescriptor(backend)
+    expect(descriptor.hasTotals).toBe(false)
+    expect(descriptor.range).toBe('A1:F4')
+    // The blocker was never overwritten or pushed down.
+    expect((await readCell(backend, SHEET, 4, 0))?.displayValue).toBe('blocker')
+  })
+
+  it('gates setTableTotalFunction: unknown id, no totals row, unknown column, unknown table', async () => {
+    const backend = await withTable()
+
+    const noRow = await backend.setTableTotalFunction!({
+      kind: 'set-table-total-function',
+      name: 'Table1',
+      column: 'Q1',
+      func: 'sum',
+    })
+    expect(noRow.applied).toBe(false)
+    if (noRow.applied) throw new Error('expected a rejected totals function')
+    expect(noRow.code).toBe('no-totals-row')
+
+    // The aggregate id is validated first, so it outranks `no-totals-row` —
+    // same gate order as the WASM binding.
+    const badId = await backend.setTableTotalFunction!({
+      kind: 'set-table-total-function',
+      name: 'Table1',
+      column: 'Q1',
+      func: 'bogus' as never,
+    })
+    expect(badId.applied).toBe(false)
+    if (badId.applied) throw new Error('expected a rejected totals function')
+    expect(badId.code).toBe('invalid-totals-function')
+
+    await backend.setTableTotalsRow!({ kind: 'set-table-totals-row', name: 'Table1', enabled: true })
+    const badColumn = await backend.setTableTotalFunction!({
+      kind: 'set-table-total-function',
+      name: 'Table1',
+      column: 'Nope',
+      func: 'sum',
+    })
+    expect(badColumn.applied).toBe(false)
+    if (badColumn.applied) throw new Error('expected a rejected totals function')
+    expect(badColumn.code).toBe('column-not-found')
+
+    const badTable = await backend.setTableTotalFunction!({
+      kind: 'set-table-total-function',
+      name: 'Nope',
+      column: 'Q1',
+      func: 'sum',
+    })
+    expect(badTable.applied).toBe(false)
+    if (badTable.applied) throw new Error('expected a rejected totals function')
+    expect(badTable.code).toBe('not-found')
+  })
+
+  it('is idempotent per state, and unknown tables reject not-found', async () => {
+    const backend = await withTable()
+    const first = await backend.setTableTotalsRow!({
+      kind: 'set-table-totals-row',
+      name: 'Table1',
+      enabled: true,
+    })
+    expect(first.applied).toBe(true)
+    // Enabling again is a successful no-op — the range does not grow twice.
+    const again = await backend.setTableTotalsRow!({
+      kind: 'set-table-totals-row',
+      name: 'Table1',
+      enabled: true,
+    })
+    expect(again.applied).toBe(true)
+    expect((await tableDescriptor(backend)).range).toBe('A1:F5')
+
+    const missing = await backend.setTableTotalsRow!({
+      kind: 'set-table-totals-row',
+      name: 'Nope',
+      enabled: true,
+    })
+    expect(missing.applied).toBe(false)
+    if (missing.applied) throw new Error('expected a rejected totals toggle')
+    expect(missing.code).toBe('not-found')
+  })
+
+  it('a totals formula follows a Table rename and a column rename', async () => {
+    const backend = await withTable()
+    await backend.setTableTotalsRow!({ kind: 'set-table-totals-row', name: 'Table1', enabled: true })
+    await backend.setTableTotalFunction!({
+      kind: 'set-table-total-function',
+      name: 'Table1',
+      column: 'Q1',
+      func: 'sum',
+    })
+
+    await backend.renameTableColumn!({
+      kind: 'rename-table-column',
+      name: 'Table1',
+      oldColumn: 'Q1',
+      newColumn: 'Quarter1',
+    })
+    await backend.renameTable!({ kind: 'rename-table', name: 'Table1', newName: 'Sales' })
+
+    const cell = await readCell(backend, SHEET, 4, 1)
+    expect(cell?.formula).toBe('=SUBTOTAL(109,Sales[Quarter1])')
+    expect(cell?.displayValue).toBe('400')
+  })
+})
+
+// SUBTOTAL is what makes the totals row work, so its own semantics are pinned
+// here against the engine `run_subtotal` arms (rust/excel-core/src/eval.rs).
+describe('static backend — SUBTOTAL semantics', () => {
+  function subtotalBackend() {
+    return createStaticSpreadsheetBackend({
+      revision: 1,
+      sheets: [{ id: SHEET, name: 'Sales' }],
+      // A1:A6 — numbers, a blank, and a text value.
+      matrix: [[10], [20], ['text'], [30], [], [40]],
+    })
+  }
+
+  async function evalAt(backend: Backend, input: string): Promise<string> {
+    await backend.setCellInput({ kind: 'set-cell-input', sheetId: SHEET, row: 0, col: 3, input })
+    return (await readCell(backend, SHEET, 0, 3))?.displayValue ?? ''
+  }
+
+  it('implements every function number, skipping blanks and text like the engine', async () => {
+    const backend = subtotalBackend()
+    expect(await evalAt(backend, '=SUBTOTAL(9,A1:A6)')).toBe('100') // SUM
+    expect(await evalAt(backend, '=SUBTOTAL(1,A1:A6)')).toBe('25') // AVERAGE
+    expect(await evalAt(backend, '=SUBTOTAL(2,A1:A6)')).toBe('4') // COUNT (numbers)
+    expect(await evalAt(backend, '=SUBTOTAL(3,A1:A6)')).toBe('5') // COUNTA (+ text)
+    expect(await evalAt(backend, '=SUBTOTAL(4,A1:A6)')).toBe('40') // MAX
+    expect(await evalAt(backend, '=SUBTOTAL(5,A1:A6)')).toBe('10') // MIN — a blank must not sink it
+    expect(await evalAt(backend, '=SUBTOTAL(6,A1:A6)')).toBe('240000') // PRODUCT
+  })
+
+  it('101-111 mirror 1-11 when nothing is hidden', async () => {
+    const backend = subtotalBackend()
+    for (const [visible, hiddenBand] of [
+      [1, 101],
+      [2, 102],
+      [3, 103],
+      [4, 104],
+      [5, 105],
+      [9, 109],
+    ]) {
+      expect(await evalAt(backend, `=SUBTOTAL(${hiddenBand},A1:A6)`)).toBe(
+        await evalAt(backend, `=SUBTOTAL(${visible},A1:A6)`),
+      )
+    }
+  })
+
+  it('101-111 exclude host-hidden rows; 1-11 are undisturbed by them', async () => {
+    const backend = subtotalBackend()
+    // Hide row 1 (A2 = 20) and row 5 (A6 = 40).
+    await backend.hideRows!({ kind: 'hide-rows', sheetId: SHEET, rowIndices: [1, 5] })
+    expect(await evalAt(backend, '=SUBTOTAL(109,A1:A6)')).toBe('40') // 10 + 30
+    expect(await evalAt(backend, '=SUBTOTAL(9,A1:A6)')).toBe('100') // unchanged
+    expect(await evalAt(backend, '=SUBTOTAL(102,A1:A6)')).toBe('2')
+    expect(await evalAt(backend, '=SUBTOTAL(104,A1:A6)')).toBe('30')
+  })
+
+  it('rejects out-of-band function numbers and short arg lists', async () => {
+    const backend = subtotalBackend()
+    expect(await evalAt(backend, '=SUBTOTAL(12,A1:A6)')).toBe('#VALUE!')
+    expect(await evalAt(backend, '=SUBTOTAL(0,A1:A6)')).toBe('#VALUE!')
+    expect(await evalAt(backend, '=SUBTOTAL(112,A1:A6)')).toBe('#VALUE!')
+    expect(await evalAt(backend, '=SUBTOTAL(9)')).toBe('#ARGS!')
   })
 })

@@ -11,7 +11,7 @@
  *   - unary minus / plus
  *   - parentheses
  *   - functions: SUM, AVERAGE, COUNT, MIN, MAX, IF, SUMIF, COUNTIF,
- *     ABS, ROUND, CONCAT
+ *     ABS, ROUND, CONCAT, SUBTOTAL
  *
  * Anything beyond this returns the string '#ERROR!'. Division by zero
  * returns '#DIV/0!'. Cyclic references return '#CYCLE!'. Cross-sheet
@@ -33,31 +33,54 @@ export interface EvalCellLookup {
   get(row: number, col: number): DisplayCell | undefined
   /**
    * Resolve an Excel Table structured reference (`Table1[Col]`, `#special`,
-   * multi-column) to a concrete range — or a structured error — so the
-   * existing range machinery can aggregate over it (#32, design-excel-table
-   * §5.3). Optional: when omitted, any `Table[...]` token fails the tokenizer
-   * and the formula surfaces `#ERROR!` (an honest "not supported here", never
-   * a faked value). See `makeStructuredRefResolver` in static-backend.ts.
+   * `[@Col]`, multi-column) to a concrete range — or a structured error — so
+   * the existing range machinery can aggregate over it (#32,
+   * design-excel-table §5.3). Optional: when omitted, any `Table[...]` token
+   * fails the tokenizer and the formula surfaces `#ERROR!` (an honest "not
+   * supported here", never a faked value). See `makeStructuredRefResolver` in
+   * static-backend.ts.
    */
   resolveStructuredRef?: StructuredRefResolver
+  /**
+   * Rows the host currently hides on the evaluated sheet — read-only
+   * evaluation input for `SUBTOTAL` 101-111 (design-excel-table §6, engine
+   * parity with `Workbook::set_eval_hidden_rows`). Codes 1-11 never consult
+   * it. Omitted / empty means "nothing hidden", in which case 101-111 and
+   * 1-11 agree.
+   */
+  hiddenRows?: ReadonlySet<number>
+}
+
+/** The cell whose formula is being evaluated — the `[@Col]` / `[Col]` anchor. */
+export interface EvalOrigin {
+  readonly row: number
+  readonly col: number
 }
 
 /**
  * Outcome of resolving one structured reference. `null` means the syntax is
- * not resolvable in the single-sheet static evaluator (bare `[Col]`,
- * `[@Col]`, `#This Row`, combined specs, cross-sheet) — the tokenizer treats
- * it as a hard failure (`#ERROR!`) rather than inventing a value. An `error`
- * result is a resolvable reference that legitimately evaluates to an Excel
- * error (`#NAME?` unknown table, `#REF!` unknown column / missing totals row).
+ * not resolvable in the single-sheet static evaluator (combined specs like
+ * `[[#Data],[Col]]`, cross-sheet Table refs) — the tokenizer treats it as a
+ * hard failure (`#ERROR!`) rather than inventing a value. An `error` result is
+ * a resolvable reference that legitimately evaluates to an Excel error
+ * (`#NAME?` unknown table, `#REF!` unknown column / missing band, `#VALUE!`
+ * for a `[@Col]` outside its Table's data body).
  */
 export type StructuredRefResolution =
   | { readonly kind: 'range'; readonly ref: RangeRef }
   | { readonly kind: 'error'; readonly code: string }
   | null
 
+/**
+ * `tableName` is `null` for a table-less `[Col]` / `[@Col]` (resolved from
+ * `origin`); `origin` is `null` when the evaluation has no anchoring cell
+ * (ad-hoc `evaluateFormula` calls), which makes every this-row form `#VALUE!`
+ * exactly as the engine's `current_cell() -> None` path does.
+ */
 export type StructuredRefResolver = (
   tableName: string | null,
   inner: string,
+  origin: EvalOrigin | null,
 ) => StructuredRefResolution
 
 function columnLabelToIndex(label: string): number {
@@ -68,6 +91,14 @@ function columnLabelToIndex(label: string): number {
   return result - 1
 }
 
+/**
+ * Parse an A1 cell reference. Deliberately NOT grid-bounded: the engine's
+ * formula parser also accepts an A1-shaped token past `XFD` and reads it as an
+ * (always empty) off-grid cell. That is what makes a bare `Table1` — column
+ * `TABLE`, row 1 — evaluate to an empty cell rather than a structured
+ * reference or `#NAME?` in BOTH engines. Verified against WASM in
+ * vnext-table-totals-static-wasm-parity.test.ts.
+ */
 function parseCellRef(token: string): { row: number; col: number } | null {
   const stripped = token.replace(/\$/g, '')
   const match = /^([A-Z]+)(\d+)$/.exec(stripped)
@@ -134,6 +165,7 @@ const FUNCTION_NAMES = new Set([
   'SQRT',
   'MOD',
   'VLOOKUP',
+  'SUBTOTAL',
 ])
 
 /** Bare-name literals (no parens) — Excel parity for TRUE/FALSE. */
@@ -178,13 +210,34 @@ function scanStructuredRef(
 function tokenize(
   input: string,
   resolveStructuredRef?: StructuredRefResolver,
+  origin?: EvalOrigin,
 ): Token[] | null {
   const tokens: Token[] = []
   let i = 0
+  /** Push the outcome of one structured reference, or fail the tokenizer. */
+  const pushStructured = (tableName: string | null, inner: string): boolean => {
+    if (!resolveStructuredRef) return false
+    const resolution = resolveStructuredRef(tableName, inner, origin ?? null)
+    if (!resolution) return false
+    if (resolution.kind === 'range') tokens.push({ kind: 'range', ref: resolution.ref })
+    else tokens.push({ kind: 'error', code: resolution.code })
+    return true
+  }
   while (i < input.length) {
     const ch = input[i]
     if (ch === ' ' || ch === '\t') {
       i += 1
+      continue
+    }
+    // Table-less structured reference written inside a Table's own cells:
+    // `[Col]` (whole data column) / `[@Col]` (this row). `[` has no other
+    // lexical role here, so a leading `[` is unambiguous — engine parity with
+    // the `'[' => parse_table_ref_body(None)` primary arm.
+    if (ch === '[') {
+      const scanned = scanStructuredRef(input, i, i)
+      if (!scanned) return null
+      if (!pushStructured(null, scanned.inner)) return null
+      i = scanned.endIndex
       continue
     }
     if (ch === '(') {
@@ -272,20 +325,14 @@ function tokenize(
         tokens.push({ kind: 'range', ref: range })
         continue
       }
-      // Structured reference: IDENT '[' ... ']' (Excel Table, #32). The bare
-      // `[Col]`, `[@Col]`, `#This Row`, combined and cross-sheet variants are
-      // not resolvable in the single-sheet static evaluator — they fall
-      // through to an honest `#ERROR!` (via `null`) instead of a faked value.
+      // Structured reference: IDENT '[' ... ']' (Excel Table, #32). Combined
+      // qualifiers (`[[#Data],[Col]]`) and cross-sheet Table refs are not
+      // resolvable in the single-sheet static evaluator — they fall through to
+      // an honest `#ERROR!` (via `null`) instead of a faked value.
       if (input[i] === '[') {
         const scanned = scanStructuredRef(input, start, i)
-        if (!scanned || !resolveStructuredRef) return null
-        const resolution = resolveStructuredRef(scanned.tableName, scanned.inner)
-        if (!resolution) return null
-        if (resolution.kind === 'range') {
-          tokens.push({ kind: 'range', ref: resolution.ref })
-        } else {
-          tokens.push({ kind: 'error', code: resolution.code })
-        }
+        if (!scanned) return null
+        if (!pushStructured(scanned.tableName, scanned.inner)) return null
         i = scanned.endIndex
         continue
       }
@@ -332,6 +379,14 @@ class Parser {
   constructor(
     private readonly tokens: Token[],
     private readonly resolve: (row: number, col: number) => Value,
+    /**
+     * Is the cell truly empty? `resolve` folds a blank to `0`, which is right
+     * for SUM but wrong for the SUBTOTAL family (the engine sees `Value::Null`
+     * and skips it, so a blank must not sink MIN or inflate COUNT).
+     */
+    private readonly isBlank: (row: number, col: number) => boolean = () => false,
+    /** Host-hidden rows consumed by SUBTOTAL 101-111 only. */
+    private readonly hiddenRows: ReadonlySet<number> | undefined = undefined,
   ) {}
 
   parse(): Value {
@@ -425,6 +480,17 @@ class Parser {
     if (tok.kind === 'cell') {
       this.pos += 1
       return this.resolve(tok.ref.row, tok.ref.col)
+    }
+    if (tok.kind === 'range') {
+      // Value context. A 1×1 range collapses to its single cell — that is the
+      // whole point of `=[@Price]*[@Qty]` inside a Table row. A WIDER range
+      // would need spill (or Excel's implicit intersection), neither of which
+      // the static evaluator models, so it stays an honest `#ERROR!` rather
+      // than silently picking a corner value.
+      const { rowStart, rowEnd, colStart, colEnd } = tok.ref
+      if (rowStart !== rowEnd || colStart !== colEnd) return '#ERROR!'
+      this.pos += 1
+      return this.resolve(rowStart, colStart)
     }
     if (tok.kind === 'func') {
       this.pos += 1
@@ -596,6 +662,8 @@ class Parser {
       }
       case 'VLOOKUP':
         return applyVlookup(args, this.resolve)
+      case 'SUBTOTAL':
+        return applySubtotal(args, this.resolve, this.isBlank, this.hiddenRows)
       // SUM-like aggregations fall through.
       default:
         return aggregateNumeric(name, args, this.resolve)
@@ -804,6 +872,132 @@ function applyVlookup(
   return '#N/A'
 }
 
+/**
+ * SUBTOTAL(function_num, ref1, [ref2…]) — the TS mirror of the engine
+ * `fn_subtotal` / `run_subtotal` (rust/excel-core/src/eval.rs). This is what
+ * makes an Excel Table totals row work on the static backend, because every
+ * generated totals formula is `=SUBTOTAL(1xx, Table[Col])`.
+ *
+ * Function numbers: 1-11 aggregate every referenced cell; **101-111 share the
+ * same accumulators but drop the host's hidden rows** (design-excel-table §6).
+ * Anything else is `#VALUE!`, matching the engine's `InvalidValue`.
+ *
+ *   1/101 AVERAGE   2/102 COUNT (numbers)   3/103 COUNTA (non-empty)
+ *   4/104 MAX       5/105 MIN               6/106 PRODUCT
+ *   7/107 STDEV     8/108 STDEVP           9/109 SUM
+ *  10/110 VAR      11/111 VARP
+ *
+ * Error propagation deliberately mirrors the engine arm-for-arm: the numeric
+ * reducers (1/4/5/6/9) surface the first error they meet, while the counters
+ * (2/3) and the deviation family (7/8/10/11) only pattern-match the value
+ * kinds they care about and therefore ignore errors.
+ *
+ * TODO(einfach-static-subtotal-filter): `hiddenRows` carries the static
+ * backend's MANUALLY hidden rows only. Rows hidden by an active filter live in
+ * the filter/sort projection, not in that set, so a 101-111 aggregate does not
+ * yet exclude filter-hidden rows here. The worker host merges both before
+ * pushing `set_eval_hidden_rows`, so WASM does exclude them.
+ */
+function applySubtotal(
+  args: Array<Value | RangeRef>,
+  resolve: (row: number, col: number) => Value,
+  isBlank: (row: number, col: number) => boolean,
+  hiddenRows: ReadonlySet<number> | undefined,
+): Value {
+  if (args.length < 2) return '#ARGS!'
+  const rawFn = args[0]
+  if (typeof rawFn === 'object') return '#TYPE!'
+  if (isErrLocal(rawFn)) return rawFn
+  const asNumber = typeof rawFn === 'number' ? rawFn : Number(rawFn)
+  if (!Number.isFinite(asNumber)) return '#TYPE!'
+  const code = Math.trunc(asNumber)
+  let mode: number
+  let ignoreHidden: boolean
+  if (code >= 1 && code <= 11) {
+    mode = code
+    ignoreHidden = false
+  } else if (code >= 101 && code <= 111) {
+    mode = code - 100
+    ignoreHidden = true
+  } else {
+    return '#VALUE!'
+  }
+
+  // Stream every data argument once, skipping blanks (the engine's
+  // `Value::Null`) and — for 101-111 — the host's hidden rows.
+  const walk = (visit: (v: Value) => void): void => {
+    for (const arg of args.slice(1)) {
+      if (typeof arg !== 'object') {
+        visit(arg)
+        continue
+      }
+      for (let row = arg.rowStart; row <= arg.rowEnd; row += 1) {
+        if (ignoreHidden && hiddenRows?.has(row)) continue
+        for (let col = arg.colStart; col <= arg.colEnd; col += 1) {
+          if (isBlank(row, col)) continue
+          visit(resolve(row, col))
+        }
+      }
+    }
+  }
+
+  // COUNTA counts every non-blank value (errors and text included).
+  if (mode === 3) {
+    let count = 0
+    walk(() => {
+      count += 1
+    })
+    return count
+  }
+  // COUNT counts numbers only and never propagates an error.
+  if (mode === 2) {
+    let count = 0
+    walk((v) => {
+      if (typeof v === 'number') count += 1
+    })
+    return count
+  }
+  // STDEV / STDEVP / VAR / VARP collect numbers and ignore everything else.
+  if (mode === 7 || mode === 8 || mode === 10 || mode === 11) {
+    const numbers: number[] = []
+    walk((v) => {
+      if (typeof v === 'number') numbers.push(v)
+    })
+    const isSample = mode === 7 || mode === 10
+    if (numbers.length < (isSample ? 2 : 1)) return '#DIV/0!'
+    const mean = numbers.reduce((a, b) => a + b, 0) / numbers.length
+    const denom = isSample ? numbers.length - 1 : numbers.length
+    const variance = numbers.reduce((acc, x) => acc + (x - mean) ** 2, 0) / denom
+    return mode === 7 || mode === 8 ? Math.sqrt(variance) : variance
+  }
+
+  // AVERAGE / MAX / MIN / PRODUCT / SUM — first error wins.
+  let error: string | null = null
+  const numbers: number[] = []
+  walk((v) => {
+    if (error !== null) return
+    if (isErrLocal(v)) {
+      error = v as string
+      return
+    }
+    if (typeof v === 'number') numbers.push(v)
+  })
+  if (error !== null) return error
+  switch (mode) {
+    case 1:
+      if (numbers.length === 0) return '#DIV/0!'
+      return numbers.reduce((a, b) => a + b, 0) / numbers.length
+    case 4:
+      return numbers.length === 0 ? 0 : Math.max(...numbers)
+    case 5:
+      return numbers.length === 0 ? 0 : Math.min(...numbers)
+    case 6:
+      return numbers.length === 0 ? 0 : numbers.reduce((a, b) => a * b, 1)
+    default:
+      return numbers.reduce((a, b) => a + b, 0)
+  }
+}
+
 function aggregateNumeric(
   name: string,
   args: Array<Value | RangeRef>,
@@ -849,17 +1043,36 @@ function aggregateNumeric(
  * Evaluate a formula string (with leading '=') against a cell lookup. Returns
  * the numeric result, or an error code string starting with '#'. Tracks the
  * call stack to break cycles.
+ *
+ * `origin` is the cell the formula lives in — the anchor a table-less `[Col]`
+ * resolves its Table from and the row `[@Col]` intersects. Callers that
+ * evaluate a real sheet cell should always pass it; omitting it makes every
+ * this-row form `#VALUE!` (engine parity with `current_cell() -> None`).
  */
 export function evaluateFormula(
   formula: string,
   lookup: EvalCellLookup,
   stack: Set<string> = new Set(),
+  origin?: EvalOrigin,
 ): Value {
   const body = formula.startsWith('=') ? formula.slice(1) : formula
-  const tokens = tokenize(body, lookup.resolveStructuredRef)
+  const tokens = tokenize(body, lookup.resolveStructuredRef, origin)
   if (!tokens) return '#ERROR!'
-  const parser = new Parser(tokens, (row, col) => resolveCellValue(lookup, row, col, stack))
+  const parser = new Parser(
+    tokens,
+    (row, col) => resolveCellValue(lookup, row, col, stack),
+    (row, col) => isBlankCell(lookup, row, col),
+    lookup.hiddenRows,
+  )
   return parser.parse()
+}
+
+/** True when the cell holds neither a formula nor any primitive text/number. */
+function isBlankCell(lookup: EvalCellLookup, row: number, col: number): boolean {
+  const cell = lookup.get(row, col)
+  if (!cell) return true
+  if (cell.formula) return false
+  return cell.displayValue === ''
 }
 
 function resolveCellValue(
@@ -874,7 +1087,9 @@ function resolveCellValue(
   if (!cell) return 0
   if (cell.formula) {
     stack.add(key)
-    const result = evaluateFormula(cell.formula, lookup, stack)
+    // A referenced cell's own formula re-anchors on THAT cell, so its
+    // `[@Col]` intersects its own row, not the referrer's.
+    const result = evaluateFormula(cell.formula, lookup, stack, { row, col })
     stack.delete(key)
     return result
   }
