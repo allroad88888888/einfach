@@ -85,7 +85,14 @@ only`. Anything that must tell the two origins apart (SUBTOTAL pushes, copy, and
 `remove-duplicates` / `text-to-columns` dense scans, which must keep splitting and
 de-duplicating manually hidden rows for Excel parity) reads the two source atoms.
 
-Slice S3 ships this shape with an always-empty filter set — the population path
-(`SetFilterSortResult.hiddenRowIndices`) lands in S4, so every derivation currently
-degrades to the manual set by reference. See
-`solid/excel/docs/online-excel-parity/design-filter-hidden-rows.md` §3 and §8.1.
+The population path is live as of #27 slice S5: `runFilterSortMutationAtom` writes
+`SetFilterSortResult.hiddenRowIndices` into the filter set on a matched ACK, and is
+its only production writer. The set is a SNAPSHOT — it is not recomputed when cells
+change (Excel's model), and inserts/deletes shift it via
+`applyViewportFilterHiddenStructuralShiftAtom` rather than triggering a rescan.
+That command is **row-axis only**: a filter set is a set of rows, so a column shift
+is a no-op for it, unlike the manual set which carries both axes. Because a delete
+band has no inverse for the members it swallows, callers pair it with a
+`VIEWPORT_FILTER_HIDDEN_REPLAY_KEY` local side payload (same reasoning as the manual
+set). See `solid/excel/docs/online-excel-parity/design-filter-hidden-rows.md` §3,
+§4.3 and §8.1, and `../../docs/filter-sort.md` for the whole-feature contract.

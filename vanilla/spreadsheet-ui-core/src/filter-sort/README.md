@@ -22,6 +22,28 @@ so nothing about "which column is sorted" survives in UI-core view state.
 - Per-cell/per-row/per-col atom risk: none — no per-cell state created here.
 - Tests: `test/filter-sort.test.ts`.
 
+## Filter visibility (#27) — hide, do not compact
+
+Filtering **hides** rows Excel-style: survivors keep their physical index, row
+numbers skip, and display row ≡ source row. `DisplayCell.originalRow` and the
+whole display→source remap layer were deleted with the compaction they undid.
+
+`runFilterSortMutationAtom` is the **only production writer** of the filter-hidden
+set. On a matched ACK it commits the rules and
+`SetFilterSortResult.hiddenRowIndices` in the same tick, via
+`setViewportFilterHiddenRowsAtom` → `viewportFilterHiddenAtom` (in
+`../viewport/effective-hidden.ts`). An ACK without `hiddenRowIndices` CLEARS the
+set rather than keeping a stale one.
+
+The set is a **SNAPSHOT**, not a live derivation: editing a cell does not move its
+row in or out of view. That matches Excel, whose `Data → Reapply` exists for
+exactly this reason — but **no Reapply entrypoint is implemented yet** (no
+`reapplyFilterAtom`, no menu item, no `Ctrl+Alt+L`); re-confirming the column
+dropdown is the only way to recompute. Structural inserts/deletes shift the set
+instead of rescanning it.
+
+Full contract: `../../docs/filter-sort.md`.
+
 ## Engine physical sort (design-engine-sort S5 / S6 / §10)
 
 The toolbar / menu / filter-dropdown sort entrypoints dispatch ONE command, `runPhysicalSortAtom`. It is the ONLY
@@ -43,9 +65,13 @@ sort mechanism — there is no display-permutation fallback:
     structured rejections set the diagnostic and record nothing.
   - `captureSortRangeCapabilityAtom` (`spreadsheet.sort.captureCapability`) — capture the witness without dispatching.
   - `clearPhysicalSortDiagnosticAtom` (`spreadsheet.sort.clearDiagnostic`).
-- Excluded-rows payload: `buildSortExcludedRows` unions `viewportHiddenAtom` (manually hidden rows) with the
-  filter-hidden rows derived from the consumed visible projection, both clipped to the sort range. Summary-row
-  pinning needs cell reads UI core does not own (known v1 gap, design §6.1).
+- Excluded-rows payload: `buildSortExcludedRows` unions `viewportHiddenAtom` (manually hidden rows) with
+  `viewportFilterHiddenAtom` (filter-hidden rows), both clipped to the sort range. Both halves are now READ;
+  the filter half used to be _inferred_ from gaps in the compacted projection's source-row echoes, which could
+  only ever judge rows the viewport happened to cover — that bounded-window gap is closed, not narrowed (#27).
+  The filter half is additionally guarded on the rules still being active, so a stale set left behind by a
+  cleared filter never pins visible rows. Summary-row pinning needs cell reads UI core does not own
+  (known v1 gap, design §6.1).
 - Backend reads: `sortRange?` on `SpreadsheetBackend` (optional). ABSENCE MEANS NO SORT: hosts gate their sort
   entrypoints on `sortRangeSupportedAtom` (toolbar button + filter-dropdown sort section) and on the `'sortRange'`
   menu capability key (Data → Sort asc/desc), so the fail-closed TS worker shows no sort affordance at all.

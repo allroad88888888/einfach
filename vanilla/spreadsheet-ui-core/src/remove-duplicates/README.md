@@ -105,6 +105,22 @@ Behaviour:
    this reason. See
    `solid/excel/docs/online-excel-parity/design-filter-hidden-rows.md` §8.1.
 
+   This guard was **required to land before** the #27 adapter flip, not
+   after. Before the flip a filtered-out row had no display slot and the
+   dense loop could never reach it; after it, the row sits inside
+   `[startRow..endRow]` while contributing no cells. Without the guard,
+   filter-hidden rows 2..N are judged duplicates of filter-hidden row 1 and
+   handed to `backend.removeRows` — silent loss of data the user cannot
+   even see. Reading the union instead would have been a different bug:
+   it would silently change today's results the moment any row is manually
+   hidden, and diverge from Excel.
+
+   Structural inserts and deletes shift the set rather than invalidating
+   it: this module calls `applyViewportFilterHiddenStructuralShiftAtom`
+   (with a `VIEWPORT_FILTER_HIDDEN_REPLAY_KEY` local side payload for undo)
+   next to its manual-set counterpart, because the filter set is a snapshot
+   and nothing else would correct it.
+
 Empty range (`startRow > endRow` or `startCol > endCol`) returns zero
 scanned rows and never throws.
 

@@ -359,8 +359,16 @@ export function rowMatchesFilterSortRules(
 /**
  * Filter VISIBILITY permutation — never a sort. The display-permutation sort
  * branch was retired with parity #29 / #24: sorting is a physical engine data
- * mutation (`sortRange`), so the projection only ever compresses filtered-out
- * rows away here. Row order is always source order.
+ * mutation (`sortRange`). Row order is always source order.
+ *
+ * NOTE (#27): the permutation this returns is NO LONGER a projection layout.
+ * Filtering hides rows instead of compacting them, so display row IS source
+ * row and nothing lays cells out by `rows[displayRow]` any more. Both adapters
+ * call this purely as an intermediate and immediately fold it into the
+ * FILTER-HIDDEN ROW SET via `filterHiddenRowsFromDisplayRows` — the gaps in
+ * this sparse array are the answer they actually want. The name and the
+ * `number[]` return type are historical; treat the output as "which rows
+ * survived the predicate", not as a display order.
  */
 export function buildFilterSortDisplayRows(
   state: FilterSortState | undefined,

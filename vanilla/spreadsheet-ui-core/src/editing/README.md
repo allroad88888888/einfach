@@ -39,6 +39,27 @@ shapes) was retired with the compaction it existed to undo. `ranges` is always
 the single input range and stays a list only so looping callers stay unchanged;
 the only block reasons left are `locked` and `invalid-target`.
 
+### Writes land on filter-hidden rows — deliberately
+
+The gateway does **not** filter its target range against the filter-hidden set,
+and must not start. Paste, fill and fill-series write a contiguous block over
+filtered-out rows, which is Excel's actual behaviour — its well-known
+data-overwrite trap, not a bug. The identity mapping satisfies this with no code
+at all, so #27 turned this into a **parity fix**: display compaction used to skip
+filtered rows on paste, diverging from Excel. It is a user-perceptible change for
+anyone used to the old build, so it belongs in release notes.
+
+The asymmetry is intentional and matches Excel: writes ignore the filter, but
+**reads that leave the app** (copy, Copy As, TSV/image export) drop filter-hidden
+rows, and delete-rows deletes only visible rows. Those live in `../copy-as/` and
+`../operations/`, never here. The rule across UI core: anything that moves data
+reads `viewportFilterHiddenAtom` (the filter subset), never the
+`effectiveHiddenAtom` union — manually hidden rows are written, copied and
+deleted exactly like visible ones.
+
+See `../../docs/filter-sort.md` and
+`solid/excel/docs/online-excel-parity/design-filter-hidden-rows.md` §8.4.
+
 - Source atoms:
   - `contentMutationLastBlockBackingAtom` (private) —
     `spreadsheet.mutationGateway.lastBlockBacking`.

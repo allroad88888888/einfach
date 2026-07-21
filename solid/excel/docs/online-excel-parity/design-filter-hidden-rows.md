@@ -1,10 +1,80 @@
 # 设计｜筛选重做：从"显示压缩"到"隐藏行"
 
-- **状态**：设计裁决稿（待主控派单）
-- **日期**：2026-07-21
+- **状态**：**已全量落地（S1–S8，2026-07-21）**。本文自此为**历史设计记录**，不是现行契约。
+- **日期**：2026-07-21（设计）／2026-07-21（S8 收口）
 - **基线**：分支 `claude/rust-core-state-plan-Auzcj`；[CANONICAL_OWNERSHIP.md](./CANONICAL_OWNERSHIP.md) #29（筛选可见性 = UI-core 视图事实，翻转顺序第 3 步）
 - **前置**：[design-engine-sort.md](./design-engine-sort.md) 已全量落地（物理排序 + `excludedRows`），本设计接手 #29 的另一半
 - **范围**：把筛选从"匹配行压缩进连续 display 槽位 + `originalRow` 回映射"改为 Excel 语义的**隐藏行**（行号保留原值、跳号显示）。产品决定已拍板，本文只裁决实现形状。
+
+> ## ⚠️ 读本文前必读（S8 收口，2026-07-21）
+>
+> **本文是设计稿，不是现状文档，且已被证明有多处与代码不符。**
+> 找现行契约请读 **`vanilla/spreadsheet-ui-core/docs/filter-sort.md`**（面向使用者的完整口径）
+> 与各模块 README（`viewport/` 两个集合、`filter-sort/`、`editing/`、`copy-as/`、
+> `operations/`、`remove-duplicates/`）。凡本文与代码冲突处，**一律以代码为准**。
+
+---
+
+## 0.0｜落地状态与勘误索引（S8 收口）
+
+### 切片落地状态
+
+| 切片 | 提交 | 状态 | 备注 |
+| ---- | ---- | ---- | ---- |
+| S1+S2 引擎双隐藏集 + 桥与协议 | `79d7efb` | ✅ 已落地 | 该提交只动 `rust/`；协议与两个 runtime 的 TS 那半边实际随 S4 落地（见 §10 "S4 重定义"） |
+| S3 稠密扫描前置加固 | `7c13fd4` | ✅ 已落地 | 顺带把筛选集提前建在 `viewport/effective-hidden.ts`（**不是** §7 规划的路径，见勘误 E1） |
+| S4 adapter 算集合并推给引擎 | `0ac8166` | ✅ 已落地 | 唯一有真实行为变化的前置切片：SUBTOTAL 两档开始排除被筛行 |
+| S5 adapter 原子翻转 | `d123275` | ✅ 已落地 | bridge 双路**有意不做**（见勘误 E6） |
+| S5a 结构位移重映射 | `1a7fae3` | ✅ 已落地 | §10 从未把它派进任何切片（见勘误 E7） |
+| S6 死代码清除 | `50a14e1` | ✅ 已落地 | 顺带改了 `SpreadsheetGrid.tsx` 与 `SpreadsheetContextMenu.tsx`（见勘误 E2） |
+| S7 可见性语义收口 | `5dc7783`（前置）+ `0f9a150`（正式） | ⚠️ **部分落地** | 复制/删除/导出全做；**`Data → Reapply` 入口未做**（见勘误 E8） |
+| S8 文档收口 | 本次 | ✅ 已落地 | `filter-sort.md` 整篇重写；CANONICAL §7-1 勘误；CUTOVER 记账；06 分册订正 |
+
+**门禁（S8 复跑，2026-07-21）**：ui-core **63 suites / 1583 tests PASS**、
+solid **97 suites / 1455 tests PASS**（1 suite / 6 tests skipped）。与 S6 提交信息记录的
+基线逐字一致。两次运行在含无关 Table 在途改动的工作树上取得。
+
+### 勘误索引 —— 七个切片各挡下一处，加 S8 新查出一处
+
+设计稿的这些错处散落在长文各处（有的在"主控裁定"块、有的在"落地记录"块）。
+**此处是唯一的入口清单**；每条给出所在节与一句话结论。
+
+| #      | 所在节 | 提出者 | 设计稿写的 | 代码实际 |
+| ------ | ------ | ------ | ---------- | -------- |
+| **E1** | §7 表 "UI-core 状态" 行；§3 末段；§9.2 末尾"另：§7 的文件规划已被 S3 超越" | S3 / S4 实施者 | 新建 `filter-sort/filter-hidden.ts`，原子名 `filterHiddenAtom` / `effectiveHiddenRowsAtom` | **文件与原子名全部作废**。实际落在 `vanilla/spreadsheet-ui-core/src/viewport/effective-hidden.ts`，原子实名 `viewportFilterHiddenAtom` / `effectiveHiddenAtom`（另有 `setViewportFilterHiddenRowsAtom` / `clearViewportFilterHiddenRowsAtom` / `applyViewportFilterHiddenStructuralShiftAtom` / `VIEWPORT_FILTER_HIDDEN_REPLAY_KEY`）。按 §7 找文件会扑空 |
+| **E2** | §5 逐点裁决表**末行**；§7 表 "Grid" 行 | S6 实施者 | `SpreadsheetGrid.tsx`"零处读 `originalRow`，必须保留（零改动）"；Grid 的唯一改动是改读并集 | 对**字段**成立、对**机制**不成立。S6 另删了两处死分支：Grid 填充柄的 per-cell 回退（读 `remapped`）、`SpreadsheetContextMenu.tsx` 为粘贴重建的 `displayToSourceRowMap`（同一常假条件）。**逐文件表遗漏了这两处**——判"零改动"的依据是搜字段，而机制在一跳之外 |
+| **E3** | §8.1 首个引用块 | S3 实施者 | "今天对手动隐藏行就存在同一 bug 的弱化版" | **不成立，已删除**。手动隐藏行的 cell 照常带真实值进 `byRow`，不会被判为全空重复行。§8.1 描述的是**新设计引入的风险**，不是存量 bug —— S3 是前置约束，不是紧急修复 |
+| **E4** | §8.1 主控裁定二；连带 §3 末段 | S3 实施者 | `remove-duplicates` / `text-to-columns` 跳过**并集**隐藏行；二者列为并集消费者 | **改为只跳过筛选子集**。跳过手动隐藏行会主动制造与 Excel 的分歧，且与 S3"行为零变化"的验收硬约束直接冲突（用户今天手动隐藏任一行，去重结果就会立刻改变）。并集的真实消费者只剩 `go-to` 与 Grid 渲染 |
+| **E5** | §7 表 "UI-core 筛选" 行 vs §10 S6 行；§9.2 主控裁定三 修正 2 | S4 实施者 | `buildSortExcludedRows` 换源归 S4（§7）／归 S6（§10）—— 设计稿**自相矛盾** | **定档 S5**。S4 完全不写 `viewportFilterHiddenAtom`（作用域止于 adapter，集合算完直接推给引擎）；换源必须与"原子真正被填值"同切片，否则它读一个恒空集合、排序排除行静默失效 |
+| **E6** | §6.5 表 "bridge" 行；§10 S5 行 | S5 实施者 | `eval-hidden-rows-bridge.ts` 扩为双路推送 | **有意不做，两处作废**。S4 已把筛选集的推送放在两个 adapter 的 `setFilterSort` 内部（ACK **之前** await）；bridge 再加一路会产生**第二个写者**，且比 adapter 内推送晚一拍。真要迁到 bridge，须先加 `SpreadsheetBackend.setEvalFilterHiddenRows` 端口并**同时**撤掉两个 adapter 的内部推送 |
+| **E7** | §3 "共性复用" 首条；§10 切片表 | S5 / S5a 实施者 | 筛选集复用 `remapIndexSetAfterStructuralShift` 随结构位移平移 | §3 要求了，但 **§10 没把它派进任何切片**，S5 派单也不含它 → S5 落地即成实测回归（筛选激活时插入行 → 陈旧索引**指向另一行真实数据**，表头被吞、被筛掉的值重现）。S5a 补齐，落点**三层**（UI-core / 两个 adapter 的本地快照 / 引擎副本），缺任一层复现都不算修好 |
+| **E8 (新，S8 查出)** | §4.3；§7 表 "UI 入口" 行；§10 S7 行；§9.1-2 | S8 实施者 | 新增 `reapplyFilterAtom` + Data 菜单 `Reapply` + `Ctrl+Alt+L`，作为快照语义的显式重算入口 | **三者均未实现**。2026-07-21 全仓核实：`reapplyFilterAtom` 无导出、菜单栏与 i18n 无 Reapply 条目、keyboard 无 `Ctrl+Alt+L`；`Reapply` 一词只出现在 4 处**注释**里。快照语义已经生效（`bumpRevision()` 刻意不失效筛选集），但配套的逃生口没建 —— 用户今天只能重开列下拉重发规则来刷新。**这是 #27 最大的在案缺口** |
+
+> **另有两项计数/强度问题，不算"与代码不符"但同样必须找得到**：
+>
+> - **§9.2 主控裁定三的白名单自相矛盾**（该块内已标为"第 5 处不符"）：修正 1 的表格把
+>   `buildSortExcludedRows` 那 6 例单列一行，修正 2 随后定档归 S5，但"S5 当天的白名单"
+>   只枚举了修正 1 的另一行。照字面执行会误报回归。**判据应为两者之并**。
+> - **§8.3 的证据强度**：删除行"只删可见行"的结论出处是 **MS Q&A 志愿版主 / MVP 与
+>   Contextures**，**不是微软规范文档**；官方 [Copy visible cells only](https://support.microsoft.com/en-us/office/copy-visible-cells-only-6e3a1f01-2884-4332-b262-8b814412847e)
+>   那句 "Excel copies hidden **or filtered** cells" 与我们采信的一侧**直接矛盾**。
+>   三条明确未证实项见 §8.3：①无微软规范文档正面写过删除行行为；②"Excel 2013+"版本
+>   限定词是原稿臆造已删；③"选区完全落在隐藏行内"无任何来源，实现取保守默认
+>   （可见集为空 ⇒ 零下发），**这是未证实的默认选择，不是已验证行为**。
+>
+> **S8 未发现第九处不符。** 逐条回代码核实过的名字见本节 E1–E8 与
+> `vanilla/spreadsheet-ui-core/docs/filter-sort.md`。
+
+### S8 另行订正的两处叙述（非新增不符，是措辞已过期）
+
+- **`buildFilterSortDisplayRows` 名字与注释已名不副实**（`backend/projection-helpers.ts`）。
+  §7 规划它改名为 `computeFilterHiddenRows(...): Set<number>`；**实际未改名、未改返回型**——
+  它仍返回 display→source 排列数组，只是那个排列**不再用于投影**，唯一消费者是
+  `filterHiddenRowsFromDisplayRows(displayRows, rowCount)`（`adapter/filter-hidden-rows.ts`），
+  把它折成隐藏行集。行为正确，命名误导。S8 只订正了它的文档注释（原文说"投影在此把被筛行压缩掉"，
+  而投影早已不压缩），**未改名**——改名会动两个 adapter 的调用点，超出纯文档切片边界。
+- **`@types/` 下仍有 `originalRow`**：那是**过期的构建产物**（`.d.ts`），不是源码。
+  S6 的 `grep -r originalRow` 判据针对 `src/` 与 `test/`，两处均零命中。
 
 ---
 
@@ -228,7 +298,10 @@ setFilterSort?(request: SetFilterSortRequest): Promise<SetFilterSortResult>
 
 配套：
 
-- 新增 UI-core 命令 `reapplyFilterAtom`：以当前 `filterSortStateAtom[sheetId]` 重发一次 `setFilterSort`，刷新 `filterHiddenAtom`。挂到 Data 菜单（`Reapply`）与 `Ctrl+Alt+L`。端口缺失时按惯例隐藏入口。
+- ~~新增 UI-core 命令 `reapplyFilterAtom`：以当前 `filterSortStateAtom[sheetId]` 重发一次 `setFilterSort`，刷新 `filterHiddenAtom`。挂到 Data 菜单（`Reapply`）与 `Ctrl+Alt+L`。端口缺失时按惯例隐藏入口。~~
+  **⚠️ 未落地 —— 见 §0.0 勘误 E8。** 快照语义本身已生效（两个 adapter 都刻意不在
+  `bumpRevision()` 里失效筛选集），但这条逃生口三个部件（原子 / 菜单项 / 键位）**一个都没建**。
+  今天刷新快照的唯一途径是重开列下拉重发规则。
 - 结构变更（插入/删除行）走 `structuralShift` 平移（§3），不触发重扫。
 - 切表：`filterHiddenAtom` 按 sheet 存，切表天然隔离；`notifyActiveSheetChangedAtom`（`filter-sort/index.ts:1208`）的既有语义不变。
 
@@ -267,7 +340,7 @@ setFilterSort?(request: SetFilterSortRequest): Promise<SetFilterSortResult>
 | `static-backend.ts:1686-1690`                                                       | filter 激活时整体抑制 merge 元数据                                                                                                                      | **语义改变 —— 顺带闭合 parity**，见 §9.3                                                                                                                                                                                           |
 | `worker-workbook-backend.ts:749/752-829/887/948/2196-2290`                          | `MappedDisplayRow`、validation overlay 的双义 `range` 与 `mappedRows` 分支、条件格式/格式的 `?? cell.row`、`readFilteredRange` 全体                     | **可删**（`readFilteredRange` 整体塌回普通窗口读；包围盒 + 逐格 `readCells` 退回矩形范围读，性能收益）                                                                                                                             |
 | `worker-workbook-backend.ts:2129-2191/4088-4093`                                    | 全列扫描与 `filterSortDisplayRowsBySheetId` 缓存                                                                                                        | **语义改变**：扫描保留，载荷改为隐藏行集；缓存层删除（真值上移 UI-core）                                                                                                                                                           |
-| `grid/SpreadsheetGrid.tsx`、各 overlay、`status-bar/`                               | 零处读 `originalRow`                                                                                                                                    | **必须保留（零改动）**：Grid 已是目标形态（§1.2）；状态栏聚合（`status-bar/index.ts:189-256`）按"单元格存在性"而非行算术工作，隐藏行不产 `DisplayCell` 故自动不计入——**与 Excel 状态栏只统计可见单元格一致，免费正确**             |
+| `grid/SpreadsheetGrid.tsx`、各 overlay、`status-bar/`                               | 零处读 `originalRow`                                                                                                                                    | ~~**必须保留（零改动）**~~ **⚠️ 见 §0.0 勘误 E2**：对**字段**成立、对**机制**不成立——Grid 填充柄与 `SpreadsheetContextMenu.tsx` 的粘贴路径都读一跳之外的 `remapped`，S6 一并删除。状态栏那半句仍正确：聚合（`status-bar/index.ts:189-256`）按"单元格存在性"而非行算术工作，隐藏行不产 `DisplayCell` 故自动不计入——**与 Excel 状态栏只统计可见单元格一致，免费正确** |
 
 **净结论**：W2 网关缩水约 60%（`:240` 以上除合法性守卫外全删，`:240` 以下全留）；`originalRow` 字段与其全部回映射机制消失；两个 adapter 的筛选投影分支整体塌回恒等路径。
 
@@ -385,7 +458,7 @@ if let Some(addr) = addr {
 | 协议           | `solid/excel/src-vnext/adapter/worker-protocol.ts`                               | capability 键 + client 方法（可选）                                                                                                                                                                                             |
 | runtime        | `worker-runtime.ts`、`worker-runtime-ts.ts`                                      | WASM dispatch case；TS `false` + `unsupported`                                                                                                                                                                                  |
 | 端口           | `vanilla/spreadsheet-ui-core/src/backend/types.ts`                               | `SetEvalFilterHiddenRowsRequest` + 端口；`SetFilterSortResult.hiddenRowIndices`；**删** `DisplayCell.originalRow`                                                                                                               |
-| UI-core 状态   | `vanilla/spreadsheet-ui-core/src/filter-sort/filter-hidden.ts`（新）             | `filterHiddenAtom`（source）、`setFilterHiddenRowsAtom` / `clearFilterHiddenRowsAtom`（command）、`applyFilterHiddenStructuralShiftAtom`（command）、`effectiveHiddenRowsForSheet`（derived helper）。README 按仓内惯例分类原子 |
+| UI-core 状态   | ~~`vanilla/spreadsheet-ui-core/src/filter-sort/filter-hidden.ts`（新）~~ **⚠️ 作废，见 §0.0 勘误 E1**。实际：`vanilla/spreadsheet-ui-core/src/viewport/effective-hidden.ts` | ~~`filterHiddenAtom` / `setFilterHiddenRowsAtom` / `clearFilterHiddenRowsAtom` / `applyFilterHiddenStructuralShiftAtom` / `effectiveHiddenRowsForSheet`~~ **本行原子名全部作废**。实名：`viewportFilterHiddenAtom`（derived 只读投影，私有 backing `spreadsheet.viewport.filterHiddenBacking`）、`setViewportFilterHiddenRowsAtom` / `clearViewportFilterHiddenRowsAtom` / `applyViewportFilterHiddenStructuralShiftAtom`（command）、`effectiveHiddenAtom`（并集 derived）、`getFilterHiddenRowsForSheet` / `unionHiddenRowsForSheet`（helper）、`VIEWPORT_FILTER_HIDDEN_REPLAY_KEY`。分类见 `viewport/README.md` |
 | UI-core 筛选   | `vanilla/spreadsheet-ui-core/src/filter-sort/index.ts`                           | `runFilterSortMutationAtom` 消费 ACK 的 `hiddenRowIndices`；新增 `reapplyFilterAtom`；**删** `deriveFilterHiddenRows`；`buildSortExcludedRows` 改读两集                                                                         |
 | UI-core 网关   | `vanilla/spreadsheet-ui-core/src/editing/mutation-gateway.ts`                    | 回映射半边全删、protection 半边全留（§5）                                                                                                                                                                                       |
 | UI-core 消费者 | `go-to/`、`remove-duplicates/`、`text-to-columns/`、`clipboard/`、`operations/`  | `go-to` 接**并集**；稠密扫描跳过**筛选**隐藏行（§8.1 裁定二）；复制只取可见（§8.2）；删除行只删可见（§8.3）                                                                                                                     |
@@ -394,7 +467,7 @@ if let Some(addr) = addr {
 | worker adapter | `solid/excel/src-vnext/adapter/worker-workbook-backend.ts`                       | `readFilteredRange` 与 `MappedDisplayRow` 删除、overlay 去 `?? cell.row`；扫描载荷改隐藏集；`filterSortDisplayRowsBySheetId` 缓存删除；`setEvalFilterHiddenRowsThroughWorker`                                                   |
 | bridge         | `solid/excel/src-vnext/provider/eval-hidden-rows-bridge.ts`                      | 双路推送（§6.5）                                                                                                                                                                                                                |
 | Grid           | `solid/excel/src-vnext/grid/SpreadsheetGrid.tsx`                                 | `getHiddenRowSet()` / `getRows()` / `getRenderedVisibleWindow()` 改读并集派生原子（**唯一渲染改动**；行号跳号免费）                                                                                                             |
-| UI 入口        | `menu-bar/SpreadsheetMenuBar.tsx`、`keyboard/`                                   | `Data → Reapply` 条目 + `Ctrl+Alt+L`；端口缺失按惯例隐藏                                                                                                                                                                        |
+| UI 入口        | `menu-bar/SpreadsheetMenuBar.tsx`、`keyboard/`                                   | ~~`Data → Reapply` 条目 + `Ctrl+Alt+L`；端口缺失按惯例隐藏~~ **⚠️ 未落地，见 §0.0 勘误 E8**                                                                                                                                    |
 
 ---
 
@@ -716,9 +789,9 @@ Excel 语义（§2 已核实）：**筛选**隐藏行复制时自动跳过；**�
 | **S3 消费者加固（前置）** | **在压缩语义下就正确的防御性改动**：`remove-duplicates` / `text-to-columns` 稠密扫描跳过隐藏行（§8.1）、`go-to` 上下文接并集、并集派生 helper 落地                                                               | `vanilla/spreadsheet-ui-core/src/remove-duplicates/`、`text-to-columns/`、`go-to/`、`viewport/`                                                     | `npx jest vanilla/spreadsheet-ui-core --no-coverage`；**行为零变化**，既有断言全绿不改                      |
 | **S4 adapter 算集合并推给引擎**（已落地，见下方"S4 重定义"） | 协议 capability `evalFilterHiddenRows` + client 可选方法；WASM runtime dispatch（缺方法回 `UNSUPPORTED`）；TS runtime `false` + `unsupported`；两个 adapter 在 `setFilterSort` 里由**同一次谓词扫描**取补集得筛选隐藏行集，worker 推 `setEvalFilterHiddenRows`、static 存进自己的求值输入。**投影压缩不动**（那是 S5） | `solid/excel/src-vnext/adapter/filter-hidden-rows.ts`（新）、`worker-workbook-backend.ts`、`static-backend.ts`、`static-formula-eval.ts`、`worker-protocol.ts`、`worker-runtime.ts`、`worker-runtime-ts.ts` | `npx jest solid/excel --no-coverage`；`npm run build:wasm`；定向 e2e。**注意：这是唯一一个有真实行为变化的前置切片** |
 | **S5 adapter 原子翻转**（已落地，见下方"S5 落地记录"） | **一次性切换**：两 adapter 投影塌回恒等、停发 `originalRow`、`setFilterSort` 回传隐藏集（`SetFilterSortResult.hiddenRowIndices`）、UI-core 写入 `viewportFilterHiddenAtom`、`buildSortExcludedRows` 改读两集、Grid 取并集、解除 merge 抑制。~~bridge 双路~~（不做，理由见落地记录）                                              | `static-backend.ts`、`worker-workbook-backend.ts`、`projection-helpers.ts`、`eval-hidden-rows-bridge.ts`、`SpreadsheetGrid.tsx`                     | `npx jest solid/excel --no-coverage` + ui-core：**只允许 §9.2 主控裁定三的 16 例白名单变红，差集非空即停**（§9.2 原表约 43 例属 S6，S5 当天必须全绿）；playwright MCP 手工 smoke（行号跳号） |
-| **S6 死代码清除**         | W2 网关回映射半边、`DisplayCell.originalRow` 字段、`deriveFilterHiddenRows`、`requireIdentityMapping` 及其两调用点、`unmapped-row` 全族；`buildSortExcludedRows` 改读两集                                        | `editing/mutation-gateway.ts`、`backend/types.ts`、`filter-sort/index.ts`、`go-to/`、`remove-duplicates/`、`text-to-columns/`、`paste-special/`     | 双包 jest 全绿；`grep -r originalRow` 仅剩文档历史条目                                                      |
+| **S6 死代码清除**（已落地 `50a14e1`） | W2 网关回映射半边、`DisplayCell.originalRow` 字段、~~`deriveFilterHiddenRows`~~（**S5 就删了，见勘误 E5**）、~~`buildSortExcludedRows` 改读两集~~（**同属 S5**）、`requireIdentityMapping` 及其两调用点、`unmapped-row` 全族、`AllowedContentMutation.remapped`。**实际另含**：`SpreadsheetGrid.tsx` 填充柄与 `SpreadsheetContextMenu.tsx` 粘贴路径的两处死分支（读 `remapped`，逐文件表遗漏，见勘误 E2）。**有意不做**：把 `ranges` 塌成单段（§5 派了、§10 没派；改 7 个读点零行为收益） | `editing/mutation-gateway.ts`、`backend/types.ts`、`filter-sort/index.ts`、`go-to/`、`remove-duplicates/`、`text-to-columns/`、`paste-special/`、`grid/`、`context-menu/`     | 双包 jest 全绿（ui-core 63/1583、solid 97/1455+6 skipped）；`grep -r originalRow` 在 `src/` 与 `test/` 零命中（`@types/` 下的过期构建产物不计）                                                      |
 | **S7 可见性语义收口**     | ~~复制只取可见（§8.2）；删除行只删可见（§8.3，先实测 Excel）~~ **已作为前置加固提前落地**（恒等，S5 后生效；§8.3 查证已定稿）。**剩余**：`exportRangeTsv` 分块复制与 `exportRangeAsImage` 两条 adapter 自产内容路径的端口扩参；`Data → Reapply` 入口 + `Ctrl+Alt+L`；粘贴/填充明确不改并加 pin                                                                                      | `clipboard/`、`copy-as/`、`operations/`、`menu-bar/SpreadsheetMenuBar.tsx`、`keyboard/`                                                             | 双包 jest + 定向 e2e；playwright MCP smoke（筛选→复制→粘贴→Reapply）                                        |
-| **S8 文档收口**           | `filter-sort.md`（仍写着 `directives` 与"backend 拥有行序"的陈旧口径）、`editing/README.md`、`remove-duplicates/README.md`、`CANONICAL_OWNERSHIP.md` #29、`CUTOVER_INVENTORY.md`、`06-tables-data-management.md` | 纯文档                                                                                                                                              | 互链一致性人工核对                                                                                          |
+| **S8 文档收口**（已落地）  | `docs/filter-sort.md` **整篇重写**；`filter-sort/README.md`（`buildSortExcludedRows` 的"从投影反推"口径已换源）、`viewport/README.md`（去掉"S3 恒空集、S4 填值"的过期段）、`operations/README.md`（去掉"今天恒等"）、`editing/README.md`（补写"粘贴/填充照写被筛行"的 Excel parity 叙述）、`remove-duplicates/README.md`（补前置约束理由与结构位移）；`CANONICAL_OWNERSHIP.md` #29 行 + §4-4 + §6 判据 + **§7-1"手动/filter 同一集合"勘误**；`CUTOVER_INVENTORY.md` 记账行 + 段落；`06-tables-data-management.md` §3.1-6/7 与 §11 的过期机制描述；**本文 §0.0 勘误索引** | 纯文档（唯一例外：`backend/projection-helpers.ts` 上 `buildFilterSortDisplayRows` 的一段过期**注释**——原文称投影在此压缩被筛行，与 #27 后的代码直接矛盾） | 互链一致性人工核对；每个 API 名 / 路径 / 原子名回代码核实                                                    |
 
 **依赖顺序**：S1 → S2 → S4 → S5；S3 → S5；S5 → S6 → S7 → S8。
 
@@ -817,5 +890,11 @@ Excel 语义（§2 已核实）：**筛选**隐藏行复制时自动跳过；**�
 1. ~~⚠️ 删除行在筛选区的确切 Excel 行为（§8.3）~~ —— **2026-07-21 已查证定稿**，暂定裁决维持，出处与三条证据缺口见 §8.3。残留未证实项仅剩"选区完全落在隐藏行内"，已按保守默认（零下发）实现并明确标注。
 2. ⚠️ 格式化筛选区是否只作用可见单元格（§2）——实测后决定是否进 §8。
 3. ⚠️ `AGGREGATE` 的 ignore-hidden 语义与本次双集合的关系——**列为后续**，`eval.rs:20029-20035` 的 TODO(#32 §6.3) 保持，seam 已由 S1 建好。
-4. `vanilla/spreadsheet-ui-core/docs/filter-sort.md` 全文是 `directives` 时代的陈旧口径（"backend 拥有行序"、`originalRow` 契约、`SortDirective` 类型），S8 整篇重写。
+4. ~~`vanilla/spreadsheet-ui-core/docs/filter-sort.md` 全文是 `directives` 时代的陈旧口径（"backend 拥有行序"、`originalRow` 契约、`SortDirective` 类型），S8 整篇重写。~~ **已完成（S8，2026-07-21）**：该文现为筛选的**现行契约规范源**，本设计稿降级为历史记录。
 5. 筛选隐藏集是否需要持久化进工作簿文件格式（Excel 的 autoFilter 会存）——超出本次范围。
+6. **⚠️ `Data → Reapply` 入口未落地（S8 查出，勘误 E8）。** 快照语义已生效但没有显式重算入口，
+   这是 #27 收尾后**最大的在案缺口**：`reapplyFilterAtom` + Data 菜单项 + `Ctrl+Alt+L` 三个部件
+   一个都没建。建议作为独立工作项补齐；实现形状 §4.3 已裁决，无需重新设计。
+7. **E2 暴露的方法论问题**：逐文件影响面表用"搜字段名"判定改动面，会漏掉**一跳之外**读派生量的
+   消费者（本次是 `remapped`）。将来做同类删除时，判据应是"从字段出发做一次可达性分析"，
+   而不是 `grep` 字段名。

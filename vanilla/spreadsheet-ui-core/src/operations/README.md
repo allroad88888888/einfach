@@ -55,8 +55,12 @@ nothing.
 With no filter active the planner returns the input span verbatim and the
 command issues exactly one operation — identical to calling
 `runStructureOperationAtom` with `createDeleteRowsOperation` directly, which
-is what every caller did before this existed. Under today's display
-compaction a filtered-out row has no display slot, so the filter set is
-always empty and this is an identity; the guard starts doing work only after
-the S5 adapter flip. See
-`solid/excel/docs/online-excel-parity/design-filter-hidden-rows.md` §8.3.
+is what every caller did before this existed. The guard became live with the
+#27 S5 adapter flip: filtered-out rows are now real rows inside the span
+rather than rows without a display slot, so the planner actually splits.
+
+`applyViewportFilterHiddenStructuralShiftAtom` runs alongside
+`applyViewportHiddenStructuralShiftAtom` here, so the filter set follows
+inserts and deletes instead of drifting one row off and hiding the wrong
+row. See `solid/excel/docs/online-excel-parity/design-filter-hidden-rows.md`
+§3 and §8.3, and `../../docs/filter-sort.md`.

@@ -71,8 +71,9 @@
 3. `SpreadsheetFilterDropdown` 内仍用多个 Solid `createSignal` 保存搜索词、勾选值和条件草稿；这些均是产品交互状态，P0 必须迁入 Einfach。
 4. 筛选值列表由当前 `spreadsheetProjectionSnapshotAtom` 累积而来，并非后端针对完整数据范围返回的 distinct-value 分页。
 5. 当前实现用首列文本 `total` / `summary` 识别并钉住汇总行。这会误判正常数据，也不支持中文或其他区域设置，必须改为显式行角色元数据。
-6. worker 筛选/排序为保证离屏正确性，首次会对当前列带读取整张工作表行域；之后依靠 display-row cache 才缩回视口。正确性已有测试，但性能与权威边界仍不合格。
-7. worker 的筛选/排序 overlay 存在主线程 Map 中，没有进入 Rust workbook。删除重复项的 WASM bridge 已要求所有 band 严格 ACK `true` 并返回新 revision；但多个 RPC 仍不是单次原子命令，任一 `false`、reject 或 partial 只能进入 `outcome-unknown`，不得写 history。TS 结构删除仍为 no-op。
+6. ~~worker 筛选/排序为保证离屏正确性，首次会对当前列带读取整张工作表行域；之后依靠 display-row cache 才缩回视口。~~ **按 #27 订正（2026-07-21）**：全列谓词扫描仍在，但**只发生在 `setFilterSort` 一次**，且改用 `listNonEmpty` 探得的精确行界（不是 `0..EXCEL_MAX_SHEET_ROW` 哨兵），受 `MAX_FILTER_SORT_PREDICATE_CELLS = 50_000` 约束、超限 `FILTER_SORT_SOURCE_TOO_LARGE` fail-closed 不截断。**display-row permutation cache 已整体删除**：扫描产出的不再是排列数组而是**筛选隐藏行集**，投影期不做任何筛选计算，投影读退回矩形范围读（比原先的"包围盒 + 逐格 `readCells`"更快）。
+7. ~~worker 的筛选/排序 overlay 存在主线程 Map 中，没有进入 Rust workbook。~~ **按 #27 订正（2026-07-21）**：筛选可见性经 CANONICAL_OWNERSHIP 翻转为 **UI-core 视图事实**（`viewportFilterHiddenAtom`），主线程 Map 不再是"冒充权威的 overlay"，而是 adapter 为投影扣行保留的本地副本，与 UI-core 真值同源于同一次扫描。求值所需的那一份**确实进了 Rust workbook**：新增独立端口 `setEvalFilterHiddenRows` 把筛选隐藏集推给引擎，引擎持第二个 per-sheet 集合与第二个失效 epoch，`SUBTOTAL(1-11)` 排除筛选行但含手动隐藏行、`(101-111)` 两者都排除。仍然成立的是：**筛选规则本身**不进 Rust workbook（不参与 xlsx 持久化，见 §11 未决项）。删除重复项的 WASM bridge 已要求所有 band 严格 ACK `true` 并返回新 revision；但多个 RPC 仍不是单次原子命令，任一 `false`、reject 或 partial 只能进入 `outcome-unknown`，不得写 history。TS 结构删除仍为 no-op。
+9. **筛选语义为 Excel 的隐藏行，不是显示压缩（#27，2026-07-21 落地）**：被筛行留在原位、行号跳号、display 序 ≡ 源序。由此产生两条**用户可感知**的行为变化，本组任何后续切片都必须按此为准：**粘贴与填充照写被筛掉的行**（Excel 的连续块覆写，是 parity 修复而非回归），**筛选不再实时**——改单元格值不会让行当场消失或出现（快照语义）。配套的 `Data → Reapply`（`Ctrl+Alt+L`）**尚未实现**，今天只能靠重开列下拉重发规则刷新。完整契约见 [design-filter-hidden-rows.md](./design-filter-hidden-rows.md) 与 `vanilla/spreadsheet-ui-core/docs/filter-sort.md`。
 8. 现有 `Table.test.tsx` 等 DOM “table” 命名不能作为 Excel Table 对象的实现证据。
 
 ## 4. 范围与非目标
@@ -512,13 +513,17 @@ operation registry 恢复 correlation。第 5 组只在 `revision > lastAppliedR
 
 P0 必须删除下列架构性例外：
 
-- worker 首次筛选/排序通过 `0..1,048,575` 行读取把完整列域暴露给主线程。
-- 筛选/排序 overlay 只存在主线程 Map，Rust workbook 不知道真实状态。
+- ~~worker 首次筛选/排序通过 `0..1,048,575` 行读取把完整列域暴露给主线程。~~ **已按 #27 收窄**：改为 `listNonEmpty` 探得的精确行界 + 50k 谓词单元格预算 + fail-closed 拒绝；仍是一次全列扫描，但不再是哨兵全域读。
+- ~~筛选/排序 overlay 只存在主线程 Map，Rust workbook 不知道真实状态。~~ **已按 #27 重述**：可见性权威翻转为 UI-core 视图事实；求值所需的隐藏行集经 `setEvalFilterHiddenRows` 真实进入 Rust workbook。仍缺的是**筛选规则的持久化**（xlsx autoFilter），见下。
 - 去重仍按连续段发多个 worker 删除 RPC；即使当前 WASM exact bridge 要求逐段 strict `true`，也不能冒充单次原子事务。
 - 用已加载投影拼 distinct values。
 - 用 `Total/Summary` 字符串判断汇总行。
 
-权威筛选/排序下沉时必须保留现有 Audit D-7 的窗口化读取契约：`worker-workbook-backend.ts` 当前用带 content generation 的 display-row permutation cache，并通过 `sourceRowRangeForWindow` 把可视 display window 映射为有界 source row band。它只是迁移期性能契约，不是最终权威状态；Rust 接管筛选/排序事实后，permutation/cursor 也应由 backend 按 revision 持有，主线程只消费窗口页和稳定 row identity。禁止在下沉过程中退回每次 viewport refresh 都读取 `0..EXCEL_MAX_SHEET_ROW`，也禁止继续把主线程 cache 当权威 overlay。
+> **按 #27 订正（2026-07-21）**：下段原文描述的 display-row permutation cache 与 `sourceRowRangeForWindow` **已不存在**——`readFilteredRange`、`MappedDisplayRow`、`filterSortDisplayRowsBySheetId` 随 S5/S6 整体删除，投影读是普通矩形范围读，不再有 display→source 映射这一层。因此"禁止退回每次 viewport refresh 读 `0..EXCEL_MAX_SHEET_ROW`"这条约束**已由结构保证**：投影期根本不做筛选计算，没有可退回的读法。下段保留作历史记录，不再是现行契约。
+
+> ~~权威筛选/排序下沉时必须保留现有 Audit D-7 的窗口化读取契约：`worker-workbook-backend.ts` 当前用带 content generation 的 display-row permutation cache，并通过 `sourceRowRangeForWindow` 把可视 display window 映射为有界 source row band。它只是迁移期性能契约，不是最终权威状态；Rust 接管筛选/排序事实后，permutation/cursor 也应由 backend 按 revision 持有，主线程只消费窗口页和稳定 row identity。禁止在下沉过程中退回每次 viewport refresh 都读取 `0..EXCEL_MAX_SHEET_ROW`，也禁止继续把主线程 cache 当权威 overlay。~~
+
+**现行替代契约**：筛选可见性是 UI-core 视图事实，adapter 在 `setFilterSort` 一次算定并随 ACK 回传完整隐藏行集；该集合是**快照**，不随 revision bump 失效（Excel 的 `Data → Reapply` 模型），结构位移经 `applyViewportFilterHiddenStructuralShiftAtom` 平移而非重扫。若将来把筛选事实下沉进 Rust，必须同时保留这两条：**快照语义**（否则筛选又变得比 Excel 更"活"）与**两个来源可区分的隐藏集**（否则 `SUBTOTAL(1-11)` 的"含手动、排筛选"规则在架构上无法表达）。
 
 ## 12. 排期、资源和产出
 
