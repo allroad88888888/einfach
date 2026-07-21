@@ -74,8 +74,6 @@ export function SpreadsheetHistoryTimeline(props: SpreadsheetHistoryTimelineProp
       class={`spreadsheet-history-timeline ${props.class ?? ''}`.trim()}
       data-testid={props['data-testid'] ?? 'history-timeline'}
       data-lifecycle-status={lifecycle().status}
-      role="list"
-      aria-label="History timeline"
     >
       <div class="history-timeline-controls">
         <button
@@ -105,7 +103,18 @@ export function SpreadsheetHistoryTimeline(props: SpreadsheetHistoryTimelineProp
         </span>
       </div>
 
-      <ul class="history-timeline-list" data-testid="history-timeline-list">
+      {/*
+        a11y: `role="list"` used to sit on the outer wrapper, which also holds
+        the undo/redo controls and the live-region cursor — non-listitem
+        children under a list role (axe `aria-required-children`, critical).
+        The real list is this <ul>, which already has native list semantics and
+        only <li> children, so the label belongs here.
+      */}
+      <ul
+        class="history-timeline-list"
+        data-testid="history-timeline-list"
+        aria-label="History timeline"
+      >
         <For each={stack().entries}>
           {(entry, index) => {
             const isApplied = () => index() < stack().cursor

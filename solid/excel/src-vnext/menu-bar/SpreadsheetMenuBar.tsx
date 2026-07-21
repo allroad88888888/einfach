@@ -756,11 +756,16 @@ function MenuBarTopButton(props: MenuBarTopButtonProps) {
     filterHostVisibleEntries(props.menu.items, props.hiddenItemIds ?? []),
   )
   return (
-    <div class="menu-bar-top" data-testid={`menu-bar-top-${props.menu.id}`}>
+    // a11y: `role="none"` strips the wrapper's generic role so the ARIA tree
+    // under role="menubar" is menubar → menuitem, matching the APG pattern
+    // (`li[role=none] > a[role=menuitem]`). Without it axe reports
+    // `aria-required-children` (critical) on `.spreadsheet-menu-bar`.
+    <div class="menu-bar-top" role="none" data-testid={`menu-bar-top-${props.menu.id}`}>
       <button
         type="button"
         class={`menu-bar-button ${props.isOpen ? 'menu-bar-button-open' : ''}`.trim()}
         data-testid={`menu-bar-button-${props.menu.id}`}
+        role="menuitem"
         aria-haspopup="menu"
         aria-expanded={props.isOpen}
         accessKey={props.menu.accessKey.toLowerCase()}

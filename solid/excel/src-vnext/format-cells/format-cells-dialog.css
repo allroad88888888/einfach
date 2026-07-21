@@ -198,10 +198,17 @@
   cursor: pointer;
 }
 
-/* Selected-row highlight replaces the native radio dot. */
+/*
+  Selected-row highlight replaces the native radio dot.
+
+  a11y: --office-blue (#0078d4) over this 12%-blue tint resolves to #e0effa
+  behind 13px text — 3.86:1, under the 4.5:1 WCAG AA floor (axe
+  `color-contrast`, serious). --office-blue-text is the same hue darkened to
+  4.93:1 on the tint (5.78:1 on white).
+*/
 .format-cells-dialog .format-cells-category-row:has(input[type='radio']:checked) {
   background: rgba(0, 120, 212, 0.12);
-  color: var(--office-blue, #0078d4);
+  color: var(--office-blue-text, #0067b8);
   font-weight: 600;
 }
 

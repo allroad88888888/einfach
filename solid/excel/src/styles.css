@@ -1187,7 +1187,15 @@ thead .row-header {
  * ========================================================================= */
 :root {
   --excel-green: #217346;
+  /* Text-safe variant of --excel-green: clears 4.5:1 against --select-bg
+     (5.68:1) and --bg-chrome. Use for green *text*; keep --excel-green for
+     borders, fills and other non-text marks. */
+  --excel-green-text: #1b6139;
   --office-blue: #0078d4;
+  /* Text-safe variant of --office-blue: #0078d4 is only 4.53:1 on white and
+     drops below AA over any tinted selection background. Use for blue *text*;
+     keep --office-blue for focus rings, borders and fills. */
+  --office-blue-text: #0067b8;
   --bg-chrome: #f3f2f1;
   --bg-chrome-light: #fafafa;
   --border: #d4d4d4;
@@ -2293,7 +2301,14 @@ thead .row-header {
 .history-timeline-entry-current .history-timeline-entry-btn {
   background: var(--select-bg);
   border-color: var(--excel-green);
-  color: var(--excel-green);
+  /*
+    a11y: --excel-green (#217346) on --select-bg (#dae3dc) is 4.43:1, just
+    under the 4.5:1 WCAG AA floor for the 11-12px text inside this button
+    (axe `color-contrast`, serious). --excel-green-text is the same hue
+    darkened to 5.68:1. The brand green is kept for the border, which is a
+    non-text element held to the 3:1 rule instead.
+  */
+  color: var(--excel-green-text);
   font-weight: 600;
 }
 
@@ -2304,6 +2319,16 @@ thead .row-header {
 .history-timeline-entry-time {
   color: var(--text-muted);
   font-size: 11px;
+}
+
+/*
+  a11y: --text-muted (#6a6a6a) clears 4.5:1 on the default chrome, but the
+  current entry swaps the background to --select-bg (#dae3dc) where it drops
+  to 4.12:1 (axe `color-contrast`, serious). Darken it only in that context —
+  #595959 on --select-bg is 5.34:1.
+*/
+.history-timeline-entry-current .history-timeline-entry-time {
+  color: #595959;
 }
 
 .history-timeline-empty {

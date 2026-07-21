@@ -3890,6 +3890,15 @@ export function SpreadsheetGrid(props: SpreadsheetGridProps) {
                               data-rich-kind={cell()?.richValue?.kind}
                               data-rich-url={getCellRichUrl(cell())}
                               data-borders={getCellBordersAttr(cell())}
+                              // a11y: a bare <td> maps to role="cell", which
+                              // does not support aria-selected (axe
+                              // `aria-allowed-attr`, critical — one node per
+                              // visible cell). role="gridcell" is both the
+                              // semantically correct role for a spreadsheet
+                              // cell and the role that legitimises
+                              // aria-selected. Parent chain already supplies
+                              // row (<tr>) / rowgroup (<tbody>) / table.
+                              role="gridcell"
                               aria-selected={selected() ? 'true' : 'false'}
                               title={getCellValidationMessage(cell())}
                               rowSpan={getCellRowSpan(row, col)}

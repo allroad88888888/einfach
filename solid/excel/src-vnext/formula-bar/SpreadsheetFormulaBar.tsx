@@ -280,6 +280,11 @@ export function SpreadsheetFormulaBar(props: SpreadsheetFormulaBarProps) {
         class="formula-bar-input spreadsheet-formula-bar-input"
         data-testid="formula-bar-input"
         type="text"
+        // a11y: the visible address chip next to this input is `display:none`
+        // + `aria-hidden`, so the field had no accessible name at all (axe
+        // `label`, critical). Screen readers announced it as an unlabeled
+        // edit box. Matches Excel's own "Formula bar" announcement.
+        aria-label="Formula bar"
         value={displayValue()}
         onInput={onInput}
         onSelect={onSelectionChange}
