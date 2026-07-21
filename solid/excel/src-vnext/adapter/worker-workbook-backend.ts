@@ -265,23 +265,65 @@ export const WORKER_UNDO_STACK_CAP = 100
  */
 export const WORKER_STRUCTURAL_SNAPSHOT_MAX = 2000
 /**
- * Table-definition transactions (#25) snapshot the WHOLE WORKBOOK's
- * non-empty cells, one scope wider than the structural full-SHEET image:
- * `renameTable` / `renameTableColumn` rewrite structured-reference formula
- * TEXT on EVERY sheet (rust/excel-core `rewrite_table_refs_across_sheets`),
- * so a table-scoped — or even sheet-scoped — range cannot restore a formula
- * that lives three sheets away, and a partial image would resurrect the old
- * name in half the workbook. The registry snapshot alone is not enough
- * either: the totals toggle WRITES and CLEARS `SUBTOTAL` cells, so replaying
- * only the registry leaves the half-state this cap exists to avoid (a table
- * whose geometry rolled back while its totals cells did not).
+ * Table-definition transactions (#25) size their cell image PER OPERATION
+ * (`TableImageScope`), because the six ports touch wildly different cell
+ * sets. Verified against `rust/excel-core/src/workbook.rs`:
+ *
+ * - `define_table` / `delete_table` (§4.1) mutate the registry map and bump
+ *   the tables epoch — they write NO cell input at all ("a Table is a *view*
+ *   over existing cells"; delete is convert-to-range and leaves values,
+ *   formulas and formats in place). Scope `'registry-only'`, cell image
+ *   `null`, no cap: these can never degrade.
+ * - `rename_table` / `rename_table_column` (§4.3) run
+ *   `rewrite_table_refs_across_sheets`, which `set_formula`s arbitrary cells
+ *   on EVERY sheet — a table-scoped or even sheet-scoped range cannot
+ *   restore a formula living three sheets away. Scope `'formula-rewrite'`
+ *   keeps the workbook-wide sweep but retains only `kind: 'formula'` cells:
+ *   `collect_table_ref_rewrites` reads `formula_exprs` / `formula_source`
+ *   ONLY, so a literal can never be rewritten, and the rewrite is in-place
+ *   (`set_formula` on an existing formula cell) so no cell is created or
+ *   destroyed — hence no clear-then-restore either.
+ * - `set_table_totals_row` / `set_table_total_function` (§7) write or clear
+ *   cells ONLY in the totals-row band of the table's own column span on its
+ *   anchor sheet (`range.end.row + 1` when enabling, `range.end.row` when
+ *   disabling or retargeting a column). Scope `'totals-band'` mirrors those
+ *   two candidate rows and nothing else.
+ *
+ * This is the #26 fix: before it, EVERY table op mirrored every non-empty
+ * cell in the workbook against a 2000-cell cap, so a 500 × 5 data table
+ * (2500 cells) silently made create / totals / rename / delete
+ * not-undoable — Ctrl+Z became a no-op at a table size Excel users hit
+ * immediately. Cost now scales with what the operation touches, not with
+ * how much data happens to sit in the workbook.
+ *
+ * CAP DERIVATION (memory-bound, not latency-bound — a full-workbook sweep
+ * measures ~1.18 µs/cell, so even 50 000 cells is ~59 ms, well inside the
+ * perf budget; what actually constrains the image is the resident undo
+ * stack). Worst case is `WORKER_UNDO_STACK_CAP` (100) records × 2 images
+ * (before + after) held simultaneously, so per-image budget = total / 200.
+ * Measured V8 retained size of one `SparseCellWire` (200k-element array,
+ * `--expose-gc`, heapUsed delta): 120 B for a literal cell, 192 B for a
+ * formula cell (~40-char text) — rounded to 128 B / 200 B here.
+ *
+ * Budget: 128 MiB worst-case resident for the whole table-undo image stack
+ * (same order as the 100 × 2 × 2000 × 120 B ≈ 48 MB envelope the structural
+ * cap already implies, and a small slice of a browser tab).
+ * Per-image budget = 128 MiB / 200 = 671 088 B.
+ *
+ *   formula image: 671 088 B / 200 B ≈ 3355 cells → 3000
+ *   totals band:   671 088 B / 128 B ≈ 5242 cells → 5000
  *
  * Same degradation contract as the structural cap: above the threshold the
- * mutation still executes but its record becomes not-undoable — the snapshot
- * is never truncated. Value kept equal to `WORKER_STRUCTURAL_SNAPSHOT_MAX`
- * so worst-case resident memory stays on the same 100 × 2 × 2000 budget.
+ * mutation still executes but its record becomes not-undoable — the image
+ * is never truncated.
  */
-export const WORKER_TABLE_SNAPSHOT_MAX = 2000
+export const WORKER_TABLE_FORMULA_SNAPSHOT_MAX = 3000
+/**
+ * Cap for the bounded totals-row image. Geometrically the band is 2 rows ×
+ * the table's column span, so this is a safety net rather than a live
+ * constraint — it only binds on a table wider than 2500 columns.
+ */
+export const WORKER_TABLE_TOTALS_SNAPSHOT_MAX = 5000
 /** u32 max — full-sheet sparse bound accepted by both worker runtimes. */
 const FULL_SHEET_INDEX_BOUND = 0xffffffff
 
@@ -1560,33 +1602,65 @@ export function createWorkerWorkbookSpreadsheetBackend(
   }
 
   /**
-   * One WORKBOOK-WIDE clear range per sheet — the pre-clear half of
-   * clear-then-restore for a #25 Table transaction, which cannot be
-   * expressed as a single `SparseRangeWire` (those address one sheet).
+   * Per-operation cell-image scope for a #25 Table transaction. See
+   * `WORKER_TABLE_FORMULA_SNAPSHOT_MAX` for the engine-source verification
+   * behind each member.
    */
-  function workbookClearRanges(): SparseRangeWire[] {
-    return lookup.sheets.map((sheet) => ({
-      sheet: sheet.idx,
-      startRow: 0,
-      startCol: 0,
-      endRow: FULL_SHEET_INDEX_BOUND,
-      endCol: FULL_SHEET_INDEX_BOUND,
-    }))
+  type TableImageScope = 'registry-only' | 'formula-rewrite' | 'totals-band'
+
+  /**
+   * The two candidate totals rows of `entry` — `range.end.row` (a totals row
+   * already in the geometry, which a disable or a `setTableTotalFunction`
+   * writes) and `range.end.row + 1` (where an enable puts the new one) —
+   * across the table's own column span on its anchor sheet. Derived from the
+   * BEFORE geometry and reused for the after-image so clear-then-restore is
+   * symmetric even though the toggle grows or shrinks the range by a row.
+   */
+  function totalsBandRange(entry: TableJSONWire | undefined): SparseRangeWire | null {
+    if (!entry) return null
+    const [startRaw, endRaw] = entry.range.split(':')
+    const start = parseA1(startRaw ?? '')
+    const end = parseA1(endRaw ?? startRaw ?? '')
+    if (start === null || end === null) return null
+    const lastRow = Math.max(start.row, end.row)
+    return {
+      sheet: entry.sheetIndex,
+      startRow: lastRow,
+      startCol: Math.min(start.col, end.col),
+      endRow: Math.min(lastRow + 1, FULL_SHEET_INDEX_BOUND),
+      endCol: Math.max(start.col, end.col),
+    }
+  }
+
+  function tableImageCap(scope: TableImageScope): number {
+    return scope === 'totals-band'
+      ? WORKER_TABLE_TOTALS_SNAPSHOT_MAX
+      : WORKER_TABLE_FORMULA_SNAPSHOT_MAX
   }
 
   /**
-   * Capture BOTH halves of a Table-definition transaction in one go: the
-   * registry envelope AND the workbook's non-empty cells. `null` means the
-   * cell image blew the cap — the caller degrades the record rather than
-   * recording a half-transaction.
+   * Cell half of a Table-definition transaction, sized to what the operation
+   * can actually touch. The outer `null` means the image blew its cap — the
+   * caller degrades the record rather than storing a half-transaction. The
+   * inner `cells: null` means the operation provably touches NO cell input
+   * (registry-only ports), which is a fully undoable record, not a
+   * degradation: `replayUndoImage` skips the cell leg and the registry
+   * envelope carries the whole transaction.
    */
-  async function captureTableTransactionImage(): Promise<{
-    tables: TableRegistrySnapshotWire
-    cells: SparseCellWire[]
-  } | null> {
-    const tables = await requireTableClient('snapshotTables')()
-    const cells = await client.snapshotSparse()
-    return cells.length > WORKER_TABLE_SNAPSHOT_MAX ? null : { tables, cells }
+  async function captureTableCellImage(
+    scope: TableImageScope,
+    band: SparseRangeWire | null,
+  ): Promise<{ cells: SparseCellWire[] | null } | null> {
+    if (scope === 'registry-only') return { cells: null }
+    if (scope === 'totals-band') {
+      if (band === null) return null
+      const cells = await client.snapshotRangeSparse(band)
+      return cells.length > WORKER_TABLE_TOTALS_SNAPSHOT_MAX ? null : { cells }
+    }
+    // Workbook-wide sweep, FORMULA cells only: a structured-reference
+    // rewrite can only ever touch a cell that already holds a formula.
+    const cells = (await client.snapshotSparse()).filter((cell) => cell.kind === 'formula')
+    return cells.length > WORKER_TABLE_FORMULA_SNAPSHOT_MAX ? null : { cells }
   }
 
   /**
@@ -1597,8 +1671,13 @@ export function createWorkerWorkbookSpreadsheetBackend(
    * would leave `SUBTOTAL` formulas sitting under a table that no longer
    * claims a totals row, and a rename would leave rewritten formula TEXT
    * pointing at a name that no longer exists. So the registry envelope and
-   * the workbook cell image are captured, stored, and replayed as ONE
-   * transaction; there is no code path that carries only one of them.
+   * the cell image are captured, stored, and replayed as ONE transaction;
+   * there is no code path that carries only one of them.
+   *
+   * `spec.scope` sizes the cell half to what the operation can touch (#26 —
+   * see `WORKER_TABLE_FORMULA_SNAPSHOT_MAX` for the per-port engine
+   * verification). The registry envelope is always full: it is one small
+   * array of table descriptors, so there is nothing to scope down.
    *
    * Formats are deliberately NOT captured: no table binding touches the
    * format layer (the engine writes values/formulas only, and `clearRange`
@@ -1625,68 +1704,92 @@ export function createWorkerWorkbookSpreadsheetBackend(
    * lands.
    */
   async function recordTableMutation<T extends { applied: boolean }>(spec: {
+    /** Sizes the cell image; see `TableImageScope`. */
+    scope: TableImageScope
     /** Known up front only for `createTable`; the rest key off a table NAME. */
     sheetIdx?: number
     /**
-     * Anchor-sheet resolution for the name-keyed ports: read off the
-     * before-image registry, so it costs no extra RPC. The record itself is
-     * workbook-wide (`affectedRange: null`, every sheet in `clearRanges`) —
-     * this index is record metadata, never a replay input.
+     * Anchor-sheet resolution for the name-keyed ports, and the geometry
+     * source for the `'totals-band'` scope: both read off the before-image
+     * registry, so they cost no extra RPC. The anchor index is record
+     * metadata, never a replay input.
      */
     tableName?: string
     execute: () => Promise<T>
   }): Promise<T> {
-    let before: { tables: TableRegistrySnapshotWire; cells: SparseCellWire[] } | null = null
+    let registryBefore: TableRegistrySnapshotWire | null = null
+    let before: { cells: SparseCellWire[] | null } | null = null
+    let band: SparseRangeWire | null = null
     let diagnostic = ''
     try {
-      before = await captureTableTransactionImage()
-      if (before === null) {
+      registryBefore = await requireTableClient('snapshotTables')()
+      const entry = registryBefore.tables.find(
+        (candidate) => candidate.name.toUpperCase() === (spec.tableName ?? '').toUpperCase(),
+      )
+      band = spec.scope === 'totals-band' ? totalsBandRange(entry) : null
+      if (spec.scope === 'totals-band' && band === null) {
         diagnostic =
-          `table before-image exceeds the workbook cap of ` +
-          `${WORKER_TABLE_SNAPSHOT_MAX} non-empty cells; the operation is not undoable`
+          'table totals-row geometry could not be resolved from the registry; ' +
+          'the operation is not undoable'
+      } else {
+        before = await captureTableCellImage(spec.scope, band)
+        if (before === null) {
+          diagnostic =
+            `table before-image exceeds the ${spec.scope} cap of ` +
+            `${tableImageCap(spec.scope)} cells; the operation is not undoable`
+        }
       }
     } catch (error) {
+      before = null
       diagnostic = `table undo before-image snapshot failed: ${
         error instanceof Error ? error.message : String(error)
       }`
     }
     const anchored =
       spec.sheetIdx ??
-      before?.tables.tables.find(
+      registryBefore?.tables.find(
         (entry) => entry.name.toUpperCase() === (spec.tableName ?? '').toUpperCase(),
       )?.sheetIndex ??
       0
     const result = await spec.execute()
     if (!result.applied) return result
-    if (before === null) {
+    if (registryBefore === null || before === null) {
       pushTransactionRecord(notUndoableRecord('table.define', anchored, null, diagnostic))
       return result
     }
-    let after: { tables: TableRegistrySnapshotWire; cells: SparseCellWire[] } | null = null
+    let registryAfter: TableRegistrySnapshotWire | null = null
+    let after: { cells: SparseCellWire[] | null } | null = null
     try {
-      after = await captureTableTransactionImage()
+      registryAfter = await requireTableClient('snapshotTables')()
+      after = await captureTableCellImage(spec.scope, band)
       if (after === null) {
         diagnostic =
-          `table after-image exceeds the workbook cap of ` +
-          `${WORKER_TABLE_SNAPSHOT_MAX} non-empty cells; the operation degraded to not-undoable`
+          `table after-image exceeds the ${spec.scope} cap of ` +
+          `${tableImageCap(spec.scope)} cells; the operation degraded to not-undoable`
       }
     } catch (error) {
+      after = null
       diagnostic = `table redo after-image snapshot failed: ${
         error instanceof Error ? error.message : String(error)
       }`
     }
     pushTransactionRecord(
-      after !== null
+      after !== null && registryAfter !== null
         ? {
             kind: 'table.define',
             sheetIdx: anchored,
             boundTransactionId: null,
             affectedRange: null,
             clearRange: null,
-            clearRanges: workbookClearRanges(),
+            // Clear-then-restore is needed only where the operation can
+            // ADD or REMOVE a cell — the totals band. A rename rewrites
+            // formulas in place, so an additive `restoreSparse` of the
+            // formula image is exact and a workbook-wide pre-clear would
+            // only put every literal in the workbook at risk.
+            clearRanges: band !== null ? [band] : [],
             before: { cells: before.cells, format: null },
             after: { cells: after.cells, format: null },
-            tableRegistry: { before: before.tables, after: after.tables },
+            tableRegistry: { before: registryBefore, after: registryAfter },
           }
         : notUndoableRecord('table.define', anchored, null, diagnostic),
     )
@@ -1710,12 +1813,15 @@ export function createWorkerWorkbookSpreadsheetBackend(
     record: WorkerTransactionRecord,
     image: WorkerUndoImage,
   ): Promise<void> {
-    // Design point A: restoreSparse is an ADDITIVE merge, so the
-    // affected region must be cleared first or a delete/overwrite undo
-    // leaves residue behind.
+    // Design point A: restoreSparse is an ADDITIVE merge, so any region the
+    // mutation could have EMPTIED must be cleared first or a delete /
+    // overwrite undo leaves residue behind. An empty clear list is not
+    // "nothing to replay" — it means the mutation only ever rewrote cells
+    // in place (#26 table rename), where the additive merge is already
+    // exact and a pre-clear would destroy cells outside the image.
     const clearRanges =
       record.clearRanges ?? (record.clearRange !== null ? [record.clearRange] : [])
-    if (image.cells !== null && clearRanges.length > 0) {
+    if (image.cells !== null) {
       for (const range of clearRanges) {
         await client.clearRange(range)
       }
@@ -3068,10 +3174,14 @@ export function createWorkerWorkbookSpreadsheetBackend(
   //
   // Undo (#25, design §11/§12): all six DEFINITION mutations are wrapped in
   // a host-orchestrated transaction by `recordTableMutation`, which pairs
-  // the `snapshotTables` registry envelope with a workbook-wide sparse cell
-  // image so registry geometry and the cells that encode it (totals-row
-  // `SUBTOTAL` formulas, rename-rewritten formula text) always roll back
-  // together. Create / rename / delete bump the revision so the next
+  // the `snapshotTables` registry envelope with a sparse cell image so
+  // registry geometry and the cells that encode it (totals-row `SUBTOTAL`
+  // formulas, rename-rewritten formula text) always roll back together. Each
+  // port declares the SCOPE of that cell image (#26) — registry-only for
+  // create / delete, workbook-wide formula cells for the renames, the
+  // totals-row band for the totals ports — so the image tracks what the
+  // engine touches instead of how much data the workbook holds. Create /
+  // rename / delete bump the revision so the next
   // projection read reflects any referencing-formula recalc (engine epoch
   // handles the recompute; worker cellsDirty pushes drive reprojection).
 
@@ -3157,6 +3267,9 @@ export function createWorkerWorkbookSpreadsheetBackend(
     const sheet = await resolveSheet(request.sheetId)
     const range = normalizeRange(request.range)
     return recordTableMutation<CreateTableResult>({
+      // `define_table` inserts a registry entry and bumps the tables epoch;
+      // it writes no cell input (workbook.rs §4.1).
+      scope: 'registry-only',
       sheetIdx: sheet.idx,
       execute: async () => {
         try {
@@ -3187,6 +3300,9 @@ export function createWorkerWorkbookSpreadsheetBackend(
   ): Promise<TableMutationResult> {
     await readyPromise
     return recordTableMutation<TableMutationResult>({
+      // `rename_table` rewrites `OldName[…]` formula TEXT on every sheet
+      // via `rewrite_table_refs_across_sheets` (workbook.rs §4.3).
+      scope: 'formula-rewrite',
       tableName: request.name,
       execute: async () => {
         try {
@@ -3213,6 +3329,9 @@ export function createWorkerWorkbookSpreadsheetBackend(
   ): Promise<TableMutationResult> {
     await readyPromise
     return recordTableMutation<TableMutationResult>({
+      // `rename_table_column` rewrites `Table[Old]` (and bare `[Old]` inside
+      // the table) formula TEXT on every sheet (workbook.rs §4.3).
+      scope: 'formula-rewrite',
       tableName: request.name,
       execute: async () => {
         try {
@@ -3243,6 +3362,9 @@ export function createWorkerWorkbookSpreadsheetBackend(
   ): Promise<TableMutationResult> {
     await readyPromise
     return recordTableMutation<TableMutationResult>({
+      // `delete_table` is convert-to-range: the registry entry goes, cell
+      // values / formulas / formats stay put (workbook.rs §4.1).
+      scope: 'registry-only',
       tableName: request.name,
       execute: async () => {
         try {
@@ -3289,6 +3411,10 @@ export function createWorkerWorkbookSpreadsheetBackend(
   ): Promise<TableMutationResult> {
     await readyPromise
     return recordTableMutation<TableMutationResult>({
+      // `set_table_totals_row` writes one SUBTOTAL at `range.end.row + 1`
+      // (enable) or clears `range.end.row` across the table's columns
+      // (disable) — nothing outside that band (workbook.rs §7).
+      scope: 'totals-band',
       tableName: request.name,
       execute: async () => {
         try {
@@ -3315,6 +3441,9 @@ export function createWorkerWorkbookSpreadsheetBackend(
   ): Promise<TableMutationResult> {
     await readyPromise
     return recordTableMutation<TableMutationResult>({
+      // `set_table_total_function` writes or clears exactly one cell in the
+      // totals row of the table's column span (workbook.rs §7).
+      scope: 'totals-band',
       tableName: request.name,
       execute: async () => {
         try {

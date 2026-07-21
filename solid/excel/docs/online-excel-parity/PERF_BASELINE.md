@@ -146,15 +146,18 @@ the host to filter would show `large.payload > small.payload` immediately.
 
 ---
 
-## 3. Table-definition undo transaction — **FINDING**
+## 3. Table-definition undo transaction — **FINDING (RESOLVED, #26)**
 
-`recordTableMutation` (`worker-workbook-backend.ts:1627`) captures a
-**full-workbook sparse image before AND after** every Table-definition
-change, so the registry envelope and the cell image replay as one
-transaction (design #25 — half a transaction would leave `SUBTOTAL`
-formulas under a table that no longer claims a totals row).
+### The finding, as first measured
 
-That is `O(workbook)`, not `O(table)`. Priced exactly:
+`recordTableMutation` captured a **full-workbook sparse image before AND
+after** every Table-definition change, so the registry envelope and the
+cell image replay as one transaction (design #25 — half a transaction
+would leave `SUBTOTAL` formulas under a table that no longer claims a
+totals row). One `WORKER_TABLE_SNAPSHOT_MAX = 2000` cap counted **every
+non-empty cell in the workbook**, for all six ports.
+
+That is `O(workbook)`, not `O(change)`. Priced exactly:
 
 | Operation | Workbook | Wall clock | `snapshotSparse` calls | Cells imaged | Ratio |
 | --- | --- | --- | --- | --- | --- |
@@ -163,79 +166,126 @@ That is `O(workbook)`, not `O(table)`. Priced exactly:
 | `createTable` | 112 cells | 0.3 ms | 2 | 224 | — |
 | `createTable` | 1 812 cells | 4.2 ms | 2 | 3 624 | **16.18×** the 112-cell case |
 
-Full RPC envelope: `snapshotSparse×2 snapshotTables×2 <mutation>×1`.
+**A 500-row × 5-column sheet — about as ordinary as a spreadsheet gets —
+is 2 500 cells and was already over the cap.** The practical ceiling was
+~400 rows × 5 columns; above it *every* Table definition mutation
+recorded as not-undoable and Ctrl+Z silently declined.
+
+Cost curve of one workbook-wide image (heavy tier):
+
+| Workbook | Cells imaged | Wall clock | Rate |
+| --- | --- | --- | --- |
+| 2 500 | 2 500 | 3.0 ms | 1.19 µs/cell |
+| 10 000 | 10 000 | 11.7 ms | 1.17 µs/cell |
+| 40 000 | 40 000 | 48.1 ms | 1.20 µs/cell |
+
+Clean linearity at **~1.18 µs/cell**: the cap bought ~4.8 ms, while 50 000
+(what `MAX_SORT_SOURCE_CELLS` already uses) would cost ~118 ms — against a
+sort of 25 000 cells this same gate accepts at 84 ms. So 2000 was never a
+latency budget; it was an unstated memory guard on the retained history
+stack, and it was ~25× more conservative than the measured cost justifies.
+
+### The fix — image what the operation touches, not what the workbook holds
+
+Verified against `rust/excel-core/src/workbook.rs`, the six ports touch
+three different cell sets, so they now declare three different scopes:
+
+| Ports | Engine fn | Cells the engine writes | Scope | Cell image |
+| --- | --- | --- | --- | --- |
+| `createTable`, `deleteTable` | `define_table` / `delete_table` (§4.1) | **none** — registry map + epoch bump; delete is convert-to-range and leaves values, formulas and formats in place | `registry-only` | none at all |
+| `renameTable`, `renameTableColumn` | `rename_table` / `rename_table_column` → `rewrite_table_refs_across_sheets` (§4.3) | `set_formula` on arbitrary cells on **every sheet** | `formula-rewrite` | workbook-wide sweep, **only `kind: 'formula'` cells retained** |
+| `setTableTotalsRow`, `setTableTotalFunction` | `set_table_totals_row` / `set_table_total_function` (§7) | totals-row band only: `range.end.row + 1` on enable, `range.end.row` on disable / retarget, across the table's own column span | `totals-band` | 2 rows × the table's columns, anchor sheet only |
+
+Two engine facts make the narrowing exact rather than optimistic:
+
+- `collect_table_ref_rewrites` (`sheet.rs`) walks `formula_exprs` /
+  `formula_source` **only**, so a literal can never be rewritten by a
+  rename — filtering the image to formula cells drops nothing a rename
+  could have changed.
+- a rename rewrites **in place** (`set_formula` on a cell that already
+  holds a formula); it creates and destroys nothing. So that scope needs
+  no clear-then-restore at all, and dropping the workbook-wide pre-clear
+  removes the only reason the literals had to be carried.
+
+The totals band keeps clear-then-restore (an enable *adds* a cell, which
+an additive `restoreSparse` cannot undo) but scoped to one bounded range.
+
+### Cap re-derivation — memory ceiling → cell ceiling
+
+The old number had no stated derivation. The new ones do, and they are
+memory-bound, since the latency curve above shows latency is not the
+binding constraint.
+
+1. **What is resident.** `WORKER_UNDO_STACK_CAP = 100` records, each
+   holding a before and an after image → worst case **200 images live at
+   once**.
+2. **Cost of one cell.** Measured V8 retained size of a `SparseCellWire`
+   (200 000-element array, `node --expose-gc`, `heapUsed` delta):
+   **120 B** for a literal cell, **192 B** for a formula cell (~40-char
+   text). Rounded up to 128 B / 200 B.
+3. **Budget.** 128 MiB worst-case resident for the whole table-undo image
+   stack. Same order as the envelope `WORKER_STRUCTURAL_SNAPSHOT_MAX`
+   already implies (100 × 2 × 2000 × 120 B ≈ 48 MB) and a small slice of a
+   browser tab. Per-image budget = 128 MiB / 200 = **671 088 B**.
+4. **Caps.**
+   - `WORKER_TABLE_FORMULA_SNAPSHOT_MAX` = 671 088 / 200 ≈ 3 355 → **3 000**
+   - `WORKER_TABLE_TOTALS_SNAPSHOT_MAX` = 671 088 / 128 ≈ 5 242 → **5 000**
+
+The two differ only because their cells differ in cost: the formula image
+is all formula cells, the totals band is mostly literals. The totals cap
+is a safety net rather than a live constraint — the band is geometrically
+2 rows × the table's column span, so it only binds on a table wider than
+2 500 columns. `registry-only` has no cap: it stores no cells, so it can
+never degrade.
+
+Degradation contract is unchanged: over cap the mutation still executes,
+the after-image is skipped, and the record is stored as *not-undoable* —
+the image is never truncated.
+
+### Measured after the fix
+
+```
+createTable   on a 612-cell workbook: snapshotSparse×0 · snapshotTables×2 · RPCs=3
+deleteTable   on a 612-cell workbook: snapshotSparse×0 · snapshotTables×2 · RPCs=3
+renameTable   on a 615-cell workbook holding 3 formulas: 5.6 ms ·
+              snapshotSparse×2 raw sweep 1 230 cells, STORED image = 3 cells/image
+setTableTotalsRow on a 2 012-cell workbook: 0.5 ms ·
+              snapshotSparse×0 · snapshotRangeSparse×2 payload = 7 cells
+rename image scaling: 113-cell workbook → raw sweep 226 cells (0.4 ms) ·
+              1 813-cell workbook → raw sweep 3 626 cells (4.4 ms) ·
+              STORED image = 1 formula cell in BOTH, and both undos applied
+COST CURVE · workbook-wide rename sweep:
+              2 500 cells → 5 000 swept, 0 retained, 5.7 ms (1.14 µs/cell)
+             10 000 cells → 20 000 swept, 0 retained, 23.1 ms (1.15 µs/cell)
+REGRESSION #26 · 500×5 sheet = 2 500 cells (over the retired 2000 cap):
+              create / totals / rename undo ALL applied
+```
+
+The raw sweep for a rename is unchanged and cannot shrink — a
+structured-reference rewrite can land on any sheet, so the *read* has to
+be workbook-wide. What changed is what is **retained**: the stored image,
+and therefore the cap and the memory, now count formulas, which is a small
+constant on a data-shaped workbook.
 
 ### Budgets
 
 | # | Budget | Kind | Measured |
 | --- | --- | --- | --- |
-| T1 | `snapshotSparse` calls `=== 2` (before + after) | work | 2 |
-| T2 | imaged cells `=== 2 × workbook non-empty cells` | work | exact |
-| T3 | `snapshotTables` calls `=== 2` | work | 2 |
-| T4 | rename pays the identical price to create | work | identical |
-| T5 | image-cell ratio grows `> 10×` for a ~16× workbook | work | 16.18× |
-| T6 | wall clock `< 3 s` | wall clock | 2.0-4.2 ms |
+| T1 | `createTable` / `deleteTable`: `snapshotSparse` + `snapshotRangeSparse` calls `=== 0` | work | 0 |
+| T2 | `createTable` / `deleteTable`: `snapshotTables` calls `=== 2` | work | 2 |
+| T3 | rename: `snapshotSparse` calls `=== 2`, raw payload `=== 2 × workbook` | work | exact |
+| T4 | rename undo issues **zero** `clearRange` (in-place rewrite) | work | 0 |
+| T5 | totals ports: `snapshotSparse === 0`, `snapshotRangeSparse === 2`, payload `<= 2 × 2 × table columns` | work | 7 |
+| T6 | totals undo issues exactly **one** `clearRange` | work | 1 |
+| T7 | rename undo applies on both a 113-cell and a 1 813-cell workbook | work | applied |
+| T8 | over `WORKER_TABLE_FORMULA_SNAPSHOT_MAX`: one sweep, record not-undoable | work | 1 sweep |
+| T9 | **500 × 5 (2 500 cells): create / totals / rename undo all apply** | work | applied |
+| T10 | wall clock `< 3 s` | wall clock | 0.0-11 ms |
 
-T2 and T4 are pinned **as documentation, not as endorsement**. A future
-optimisation to a bounded image will trip them; that is intended — update
-this table when it does.
-
-### F1 — the cap is reachable by an ordinary sheet
-
-`WORKER_TABLE_SNAPSHOT_MAX = 2000` (`worker-workbook-backend.ts:284`)
-counts **non-empty cells across the entire workbook**. Over it, the
-after-image is never taken, one snapshot is paid instead of two, and the
-record is stored as *not-undoable* — the mutation still applies, but
-Ctrl+Z silently declines.
-
-Measured reachability:
-
-```
-REACHABILITY · 500×5 sheet = 2500 cells vs cap 2000:
-  createTable 2.9 ms, ONE workbook snapshot of 2500 cells,
-  record degraded to not-undoable
-```
-
-**A 500-row × 5-column sheet — about as ordinary as a spreadsheet gets —
-is already over the cap.** The practical ceiling is ~400 rows × 5 columns.
-On anything larger, *every* Excel Table definition mutation (create,
-rename, rename-column, delete, totals toggle) is non-undoable.
-
-### Is 2000 the right number? The cost curve says no.
-
-Measured cost of one workbook-wide sparse image (heavy tier):
-
-| Workbook | Images taken | Cells imaged | Wall clock | Rate |
-| --- | --- | --- | --- | --- |
-| 2 500 | 1 (degraded) | 2 500 | 3.0 ms | 1.19 µs/cell |
-| 10 000 | 1 (degraded) | 10 000 | 11.7 ms | 1.17 µs/cell |
-| 40 000 | 1 (degraded) | 40 000 | 48.1 ms | 1.20 µs/cell |
-
-Clean linearity at **~1.18 µs/cell**. Extrapolating on that rate:
-
-- at the current cap (2 000): ~2.4 ms per image, **~4.8 ms** for both;
-- at 50 000 (the value `MAX_SORT_SOURCE_CELLS` already uses for sort):
-  ~59 ms per image, **~118 ms** for the pair.
-
-For comparison, this same gate accepts an 84 ms sort of 25 000 cells as a
-normal interactive operation. So the cap is roughly **25× more
-conservative than the measured cost justifies**, and it buys that
-conservatism by removing undo from Table operations on essentially every
-real workbook.
-
-**Suspected reason it is set this way:** 2000 reads like a memory /
-blast-radius guard on the retained history stack (two images per record ×
-100 history entries), not a latency budget — the latency numbers above
-would not have motivated it. If that is the intent, the right fix is
-probably a *byte* budget over the whole history stack rather than a
-per-transaction cell count, or an image scoped to the sheets a table
-actually touches instead of the whole workbook.
-
-**This slice measures only.** No product code was changed. Raising the cap
-or narrowing the image is a separate change against
-`solid/excel/src-vnext/adapter/worker-workbook-backend.ts` and needs its
-own review — the memory ceiling has to be re-derived before the number
-moves.
+T9 is the regression gate for this defect. Verified to be a real gate:
+temporarily restoring the old whole-workbook 2000-cell decision fails T9
+and all six `#26 Table undo at 500 rows × 5 columns` round-trip tests in
+`vnext-worker-tables-wasm.test.ts`.
 
 ---
 
@@ -263,19 +313,23 @@ EINFACH_SCALE=1 npx jest solid/excel/test/perf-functional-budgets.test.ts --no-c
 
 ## Open items
 
-1. **F1 cap re-tuning** — decide whether `WORKER_TABLE_SNAPSHOT_MAX` moves
-   (to ~50 000, matching `MAX_SORT_SOURCE_CELLS`) or whether the image
-   narrows to the touched sheets. Needs a memory ceiling for the retained
-   history stack first. Product-code change, out of scope here.
+1. ~~**F1 cap re-tuning**~~ — **CLOSED by #26.** The image is now scoped
+   per operation and the two surviving caps are derived from a stated
+   128 MiB memory ceiling; see § 3. What remains open is the *raw sweep*
+   for a rename, which is still `O(workbook)` because a structured-ref
+   rewrite can land on any sheet. Narrowing it would need the engine to
+   report which cells it rewrote (an engine-side change), or the adapter to
+   duplicate structured-reference parsing — deliberately not done.
 2. **Filtered-sort projection path is not yet budgeted.** `readRange`
    branches to `readFilteredRange` when a filter is active; that branch has
    no gate. Same bounded-window claim, different code path.
 3. **No budget on `setCellInput` recalculation fan-out.** A single edit
    feeding a long dependency chain is the other classic interactive
    latency risk; the recompute count is not yet asserted anywhere.
-4. **No cross-sheet workload.** All budgets here are single-sheet. The
-   Table image is workbook-wide, so a multi-sheet workbook makes F1 worse
-   in exact proportion to the sheets it does not touch — unmeasured.
+4. **No cross-sheet workload.** All budgets here are single-sheet. After
+   #26 only the rename sweep is workbook-wide, and it retains formulas
+   only — but a multi-sheet workbook still pays the read in proportion to
+   sheets it does not touch. Unmeasured.
 5. **CI reference numbers.** Every wall-clock figure is from one Apple M4.
    When this runs on CI, record a second column rather than loosening the
    ceilings.

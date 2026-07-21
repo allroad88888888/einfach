@@ -127,7 +127,8 @@ const instrumentedWorker: WorkerLike = {
 }
 
 let createBackendImpl: (() => WorkerWorkbookSpreadsheetBackend) | undefined
-let SNAPSHOT_CAP = 0
+let FORMULA_CAP = 0
+let TOTALS_CAP = 0
 
 beforeAll(async () => {
   ;(globalThis as Record<string, unknown>).self = {
@@ -145,7 +146,8 @@ beforeAll(async () => {
   }
   await import('../src-vnext/adapter/worker-runtime')
   const adapter = await import('../src-vnext/adapter')
-  SNAPSHOT_CAP = adapter.WORKER_TABLE_SNAPSHOT_MAX
+  FORMULA_CAP = adapter.WORKER_TABLE_FORMULA_SNAPSHOT_MAX
+  TOTALS_CAP = adapter.WORKER_TABLE_TOTALS_SNAPSHOT_MAX
   createBackendImpl = () =>
     adapter.createWorkerWorkbookSpreadsheetBackend({
       workerFactory: () => instrumentedWorker,
@@ -466,17 +468,25 @@ describe('perf budget · readVisibleProjection is bounded by the window', () => 
 })
 
 // =====================================================================
-// 3. Table-definition undo transaction — the WORKBOOK-WIDE snapshot.
+// 3. Table-definition undo transaction — the PER-OPERATION image (#26).
 //
-// `recordTableMutation` captures a full-workbook sparse image BEFORE and
-// AFTER every Table definition change (design #25 pairs the registry
-// envelope with the cell image so undo can never restore half a
-// transaction). That is O(workbook), not O(table) — this section prices
-// it exactly and pins the `WORKER_TABLE_SNAPSHOT_MAX` escape hatch.
+// `recordTableMutation` pairs the registry envelope with a cell image so
+// undo can never restore half a transaction (design #25). Until #26 that
+// cell image was a full-workbook sparse snapshot for ALL SIX ports against
+// a single 2000-cell cap — O(workbook), not O(change) — which made every
+// table op on a 500x5 sheet (2500 cells) silently not-undoable.
+//
+// The image is now scoped to what each engine call can actually touch:
+//   registry-only  create / delete        -> no cell image at all
+//   formula-rewrite rename / renameColumn -> workbook-wide, FORMULA cells only
+//   totals-band    totals row / function  -> 2 rows x the table's columns
+//
+// This section prices each scope and pins the shape, so a regression back
+// to "snapshot everything" fails here first.
 // =====================================================================
-describe('perf budget · Table-definition mutations snapshot the whole workbook', () => {
+describe('perf budget · Table-definition mutations image only what they touch (#26)', () => {
   test(
-    'createTable costs exactly two workbook-wide sparse snapshots',
+    'createTable takes NO cell image — registry-only, independent of workbook size',
     async () => {
       const backend = await createBackend()
       await seedTableAnchor(backend)
@@ -498,19 +508,26 @@ describe('perf budget · Table-definition mutations snapshot the whole workbook'
       log(
         `createTable on a ${workbookCells}-cell workbook: ${elapsed.toFixed(1)} ms · ` +
           `snapshotSparse×${calls('snapshotSparse')} payload=${payloadCells('snapshotSparse')} ` +
-          `cells (${(payloadCells('snapshotSparse') / workbookCells).toFixed(2)}× workbook) · ` +
-          `RPCs=${totalCalls()} [${digest()}]`,
+          `cells · snapshotTables×${calls('snapshotTables')} · RPCs=${totalCalls()} [${digest()}]`,
       )
 
       // --- WORK BUDGET ----------------------------------------------
-      // Two images: before + after. Not one, not per-column.
-      expect(calls('snapshotSparse')).toBe(2)
-      // Each image is the ENTIRE workbook. Documented cost, pinned so a
-      // regression that makes it three images (or a per-column re-capture)
-      // is caught; a future optimisation to a bounded image will also trip
-      // this and should update PERF_BASELINE.md.
-      expect(payloadCells('snapshotSparse')).toBe(2 * workbookCells)
+      // `define_table` inserts a registry entry and bumps the tables epoch
+      // (workbook.rs §4.1) — it writes no cell input, so imaging cells is
+      // pure waste. Two registry envelopes (before + after) and nothing
+      // else.
+      expect(calls('snapshotSparse')).toBe(0)
+      expect(calls('snapshotRangeSparse')).toBe(0)
       expect(calls('snapshotTables')).toBe(2)
+
+      // …and it is fully undoable, which the old whole-workbook cap could
+      // not promise at any interesting size.
+      const undone = await backend.undoTransaction!({
+        kind: 'undo-transaction',
+        transactionId: `perf-create-${nextId()}`,
+        requestId: nextId(),
+      })
+      expect(undone.applied).not.toBe(false)
 
       expect(elapsed).toBeLessThan(SCALE ? 10_000 : 3_000)
       backend.dispose()
@@ -519,7 +536,41 @@ describe('perf budget · Table-definition mutations snapshot the whole workbook'
   )
 
   test(
-    'renameTable pays the SAME workbook-wide price as createTable — cost tracks the workbook, not the change',
+    'deleteTable takes NO cell image either (convert-to-range leaves every value in place)',
+    async () => {
+      const backend = await createBackend()
+      await seedTableAnchor(backend)
+      await seed(backend, buildFiller(600, 100))
+      const created = await backend.createTable!({
+        kind: 'create-table',
+        sheetId: SHEET,
+        range: TABLE_RANGE,
+        requestId: nextId(),
+      })
+      expect(created.applied).toBe(true)
+      if (!created.applied) throw new Error('expected an applied createTable')
+
+      resetCounters()
+      const deleted = await backend.deleteTable!({
+        kind: 'delete-table',
+        name: created.name,
+        requestId: nextId(),
+      })
+      expect(deleted.applied).toBe(true)
+
+      log(
+        `deleteTable: snapshotSparse×${calls('snapshotSparse')} · RPCs=${totalCalls()} [${digest()}]`,
+      )
+      expect(calls('snapshotSparse')).toBe(0)
+      expect(calls('snapshotRangeSparse')).toBe(0)
+      expect(calls('snapshotTables')).toBe(2)
+      backend.dispose()
+    },
+    TEST_TIMEOUT,
+  )
+
+  test(
+    'renameTable still sweeps the workbook (cross-sheet rewrite) but images FORMULA cells only',
     async () => {
       const backend = await createBackend()
       await seedTableAnchor(backend)
@@ -536,6 +587,14 @@ describe('perf budget · Table-definition mutations snapshot the whole workbook'
       expect(created.applied).toBe(true)
       if (!created.applied) throw new Error('expected an applied createTable')
 
+      // Three referencing formulas — the ONLY cells a rename can rewrite.
+      const formulaCells = 3
+      await seed(backend, [
+        { row: 900, col: 0, input: `=SUM(${created.name}[Age])` },
+        { row: 901, col: 0, input: `=COUNT(${created.name}[Age])` },
+        { row: 902, col: 0, input: `=MAX(${created.name}[Age])` },
+      ])
+
       resetCounters()
       const t0 = performance.now()
       const renamed = await backend.renameTable!({
@@ -548,15 +607,29 @@ describe('perf budget · Table-definition mutations snapshot the whole workbook'
 
       expect(renamed.applied).toBe(true)
       log(
-        `renameTable (a 1-token change) on a ${workbookCells}-cell workbook: ` +
-          `${elapsed.toFixed(1)} ms · snapshotSparse payload=${payloadCells('snapshotSparse')} ` +
-          `cells · RPCs=${totalCalls()} [${digest()}]`,
+        `renameTable on a ${workbookCells + formulaCells}-cell workbook holding ` +
+          `${formulaCells} formulas: ${elapsed.toFixed(1)} ms · snapshotSparse×` +
+          `${calls('snapshotSparse')} raw payload=${payloadCells('snapshotSparse')} cells, ` +
+          `STORED image=${formulaCells} formula cells/image · RPCs=${totalCalls()} [${digest()}]`,
       )
 
-      // A rename changes ONE string in the registry, yet still copies the
-      // workbook twice. Pinned, not endorsed — see PERF_BASELINE.md § F1.
+      // The RPC still returns the whole workbook — `rewrite_table_refs_
+      // across_sheets` can touch a formula on any sheet, so the SWEEP
+      // cannot shrink. What shrinks is what is RETAINED: the adapter keeps
+      // only `kind: 'formula'` cells, because a literal is not reachable by
+      // a structured-reference rewrite. That is what the cap now counts.
       expect(calls('snapshotSparse')).toBe(2)
-      expect(payloadCells('snapshotSparse')).toBe(2 * workbookCells)
+      expect(payloadCells('snapshotSparse')).toBe(2 * (workbookCells + formulaCells))
+
+      // Undo is REAL on a workbook this size (it was not before #26), and
+      // restores the formula text without a workbook-wide pre-clear.
+      const undone = await backend.undoTransaction!({
+        kind: 'undo-transaction',
+        transactionId: `perf-rename-${nextId()}`,
+        requestId: nextId(),
+      })
+      expect(undone.applied).not.toBe(false)
+      expect(calls('clearRange')).toBe(0)
 
       expect(elapsed).toBeLessThan(SCALE ? 10_000 : 3_000)
       backend.dispose()
@@ -565,79 +638,167 @@ describe('perf budget · Table-definition mutations snapshot the whole workbook'
   )
 
   test(
-    'the snapshot cost grows LINEARLY with the workbook, not with the table',
-    async () => {
-      async function priceCreateTable(filler: number): Promise<{ payload: number; ms: number }> {
-        const backend = await createBackend()
-        await seedTableAnchor(backend)
-        await seed(backend, buildFiller(filler, 100))
-        resetCounters()
-        const t0 = performance.now()
-        const created = await backend.createTable!({
-          kind: 'create-table',
-          sheetId: SHEET,
-          range: TABLE_RANGE,
-          requestId: nextId(),
-        })
-        const ms = performance.now() - t0
-        expect(created.applied).toBe(true)
-        const payload = payloadCells('snapshotSparse')
-        backend.dispose()
-        return { payload, ms }
-      }
-
-      const small = await priceCreateTable(100)
-      const large = await priceCreateTable(1_800)
-
-      log(
-        `createTable snapshot scaling: 112-cell workbook → ${small.payload} cells ` +
-          `(${small.ms.toFixed(1)} ms) · 1812-cell workbook → ${large.payload} cells ` +
-          `(${large.ms.toFixed(1)} ms) · ratio=${(large.payload / small.payload).toFixed(2)}×`,
-      )
-
-      // The identical table definition costs ~16× more snapshot work on a
-      // ~16× larger workbook. THIS IS THE FINDING, asserted so it cannot
-      // silently get worse.
-      expect(small.payload).toBe(2 * 112)
-      expect(large.payload).toBe(2 * 1_812)
-      expect(large.payload / small.payload).toBeGreaterThan(10)
-    },
-    TEST_TIMEOUT,
-  )
-
-  test(
-    `WORKER_TABLE_SNAPSHOT_MAX (${SNAPSHOT_CAP || 2000}) caps the blast radius — over it, no image is stored`,
+    'the totals ports image a BOUNDED band — 2 rows × the table columns, not the workbook',
     async () => {
       const backend = await createBackend()
       await seedTableAnchor(backend)
-      // 12 anchor cells + (cap + 1) filler → strictly over the cap.
-      await seed(backend, buildFiller(SNAPSHOT_CAP + 1, 100))
+      await seed(backend, buildFiller(2_000, 100))
 
-      resetCounters()
-      const t0 = performance.now()
       const created = await backend.createTable!({
         kind: 'create-table',
         sheetId: SHEET,
         range: TABLE_RANGE,
         requestId: nextId(),
       })
-      const elapsed = performance.now() - t0
-
       expect(created.applied).toBe(true)
+      if (!created.applied) throw new Error('expected an applied createTable')
+
+      resetCounters()
+      const t0 = performance.now()
+      const toggled = await backend.setTableTotalsRow!({
+        kind: 'set-table-totals-row',
+        name: created.name,
+        enabled: true,
+        requestId: nextId(),
+      })
+      const elapsed = performance.now() - t0
+      expect(toggled.applied).toBe(true)
+
+      const banded = payloadCells('snapshotRangeSparse')
       log(
-        `createTable OVER the ${SNAPSHOT_CAP}-cell cap: ${elapsed.toFixed(1)} ms · ` +
-          `snapshotSparse×${calls('snapshotSparse')} payload=${payloadCells('snapshotSparse')} · ` +
-          `RPCs=${totalCalls()} [${digest()}]`,
+        `setTableTotalsRow on a 2012-cell workbook: ${elapsed.toFixed(1)} ms · ` +
+          `snapshotSparse×${calls('snapshotSparse')} · snapshotRangeSparse×` +
+          `${calls('snapshotRangeSparse')} payload=${banded} cells · RPCs=${totalCalls()} ` +
+          `[${digest()}]`,
+      )
+
+      // No workbook sweep at all; two band images (before + after).
+      expect(calls('snapshotSparse')).toBe(0)
+      expect(calls('snapshotRangeSparse')).toBe(2)
+      // The band is A4:C5 — the table's last data row plus the totals row.
+      // Before: 3 data cells. After: 3 data + 1 default SUM. Bounded by the
+      // TABLE (6 cells max), never by the 2000 filler cells around it.
+      expect(banded).toBeLessThanOrEqual(2 * 2 * 3)
+
+      const undone = await backend.undoTransaction!({
+        kind: 'undo-transaction',
+        transactionId: `perf-totals-${nextId()}`,
+        requestId: nextId(),
+      })
+      expect(undone.applied).not.toBe(false)
+      // Clear-then-restore is needed here (an enable ADDS a cell) but it is
+      // scoped to the same band — one clearRange, not one per sheet.
+      expect(calls('clearRange')).toBe(1)
+
+      expect(elapsed).toBeLessThan(SCALE ? 10_000 : 3_000)
+      backend.dispose()
+    },
+    TEST_TIMEOUT,
+  )
+
+  test(
+    'the retained image tracks the CHANGE, not the workbook — literals no longer price it',
+    async () => {
+      async function priceRename(filler: number): Promise<{ raw: number; ms: number }> {
+        const backend = await createBackend()
+        await seedTableAnchor(backend)
+        await seed(backend, buildFiller(filler, 100))
+        const created = await backend.createTable!({
+          kind: 'create-table',
+          sheetId: SHEET,
+          range: TABLE_RANGE,
+          requestId: nextId(),
+        })
+        expect(created.applied).toBe(true)
+        if (!created.applied) throw new Error('expected an applied createTable')
+        await seed(backend, [{ row: 900, col: 0, input: `=SUM(${created.name}[Age])` }])
+
+        resetCounters()
+        const t0 = performance.now()
+        const renamed = await backend.renameTable!({
+          kind: 'rename-table',
+          name: created.name,
+          newName: 'Renamed1',
+          requestId: nextId(),
+        })
+        const ms = performance.now() - t0
+        expect(renamed.applied).toBe(true)
+
+        // Undo must LAND at both sizes — that is the #26 fix in one line.
+        const undone = await backend.undoTransaction!({
+          kind: 'undo-transaction',
+          transactionId: `perf-scale-${nextId()}`,
+          requestId: nextId(),
+        })
+        expect(undone.applied).not.toBe(false)
+
+        const raw = payloadCells('snapshotSparse')
+        backend.dispose()
+        return { raw, ms }
+      }
+
+      const small = await priceRename(100)
+      const large = await priceRename(1_800)
+
+      log(
+        `rename image scaling: 113-cell workbook → raw sweep ${small.raw} cells ` +
+          `(${small.ms.toFixed(1)} ms) · 1813-cell workbook → raw sweep ${large.raw} cells ` +
+          `(${large.ms.toFixed(1)} ms) · STORED image = 1 formula cell in BOTH, and both ` +
+          `undos applied`,
+      )
+
+      // The RAW sweep still scales with the workbook (it must — a rewrite
+      // can hit any sheet)…
+      expect(large.raw / small.raw).toBeGreaterThan(10)
+      // …but the number the cap counts, and the memory the undo stack
+      // holds, is the formula count, which is 1 at BOTH sizes. Pinned via
+      // the observable that matters: undo applies either way.
+    },
+    TEST_TIMEOUT,
+  )
+
+  test(
+    `over WORKER_TABLE_FORMULA_SNAPSHOT_MAX (${FORMULA_CAP || 3000}) a rename still degrades to not-undoable`,
+    async () => {
+      const backend = await createBackend()
+      await seedTableAnchor(backend)
+      const created = await backend.createTable!({
+        kind: 'create-table',
+        sheetId: SHEET,
+        range: TABLE_RANGE,
+        requestId: nextId(),
+      })
+      expect(created.applied).toBe(true)
+      if (!created.applied) throw new Error('expected an applied createTable')
+
+      // Only FORMULA cells enter the image, so the cap has to be crossed
+      // with formulas. Literals are free now.
+      await seed(
+        backend,
+        buildFiller(FORMULA_CAP + 1, 100).map((cell) => ({ ...cell, input: `=${cell.input}` })),
+      )
+
+      resetCounters()
+      const t0 = performance.now()
+      const renamed = await backend.renameTable!({
+        kind: 'rename-table',
+        name: created.name,
+        newName: 'Renamed1',
+        requestId: nextId(),
+      })
+      const elapsed = performance.now() - t0
+      expect(renamed.applied).toBe(true)
+
+      log(
+        `renameTable OVER the ${FORMULA_CAP}-formula cap: ${elapsed.toFixed(1)} ms · ` +
+          `snapshotSparse×${calls('snapshotSparse')} · RPCs=${totalCalls()} [${digest()}]`,
       )
 
       // The DEGRADATION is the budget: the after-image is never taken, so
-      // an over-cap workbook pays ONE snapshot, not two. The mutation
-      // still applies — degradation never blocks the operation.
+      // an over-cap workbook pays ONE sweep, not two. The mutation still
+      // applies — degradation never blocks the operation.
       expect(calls('snapshotSparse')).toBe(1)
-      expect(payloadCells('snapshotSparse')).toBeGreaterThan(SNAPSHOT_CAP)
 
-      // ...and the record is stored as not-undoable rather than as a
-      // half-transaction. This is the correctness half of the cap.
       const undone = await backend.undoTransaction!({
         kind: 'undo-transaction',
         transactionId: `perf-cap-${nextId()}`,
@@ -645,7 +806,7 @@ describe('perf budget · Table-definition mutations snapshot the whole workbook'
       })
       expect(undone.applied).toBe(false)
       if (undone.applied !== false) throw new Error('expected a not-applied undo')
-      expect(undone.notAppliedReason).toContain(String(SNAPSHOT_CAP))
+      expect(undone.notAppliedReason).toContain(String(FORMULA_CAP))
 
       expect(elapsed).toBeLessThan(SCALE ? 15_000 : 5_000)
       backend.dispose()
@@ -654,27 +815,21 @@ describe('perf budget · Table-definition mutations snapshot the whole workbook'
   )
 
   /**
-   * REACHABILITY OF THE CAP — the finding this file exists to surface.
+   * THE #26 REGRESSION GATE — the exact scenario the old cap broke.
    *
-   * `WORKER_TABLE_SNAPSHOT_MAX` is 2000 NON-EMPTY CELLS across the whole
-   * workbook. A perfectly ordinary tabular sheet — 500 data rows × 5
-   * columns — is 2500 cells, i.e. already over it. So on any realistic
-   * workbook, EVERY Excel Table definition mutation records as
-   * not-undoable and Ctrl+Z silently declines.
-   *
-   * This test pins that reachability AND times the single workbook-wide
-   * snapshot at that size, so the doc can say whether 2000 is a time
-   * budget or a (much more conservative) memory guard.
+   * 500 data rows × 5 columns = 2500 non-empty cells. Under the retired
+   * whole-workbook `WORKER_TABLE_SNAPSHOT_MAX = 2000` this was ALREADY over
+   * the cap, so every Table definition mutation on an ordinary sheet
+   * recorded as not-undoable and Ctrl+Z silently declined. Now each of the
+   * three scopes is exercised at that size and each undo must APPLY.
    */
   test(
-    'a 500-row × 5-col data region — an ordinary sheet — already exceeds the cap',
+    'a 500-row × 5-col data region — an ordinary sheet — is fully undoable across all three scopes',
     async () => {
       const rows = 500
       const cols = 5
       const backend = await createBackend()
 
-      // A realistic sheet shape: header row + 499 data rows, 5 columns,
-      // with the Table anchored on the first four rows of it.
       const cells: ImportCellInput[] = []
       for (let col = 0; col < cols; col += 1) cells.push({ row: 0, col, input: `H${col}` })
       for (let row = 1; row < rows; row += 1) {
@@ -684,52 +839,99 @@ describe('perf budget · Table-definition mutations snapshot the whole workbook'
       }
       await seed(backend, cells)
       const workbookCells = cells.length
-      expect(workbookCells).toBeGreaterThan(SNAPSHOT_CAP)
+      // The size that broke it: 2500 cells against the retired 2000 cap.
+      expect(workbookCells).toBe(2_500)
+      expect(workbookCells).toBeGreaterThan(2_000)
+
+      // The table spans the WHOLE region, so the totals row lands on the
+      // first free row below it (an A1:C4 anchor would be totals-blocked by
+      // the data underneath).
+      const bigRange: CellRange = {
+        rowStart: 0,
+        rowEnd: rows - 1,
+        colStart: 0,
+        colEnd: cols - 1,
+      }
 
       resetCounters()
       const t0 = performance.now()
       const created = await backend.createTable!({
         kind: 'create-table',
         sheetId: SHEET,
-        range: TABLE_RANGE,
+        range: bigRange,
         requestId: nextId(),
       })
-      const elapsed = performance.now() - t0
+      const createMs = performance.now() - t0
       expect(created.applied).toBe(true)
+      if (!created.applied) throw new Error('expected an applied createTable')
+      const createSweep = calls('snapshotSparse')
+
+      // registry-only scope. The record binds to the id of its first undo,
+      // so the redo must present the SAME transactionId.
+      const createTx = `perf-reach-c-${nextId()}`
+      let undone = await backend.undoTransaction!({
+        kind: 'undo-transaction',
+        transactionId: createTx,
+        requestId: nextId(),
+      })
+      expect(undone.applied).not.toBe(false)
+      const redone = await backend.redoTransaction!({
+        kind: 'redo-transaction',
+        transactionId: createTx,
+        requestId: nextId(),
+      })
+      expect(redone.applied).not.toBe(false)
+
+      // totals-band scope.
+      const toggled = await backend.setTableTotalsRow!({
+        kind: 'set-table-totals-row',
+        name: created.name,
+        enabled: true,
+        requestId: nextId(),
+      })
+      expect(toggled.applied).toBe(true)
+      undone = await backend.undoTransaction!({
+        kind: 'undo-transaction',
+        transactionId: `perf-reach-t-${nextId()}`,
+        requestId: nextId(),
+      })
+      expect(undone.applied).not.toBe(false)
+
+      // formula-rewrite scope.
+      const renamed = await backend.renameTable!({
+        kind: 'rename-table',
+        name: created.name,
+        newName: 'Renamed1',
+        requestId: nextId(),
+      })
+      expect(renamed.applied).toBe(true)
+      undone = await backend.undoTransaction!({
+        kind: 'undo-transaction',
+        transactionId: `perf-reach-r-${nextId()}`,
+        requestId: nextId(),
+      })
+      expect(undone.applied).not.toBe(false)
 
       log(
-        `REACHABILITY · ${rows}×${cols} sheet = ${workbookCells} cells vs cap ${SNAPSHOT_CAP}: ` +
-          `createTable ${elapsed.toFixed(1)} ms, ONE workbook snapshot of ` +
-          `${payloadCells('snapshotSparse')} cells, record degraded to not-undoable`,
+        `REGRESSION #26 · ${rows}×${cols} sheet = ${workbookCells} cells (over the retired ` +
+          `2000 cap): createTable ${createMs.toFixed(1)} ms with ${createSweep} workbook ` +
+          `sweeps; create / totals / rename undo ALL applied`,
       )
 
-      // Over the cap → one image only, and undo declines.
-      expect(calls('snapshotSparse')).toBe(1)
-      const undone = await backend.undoTransaction!({
-        kind: 'undo-transaction',
-        transactionId: `perf-reach-${nextId()}`,
-        requestId: nextId(),
-      })
-      expect(undone.applied).toBe(false)
-
-      // The measured cost of that single workbook-wide snapshot is tiny
-      // relative to the undo capability it buys back — evidence that 2000
-      // is a memory/blast-radius guard, not a latency budget. Pinned
-      // loosely: this is the number PERF_BASELINE.md § F1 argues from.
-      expect(elapsed).toBeLessThan(SCALE ? 15_000 : 5_000)
+      expect(createMs).toBeLessThan(SCALE ? 15_000 : 5_000)
       backend.dispose()
     },
     TEST_TIMEOUT,
   )
 
   /**
-   * COST CURVE for the workbook-wide image, so PERF_BASELINE.md can argue
-   * about the cap from measurements instead of extrapolation. Log-only
-   * plus a very loose ceiling — the per-cell rate is the deliverable.
-   * SCALE tier extends the curve to 40k cells.
+   * COST CURVE for the surviving workbook-wide sweep (rename only), so
+   * PERF_BASELINE.md can argue about the cap from measurements instead of
+   * extrapolation. Log-only plus a very loose ceiling — the per-cell rate
+   * is the deliverable. SCALE tier extends the curve to 40k cells.
    */
   test(
-    'workbook-wide snapshot cost curve (per-cell rate for cap re-tuning)',
+    'workbook-wide rename sweep cost curve (per-cell rate for cap re-tuning)',
     async () => {
       const sizes = SCALE ? [2_500, 10_000, 40_000] : [2_500, 10_000]
       const rows: string[] = []
@@ -738,28 +940,39 @@ describe('perf budget · Table-definition mutations snapshot the whole workbook'
         const backend = await createBackend()
         await seedTableAnchor(backend)
         await seed(backend, buildFiller(size - 12, 100))
-        resetCounters()
-        const t0 = performance.now()
         const created = await backend.createTable!({
           kind: 'create-table',
           sheetId: SHEET,
           range: TABLE_RANGE,
           requestId: nextId(),
         })
-        const ms = performance.now() - t0
         expect(created.applied).toBe(true)
-        const imaged = payloadCells('snapshotSparse')
+        if (!created.applied) throw new Error('expected an applied createTable')
+
+        resetCounters()
+        const t0 = performance.now()
+        const renamed = await backend.renameTable!({
+          kind: 'rename-table',
+          name: created.name,
+          newName: 'Renamed1',
+          requestId: nextId(),
+        })
+        const ms = performance.now() - t0
+        expect(renamed.applied).toBe(true)
+        const swept = payloadCells('snapshotSparse')
         rows.push(
-          `${size} cells → ${calls('snapshotSparse')} image(s), ${imaged} cells imaged, ` +
-            `${ms.toFixed(1)} ms (${((ms * 1000) / Math.max(1, imaged)).toFixed(2)} µs/cell)`,
+          `${size} cells → ${calls('snapshotSparse')} sweep(s), ${swept} cells swept, ` +
+            `0 retained (no formulas), ${ms.toFixed(1)} ms ` +
+            `(${((ms * 1000) / Math.max(1, swept)).toFixed(2)} µs/cell)`,
         )
         backend.dispose()
       }
 
-      log(`COST CURVE · workbook-wide table image: ${rows.join(' | ')}`)
+      log(`COST CURVE · workbook-wide rename sweep: ${rows.join(' | ')}`)
 
       // Loose ceiling only — the point of this test is the printed rate.
       expect(rows).toHaveLength(sizes.length)
+      expect(TOTALS_CAP).toBeGreaterThan(0)
     },
     TEST_TIMEOUT,
   )

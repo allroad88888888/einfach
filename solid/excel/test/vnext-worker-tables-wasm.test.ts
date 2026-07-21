@@ -417,7 +417,11 @@ describe('worker adapter Excel Table totals row — real WASM engine + real disp
     if (noRow.applied) throw new Error('expected a rejected totals function')
     expect(noRow.code).toBe('no-totals-row')
 
-    await backend.setTableTotalsRow!({ kind: 'set-table-totals-row', name: 'Table1', enabled: true })
+    await backend.setTableTotalsRow!({
+      kind: 'set-table-totals-row',
+      name: 'Table1',
+      enabled: true,
+    })
     const badFunc = await backend.setTableTotalFunction!({
       kind: 'set-table-total-function',
       name: 'Table1',
@@ -667,6 +671,14 @@ describe('worker adapter Excel Table definition undo — real WASM engine + real
     const backend = await createBackend()
     await seedTableData(backend)
     await backend.createTable!({ kind: 'create-table', sheetId: SHEET, range: A1_C4 })
+    // A totals toggle is the op whose undo exercises BOTH legs (#26): it is
+    // the only scope that clears before restoring, so it is the one that can
+    // observe registry-before-cells across all three RPCs.
+    await backend.setTableTotalsRow!({
+      kind: 'set-table-totals-row',
+      name: 'Table1',
+      enabled: true,
+    })
 
     commandLog.length = 0
     await backend.undoTransaction!(undoRequest())
@@ -679,6 +691,50 @@ describe('worker adapter Excel Table definition undo — real WASM engine + real
     expect(restoreSparse).toBeGreaterThanOrEqual(0)
     expect(restoreTables).toBeLessThan(clearRange)
     expect(restoreTables).toBeLessThan(restoreSparse)
+    backend.dispose()
+  })
+
+  test('#26 create / delete undo emits NO cell RPC at all (registry-only scope)', async () => {
+    const backend = await createBackend()
+    await seedTableData(backend)
+    await backend.createTable!({ kind: 'create-table', sheetId: SHEET, range: A1_C4 })
+
+    commandLog.length = 0
+    const undone = await backend.undoTransaction!(undoRequest())
+    expect(undone.applied).not.toBe(false)
+    // `define_table` writes no cell input, so the transaction is pure
+    // registry — a workbook-wide clear-then-restore here would be blast
+    // radius for nothing.
+    expect(commandLog).toContain('restoreTables')
+    expect(commandLog).not.toContain('clearRange')
+    expect(commandLog).not.toContain('restoreSparse')
+    expect((await backend.listTables!({ kind: 'list-tables' })).tables).toHaveLength(0)
+    backend.dispose()
+  })
+
+  test('#26 rename undo restores formula TEXT with no pre-clear (in-place rewrite)', async () => {
+    const backend = await createBackend()
+    await seedTableData(backend)
+    await backend.createTable!({ kind: 'create-table', sheetId: SHEET, range: A1_C4 })
+    await set(backend, 6, 0, '=SUM(Table1[Age])')
+    // A literal that a workbook-wide clear-then-restore would have had to
+    // carry; the formula-only image must leave it strictly alone.
+    await set(backend, 7, 0, 'untouched-literal')
+
+    await backend.renameTable!({ kind: 'rename-table', name: 'Table1', newName: 'Sales' })
+    expect((await readCell(backend, 6, 0))?.formula).toBe('=SUM(Sales[Age])')
+
+    commandLog.length = 0
+    const undone = await backend.undoTransaction!(undoRequest())
+    expect(undone.applied).not.toBe(false)
+    expect(commandLog).toContain('restoreTables')
+    expect(commandLog).toContain('restoreSparse')
+    expect(commandLog).not.toContain('clearRange')
+
+    expect((await readCell(backend, 6, 0))?.formula).toBe('=SUM(Table1[Age])')
+    expect((await readCell(backend, 6, 0))?.displayValue).toBe('95')
+    expect((await readCell(backend, 7, 0))?.displayValue).toBe('untouched-literal')
+    expect((await backend.listTables!({ kind: 'list-tables' })).tables[0].name).toBe('Table1')
     backend.dispose()
   })
 
@@ -703,15 +759,20 @@ describe('worker adapter Excel Table definition undo — real WASM engine + real
     backend.dispose()
   })
 
-  test('a workbook over WORKER_TABLE_SNAPSHOT_MAX degrades the record to not-undoable', async () => {
+  test('#26 a workbook of LITERALS over the old cap no longer degrades anything', async () => {
     const adapter = await import('../src-vnext/adapter')
-    const cap = adapter.WORKER_TABLE_SNAPSHOT_MAX
     const backend = await createBackend()
     await seedTableData(backend)
 
-    // Push the workbook past the cap in one bulk import (12 seeded + filler).
+    // 4000 literal cells — double the retired 2000 whole-workbook cap, and
+    // over BOTH new caps. None of them can be touched by a table op, so no
+    // image counts them and nothing degrades.
+    const bulk = Math.max(
+      adapter.WORKER_TABLE_FORMULA_SNAPSHOT_MAX,
+      adapter.WORKER_TABLE_TOTALS_SNAPSHOT_MAX,
+    )
     const cells: Array<{ row: number; col: number; input: string }> = []
-    for (let i = 0; i <= cap; i += 1) {
+    for (let i = 0; i <= bulk; i += 1) {
       cells.push({ row: 100 + Math.floor(i / 50), col: i % 50, input: String(i + 1) })
     }
     await backend.importCells!({ kind: 'import-cells', sheetId: SHEET, cells, requestId: 250 })
@@ -722,17 +783,245 @@ describe('worker adapter Excel Table definition undo — real WASM engine + real
       range: A1_C4,
       requestId: 251,
     })
-    // The mutation still RUNS — degradation never blocks the operation.
     expect(created.applied).toBe(true)
-    expect((await backend.listTables!({ kind: 'list-tables' })).tables).toHaveLength(1)
+
+    const undone = await backend.undoTransaction!(undoRequest())
+    expect(undone.applied).not.toBe(false)
+    expect((await backend.listTables!({ kind: 'list-tables' })).tables).toHaveLength(0)
+    // …and the filler literals are exactly where they were.
+    expect((await readCell(backend, 100, 0))?.displayValue).toBe('1')
+    backend.dispose()
+  })
+
+  test('#26 over WORKER_TABLE_FORMULA_SNAPSHOT_MAX a RENAME still degrades to not-undoable', async () => {
+    const adapter = await import('../src-vnext/adapter')
+    const cap = adapter.WORKER_TABLE_FORMULA_SNAPSHOT_MAX
+    const backend = await createBackend()
+    await seedTableData(backend)
+    await backend.createTable!({ kind: 'create-table', sheetId: SHEET, range: A1_C4 })
+
+    // Only FORMULA cells enter a rename image, so the cap must be crossed
+    // with formulas — literals are free.
+    const cells: Array<{ row: number; col: number; input: string }> = []
+    for (let i = 0; i <= cap; i += 1) {
+      cells.push({ row: 100 + Math.floor(i / 50), col: i % 50, input: `=${i + 1}` })
+    }
+    await backend.importCells!({ kind: 'import-cells', sheetId: SHEET, cells, requestId: 260 })
+
+    const renamed = await backend.renameTable!({
+      kind: 'rename-table',
+      name: 'Table1',
+      newName: 'Sales',
+      requestId: 261,
+    })
+    // The mutation still RUNS — degradation never blocks the operation.
+    expect(renamed.applied).toBe(true)
+    expect((await backend.listTables!({ kind: 'list-tables' })).tables[0].name).toBe('Sales')
 
     const undone = await backend.undoTransaction!(undoRequest())
     expect(undone.applied).toBe(false)
     if (undone.applied !== false) throw new Error('expected a not-applied undo')
     expect(undone.notAppliedReason).toContain(String(cap))
     expect(undone.notAppliedReason).toContain('not undoable')
-    // The table is still there — nothing was half-restored.
-    expect((await backend.listTables!({ kind: 'list-tables' })).tables).toHaveLength(1)
+    // Nothing half-restored.
+    expect((await backend.listTables!({ kind: 'list-tables' })).tables[0].name).toBe('Sales')
+    backend.dispose()
+  })
+})
+
+/**
+ * #26 REGRESSION — the defect the perf gate exposed, at the size that
+ * exposed it.
+ *
+ * Under the retired whole-workbook `WORKER_TABLE_SNAPSHOT_MAX = 2000`, a
+ * 500-row × 5-column table (2500 non-empty cells) put EVERY table-definition
+ * op over the cap, so each one recorded as not-undoable and Ctrl+Z silently
+ * did nothing — at a table size an Excel user reaches immediately. Each case
+ * below drives the real engine at exactly that size and proves the undo
+ * lands, plus the redo round-trip back.
+ */
+describe('#26 Table undo at 500 rows × 5 columns (over the retired workbook cap)', () => {
+  const BIG_ROWS = 500
+  const BIG_COLS = 5
+  /** A1:E500 — header row + 499 data rows, 2500 non-empty cells. */
+  const BIG_RANGE = { rowStart: 0, rowEnd: BIG_ROWS - 1, colStart: 0, colEnd: BIG_COLS - 1 }
+
+  async function bigBackend(): Promise<WorkerWorkbookSpreadsheetBackend> {
+    const backend = await createBackend()
+    const cells: Array<{ row: number; col: number; input: string }> = []
+    for (let col = 0; col < BIG_COLS; col += 1) {
+      cells.push({ row: 0, col, input: `Col${col + 1}` })
+    }
+    for (let row = 1; row < BIG_ROWS; row += 1) {
+      for (let col = 0; col < BIG_COLS; col += 1) {
+        cells.push({ row, col, input: String(row * BIG_COLS + col) })
+      }
+    }
+    expect(cells).toHaveLength(BIG_ROWS * BIG_COLS)
+    await backend.importCells!({ kind: 'import-cells', sheetId: SHEET, cells })
+    return backend
+  }
+
+  test('createTable undo/redo round-trips', async () => {
+    const backend = await bigBackend()
+    const created = await backend.createTable!({
+      kind: 'create-table',
+      sheetId: SHEET,
+      range: BIG_RANGE,
+    })
+    expect(created.applied).toBe(true)
+    expect((await backend.listTables!({ kind: 'list-tables' })).tables[0].range).toBe('A1:E500')
+
+    const request = undoRequest()
+    const undone = await backend.undoTransaction!(request)
+    expect(undone.applied).not.toBe(false)
+    expect((await backend.listTables!({ kind: 'list-tables' })).tables).toHaveLength(0)
+    // The 2500 data cells are untouched by the round trip.
+    expect((await readCell(backend, 499, 4))?.displayValue).toBe(String(499 * BIG_COLS + 4))
+
+    const redone = await backend.redoTransaction!(redoRequest(request.transactionId))
+    expect(redone.applied).not.toBe(false)
+    expect((await backend.listTables!({ kind: 'list-tables' })).tables[0].range).toBe('A1:E500')
+    backend.dispose()
+  })
+
+  test('totals-row toggle undo/redo round-trips (registry geometry + SUBTOTAL cell)', async () => {
+    const backend = await bigBackend()
+    await backend.createTable!({ kind: 'create-table', sheetId: SHEET, range: BIG_RANGE })
+
+    await backend.setTableTotalsRow!({
+      kind: 'set-table-totals-row',
+      name: 'Table1',
+      enabled: true,
+    })
+    let listed = await backend.listTables!({ kind: 'list-tables' })
+    expect(listed.tables[0].hasTotals).toBe(true)
+    expect(listed.tables[0].range).toBe('A1:E501')
+    // Excel default SUM lands in the LAST column of the new totals row.
+    expect((await readCell(backend, 500, 4))?.formula).toBe('=SUBTOTAL(109,Table1[Col5])')
+
+    const request = undoRequest()
+    const undone = await backend.undoTransaction!(request)
+    expect(undone.applied).not.toBe(false)
+    listed = await backend.listTables!({ kind: 'list-tables' })
+    expect(listed.tables[0].hasTotals).toBe(false)
+    expect(listed.tables[0].range).toBe('A1:E500')
+    expect((await readCell(backend, 500, 4))?.displayValue ?? '').toBe('')
+    // The last DATA row sits inside the mirrored band — it must survive the
+    // clear-then-restore untouched.
+    expect((await readCell(backend, 499, 4))?.displayValue).toBe(String(499 * BIG_COLS + 4))
+
+    const redone = await backend.redoTransaction!(redoRequest(request.transactionId))
+    expect(redone.applied).not.toBe(false)
+    listed = await backend.listTables!({ kind: 'list-tables' })
+    expect(listed.tables[0].hasTotals).toBe(true)
+    expect(listed.tables[0].range).toBe('A1:E501')
+    expect((await readCell(backend, 500, 4))?.formula).toBe('=SUBTOTAL(109,Table1[Col5])')
+    backend.dispose()
+  })
+
+  test('totals FUNCTION undo/redo round-trips', async () => {
+    const backend = await bigBackend()
+    await backend.createTable!({ kind: 'create-table', sheetId: SHEET, range: BIG_RANGE })
+    await backend.setTableTotalsRow!({
+      kind: 'set-table-totals-row',
+      name: 'Table1',
+      enabled: true,
+    })
+
+    await backend.setTableTotalFunction!({
+      kind: 'set-table-total-function',
+      name: 'Table1',
+      column: 'Col2',
+      func: 'sum' as TableTotalsFunction,
+    })
+    expect((await readCell(backend, 500, 1))?.formula).toBe('=SUBTOTAL(109,Table1[Col2])')
+
+    const request = undoRequest()
+    const undone = await backend.undoTransaction!(request)
+    expect(undone.applied).not.toBe(false)
+    expect((await readCell(backend, 500, 1))?.displayValue ?? '').toBe('')
+    // Sibling totals cell written by the toggle is NOT collateral damage.
+    expect((await readCell(backend, 500, 4))?.formula).toBe('=SUBTOTAL(109,Table1[Col5])')
+
+    const redone = await backend.redoTransaction!(redoRequest(request.transactionId))
+    expect(redone.applied).not.toBe(false)
+    expect((await readCell(backend, 500, 1))?.formula).toBe('=SUBTOTAL(109,Table1[Col2])')
+    backend.dispose()
+  })
+
+  test('renameTable undo/redo round-trips the cross-sheet formula TEXT', async () => {
+    const backend = await bigBackend()
+    await backend.createTable!({ kind: 'create-table', sheetId: SHEET, range: BIG_RANGE })
+    await set(backend, 600, 0, '=SUM(Table1[Col2])')
+    const total = (await readCell(backend, 600, 0))?.displayValue
+    expect(total).not.toBe('#NAME?')
+
+    await backend.renameTable!({ kind: 'rename-table', name: 'Table1', newName: 'Sales' })
+    expect((await readCell(backend, 600, 0))?.formula).toBe('=SUM(Sales[Col2])')
+
+    const request = undoRequest()
+    const undone = await backend.undoTransaction!(request)
+    expect(undone.applied).not.toBe(false)
+    expect((await backend.listTables!({ kind: 'list-tables' })).tables[0].name).toBe('Table1')
+    expect((await readCell(backend, 600, 0))?.formula).toBe('=SUM(Table1[Col2])')
+    expect((await readCell(backend, 600, 0))?.displayValue).toBe(total)
+
+    const redone = await backend.redoTransaction!(redoRequest(request.transactionId))
+    expect(redone.applied).not.toBe(false)
+    expect((await backend.listTables!({ kind: 'list-tables' })).tables[0].name).toBe('Sales')
+    expect((await readCell(backend, 600, 0))?.formula).toBe('=SUM(Sales[Col2])')
+    backend.dispose()
+  })
+
+  test('renameTableColumn undo/redo round-trips the referencing formula TEXT', async () => {
+    const backend = await bigBackend()
+    await backend.createTable!({ kind: 'create-table', sheetId: SHEET, range: BIG_RANGE })
+    await set(backend, 600, 0, '=SUM(Table1[Col2])')
+
+    await backend.renameTableColumn!({
+      kind: 'rename-table-column',
+      name: 'Table1',
+      oldColumn: 'Col2',
+      newColumn: 'Amount',
+    })
+    expect((await readCell(backend, 600, 0))?.formula).toBe('=SUM(Table1[Amount])')
+
+    const request = undoRequest()
+    const undone = await backend.undoTransaction!(request)
+    expect(undone.applied).not.toBe(false)
+    expect([...(await backend.listTables!({ kind: 'list-tables' })).tables[0].columns]).toContain(
+      'Col2',
+    )
+    expect((await readCell(backend, 600, 0))?.formula).toBe('=SUM(Table1[Col2])')
+
+    const redone = await backend.redoTransaction!(redoRequest(request.transactionId))
+    expect(redone.applied).not.toBe(false)
+    expect((await readCell(backend, 600, 0))?.formula).toBe('=SUM(Table1[Amount])')
+    backend.dispose()
+  })
+
+  test('deleteTable undo/redo round-trips (convert-to-range keeps the 2500 values)', async () => {
+    const backend = await bigBackend()
+    await backend.createTable!({ kind: 'create-table', sheetId: SHEET, range: BIG_RANGE })
+    await set(backend, 600, 0, '=SUM(Table1[Col2])')
+    const total = (await readCell(backend, 600, 0))?.displayValue
+
+    await backend.deleteTable!({ kind: 'delete-table', name: 'Table1' })
+    expect((await backend.listTables!({ kind: 'list-tables' })).tables).toHaveLength(0)
+    expect((await readCell(backend, 600, 0))?.displayValue).toBe('#NAME?')
+
+    const request = undoRequest()
+    const undone = await backend.undoTransaction!(request)
+    expect(undone.applied).not.toBe(false)
+    expect((await backend.listTables!({ kind: 'list-tables' })).tables[0].range).toBe('A1:E500')
+    expect((await readCell(backend, 600, 0))?.displayValue).toBe(total)
+    expect((await readCell(backend, 250, 3))?.displayValue).toBe(String(250 * BIG_COLS + 3))
+
+    const redone = await backend.redoTransaction!(redoRequest(request.transactionId))
+    expect(redone.applied).not.toBe(false)
+    expect((await backend.listTables!({ kind: 'list-tables' })).tables).toHaveLength(0)
+    expect((await readCell(backend, 600, 0))?.displayValue).toBe('#NAME?')
     backend.dispose()
   })
 })
