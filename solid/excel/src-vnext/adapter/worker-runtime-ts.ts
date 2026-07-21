@@ -1520,11 +1520,15 @@ export function createWorkerRuntimeTs(events?: WorkerRuntimeTsEvents): ExcelCore
       case 'getTable':
       case 'setTableTotalsRow':
       case 'setTableTotalFunction':
+      case 'snapshotTables':
+      case 'restoreTables':
         // Fail-closed: the TS core models no Excel Table registry (nor a
         // totals row). The `structuredTables: false` witness withholds the
         // host ports, so a compliant adapter never sends these; if one does,
         // refuse honestly rather than fake an ACK (an empty `listTables`
-        // would read as "workbook has no tables" — a lie).
+        // would read as "workbook has no tables" — a lie, and an empty
+        // `snapshotTables` envelope replayed through `restoreTables` would
+        // CLEAR a registry rather than restore one).
         return unsupported(`${String(msg.cmd)} (structured tables)`)
       case 'setFormatRange':
         // Fail-closed: was "succeed with 0 cells affected".

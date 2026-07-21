@@ -23,6 +23,13 @@ export type HistoryEntryKind =
   | 'viewport.freeze'
   | 'viewport.hidden'
   | 'outline'
+  /**
+   * Any Excel Table definition change (create / rename / rename column /
+   * delete / totals-row toggle). One kind for the whole family: the adapter
+   * records one transaction per definition change and these entries align
+   * with it positionally, so the distinction is cosmetic here.
+   */
+  | 'table.define'
 
 export interface HistoryAffectedRange {
   readonly rowStart: number

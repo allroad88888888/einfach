@@ -290,10 +290,33 @@ export type TableRejectCode =
   | 'totals-row-blocked'
   | 'no-totals-row'
   | 'invalid-totals-function'
+  // Registry snapshot/restore gates (#25 undo). `restoreTables` validates the
+  // WHOLE payload before it swaps anything, so these two never leave the
+  // registry half-applied. They are not `TableError` variants — the WASM
+  // binding raises them for a bad envelope — but they ride the same
+  // bare-string path, so they recognize here alongside the engine reasons.
+  | 'unsupported-snapshot-version'
+  | 'malformed-snapshot'
 
 export interface TableRejectWire {
   code: TableRejectCode
   message?: string
+}
+
+/**
+ * Versioned envelope produced by `snapshotTables` and consumed by
+ * `restoreTables` (rust/wasm `TableRegistrySnapshotJSON`). `tables` carries
+ * the same per-Table shape `listTables` emits; `sheetIndex` is IGNORED on the
+ * way back in (the engine anchors Tables by sheet NAME, so a snapshot
+ * survives `moveSheet` between capture and restore).
+ *
+ * This is the before-image for Table DEFINITION changes — the registry
+ * itself (name, sheet anchor, range, header/totals flags, column names),
+ * which no sparse-cell or format snapshot carries.
+ */
+export interface TableRegistrySnapshotWire {
+  version: number
+  tables: TableJSONWire[]
 }
 
 export interface WorkbookPersistenceSheetWire {
@@ -474,6 +497,22 @@ export interface WorkerWorkbookClient {
    */
   setTableTotalsRow?(name: string, enabled: boolean): Promise<void>
   setTableTotalFunction?(name: string, column: string, func: string): Promise<void>
+  /**
+   * Table registry snapshot / restore (#25, design-excel-table.md §11/§12) —
+   * the undo primitive behind host-orchestrated Table-definition
+   * transactions. `snapshotTables` is a pure read (no epoch bump, no
+   * recompute). `restoreTables` REPLACES the whole registry and resolves the
+   * number of Tables now registered: Tables created after the snapshot are
+   * dropped and Tables deleted since are revived, so restoring an empty
+   * `tables` array CLEARS the registry rather than doing nothing. It is
+   * all-or-nothing (a rejection leaves the live registry untouched) and bumps
+   * the tables epoch only when the registry actually changes.
+   *
+   * Optional for the same reason as the CRUD ports: hand-rolled client
+   * doubles keep compiling and the TS runtime answers `UNSUPPORTED`.
+   */
+  snapshotTables?(): Promise<TableRegistrySnapshotWire>
+  restoreTables?(snapshot: TableRegistrySnapshotWire): Promise<number>
   beginImport(
     sessionIdOrOptions?: number | BeginImportOptionsWire,
     options?: BeginImportOptionsWire,
@@ -803,6 +842,12 @@ export function createWorkerWorkbook(opts: WorkerWorkbookOptions): WorkerWorkboo
     },
     setTableTotalFunction(name, column, func) {
       return request<void>('setTableTotalFunction', { name, column, func })
+    },
+    snapshotTables() {
+      return request<TableRegistrySnapshotWire>('snapshotTables')
+    },
+    restoreTables(snapshot) {
+      return request<number>('restoreTables', { snapshot })
     },
     beginImport(sessionIdOrOptions, options) {
       const sessionId =

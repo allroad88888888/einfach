@@ -34,6 +34,7 @@ import {
   refreshTableCatalogAtom,
   renameTableColumnSupportedAtom,
   renameTableSupportedAtom,
+  historyStackAtom,
   runCreateTableAtom,
   runDeleteTableAtom,
   runRenameTableAtom,
@@ -1012,5 +1013,57 @@ describe('tables — runRenameTableColumnAtom', () => {
 
     expect(harness.renameColumnRequests).toHaveLength(1)
     expect(store.getter(tableDiagnosticAtom)).toBeNull()
+  })
+})
+
+// The adapter records ONE transaction per applied table definition change and
+// the two stacks align positionally, so a mutation that records on one side
+// only offsets every later undo by one. These pin the 1:1 invariant.
+describe('tables — history pairing', () => {
+  test('an applied create pushes exactly one history entry', async () => {
+    const store = makeStore()
+    const { source } = makeSource()
+    expect(store.getter(historyStackAtom).entries).toHaveLength(0)
+
+    await store.setter(runCreateTableAtom, { source, sheetId: 'sheet-1', range: A1_C4 })
+
+    const { entries } = store.getter(historyStackAtom)
+    expect(entries).toHaveLength(1)
+    expect(entries[0]?.kind).toBe('table.define')
+    expect(entries[0]?.sheetId).toBe('sheet-1')
+    expect(store.getter(tableDiagnosticAtom)).toBeNull()
+  })
+
+  test('a structurally rejected create pushes no history entry', async () => {
+    const store = makeStore()
+    const { source } = makeSource({
+      result: () => ({
+        kind: 'table-mutation-not-applied',
+        applied: false,
+        code: 'name-conflict',
+      }),
+    })
+
+    await store.setter(runCreateTableAtom, { source, sheetId: 'sheet-1', range: A1_C4 })
+
+    expect(store.getter(historyStackAtom).entries).toHaveLength(0)
+    expect(store.getter(tableDiagnosticAtom)?.code).toBe('name-conflict')
+  })
+
+  test('an applied result with no revision cannot pair, so it reports outcome-unknown', async () => {
+    const store = makeStore()
+    const { source } = makeSource({
+      result: (request) => ({
+        kind: 'create-table',
+        applied: true,
+        name: request.name ?? 'Table1',
+        requestId: request.requestId,
+      }),
+    })
+
+    await store.setter(runCreateTableAtom, { source, sheetId: 'sheet-1', range: A1_C4 })
+
+    expect(store.getter(historyStackAtom).entries).toHaveLength(0)
+    expect(store.getter(tableDiagnosticAtom)?.code).toBe('outcome-unknown')
   })
 })

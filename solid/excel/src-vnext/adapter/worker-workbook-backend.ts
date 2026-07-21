@@ -132,6 +132,7 @@ import {
   type SortRangeReportWire,
   type SparseCellWire,
   type TableJSONWire,
+  type TableRegistrySnapshotWire,
   type SparseRangeWire,
   type WorkerLike,
   type WorkerRuntimeCapabilitiesWire,
@@ -263,6 +264,24 @@ export const WORKER_UNDO_STACK_CAP = 100
  * is never truncated.
  */
 export const WORKER_STRUCTURAL_SNAPSHOT_MAX = 2000
+/**
+ * Table-definition transactions (#25) snapshot the WHOLE WORKBOOK's
+ * non-empty cells, one scope wider than the structural full-SHEET image:
+ * `renameTable` / `renameTableColumn` rewrite structured-reference formula
+ * TEXT on EVERY sheet (rust/excel-core `rewrite_table_refs_across_sheets`),
+ * so a table-scoped — or even sheet-scoped — range cannot restore a formula
+ * that lives three sheets away, and a partial image would resurrect the old
+ * name in half the workbook. The registry snapshot alone is not enough
+ * either: the totals toggle WRITES and CLEARS `SUBTOTAL` cells, so replaying
+ * only the registry leaves the half-state this cap exists to avoid (a table
+ * whose geometry rolled back while its totals cells did not).
+ *
+ * Same degradation contract as the structural cap: above the threshold the
+ * mutation still executes but its record becomes not-undoable — the snapshot
+ * is never truncated. Value kept equal to `WORKER_STRUCTURAL_SNAPSHOT_MAX`
+ * so worst-case resident memory stays on the same 100 × 2 × 2000 budget.
+ */
+export const WORKER_TABLE_SNAPSHOT_MAX = 2000
 /** u32 max — full-sheet sparse bound accepted by both worker runtimes. */
 const FULL_SHEET_INDEX_BOUND = 0xffffffff
 
@@ -271,6 +290,18 @@ interface WorkerUndoImage {
   cells: SparseCellWire[] | null
   /** Format snapshot to restore; null when the mutation cannot touch formats. */
   format: FormatRangeSnapshot | null
+}
+
+/**
+ * Parity #25 Table-definition transaction payload: before/after images of
+ * the whole Table REGISTRY, replayed through `restoreTables` (REPLACE
+ * semantics, so an empty `tables` array clears the registry). Rides on the
+ * SAME record as the transaction's workbook-wide cell image — the pairing is
+ * the point, see `recordTableMutation`.
+ */
+interface WorkerTableRegistryImage {
+  before: TableRegistrySnapshotWire
+  after: TableRegistrySnapshotWire
 }
 
 /**
@@ -286,7 +317,13 @@ interface WorkerMergeOverlayImage {
 }
 
 interface WorkerTransactionRecord {
-  kind: HistoryEntryKind
+  /**
+   * `'table.define'` is adapter-local (#25): UI-core's `HistoryEntryKind`
+   * has no Table member yet, and the field is inert on the replay path — it
+   * exists so a diagnostic names the transaction truthfully instead of
+   * borrowing an unrelated kind.
+   */
+  kind: HistoryEntryKind | 'table.define'
   sheetIdx: number
   /**
    * The UI transaction id is minted AFTER the mutation acknowledges
@@ -300,6 +337,13 @@ interface WorkerTransactionRecord {
   affectedRange: CellRange | null
   /** Region cleared before restoring `cells` (clear-then-restore, design point A). */
   clearRange: SparseRangeWire | null
+  /**
+   * Multi-sheet clear list for WORKBOOK-WIDE images (#25 Table
+   * definitions). `clearRange` addresses one sheet, which cannot express
+   * "clear every sheet before restoring the workbook image"; when this is
+   * present it REPLACES `clearRange` on the replay path.
+   */
+  clearRanges?: SparseRangeWire[]
   /** null before/after → the record is not undoable; see `diagnostic`. */
   before: WorkerUndoImage | null
   after: WorkerUndoImage | null
@@ -310,6 +354,13 @@ interface WorkerTransactionRecord {
    * engine images so undo restores the pre-shift merge set too.
    */
   mergeOverlay?: WorkerMergeOverlayImage
+  /**
+   * Present when the mutation changed the Excel Table REGISTRY (#25).
+   * Always carried NEXT TO the sparse cell images, never alone: replaying
+   * the registry without the cells (or vice versa) is exactly the
+   * "geometry rolled back but the totals cells are still there" half-state.
+   */
+  tableRegistry?: WorkerTableRegistryImage
   diagnostic?: string
 }
 function normalizeSheetInputs(
@@ -1288,7 +1339,7 @@ export function createWorkerWorkbookSpreadsheetBackend(
   }
 
   function notUndoableRecord(
-    kind: HistoryEntryKind,
+    kind: WorkerTransactionRecord['kind'],
     sheetIdx: number,
     affectedRange: CellRange | null,
     diagnostic: string,
@@ -1508,6 +1559,140 @@ export function createWorkerWorkbookSpreadsheetBackend(
     return result
   }
 
+  /**
+   * One WORKBOOK-WIDE clear range per sheet — the pre-clear half of
+   * clear-then-restore for a #25 Table transaction, which cannot be
+   * expressed as a single `SparseRangeWire` (those address one sheet).
+   */
+  function workbookClearRanges(): SparseRangeWire[] {
+    return lookup.sheets.map((sheet) => ({
+      sheet: sheet.idx,
+      startRow: 0,
+      startCol: 0,
+      endRow: FULL_SHEET_INDEX_BOUND,
+      endCol: FULL_SHEET_INDEX_BOUND,
+    }))
+  }
+
+  /**
+   * Capture BOTH halves of a Table-definition transaction in one go: the
+   * registry envelope AND the workbook's non-empty cells. `null` means the
+   * cell image blew the cap — the caller degrades the record rather than
+   * recording a half-transaction.
+   */
+  async function captureTableTransactionImage(): Promise<{
+    tables: TableRegistrySnapshotWire
+    cells: SparseCellWire[]
+  } | null> {
+    const tables = await requireTableClient('snapshotTables')()
+    const cells = await client.snapshotSparse()
+    return cells.length > WORKER_TABLE_SNAPSHOT_MAX ? null : { tables, cells }
+  }
+
+  /**
+   * Record one undoable Table-DEFINITION mutation (#25).
+   *
+   * The E1 hazard this exists to close: `snapshotTables` alone rolls the
+   * registry back while the cells it implies stay put — a totals toggle
+   * would leave `SUBTOTAL` formulas sitting under a table that no longer
+   * claims a totals row, and a rename would leave rewritten formula TEXT
+   * pointing at a name that no longer exists. So the registry envelope and
+   * the workbook cell image are captured, stored, and replayed as ONE
+   * transaction; there is no code path that carries only one of them.
+   *
+   * Formats are deliberately NOT captured: no table binding touches the
+   * format layer (the engine writes values/formulas only, and `clearRange`
+   * is values-only), same reasoning as `recordStructuralMutation`.
+   *
+   * A structured engine reject records NOTHING — table mutations are
+   * all-or-nothing, so a not-applied result changed neither registry nor
+   * cells, and UI-core pushes no history entry for it either. An applied
+   * mutation ALWAYS records, including an idempotent no-op toggle: the
+   * host stack must stay aligned entry-for-entry, and replaying an
+   * identity image is harmless.
+   *
+   * REQUIRED UI-CORE COUNTERPART — `vanilla/spreadsheet-ui-core/src/tables/
+   * commands.ts` must `set(pushHistoryAtom, …)` on every APPLIED table
+   * mutation. Adapter records align POSITIONALLY with UI-core history
+   * entries (`runHistoryTransaction` pops the top record and binds whatever
+   * transactionId arrives), so a record pushed here without a matching
+   * UI-core entry offsets the two stacks by one: every later Ctrl+Z reverts
+   * a mutation one step older than the UI believes, and the oldest record
+   * strands when UI-core's stack empties first. Measured on the vNext Worker
+   * demo: seed six cells, create a table, then Ctrl+Z three times — the
+   * table reverts on the first press but `F3` only clears on the third.
+   * The registry half of this feature is not safe to ship until that push
+   * lands.
+   */
+  async function recordTableMutation<T extends { applied: boolean }>(spec: {
+    /** Known up front only for `createTable`; the rest key off a table NAME. */
+    sheetIdx?: number
+    /**
+     * Anchor-sheet resolution for the name-keyed ports: read off the
+     * before-image registry, so it costs no extra RPC. The record itself is
+     * workbook-wide (`affectedRange: null`, every sheet in `clearRanges`) —
+     * this index is record metadata, never a replay input.
+     */
+    tableName?: string
+    execute: () => Promise<T>
+  }): Promise<T> {
+    let before: { tables: TableRegistrySnapshotWire; cells: SparseCellWire[] } | null = null
+    let diagnostic = ''
+    try {
+      before = await captureTableTransactionImage()
+      if (before === null) {
+        diagnostic =
+          `table before-image exceeds the workbook cap of ` +
+          `${WORKER_TABLE_SNAPSHOT_MAX} non-empty cells; the operation is not undoable`
+      }
+    } catch (error) {
+      diagnostic = `table undo before-image snapshot failed: ${
+        error instanceof Error ? error.message : String(error)
+      }`
+    }
+    const anchored =
+      spec.sheetIdx ??
+      before?.tables.tables.find(
+        (entry) => entry.name.toUpperCase() === (spec.tableName ?? '').toUpperCase(),
+      )?.sheetIndex ??
+      0
+    const result = await spec.execute()
+    if (!result.applied) return result
+    if (before === null) {
+      pushTransactionRecord(notUndoableRecord('table.define', anchored, null, diagnostic))
+      return result
+    }
+    let after: { tables: TableRegistrySnapshotWire; cells: SparseCellWire[] } | null = null
+    try {
+      after = await captureTableTransactionImage()
+      if (after === null) {
+        diagnostic =
+          `table after-image exceeds the workbook cap of ` +
+          `${WORKER_TABLE_SNAPSHOT_MAX} non-empty cells; the operation degraded to not-undoable`
+      }
+    } catch (error) {
+      diagnostic = `table redo after-image snapshot failed: ${
+        error instanceof Error ? error.message : String(error)
+      }`
+    }
+    pushTransactionRecord(
+      after !== null
+        ? {
+            kind: 'table.define',
+            sheetIdx: anchored,
+            boundTransactionId: null,
+            affectedRange: null,
+            clearRange: null,
+            clearRanges: workbookClearRanges(),
+            before: { cells: before.cells, format: null },
+            after: { cells: after.cells, format: null },
+            tableRegistry: { before: before.tables, after: after.tables },
+          }
+        : notUndoableRecord('table.define', anchored, null, diagnostic),
+    )
+    return result
+  }
+
   function historyNotApplied(
     request: UndoTransactionRequest | RedoTransactionRequest,
     reason: string,
@@ -1528,8 +1713,12 @@ export function createWorkerWorkbookSpreadsheetBackend(
     // Design point A: restoreSparse is an ADDITIVE merge, so the
     // affected region must be cleared first or a delete/overwrite undo
     // leaves residue behind.
-    if (image.cells !== null && record.clearRange !== null) {
-      await client.clearRange(record.clearRange)
+    const clearRanges =
+      record.clearRanges ?? (record.clearRange !== null ? [record.clearRange] : [])
+    if (image.cells !== null && clearRanges.length > 0) {
+      for (const range of clearRanges) {
+        await client.clearRange(range)
+      }
       if (image.cells.length > 0) {
         await client.restoreSparse(image.cells)
       }
@@ -1570,6 +1759,29 @@ export function createWorkerWorkbookSpreadsheetBackend(
         request,
         record.diagnostic ?? 'transaction was recorded as not undoable',
       )
+    }
+    if (record.tableRegistry) {
+      // #25 REPLAY ORDER — registry FIRST, then cells.
+      //
+      // MEASURED, not assumed: both orders were driven against the real
+      // engine for create-undo, delete-undo, rename-undo and totals-off-undo
+      // (including the sharp case where the restored `SUBTOTAL` lands in a
+      // totals row whose `Table[Col]` #Data band must EXCLUDE it), and every
+      // pair agreed. Structured-reference resolution is epoch-LAZY: a
+      // formula installed by `restoreSparse` while its table is absent or
+      // still carries the other name re-derives on the epoch bump
+      // `restoreTables` fires, so neither order can strand a `#NAME?` or a
+      // self-referencing band today.
+      //
+      // Registry-first is chosen because it is the order that stays correct
+      // if that ever changes — it is the only one that guarantees the
+      // registry a formula is interpreted against is already the restored
+      // one at install time — and because it spends one fewer full recompute
+      // over a stale registry. The test
+      // "undo replays the registry before the cells" pins the sequence so a
+      // refactor cannot silently swap it back.
+      const snapshot = action === 'undo' ? record.tableRegistry.before : record.tableRegistry.after
+      await requireTableClient('restoreTables')(snapshot)
     }
     if (record.before !== null && record.after !== null) {
       const image = action === 'undo' ? record.before : record.after
@@ -2854,14 +3066,12 @@ export function createWorkerWorkbookSpreadsheetBackend(
   // ports are the only path UI core reads a table's geometry, and the
   // adapter keeps no second copy. Capability-gated by `structuredTables`.
   //
-  // TODO(#32 undo, design §11/§12): table-definition mutations are NOT
-  // wrapped in a host-orchestrated undo transaction. The snapshot
-  // primitive and persistence v1 do not carry the table registry, so a
-  // Ctrl+Z cannot replay a create/rename/delete of the table itself.
-  // The cell-level fallout of a totals-row toggle (formula writes) is
-  // still covered by the existing recordCellMutation cell snapshots; the
-  // registry entry is not. Wire this once the registry replay protocol
-  // lands (§4-3). Create / rename / delete bump the revision so the next
+  // Undo (#25, design §11/§12): all six DEFINITION mutations are wrapped in
+  // a host-orchestrated transaction by `recordTableMutation`, which pairs
+  // the `snapshotTables` registry envelope with a workbook-wide sparse cell
+  // image so registry geometry and the cells that encode it (totals-row
+  // `SUBTOTAL` formulas, rename-rewritten formula text) always roll back
+  // together. Create / rename / delete bump the revision so the next
   // projection read reflects any referencing-formula recalc (engine epoch
   // handles the recompute; worker cellsDirty pushes drive reprojection).
 
@@ -2898,6 +3108,8 @@ export function createWorkerWorkbookSpreadsheetBackend(
     | 'getTable'
     | 'setTableTotalsRow'
     | 'setTableTotalFunction'
+    | 'snapshotTables'
+    | 'restoreTables'
 
   function requireTableClient<K extends TableClientMethod>(
     method: K,
@@ -2944,92 +3156,112 @@ export function createWorkerWorkbookSpreadsheetBackend(
   async function createTableThroughWorker(request: CreateTableRequest): Promise<CreateTableResult> {
     const sheet = await resolveSheet(request.sheetId)
     const range = normalizeRange(request.range)
-    try {
-      const name = await requireTableClient('createTable')(
-        sheet.idx,
-        toSortRangeBounds(range),
-        request.name,
-      )
-      const nextRevision = bumpRevision()
-      return {
-        kind: 'create-table',
-        applied: true,
-        name,
-        requestId: request.requestId,
-        revision: request.revision ?? nextRevision,
-      }
-    } catch (error) {
-      const rejection = tableRejectionFromError(request, error)
-      if (rejection !== null) return rejection
-      throw error
-    }
+    return recordTableMutation<CreateTableResult>({
+      sheetIdx: sheet.idx,
+      execute: async () => {
+        try {
+          const name = await requireTableClient('createTable')(
+            sheet.idx,
+            toSortRangeBounds(range),
+            request.name,
+          )
+          const nextRevision = bumpRevision()
+          return {
+            kind: 'create-table',
+            applied: true,
+            name,
+            requestId: request.requestId,
+            revision: request.revision ?? nextRevision,
+          }
+        } catch (error) {
+          const rejection = tableRejectionFromError(request, error)
+          if (rejection !== null) return rejection
+          throw error
+        }
+      },
+    })
   }
 
   async function renameTableThroughWorker(
     request: RenameTableRequest,
   ): Promise<TableMutationResult> {
     await readyPromise
-    try {
-      await requireTableClient('renameTable')(request.name, request.newName)
-      const nextRevision = bumpRevision()
-      return {
-        kind: 'table-mutation',
-        applied: true,
-        name: request.newName,
-        requestId: request.requestId,
-        revision: request.revision ?? nextRevision,
-      }
-    } catch (error) {
-      const rejection = tableRejectionFromError(request, error)
-      if (rejection !== null) return rejection
-      throw error
-    }
+    return recordTableMutation<TableMutationResult>({
+      tableName: request.name,
+      execute: async () => {
+        try {
+          await requireTableClient('renameTable')(request.name, request.newName)
+          const nextRevision = bumpRevision()
+          return {
+            kind: 'table-mutation',
+            applied: true,
+            name: request.newName,
+            requestId: request.requestId,
+            revision: request.revision ?? nextRevision,
+          }
+        } catch (error) {
+          const rejection = tableRejectionFromError(request, error)
+          if (rejection !== null) return rejection
+          throw error
+        }
+      },
+    })
   }
 
   async function renameTableColumnThroughWorker(
     request: RenameTableColumnRequest,
   ): Promise<TableMutationResult> {
     await readyPromise
-    try {
-      await requireTableClient('renameTableColumn')(
-        request.name,
-        request.oldColumn,
-        request.newColumn,
-      )
-      const nextRevision = bumpRevision()
-      return {
-        kind: 'table-mutation',
-        applied: true,
-        name: request.name,
-        requestId: request.requestId,
-        revision: request.revision ?? nextRevision,
-      }
-    } catch (error) {
-      const rejection = tableRejectionFromError(request, error)
-      if (rejection !== null) return rejection
-      throw error
-    }
+    return recordTableMutation<TableMutationResult>({
+      tableName: request.name,
+      execute: async () => {
+        try {
+          await requireTableClient('renameTableColumn')(
+            request.name,
+            request.oldColumn,
+            request.newColumn,
+          )
+          const nextRevision = bumpRevision()
+          return {
+            kind: 'table-mutation',
+            applied: true,
+            name: request.name,
+            requestId: request.requestId,
+            revision: request.revision ?? nextRevision,
+          }
+        } catch (error) {
+          const rejection = tableRejectionFromError(request, error)
+          if (rejection !== null) return rejection
+          throw error
+        }
+      },
+    })
   }
 
   async function deleteTableThroughWorker(
     request: DeleteTableRequest,
   ): Promise<TableMutationResult> {
     await readyPromise
-    try {
-      await requireTableClient('deleteTable')(request.name)
-      const nextRevision = bumpRevision()
-      return {
-        kind: 'table-mutation',
-        applied: true,
-        name: request.name,
-        requestId: request.requestId,
-        revision: request.revision ?? nextRevision,
-      }
-    } catch (error) {
-      const rejection = tableRejectionFromError(request, error)
-      if (rejection !== null) return rejection
-      throw error
-    }
+    return recordTableMutation<TableMutationResult>({
+      tableName: request.name,
+      execute: async () => {
+        try {
+          await requireTableClient('deleteTable')(request.name)
+          const nextRevision = bumpRevision()
+          return {
+            kind: 'table-mutation',
+            applied: true,
+            name: request.name,
+            requestId: request.requestId,
+            revision: request.revision ?? nextRevision,
+          }
+        } catch (error) {
+          const rejection = tableRejectionFromError(request, error)
+          if (rejection !== null) return rejection
+          throw error
+        }
+      },
+    })
   }
 
   async function listTablesThroughWorker(request: ListTablesRequest): Promise<ListTablesResult> {
@@ -3056,42 +3288,56 @@ export function createWorkerWorkbookSpreadsheetBackend(
     request: SetTableTotalsRowRequest,
   ): Promise<TableMutationResult> {
     await readyPromise
-    try {
-      await requireTableClient('setTableTotalsRow')(request.name, request.enabled)
-      const nextRevision = bumpRevision()
-      return {
-        kind: 'table-mutation',
-        applied: true,
-        name: request.name,
-        requestId: request.requestId,
-        revision: request.revision ?? nextRevision,
-      }
-    } catch (error) {
-      const rejection = tableRejectionFromError(request, error)
-      if (rejection !== null) return rejection
-      throw error
-    }
+    return recordTableMutation<TableMutationResult>({
+      tableName: request.name,
+      execute: async () => {
+        try {
+          await requireTableClient('setTableTotalsRow')(request.name, request.enabled)
+          const nextRevision = bumpRevision()
+          return {
+            kind: 'table-mutation',
+            applied: true,
+            name: request.name,
+            requestId: request.requestId,
+            revision: request.revision ?? nextRevision,
+          }
+        } catch (error) {
+          const rejection = tableRejectionFromError(request, error)
+          if (rejection !== null) return rejection
+          throw error
+        }
+      },
+    })
   }
 
   async function setTableTotalFunctionThroughWorker(
     request: SetTableTotalFunctionRequest,
   ): Promise<TableMutationResult> {
     await readyPromise
-    try {
-      await requireTableClient('setTableTotalFunction')(request.name, request.column, request.func)
-      const nextRevision = bumpRevision()
-      return {
-        kind: 'table-mutation',
-        applied: true,
-        name: request.name,
-        requestId: request.requestId,
-        revision: request.revision ?? nextRevision,
-      }
-    } catch (error) {
-      const rejection = tableRejectionFromError(request, error)
-      if (rejection !== null) return rejection
-      throw error
-    }
+    return recordTableMutation<TableMutationResult>({
+      tableName: request.name,
+      execute: async () => {
+        try {
+          await requireTableClient('setTableTotalFunction')(
+            request.name,
+            request.column,
+            request.func,
+          )
+          const nextRevision = bumpRevision()
+          return {
+            kind: 'table-mutation',
+            applied: true,
+            name: request.name,
+            requestId: request.requestId,
+            revision: request.revision ?? nextRevision,
+          }
+        } catch (error) {
+          const rejection = tableRejectionFromError(request, error)
+          if (rejection !== null) return rejection
+          throw error
+        }
+      },
+    })
   }
 
   return {

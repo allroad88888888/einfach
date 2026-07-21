@@ -177,6 +177,17 @@ describe('TS worker runtime — structured UNSUPPORTED instead of success-shaped
     expectUnsupported(await raw({ cmd: 'getTable', name: 'Table1' }))
   })
 
+  test('table registry snapshot/restore refuse with UNSUPPORTED (#25 undo primitive)', async () => {
+    const { raw } = makeRpc()
+    await raw({ cmd: 'initWorkbook', sheets: ['Sheet1'] })
+
+    // Fail-closed for the same reason as the CRUD family, and one sharper:
+    // an empty `snapshotTables` envelope replayed through `restoreTables`
+    // (REPLACE semantics) would CLEAR a registry rather than restore one.
+    expectUnsupported(await raw({ cmd: 'snapshotTables' }))
+    expectUnsupported(await raw({ cmd: 'restoreTables', snapshot: { version: 1, tables: [] } }))
+  })
+
   test('sortRange refuses with UNSUPPORTED and moves no data', async () => {
     const { raw } = makeRpc()
     await raw({ cmd: 'initWorkbook', sheets: ['Sheet1'] })

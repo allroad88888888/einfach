@@ -22,6 +22,7 @@ import type {
   SortRangeReportWire,
   SparseCellWire,
   TableJSONWire,
+  TableRegistrySnapshotWire,
   TableRejectCode,
   SparseRangeWire,
   WorkbookImportStatsWire,
@@ -181,6 +182,17 @@ type WasmWorkbookRuntime = {
    */
   setTableTotalsRow?: (name: string, enabled: boolean) => void
   setTableTotalFunction?: (name: string, column: string, func: string) => void
+  /**
+   * Table registry snapshot / restore (#25). `snapshotTables` is a pure read;
+   * `restoreTables` REPLACES the registry wholesale and returns the resulting
+   * Table count, THROWING a bare string (`"unsupported-snapshot-version"`,
+   * `"malformed-snapshot"`, or a `TableError` id) for a payload it refuses —
+   * all-or-nothing, so a refusal leaves the live registry untouched. Optional
+   * so pre-#25 wasm-pkg builds and test mocks keep compiling; `assertMethod`
+   * guards the call at dispatch time.
+   */
+  snapshotTables?: () => TableRegistrySnapshotWire
+  restoreTables?: (snapshot: TableRegistrySnapshotWire) => number
   snapshot_persistence_v1?: () => WorkbookPersistenceSnapshotWire
   restore_persistence_v1?: (
     snapshot: WorkbookPersistenceSnapshotWire,
@@ -1303,6 +1315,9 @@ const TABLE_REJECTION_CODES = new Set<TableRejectCode>([
   'totals-row-blocked',
   'no-totals-row',
   'invalid-totals-function',
+  // #25 `restoreTables` envelope gates — same bare-string throw shape.
+  'unsupported-snapshot-version',
+  'malformed-snapshot',
 ])
 
 function tableRejectionCode(err: unknown): TableRejectCode | null {
@@ -1614,6 +1629,23 @@ export function installWorkerRuntime() {
               )
               return true
             })
+          }
+          break
+        case 'snapshotTables':
+          {
+            const snapshotTables = assertMethod(wb, 'snapshotTables')
+            dispatchTable(msg.id, () => snapshotTables.call(wb))
+          }
+          break
+        case 'restoreTables':
+          {
+            // REPLACE semantics + all-or-nothing validation live in the
+            // engine; the dispatcher only maps a refusal onto the shared
+            // `TABLE_REJECTED` error so the host sees a structured reason
+            // instead of a generic WORKER_ERROR.
+            const restoreTables = assertMethod(wb, 'restoreTables')
+            const snapshot = msg.snapshot as TableRegistrySnapshotWire
+            dispatchTable(msg.id, () => restoreTables.call(wb, snapshot))
           }
           break
         case 'setFormatRange':

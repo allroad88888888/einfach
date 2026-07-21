@@ -1,5 +1,7 @@
 import { atom } from '@einfach/core'
 import type { Atom } from '@einfach/core'
+import { nextHistoryTransactionId, pushHistoryAtom } from '../history'
+import type { HistoryEntry } from '../history'
 import { parseA1Cell, parseA1Range } from '../name-box'
 import type { CellCoord, CellRange } from '../shared'
 import type {
@@ -541,7 +543,10 @@ export const runCreateTableAtom = atom(
       return
     }
 
-    // Applied — refresh the bounded cache from the canonical engine registry.
+    // Applied — pair the adapter's transaction record with a UI-core entry
+    // before anything else, then refresh the bounded cache from the
+    // canonical engine registry.
+    const recorded = recordTableHistory(set, input.sheetId, result.revision)
     set(lastCreatedTableNameBackingAtom, result.name)
     await set(refreshTableCatalogAtom, input.source)
     if (typeof input.refreshProjection === 'function') {
@@ -552,6 +557,10 @@ export const runCreateTableAtom = atom(
       }
     }
     set(activeCreateTableAtom, false)
+    if (!recorded) {
+      setDiagnostic(set, 'outcome-unknown', TABLE_HISTORY_SKEW_MESSAGE)
+      return
+    }
     set(tableDiagnosticBackingAtom, null)
   },
 )
@@ -658,8 +667,10 @@ export const runToggleTableTotalsAtom = atom(
       return
     }
 
-    // Applied — refresh the bounded cache (hasTotals + grown range) and
-    // publish the visible witness.
+    // Applied — pair the adapter's transaction record with a UI-core entry,
+    // then refresh the bounded cache (hasTotals + grown range) and publish
+    // the visible witness.
+    const recorded = recordTableHistory(set, input.sheetId ?? null, result.revision)
     set(
       lastToggledTableTotalsBackingAtom,
       Object.freeze({ name: result.name, hasTotals: input.enabled }),
@@ -673,6 +684,10 @@ export const runToggleTableTotalsAtom = atom(
       }
     }
     set(activeToggleTotalsAtom, false)
+    if (!recorded) {
+      setDiagnostic(set, 'outcome-unknown', TABLE_HISTORY_SKEW_MESSAGE)
+      return
+    }
     set(tableDiagnosticBackingAtom, null)
   },
 )
@@ -817,6 +832,7 @@ export const runSetTableTotalFunctionAtom = atom(
       return
     }
 
+    const recorded = recordTableHistory(set, input.sheetId ?? null, result.revision)
     await set(refreshTableCatalogAtom, input.source)
     if (typeof input.refreshProjection === 'function') {
       try {
@@ -824,6 +840,10 @@ export const runSetTableTotalFunctionAtom = atom(
       } catch {
         // Projection refresh failure is non-fatal; the totals write landed.
       }
+    }
+    if (!recorded) {
+      setDiagnostic(set, 'outcome-unknown', TABLE_HISTORY_SKEW_MESSAGE)
+      return
     }
     set(tableDiagnosticBackingAtom, null)
   },
@@ -870,6 +890,37 @@ function setDiagnostic(
 ): void {
   set(tableDiagnosticBackingAtom, Object.freeze({ code, message }))
 }
+
+/**
+ * Push the ONE UI-core history entry that pairs with the ONE adapter
+ * transaction record a table definition change produces.
+ *
+ * The two stacks align POSITIONALLY: `runHistoryTransaction` pops the
+ * adapter's top record and binds whatever transaction id the UI entry
+ * carries. Recording on one side only offsets them by one, so every later
+ * undo reverts a mutation one step older than the UI believes and the
+ * oldest record strands when the UI stack empties first. Returns false when
+ * the entry could not be pushed (a history ticket is in flight, or the
+ * backend returned no parseable revision); callers surface that as
+ * `outcome-unknown` rather than leaving a silently skewed stack.
+ */
+function recordTableHistory(
+  set: (atomToSet: typeof pushHistoryAtom, value: HistoryEntry) => boolean,
+  sheetId: string | null,
+  revision: number | string | undefined,
+): boolean {
+  if (revision === undefined) return false
+  return set(pushHistoryAtom, {
+    transactionId: nextHistoryTransactionId(),
+    kind: 'table.define',
+    sheetId,
+    projectionRevision: revision,
+  })
+}
+
+/** Shared `outcome-unknown` copy for a mutation whose history push failed. */
+const TABLE_HISTORY_SKEW_MESSAGE =
+  'The table changed but it could not be recorded in the undo history; undo may be out of step.'
 
 export interface RunRenameTableInput {
   readonly source: TablesControllerPort
@@ -952,6 +1003,7 @@ export const runRenameTableAtom = atom(
       return
     }
 
+    const recorded = recordTableHistory(set, input.sheetId ?? null, result.revision)
     set(lastRenamedTableBackingAtom, Object.freeze({ from: name, to: result.name }))
     await set(refreshTableCatalogAtom, input.source)
     if (typeof input.refreshProjection === 'function') {
@@ -962,6 +1014,10 @@ export const runRenameTableAtom = atom(
       }
     }
     set(activeRenameTableAtom, false)
+    if (!recorded) {
+      setDiagnostic(set, 'outcome-unknown', TABLE_HISTORY_SKEW_MESSAGE)
+      return
+    }
     set(tableDiagnosticBackingAtom, null)
   },
 )
@@ -1045,6 +1101,7 @@ export const runRenameTableColumnAtom = atom(
       return
     }
 
+    const recorded = recordTableHistory(set, input.sheetId ?? null, result.revision)
     await set(refreshTableCatalogAtom, input.source)
     if (typeof input.refreshProjection === 'function') {
       try {
@@ -1052,6 +1109,10 @@ export const runRenameTableColumnAtom = atom(
       } catch {
         // Projection refresh failure is non-fatal; the rename landed.
       }
+    }
+    if (!recorded) {
+      setDiagnostic(set, 'outcome-unknown', TABLE_HISTORY_SKEW_MESSAGE)
+      return
     }
     set(tableDiagnosticBackingAtom, null)
   },
@@ -1116,6 +1177,7 @@ export const runDeleteTableAtom = atom(
       return
     }
 
+    const recorded = recordTableHistory(set, input.sheetId ?? null, result.revision)
     set(lastDeletedTableNameBackingAtom, result.name || name)
     await set(refreshTableCatalogAtom, input.source)
     if (typeof input.refreshProjection === 'function') {
@@ -1126,6 +1188,10 @@ export const runDeleteTableAtom = atom(
       }
     }
     set(activeDeleteTableAtom, false)
+    if (!recorded) {
+      setDiagnostic(set, 'outcome-unknown', TABLE_HISTORY_SKEW_MESSAGE)
+      return
+    }
     set(tableDiagnosticBackingAtom, null)
   },
 )
