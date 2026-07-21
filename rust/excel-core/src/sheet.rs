@@ -1,6 +1,6 @@
 use std::cell::{Cell, RefCell};
 use std::cmp::Ordering;
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::hash::Hash;
 use std::rc::{Rc, Weak};
 
@@ -658,6 +658,24 @@ pub struct Sheet {
     row_heights: BTreeMap<u32, u32>,
     /// Sparse column widths in physical pixels. Absent means the UI default.
     col_widths: BTreeMap<u32, u32>,
+    /// MANUALLY hidden rows, 0-based (E2 of `design-engine-hidden-rows.md`).
+    /// The engine's OWNED copy of the fact — as opposed to
+    /// `WorkbookAtomContext::eval_hidden_rows`, which is now a read-only
+    /// evaluation mirror republished from here.
+    ///
+    /// Sits beside `row_heights` / `col_widths` because it is the same kind
+    /// of fact: sparse, row-indexed, per-sheet dimension metadata that
+    /// belongs to the sheet rather than to the workbook. Three consequences
+    /// come free from the placement — `apply_structural_shift` displaces it
+    /// in the same pass that displaces `row_heights`; `move_sheet` /
+    /// `remove_sheet` carry it because they move the whole `Sheet`; and
+    /// persistence-v1, which already walks sheets, can serialize it without
+    /// a new keying scheme.
+    ///
+    /// Filter-hidden rows are deliberately NOT here: they stay a host-pushed
+    /// evaluation input until E3, because the two SUBTOTAL layers need the
+    /// manual/filter distinction and only the manual half is owned yet.
+    hidden_rows: BTreeSet<u32>,
     /// Cumulative count of completed formula-inner evaluations. Read-only
     /// debug counter used by the Phase 1 scale tests to assert laziness —
     /// `bulk_load` of N formulas
@@ -953,12 +971,36 @@ fn remap_index_keyed_rows(
     changed
 }
 
-/// Displace the ROW numbers inside ONE sheet's entry of an index-keyed
-/// hidden-row store, mirroring `ShiftEdit`'s row-axis address arithmetic:
+/// Displace ONE row number through a row insert/delete, mirroring
+/// `ShiftEdit`'s row-axis address arithmetic:
 ///
 ///   - insert at or before a row  → the row moves down by `count`
 ///   - delete strictly before it  → the row moves up by `count`
-///   - delete covering it         → the row is DROPPED (it no longer exists)
+///   - delete covering it         → `None`; the row no longer exists
+///
+/// THE single definition of hidden-row displacement (82f4283 established the
+/// arithmetic; E2 of `design-engine-hidden-rows.md` factored it out). Both
+/// callers go through here — the index-keyed evaluation mirror below and
+/// `Sheet::hidden_rows`, the engine-owned set — so the two can never drift
+/// into disagreeing about where a hidden row landed. It also matches
+/// `Sheet::shift_dimension_insert` / `shift_dimension_delete`, which move
+/// `row_heights` on the same edit.
+pub(crate) fn shift_hidden_row(row: u32, at: u32, count: u32, insert: bool) -> Option<u32> {
+    if insert {
+        return Some(if row >= at { row.saturating_add(count) } else { row });
+    }
+    if row >= at.saturating_add(count) {
+        Some(row - count)
+    } else if row < at {
+        Some(row)
+    } else {
+        // Inside the deleted band — gone, not moved.
+        None
+    }
+}
+
+/// Displace the ROW numbers inside ONE sheet's entry of an index-keyed
+/// hidden-row store, via [`shift_hidden_row`].
 ///
 /// Sibling of `remap_index_keyed_rows` above on the other axis: that one
 /// rewrites the map's KEYS (sheet indices) after a sheet reorder, this one
@@ -982,14 +1024,9 @@ fn shift_rows_for_sheet(
     };
     let mut next: HashSet<u32> = HashSet::with_capacity(rows.len());
     for &row in rows.iter() {
-        if insert {
-            next.insert(if row >= at { row.saturating_add(count) } else { row });
-        } else if row >= at.saturating_add(count) {
-            next.insert(row - count);
-        } else if row < at {
-            next.insert(row);
+        if let Some(moved) = shift_hidden_row(row, at, count, insert) {
+            next.insert(moved);
         }
-        // else: the row sat inside the deleted band — it is gone, not moved.
     }
     // Set equality: same cardinality plus containment. A no-op edit must not
     // bump the epoch.
@@ -1222,14 +1259,37 @@ impl WorkbookAtomContext {
         self.eval_filter_hidden_rows.borrow().get(&sheet_index).cloned()
     }
 
-    /// Full-replace the MANUAL hidden-row set for `sheet_index` (design doc #32
-    /// §6.1 — idempotent whole-set push) and fire the epoch so every SUBTOTAL
-    /// 101-111 formula that consumed this sheet's set re-derives. An empty set
-    /// drops the entry. The side storage is updated BEFORE the epoch bump so
-    /// the eager re-derivation the `store.set` triggers reads the new set.
-    pub(crate) fn set_eval_hidden_rows(&self, sheet_index: usize, rows: HashSet<u32>) {
+    /// Republish `Workbook`'s engine-owned MANUAL hidden set for
+    /// `sheet_index` into the evaluation mirror (E2 of
+    /// `design-engine-hidden-rows.md` §2.1). Whole-set replace; an empty set
+    /// drops the entry, upholding the "a lookup miss and an empty set are the
+    /// same no-filtering signal" contract. The side storage is updated BEFORE
+    /// the epoch bump so the eager re-derivation the `store.set` triggers
+    /// reads the new set.
+    ///
+    /// **Idempotent** (§3): the epoch fires only when the mirror actually
+    /// changed. This ledger used to live in the host — the bridge compared a
+    /// serialized `lastPushed` string and `continue`d on a match — and the
+    /// setter below it bumped unconditionally. Owning the state moves the
+    /// publisher onto hot paths (every structural edit republishes), so
+    /// without the equality check a plain `insert_rows` would dirty every
+    /// SUBTOTAL 101-111 formula in the workbook for nothing. The filter half
+    /// keeps its own store and its own epoch and is untouched here, so a
+    /// manual republish still cannot dirty the 1-11 formulas that hold only
+    /// the filter edge.
+    ///
+    /// Returns whether the epoch fired.
+    pub(crate) fn publish_eval_hidden_rows(&self, sheet_index: usize, rows: HashSet<u32>) -> bool {
         {
             let mut map = self.eval_hidden_rows.borrow_mut();
+            let current = map.get(&sheet_index);
+            let unchanged = match current {
+                Some(existing) => **existing == rows,
+                None => rows.is_empty(),
+            };
+            if unchanged {
+                return false;
+            }
             if rows.is_empty() {
                 map.remove(&sheet_index);
             } else {
@@ -1237,6 +1297,24 @@ impl WorkbookAtomContext {
             }
         }
         self.bump_epoch(&self.manual_hidden_epoch, &self.manual_hidden_revision);
+        true
+    }
+
+    /// Drop the mirror entry for a sheet index that no longer exists, without
+    /// consulting an owned set (there is none to consult). Used by
+    /// `Workbook::republish_hidden_all` to reconcile the mirror's key space
+    /// with the sheet vector after a topology change.
+    pub(crate) fn drop_eval_hidden_rows_above(&self, sheet_count: usize) -> bool {
+        let removed = {
+            let mut map = self.eval_hidden_rows.borrow_mut();
+            let before = map.len();
+            map.retain(|key, _| *key < sheet_count);
+            map.len() != before
+        };
+        if removed {
+            self.bump_epoch(&self.manual_hidden_epoch, &self.manual_hidden_revision);
+        }
+        removed
     }
 
     /// Full-replace the FILTER hidden-row set for `sheet_index`
@@ -2194,6 +2272,7 @@ impl Sheet {
             conditional_rules: Vec::new(),
             row_heights: BTreeMap::new(),
             col_widths: BTreeMap::new(),
+            hidden_rows: BTreeSet::new(),
             formula_eval_count: Rc::new(Cell::new(0)),
             imported_formula_count: Cell::new(0),
             reverse_dep_visit_count: Cell::new(0),
@@ -2293,6 +2372,70 @@ impl Sheet {
             .iter()
             .map(|(col_index, width_px)| (*col_index, *width_px))
             .collect()
+    }
+
+    // --- Engine-owned MANUAL hidden rows (E2, `design-engine-hidden-rows`) --
+    //
+    // Deliberately `pub(crate)`: `Workbook` is the only entry point, because
+    // every mutation has to be followed by a `republish_hidden` that refreshes
+    // the evaluation mirror. A `pub` mutator here would let a caller change
+    // the owned set without the mirror noticing, which is exactly the
+    // two-writers failure this slice exists to remove.
+
+    /// The manually hidden rows, ascending. Empty when nothing is hidden.
+    pub(crate) fn hidden_rows(&self) -> Vec<u32> {
+        self.hidden_rows.iter().copied().collect()
+    }
+
+    /// Borrow the owned set for republishing into the evaluation mirror.
+    pub(crate) fn hidden_row_set(&self) -> &BTreeSet<u32> {
+        &self.hidden_rows
+    }
+
+    /// Add `rows` to the hidden set. Returns whether anything changed, so the
+    /// caller can skip a republish that would only re-confirm the mirror.
+    pub(crate) fn hide_rows(&mut self, rows: &[u32]) -> bool {
+        let mut changed = false;
+        for &row in rows {
+            changed |= self.hidden_rows.insert(row);
+        }
+        changed
+    }
+
+    /// Remove `rows` from the hidden set. Rows that were not hidden are
+    /// ignored. Returns whether anything changed.
+    pub(crate) fn unhide_rows(&mut self, rows: &[u32]) -> bool {
+        let mut changed = false;
+        for row in rows {
+            changed |= self.hidden_rows.remove(row);
+        }
+        changed
+    }
+
+    /// Whole-set REPLACE. Backs `Workbook::set_eval_hidden_rows` (the host
+    /// port, whose contract has always been replace-not-merge) and
+    /// `restore_hidden`. Returns whether anything changed.
+    pub(crate) fn replace_hidden_rows(&mut self, rows: BTreeSet<u32>) -> bool {
+        if self.hidden_rows == rows {
+            return false;
+        }
+        self.hidden_rows = rows;
+        true
+    }
+
+    /// Displace the owned set through a ROW insert/delete on this sheet,
+    /// through the shared [`shift_hidden_row`] arithmetic. Driven from
+    /// `apply_structural_shift`; column edits never call it because they
+    /// displace nothing in a row set.
+    fn shift_hidden_rows(&mut self, at: u32, count: u32, insert: bool) {
+        if count == 0 || self.hidden_rows.is_empty() {
+            return;
+        }
+        self.hidden_rows = self
+            .hidden_rows
+            .iter()
+            .filter_map(|&row| shift_hidden_row(row, at, count, insert))
+            .collect();
     }
 
     fn shift_dimension_insert(dimensions: &mut BTreeMap<u32, u32>, at: u32, count: u32) {
@@ -5647,9 +5790,15 @@ impl Sheet {
             match edit {
                 crate::shift::ShiftEdit::RowInsert { at, count } => {
                     Self::shift_dimension_insert(&mut sheet.row_heights, at, count);
+                    // The engine-owned hidden set is row-indexed dimension
+                    // metadata too, so it rides the SAME pass — through the
+                    // single `shift_hidden_row` arithmetic the evaluation
+                    // mirror uses, which is why the two cannot drift.
+                    sheet.shift_hidden_rows(at, count, true);
                 }
                 crate::shift::ShiftEdit::RowDelete { at, count } => {
                     Self::shift_dimension_delete(&mut sheet.row_heights, at, count);
+                    sheet.shift_hidden_rows(at, count, false);
                 }
                 crate::shift::ShiftEdit::ColInsert { at, count } => {
                     Self::shift_dimension_insert(&mut sheet.col_widths, at, count);

@@ -1,10 +1,10 @@
 use einfach_core::{CellListener, Value, ValueError};
 use einfach_excel_core::{
     Align, BorderSpec, BorderStyle, CellAddress, CellBorders, CellFormat, CellRange,
-    CellSubscription, CustomFunctionRegistry, DepGraphStats, FormatRangeSnapshot, NumberFormat,
-    RangeFormatSnapshotLayer, Rotation, Sheet, SheetError, SortDirection, SortKey, SortRangeError,
-    SortRangeReport, TableEntry, TableError, TableRegistrySnapshot, TotalsFunction, VerticalAlign,
-    Workbook, WorkbookError,
+    CellSubscription, CustomFunctionRegistry, DepGraphStats, FormatRangeSnapshot,
+    HiddenRowsSnapshot, NumberFormat, RangeFormatSnapshotLayer, Rotation, Sheet, SheetError,
+    SheetHiddenRows, SortDirection, SortKey, SortRangeError, SortRangeReport, TableEntry,
+    TableError, TableRegistrySnapshot, TotalsFunction, VerticalAlign, Workbook, WorkbookError,
 };
 use serde::{de, Deserialize, Serialize};
 use std::cell::Cell;
@@ -1143,6 +1143,20 @@ struct WorkbookPersistenceV1JSON {
     /// structured references reading `#NAME?`, i.e. a lossy restore.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     tables: Vec<TableJSON>,
+    /// Manually hidden rows, per sheet (E2 of `design-engine-hidden-rows.md`).
+    /// Same `default` + `skip_serializing_if` backward-compatibility argument
+    /// as `tables` above: payloads written before this field existed restore
+    /// as "nothing hidden", and a workbook with nothing hidden still
+    /// serializes byte-identical to before.
+    ///
+    /// Included because `restore_persistence_v1` builds a FRESH `Workbook`.
+    /// Before the engine owned the set there was nothing on this side to
+    /// serialize — the host's hidden state never reached the engine's
+    /// snapshot at all — so every save/load round trip silently un-hid every
+    /// row and changed every `SUBTOTAL(101-111)` that depended on one. That
+    /// also closes an xlsx-parity gap: real workbooks persist hidden rows.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    hidden: Vec<SheetHiddenRowsJSON>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -1153,6 +1167,9 @@ struct WorkbookPersistenceRestoreStatsJSON {
     /// Excel Tables re-registered (#32). Additive output key — hosts that
     /// predate it simply ignore it.
     restored_tables: u32,
+    /// Sheets that came back with at least one manually hidden row (E2).
+    /// Additive output key, same as `restored_tables`.
+    restored_hidden_sheets: u32,
 }
 
 // === Engine physical sort (`sortRange`) wire — S2 of
@@ -1349,6 +1366,48 @@ impl TableJSON {
 struct TableRegistrySnapshotJSON {
     version: u32,
     tables: Vec<TableJSON>,
+}
+
+// === Engine-owned MANUAL hidden rows wire (E2 of
+// `design-engine-hidden-rows.md`) ===
+
+/// One sheet's manually hidden rows. Element of both the
+/// `snapshotHidden` / `restoreHidden` undo envelope and the persistence-v1
+/// `hidden` field, so the two agree by construction.
+///
+/// Keyed by sheet INDEX, unlike `TableJSON`'s sheet NAME: hidden rows are
+/// per-`Sheet` dimension metadata that rides `moveSheet` automatically, and
+/// every other per-sheet persistence payload here (`FormatRangeSnapshotJSON`,
+/// `ViewportSizeSnapshotJSON`) is already index-keyed.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct SheetHiddenRowsJSON {
+    sheet: u32,
+    rows: Vec<u32>,
+}
+
+impl SheetHiddenRowsJSON {
+    fn from_entry(entry: &SheetHiddenRows) -> Self {
+        SheetHiddenRowsJSON {
+            sheet: entry.sheet_index as u32,
+            rows: entry.rows.clone(),
+        }
+    }
+
+    fn into_entry(self) -> SheetHiddenRows {
+        SheetHiddenRows {
+            sheet_index: self.sheet as usize,
+            rows: self.rows,
+        }
+    }
+}
+
+/// Envelope for `snapshotHidden` / `restoreHidden`. Versioned exactly like
+/// `TableRegistrySnapshotJSON`, so a stored undo record from a future shape
+/// is rejected loudly rather than half-applied.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct HiddenRowsSnapshotJSON {
+    version: u32,
+    hidden: Vec<SheetHiddenRowsJSON>,
 }
 
 /// Map a `TableError` to a stable JS error string (mirrors
@@ -2503,6 +2562,63 @@ impl WasmWorkbook {
     pub fn set_eval_filter_hidden_rows(&mut self, sheet_idx: u32, rows: Vec<u32>) {
         self.workbook
             .set_eval_filter_hidden_rows(sheet_idx as usize, &rows);
+    }
+
+    // --- Engine-owned MANUAL hidden rows (E2 of
+    // `design-engine-hidden-rows.md`) --------------------------------------
+    //
+    // Additive. `setEvalHiddenRows` above keeps its exact signature and stays
+    // the host's write path for now; these expose the state the engine has
+    // begun to own, so a later slice can flip the host from "pusher" to
+    // "caller" without another export-surface change.
+
+    /// Mark `rows` (0-based) manually hidden on `sheetIdx`, additively.
+    /// Returns whether anything changed. Out-of-range `sheetIdx` and rows
+    /// that were already hidden are silent `false`s; never throws.
+    #[wasm_bindgen(js_name = "hideRows")]
+    pub fn hide_rows(&mut self, sheet_idx: u32, rows: Vec<u32>) -> bool {
+        self.workbook.hide_rows(sheet_idx as usize, &rows)
+    }
+
+    /// Un-hide `rows` (0-based) on `sheetIdx`. Rows that were not hidden are
+    /// ignored. Returns whether anything changed; never throws.
+    #[wasm_bindgen(js_name = "unhideRows")]
+    pub fn unhide_rows(&mut self, sheet_idx: u32, rows: Vec<u32>) -> bool {
+        self.workbook.unhide_rows(sheet_idx as usize, &rows)
+    }
+
+    /// The manually hidden rows on `sheetIdx` as a `number[]`, ascending.
+    /// Empty for an out-of-range sheet.
+    #[wasm_bindgen(js_name = "listHiddenRows")]
+    pub fn list_hidden_rows(&self, sheet_idx: u32) -> Vec<u32> {
+        self.workbook.list_hidden_rows(sheet_idx as usize)
+    }
+
+    /// Capture every sheet's manually hidden rows as an undo before-image.
+    /// Twin of `snapshotTables`: pure read, no epoch bump, whole-workbook
+    /// REPLACE on the way back through `restoreHidden`. Sheets with nothing
+    /// hidden are omitted.
+    #[wasm_bindgen(js_name = "snapshotHidden")]
+    pub fn snapshot_hidden(&self) -> Result<JsValue, JsValue> {
+        serde_wasm_bindgen::to_value(&HiddenRowsSnapshotJSON {
+            version: 1,
+            hidden: self.hidden_rows_json(),
+        })
+        .map_err(|err| JsValue::from_str(&format!("serialize hidden snapshot: {err}")))
+    }
+
+    /// Replace every sheet's manually hidden rows with a `snapshotHidden`
+    /// payload, returning how many sheets ended up with at least one hidden
+    /// row. Restoring an empty `hidden` array CLEARS everything — that is the
+    /// point of REPLACE, not a no-op. Entries for sheets that no longer exist
+    /// are dropped silently. A restore that reproduces the current state
+    /// fires no epoch and costs no recompute.
+    #[wasm_bindgen(js_name = "restoreHidden")]
+    pub fn restore_hidden(&mut self, value: JsValue) -> Result<u32, JsValue> {
+        let payload: HiddenRowsSnapshotJSON = serde_wasm_bindgen::from_value(value)
+            .map_err(|err| JsValue::from_str(&format!("invalid hidden snapshot: {err}")))?;
+        self.restore_hidden_json(payload)
+            .map_err(|err| JsValue::from_str(&err))
     }
 
     /// Toggle a Table's totals row (design doc #32 §7). `enabled == true`
@@ -3889,7 +4005,37 @@ impl WasmWorkbook {
             formats,
             sizes,
             tables: self.tables_json(),
+            hidden: self.hidden_rows_json(),
         }
+    }
+
+    /// The engine-owned manual hidden sets as wire elements, shared by
+    /// `snapshotHidden` and the persistence-v1 envelope.
+    fn hidden_rows_json(&self) -> Vec<SheetHiddenRowsJSON> {
+        self.workbook
+            .snapshot_hidden()
+            .sheets()
+            .iter()
+            .map(SheetHiddenRowsJSON::from_entry)
+            .collect()
+    }
+
+    fn hidden_snapshot_from_json(hidden: Vec<SheetHiddenRowsJSON>) -> HiddenRowsSnapshot {
+        HiddenRowsSnapshot::from_sheets(
+            hidden
+                .into_iter()
+                .map(SheetHiddenRowsJSON::into_entry)
+                .collect(),
+        )
+    }
+
+    fn restore_hidden_json(&mut self, payload: HiddenRowsSnapshotJSON) -> Result<u32, String> {
+        if payload.version != 1 {
+            return Err("unsupported-snapshot-version".into());
+        }
+        self.workbook
+            .restore_hidden(Self::hidden_snapshot_from_json(payload.hidden))
+            .map_err(|_| "mutation-during-custom-call".to_string())
     }
 
     fn restore_persistence_v1_json(
@@ -3963,6 +4109,7 @@ impl WasmWorkbook {
         // malformed range string joins the other reject-without-mutating
         // failures rather than stranding a half-restored workbook.
         let table_snapshot = Self::table_snapshot_from_json(payload.tables)?;
+        let hidden_snapshot = Self::hidden_snapshot_from_json(payload.hidden);
 
         let mut workbook = Workbook::new();
         let first_name = payload.sheets[0].name.clone();
@@ -4029,11 +4176,21 @@ impl WasmWorkbook {
             .map_err(|err| format!("persistence restore tables failed: {}", table_error_id(err)))?
             as u32;
 
+        // Hidden rows last as well, and for the same reason as the registry:
+        // every sheet must exist first. REPLACE semantics are exact against
+        // the fresh workbook, and entries for sheets the payload does not
+        // contain are dropped by `restore_hidden` rather than failing here.
+        let restored_hidden_sheets = self
+            .workbook
+            .restore_hidden(hidden_snapshot)
+            .map_err(|_| "persistence restore hidden rows failed".to_string())?;
+
         let stats = WorkbookPersistenceRestoreStatsJSON {
             restored_cells,
             restored_formats,
             sheets: payload.sheets.len() as u32,
             restored_tables,
+            restored_hidden_sheets,
         };
         Ok(stats)
     }
@@ -4637,6 +4794,141 @@ mod tests {
         let entry = wb.workbook.get_table("Inventory").expect("entry");
         assert!(entry.has_totals(), "flag restored");
         assert_eq!(entry.range().end.row, 4, "grown range restored");
+    }
+
+    // === Engine-owned MANUAL hidden rows (E2 of
+    // `design-engine-hidden-rows.md`) ===
+
+    /// A1:A5 = 1..5 with `C1 = SUBTOTAL(109, A1:A5)` on sheet 0, plus a
+    /// second sheet so the per-sheet keying is exercised.
+    fn workbook_with_hidden_rows() -> WasmWorkbook {
+        let mut wb = WasmWorkbook::new();
+        let _ = wb.add_sheet("Second");
+        for i in 0..5u32 {
+            wb.set_number(0, &format!("A{}", i + 1), (i + 1) as f64);
+        }
+        assert!(wb.set_formula(0, "C1", "=SUBTOTAL(109, A1:A5)"));
+        wb
+    }
+
+    /// **Counterexample.** Hidden rows must survive a persistence round trip.
+    ///
+    /// Until the engine owned the set there was nothing on this side of the
+    /// boundary to serialize: `snapshot_persistence_v1` had no hidden field
+    /// and `restore_persistence_v1` builds a FRESH `Workbook`, so every
+    /// save/load silently un-hid every row. This fails on the unfixed engine
+    /// with a WRONG SUBTOTAL — 15 instead of 9 — not with an error.
+    #[test]
+    fn wasm_persistence_v1_round_trips_manually_hidden_rows() {
+        let mut source = workbook_with_hidden_rows();
+        assert!(source.hide_rows(0, vec![1, 3])); // A2 = 2, A4 = 4
+        assert!(source.hide_rows(1, vec![7]));
+        assert_eq!(source.get_number(0, "C1"), 9.0); // 15 - 2 - 4
+
+        let envelope = source.snapshot_persistence_v1_json();
+        assert_eq!(envelope.hidden.len(), 2, "both sheets carried");
+
+        let mut restored = WasmWorkbook::new();
+        let stats = restored
+            .restore_persistence_v1_json(envelope)
+            .expect("restore");
+        assert_eq!(stats.restored_hidden_sheets, 2);
+        assert_eq!(restored.list_hidden_rows(0), vec![1, 3]);
+        assert_eq!(restored.list_hidden_rows(1), vec![7]);
+        assert_eq!(
+            restored.get_number(0, "C1"),
+            9.0,
+            "SUBTOTAL 101-111 must still exclude the restored hidden rows"
+        );
+    }
+
+    /// A workbook with nothing hidden serializes byte-identically to a
+    /// pre-E2 payload — the `skip_serializing_if` half of the backward
+    /// compatibility argument — and a payload with no `hidden` key restores
+    /// as "nothing hidden" rather than failing.
+    #[test]
+    fn wasm_persistence_v1_hidden_field_is_backward_compatible_both_ways() {
+        let source = workbook_with_hidden_rows();
+        let envelope = source.snapshot_persistence_v1_json();
+        assert!(envelope.hidden.is_empty());
+        let json = serde_json::to_string(&envelope).expect("serialize");
+        assert!(
+            !json.contains("\"hidden\""),
+            "an unhidden workbook must not emit the key: {json}"
+        );
+
+        // A payload that predates the field (no `hidden` key at all).
+        let legacy: WorkbookPersistenceV1JSON =
+            serde_json::from_str(&json).expect("deserialize legacy");
+        let mut restored = WasmWorkbook::new();
+        let stats = restored
+            .restore_persistence_v1_json(legacy)
+            .expect("restore");
+        assert_eq!(stats.restored_hidden_sheets, 0);
+        assert!(restored.list_hidden_rows(0).is_empty());
+    }
+
+    /// The `snapshotHidden` / `restoreHidden` undo envelope round-trips, and
+    /// an empty one CLEARS rather than no-ops (REPLACE semantics).
+    #[test]
+    fn wasm_hidden_snapshot_restore_round_trip() {
+        let mut wb = workbook_with_hidden_rows();
+        assert!(wb.hide_rows(0, vec![1]));
+        assert_eq!(wb.get_number(0, "C1"), 13.0);
+
+        let before = HiddenRowsSnapshotJSON {
+            version: 1,
+            hidden: wb.hidden_rows_json(),
+        };
+
+        assert!(wb.hide_rows(0, vec![3]));
+        assert_eq!(wb.get_number(0, "C1"), 9.0);
+
+        assert_eq!(wb.restore_hidden_json(before), Ok(1));
+        assert_eq!(wb.list_hidden_rows(0), vec![1]);
+        assert_eq!(wb.get_number(0, "C1"), 13.0);
+
+        let empty = HiddenRowsSnapshotJSON {
+            version: 1,
+            hidden: vec![],
+        };
+        assert_eq!(wb.restore_hidden_json(empty), Ok(0));
+        assert!(wb.list_hidden_rows(0).is_empty());
+        assert_eq!(wb.get_number(0, "C1"), 15.0);
+    }
+
+    /// A future envelope version is rejected loudly, mirroring
+    /// `restoreTables`.
+    #[test]
+    fn wasm_hidden_restore_rejects_unsupported_version_without_mutating() {
+        let mut wb = workbook_with_hidden_rows();
+        assert!(wb.hide_rows(0, vec![1]));
+        let bad = HiddenRowsSnapshotJSON {
+            version: 2,
+            hidden: vec![],
+        };
+        assert_eq!(
+            wb.restore_hidden_json(bad),
+            Err("unsupported-snapshot-version".into())
+        );
+        assert_eq!(wb.list_hidden_rows(0), vec![1], "rejected without mutating");
+    }
+
+    /// The wasm hide/unhide/list surface reports change and degrades quietly
+    /// on an out-of-range sheet.
+    #[test]
+    fn wasm_hide_unhide_list_surface() {
+        let mut wb = workbook_with_hidden_rows();
+        assert!(wb.hide_rows(0, vec![3, 1]));
+        assert_eq!(wb.list_hidden_rows(0), vec![1, 3]);
+        assert!(!wb.hide_rows(0, vec![1]), "already hidden");
+        assert!(wb.unhide_rows(0, vec![1]));
+        assert_eq!(wb.list_hidden_rows(0), vec![3]);
+        assert!(!wb.unhide_rows(0, vec![1]), "not hidden");
+
+        assert!(!wb.hide_rows(99, vec![0]));
+        assert!(!wb.unhide_rows(99, vec![0]));
+        assert!(wb.list_hidden_rows(99).is_empty());
     }
 
     #[test]
@@ -5351,6 +5643,7 @@ mod tests {
                 col_widths: vec![],
             }],
             tables: vec![],
+            hidden: vec![],
         };
 
         assert!(wb.restore_persistence_v1_json(payload).is_err());
@@ -5373,6 +5666,7 @@ mod tests {
             formats: vec![],
             sizes: vec![],
             tables: vec![],
+            hidden: vec![],
         };
         assert!(wb.restore_persistence_v1_json(payload).is_err());
     }
@@ -5401,6 +5695,7 @@ mod tests {
             formats: vec![],
             sizes: vec![],
             tables: vec![],
+            hidden: vec![],
         };
 
         let stats = wb.restore_persistence_v1_json(payload).unwrap();
@@ -5442,6 +5737,7 @@ mod tests {
             }],
             sizes: vec![],
             tables: vec![],
+            hidden: vec![],
         };
 
         assert!(wb.restore_persistence_v1_json(payload).is_err());
@@ -5466,6 +5762,7 @@ mod tests {
             formats: vec![],
             sizes: vec![],
             tables: vec![],
+            hidden: vec![],
         };
 
         let stats = wb.restore_persistence_v1_json(payload).unwrap();
@@ -5509,6 +5806,7 @@ mod tests {
             formats: vec![],
             sizes: vec![],
             tables: vec![],
+            hidden: vec![],
         }
     }
 

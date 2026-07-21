@@ -1,5 +1,5 @@
 use std::cell::Cell;
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::rc::Rc;
 use std::sync::Arc;
 
@@ -290,6 +290,73 @@ impl TableRegistrySnapshot {
     pub fn is_empty(&self) -> bool {
         self.entries.is_empty()
     }
+}
+
+/// One sheet's manually hidden rows inside a [`HiddenRowsSnapshot`].
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct SheetHiddenRows {
+    /// 0-based sheet index at capture time.
+    pub sheet_index: usize,
+    /// 0-based hidden row indices, ascending and deduplicated.
+    pub rows: Vec<u32>,
+}
+
+/// Undo / persistence primitive for the engine-owned MANUALLY hidden rows
+/// (E2 of `design-engine-hidden-rows.md` §6.2). Shaped after
+/// [`TableRegistrySnapshot`]: pure read on capture, whole-workbook REPLACE on
+/// restore, so it can express "these rows stopped being hidden" — an additive
+/// merge cannot, and unhide is at least as common as hide.
+///
+/// Unlike the Table registry, entries key by sheet INDEX rather than sheet
+/// NAME. Tables need name anchoring because the registry is a workbook-level
+/// namespace that must survive `move_sheet` between capture and restore;
+/// hidden rows are per-`Sheet` dimension metadata that RIDES a `move_sheet`
+/// automatically, and every other per-sheet persistence payload in the
+/// codebase (formats, row heights, column widths) is already index-keyed.
+/// Entries pointing past the end of the sheet vector are dropped silently on
+/// restore rather than failing the transaction, matching how the size and
+/// format snapshots degrade.
+///
+/// Sheets with nothing hidden are omitted, so a workbook with no hidden rows
+/// snapshots to an empty vector — which is what lets the persistence-v1 wire
+/// field stay `skip_serializing_if = "Vec::is_empty"` and keep byte-identical
+/// output for payloads that predate it.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct HiddenRowsSnapshot {
+    sheets: Vec<SheetHiddenRows>,
+}
+
+impl HiddenRowsSnapshot {
+    /// Build a snapshot from entries a host previously serialized. Order is
+    /// irrelevant; [`Workbook::restore_hidden`] applies them by index.
+    pub fn from_sheets(sheets: Vec<SheetHiddenRows>) -> Self {
+        HiddenRowsSnapshot { sheets }
+    }
+
+    /// The captured per-sheet entries, for serialization by a host (wasm DTO).
+    pub fn sheets(&self) -> &[SheetHiddenRows] {
+        &self.sheets
+    }
+
+    /// Number of sheets with at least one hidden row.
+    pub fn len(&self) -> usize {
+        self.sheets.len()
+    }
+
+    /// Whether nothing was hidden anywhere. Restoring an empty snapshot
+    /// CLEARS every sheet — it is not a no-op.
+    pub fn is_empty(&self) -> bool {
+        self.sheets.is_empty()
+    }
+}
+
+/// Rejections from [`Workbook::restore_hidden`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum HiddenRowsError {
+    /// A custom-formula callback tried to mutate the workbook it is being
+    /// evaluated inside. Mirrors [`TableError::MutationDuringCustomCall`] and
+    /// the cell mutators' re-entrancy guard.
+    MutationDuringCustomCall,
 }
 
 /// Failure modes for the workbook Table registry (design doc #32 §4.1).
@@ -1098,6 +1165,7 @@ impl Workbook {
         self.atom_context.remap_hidden_rows_after_sheet_move(from, to);
         self.rebuild_name_lookup();
         self.sync_atom_topology();
+        self.republish_hidden_all(); // see `remove_sheet`
         true
     }
 
@@ -1782,6 +1850,11 @@ impl Workbook {
         self.atom_context.remap_hidden_rows_after_sheet_remove(idx);
         self.rebuild_name_lookup();
         self.sync_atom_topology();
+        // The MANUAL half is engine-owned since E2 and rides the `Sheet` that
+        // just moved, so re-assert the mirror from the owning side (and drop
+        // the now-out-of-range top key). No-ops when the remap above already
+        // produced the same answer, which it should.
+        self.republish_hidden_all();
         Some(sheet)
     }
 
@@ -2462,29 +2535,201 @@ impl Workbook {
         occupied
     }
 
-    /// Push the host's per-sheet MANUALLY-hidden row set as read-only
-    /// evaluation input for SUBTOTAL 101-111 (design doc #32 §6,
-    /// CANONICAL_OWNERSHIP §7-1).
+    // === Engine-owned MANUAL hidden rows ================================
+    //
+    // E2 of `solid/excel/docs/online-excel-parity/design-engine-hidden-rows.md`.
+    //
+    // Storage moved from "host-pushed evaluation input the engine keeps in a
+    // side map" to "a `Sheet` field the engine owns", with
+    // `WorkbookAtomContext::eval_hidden_rows` demoted to a read-only
+    // evaluation MIRROR that exactly one private publisher writes
+    // (`republish_hidden`). The mirror stays because the reason it existed
+    // has not gone away: a cross-sheet `SUBTOTAL` resolves from inside the
+    // formula-inner provider, which holds no `&Workbook` and so cannot reach
+    // any `Sheet`.
+    //
+    // The host is still the WRITER in this slice — `set_eval_hidden_rows`
+    // keeps its exact signature (INV-4 fingerprints parameters, so changing
+    // one is a removal) and is simply re-pointed at the owned state. Nothing
+    // observable changes: push the same rows, evaluate the same numbers. The
+    // engine does not yet decide anything for itself; it has become the
+    // authoritative STORE, not yet the authoritative SOURCE.
+    //
+    // Filter-hidden rows are NOT owned yet (E3). They keep their own store,
+    // their own epoch, and their own host port.
+
+    /// Push the host's per-sheet MANUALLY-hidden row set as SUBTOTAL 101-111
+    /// evaluation input (design doc #32 §6, CANONICAL_OWNERSHIP §7-1).
     ///
-    /// The engine models NO hidden state and never infers the source: the host
-    /// decides which rows are "manually hidden" (this port) and which are
-    /// "filter hidden" (`set_eval_filter_hidden_rows`). Semantics are
-    /// full-replace (idempotent whole-set push): `rows` becomes the complete
-    /// manual hidden set for `sheet_index`; an empty slice clears it. The
-    /// paired `manual_hidden_epoch` bump re-derives precisely the 101-111
-    /// formulas that consumed the referenced sheet's set, leaving 1-11 (which
-    /// never read this set) and every unrelated formula undisturbed.
+    /// Signature and contract are verbatim what they have always been —
+    /// full-replace (`rows` becomes the complete manual hidden set for
+    /// `sheet_index`; an empty slice clears it), out-of-range sheet index is
+    /// a silent no-op, and a call from inside a custom-formula callback is
+    /// refused by the re-entrancy guard. What changed underneath is the
+    /// destination: the rows now land in `Sheet::hidden_rows`, and the
+    /// evaluation mirror is refreshed from there by `republish_hidden`.
     ///
-    /// No-op when `sheet_index` is out of range, or during a host
-    /// custom-formula callback (a `store.set` there would mutate the
-    /// dependency graph mid-derivation, exactly what the re-entrancy guard
-    /// forbids for every other mutation entry point).
+    /// One consequence is visible only through a recomputation counter: a
+    /// byte-identical re-push no longer bumps `manual_hidden_epoch`, because
+    /// the de-duplication ledger the host bridge used to keep now lives in
+    /// `publish_eval_hidden_rows`. Values are unaffected — a skipped bump
+    /// only skips re-deriving formulas that would have produced the same
+    /// answer.
     pub fn set_eval_hidden_rows(&mut self, sheet_index: usize, rows: &[u32]) {
-        if self.is_inside_custom_call() || sheet_index >= self.sheets.len() {
+        if self.is_inside_custom_call() {
             return;
         }
-        let set: HashSet<u32> = rows.iter().copied().collect();
-        self.atom_context.set_eval_hidden_rows(sheet_index, set);
+        let Some(sheet) = self.sheets.get_mut(sheet_index) else {
+            return;
+        };
+        sheet.replace_hidden_rows(rows.iter().copied().collect());
+        self.republish_hidden(sheet_index);
+    }
+
+    /// Mark `rows` (0-based) hidden on `sheet_index`, additively. Returns
+    /// whether anything changed; `false` covers an out-of-range sheet, an
+    /// empty request, rows that were already hidden, and a call refused by
+    /// the custom-call re-entrancy guard.
+    pub fn hide_rows(&mut self, sheet_index: usize, rows: &[u32]) -> bool {
+        self.mutate_hidden_rows(sheet_index, |sheet| sheet.hide_rows(rows))
+    }
+
+    /// Un-hide `rows` (0-based) on `sheet_index`. Rows that were not hidden
+    /// are ignored. Returns whether anything changed.
+    pub fn unhide_rows(&mut self, sheet_index: usize, rows: &[u32]) -> bool {
+        self.mutate_hidden_rows(sheet_index, |sheet| sheet.unhide_rows(rows))
+    }
+
+    /// The manually hidden rows on `sheet_index`, ascending. Empty for an
+    /// out-of-range sheet — a missing sheet hides nothing, which is the same
+    /// "no filtering" signal an absent mirror entry carries.
+    pub fn list_hidden_rows(&self, sheet_index: usize) -> Vec<u32> {
+        self.sheets
+            .get(sheet_index)
+            .map(Sheet::hidden_rows)
+            .unwrap_or_default()
+    }
+
+    /// Shared body of `hide_rows` / `unhide_rows`: guard, mutate the owned
+    /// set, republish only if it moved.
+    fn mutate_hidden_rows(
+        &mut self,
+        sheet_index: usize,
+        mutate: impl FnOnce(&mut Sheet) -> bool,
+    ) -> bool {
+        if self.is_inside_custom_call() {
+            return false;
+        }
+        let Some(sheet) = self.sheets.get_mut(sheet_index) else {
+            return false;
+        };
+        if !mutate(sheet) {
+            return false;
+        }
+        self.republish_hidden(sheet_index);
+        true
+    }
+
+    /// Copy one sheet's owned hidden set into the evaluation mirror. THE only
+    /// writer of the manual mirror (design §2.1).
+    ///
+    /// Call sites are finite and enumerable: the host push, `hide_rows` /
+    /// `unhide_rows`, the structural-shift wrappers, `restore_hidden`, and
+    /// the sheet-lifecycle reconciliation in `republish_hidden_all`. Cheap
+    /// and idempotent — `publish_eval_hidden_rows` compares before it writes,
+    /// so republishing an unchanged set costs one set comparison and fires no
+    /// epoch.
+    fn republish_hidden(&self, sheet_index: usize) {
+        let Some(sheet) = self.sheets.get(sheet_index) else {
+            return;
+        };
+        let rows: HashSet<u32> = sheet.hidden_row_set().iter().copied().collect();
+        self.atom_context.publish_eval_hidden_rows(sheet_index, rows);
+    }
+
+    /// Reconcile the whole mirror against the sheet vector. Used after a
+    /// topology change (`remove_sheet` / `move_sheet`), where the mirror has
+    /// just been re-keyed to follow the same rotation the sheet vector
+    /// underwent: this re-asserts the outcome from the owning side rather
+    /// than trusting two independent index remaps to agree forever, and drops
+    /// any entry left keyed past the end of the vector.
+    ///
+    /// Costs nothing when they already agree — every comparison short-
+    /// circuits and no epoch fires.
+    fn republish_hidden_all(&self) {
+        self.atom_context
+            .drop_eval_hidden_rows_above(self.sheets.len());
+        for sheet_index in 0..self.sheets.len() {
+            self.republish_hidden(sheet_index);
+        }
+    }
+
+    /// Capture every sheet's manually hidden rows (see [`HiddenRowsSnapshot`]
+    /// for why this is REPLACE rather than additive). Pure read — no epoch
+    /// bump, no reactive traffic. Sheets with nothing hidden are omitted.
+    ///
+    /// A host undo transaction records `snapshot_hidden()` as the
+    /// before-image, applies the mutation, and calls `restore_hidden(before)`
+    /// to undo — the same shape `snapshot_tables` / `restore_tables` already
+    /// document.
+    pub fn snapshot_hidden(&self) -> HiddenRowsSnapshot {
+        HiddenRowsSnapshot::from_sheets(
+            self.sheets
+                .iter()
+                .enumerate()
+                .filter(|(_, sheet)| !sheet.hidden_row_set().is_empty())
+                .map(|(sheet_index, sheet)| SheetHiddenRows {
+                    sheet_index,
+                    rows: sheet.hidden_rows(),
+                })
+                .collect(),
+        )
+    }
+
+    /// Replace every sheet's manually hidden rows with `snapshot`, returning
+    /// the number of sheets that ended up with at least one hidden row.
+    ///
+    /// REPLACE across the WHOLE workbook: a sheet the snapshot does not
+    /// mention is cleared, not left alone. That is what makes an undo of
+    /// "hide rows on a previously-unhidden sheet" symmetric.
+    ///
+    /// Entries whose `sheet_index` is past the end of the sheet vector are
+    /// dropped silently — the snapshot may have been captured against a wider
+    /// workbook, and refusing the whole transaction over a sheet that no
+    /// longer exists would make the primitive one-directional. (The Table
+    /// registry keeps such entries instead, because it anchors by NAME and a
+    /// deleted sheet can come back under the same name; an index cannot be
+    /// resurrected meaningfully.)
+    ///
+    /// Epochs fire per sheet and only where the set actually moved, so a
+    /// restore that reproduces the current state costs no recompute — which
+    /// matters because a host that snapshots hidden state in every undo
+    /// transaction will restore identical state most of the time.
+    pub fn restore_hidden(
+        &mut self,
+        snapshot: HiddenRowsSnapshot,
+    ) -> Result<u32, HiddenRowsError> {
+        if self.is_inside_custom_call() {
+            return Err(HiddenRowsError::MutationDuringCustomCall);
+        }
+        let sheet_count = self.sheets.len();
+        let mut wanted: Vec<BTreeSet<u32>> = vec![BTreeSet::new(); sheet_count];
+        for entry in snapshot.sheets() {
+            if entry.sheet_index >= sheet_count {
+                continue; // captured against a wider workbook
+            }
+            wanted[entry.sheet_index].extend(entry.rows.iter().copied());
+        }
+        let mut restored = 0u32;
+        for (sheet_index, rows) in wanted.into_iter().enumerate() {
+            if !rows.is_empty() {
+                restored += 1;
+            }
+            if self.sheets[sheet_index].replace_hidden_rows(rows) {
+                self.republish_hidden(sheet_index);
+            }
+        }
+        Ok(restored)
     }
 
     /// Push the host's per-sheet FILTER-hidden row set as read-only evaluation
@@ -2596,12 +2841,22 @@ impl Workbook {
         // `WorkbookAtomContext::shift_hidden_rows_after_row_edit` for why this
         // cannot double-shift against the host's own re-push.
         match edit {
-            crate::shift::ShiftEdit::RowInsert { at, count } => self
-                .atom_context
-                .shift_hidden_rows_after_row_edit(sheet_index, at, count, true),
-            crate::shift::ShiftEdit::RowDelete { at, count } => self
-                .atom_context
-                .shift_hidden_rows_after_row_edit(sheet_index, at, count, false),
+            crate::shift::ShiftEdit::RowInsert { at, count } => {
+                self.atom_context
+                    .shift_hidden_rows_after_row_edit(sheet_index, at, count, true);
+                // `Sheet::apply_structural_shift` already displaced the OWNED
+                // set through the same `shift_hidden_row` arithmetic, so this
+                // republish normally finds the mirror already correct and
+                // fires nothing. It is here so the owning side has the last
+                // word: the mirror is a projection, never an independent
+                // maintainer of the fact.
+                self.republish_hidden(sheet_index);
+            }
+            crate::shift::ShiftEdit::RowDelete { at, count } => {
+                self.atom_context
+                    .shift_hidden_rows_after_row_edit(sheet_index, at, count, false);
+                self.republish_hidden(sheet_index);
+            }
             crate::shift::ShiftEdit::ColInsert { .. } | crate::shift::ShiftEdit::ColDelete { .. } => {}
         }
     }
