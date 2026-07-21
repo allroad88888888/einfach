@@ -426,7 +426,35 @@ Excel 语义（§2 已核实）：**筛选**隐藏行复制时自动跳过；**�
 > - html `rowspan` 按交集内**可见行数**重新裁剪、锚点下移到首个可见行；整片隐藏的 merge 整体丢弃。不做这一步会产出 `rowspan` 大于实际 `<tr>` 数的坏表格。
 > - TSV origin marker 取**首个实际输出行**，因为它是粘贴时相对引用平移的锚。
 >
-> **仍未覆盖（记入 S7 正式切片）**：`backend.exportRangeTsv` / `consumeExportRangeTsvChunks` 大区间分块复制路径与 `backend.exportRangeAsImage` 图片导出路径都由 adapter 自行产出内容，端口上没有隐藏集入参，S5 之后会把被筛行一并导出。二者需扩端口，不属于本次前置加固范围。
+> ~~**仍未覆盖（记入 S7 正式切片）**：`backend.exportRangeTsv` / `consumeExportRangeTsvChunks` 大区间分块复制路径与 `backend.exportRangeAsImage` 图片导出路径都由 adapter 自行产出内容，端口上没有隐藏集入参，S5 之后会把被筛行一并导出。二者需扩端口，不属于本次前置加固范围。~~ **已闭合，见下。**
+
+> **落地记录（S7 正式切片实施者，2026-07-21）**：上述缺口已闭合，今天仍是恒等。
+>
+> **形态裁决：隐藏集作为端口入参，由 UI-core 下发。** `RangeTsvExportRequest.hiddenRows` 与 `RangeImageExportRequest.hiddenRows` 新增为可选入参（ADDITIVE，省略 = 今天的行为）。依据是 CANONICAL_OWNERSHIP §2：**filter 可见性是 UI-core 视图事实，UI-core 是唯一权威，backend 端口降级为可选钩子**。端口是执行者，不是权威。
+>
+> 放弃的两个方案及其错处：
+>
+> - **adapter 自己读 `setFilterSort` 快照**（改动最小）。这会让 adapter 成为第二个权威。S4 落地记录已写明该快照与实时投影可以不一致（"编辑一个单元格可以让行在视图里移动而聚合不动"），于是小区间复制读实时 atom、大区间复制读陈旧快照 —— 把"按大小分叉"换成"按新鲜度分叉"，没有消除分叉。且自定义 backend 若从不调 `setFilterSort` 就完全无从得知。
+> - **UI-core 先把选区拆成可见 run、逐 run 调端口**。TSV 上会把一次导出变成 O(run 数) 次 RPC（重度筛选的 10 万行区间可达数千次），且 `originAddr` 与分块边界要由调用方重新缝合；图片上**根本不成立** —— UI-core 无 DOM，无法把 N 张 PNG 拼成一张。
+> - **把隐藏集推进 worker/WASM**（S4 对 SUBTOTAL 就是这么做的）。这里不行：SUBTOTAL 是公式语义（数据事实），导出内容成形是视图关注点。推进引擎还会引入 capability 门控与 wasm-pkg 版本偏斜 —— 旧 wasm-pkg 会静默地把 bug 放回来。现方案在**主线程 adapter 边界**过滤，隐藏集从不跨 `postMessage`，因此 WASM runtime、TS runtime（`tsvChunkExport: false` 走单发回退）、static 三条路一致生效，无门控、无版本风险。
+>
+> **TSV 实现**：共享纯函数 `filterTsvBandRows`（`adapter/filter-hidden-rows.ts`，与 S4 同一模块）按行带丢弃已序列化文本的行。可行性依据：`sparseRangeToTSV` 对行带恒产出"一行一 row、`\n` 连接"，且本仓 clipboard TSV 合同**两侧都不带引号**（`serializeClipboardTsv` join `\n` / `parseClipboardTsv` split `\n`），所以按行号过滤与格式本身同精度。单点插桩在 `worker-workbook-backend.consumeExportRangeTsvChunks`，同时覆盖流式、单发回退、以及委派过来的 `exportRangeTsv` 三条出口。
+>
+> 三个连带语义，与 §8.2 前置切片同构：
+>
+> - **origin marker 取首个实际输出行**（两个 adapter 均已改），否则粘贴时相对引用整体偏移。
+> - **被过滤空的 chunk 整块不下发**：宿主用 `'\n'` 拼接 chunk，发一个 `''` 会在剪贴板中间插入空行。
+> - **失败开放的形状守卫**：行数与行带不符（单元格值内含裸换行）时整带原样放行 —— 误删一个**可见**行是数据损坏，多导一个被筛行只是已知的次要缺陷。
+>
+> **图片导出路径查证结论：同构问题存在，且多出一条文本编码器没有的**。三处都必须改，缺一处都留可见瑕疵：
+>
+> 1. SVG 路径 —— `encodeSelectionAsHtml` 自 S7 起已支持 `hiddenRows`（含 `rowspan` 重裁），但图片路径从未把集合传进去，于是每个被筛行产出一个空 `<tr>`。
+> 2. canvas 回退路径 `paintCellsToCanvasPng` —— S7 从未触及的**另一个画笔**，每个被筛行画出一条空的带边框行带。
+> 3. **几何**（文本编码器无此物）：画布高度是行高之和，只修 1、2 会得到"表格正确 + 底部一条与被筛行等高的空白带"。`resolveRowHeights` 现只遍历可见行。
+>
+> 另外 `encodeSelectionAsImage` 的 `too-large` 预检也只计可见行，否则重度筛选的选区会因它根本不会渲染的尺寸被拒。
+>
+> **顺带闭合的第四个洞（S7 前置记录未提及）**：`SpreadsheetGrid.tsx` 的 `copySelectionToClipboard` —— 即 **Ctrl+C / Ctrl+X 本身** —— 两个分支都没被 S7 接线（S7 改的是右键菜单与 `copy-as/`）。只补大区间分支会把"按大小分叉"**反转**而非消除，因此小区间分支（含其 origin marker）在本切片一并加固。
 
 ### 8.3 删除行只删可见行
 

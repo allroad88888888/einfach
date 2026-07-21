@@ -348,6 +348,11 @@ export function SpreadsheetContextMenu(props: SpreadsheetContextMenuProps) {
       sheetId,
       range,
       requestId,
+      // The large-range path must drop the same rows the small-range encoders
+      // drop (§8.2). Without this a copy would fork on SIZE: under the same
+      // filter, a rect under CLIPBOARD_CELL_LIMIT excludes filtered rows and
+      // anything above it includes them, with no error shown either way.
+      hiddenRows: filterHiddenRowsFor(sheetId),
     }
 
     if (backend.consumeExportRangeTsvChunks) {

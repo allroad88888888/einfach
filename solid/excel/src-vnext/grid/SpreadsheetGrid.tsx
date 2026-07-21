@@ -102,6 +102,8 @@ import {
   type SelectionState,
   type SpreadsheetCellFormat,
   type ViewportMetrics,
+  getFilterHiddenRowsForSheet,
+  viewportFilterHiddenAtom,
   viewportFreezeAtom,
   viewportHiddenAtom,
   viewportMetricsAtom,
@@ -2361,6 +2363,17 @@ export function SpreadsheetGrid(props: SpreadsheetGridProps) {
 
     const range = selection.range
     const cellCount = (range.rowEnd - range.rowStart + 1) * (range.colEnd - range.colStart + 1)
+
+    // FILTER-hidden rows, read once and honoured by BOTH branches below.
+    //
+    // S7 hardened the context menu's copy and the `copy-as/` encoders, but
+    // this function — the Ctrl+C / Ctrl+X path — was never wired, so its
+    // small-range branch still expanded the raw row span. Guarding only the
+    // large-range branch would have inverted the size-dependent fork rather
+    // than removing it, so both are guarded here.
+    const filterHiddenRows = new Set(
+      getFilterHiddenRowsForSheet(store.getter(viewportFilterHiddenAtom), props.sheetId),
+    )
     const originAddr = `${getColumnLabel(range.colStart)}${range.rowStart + 1}`
 
     let text: string
@@ -2380,6 +2393,10 @@ export function SpreadsheetGrid(props: SpreadsheetGridProps) {
         sheetId: props.sheetId,
         range,
         requestId,
+        // FILTER subset only (§8.2) — the same set the small-range branch
+        // below hands the encoders, so Ctrl+C produces the same rows either
+        // side of CLIPBOARD_CELL_LIMIT.
+        hiddenRows: filterHiddenRows,
       }
       const chunks: string[] = []
       let streamResult:
@@ -2424,7 +2441,10 @@ export function SpreadsheetGrid(props: SpreadsheetGridProps) {
       for (const cell of result.cells) {
         cellsByKey.set(`${cell.row}:${cell.col}`, cell)
       }
+      let firstEmittedRow = -1
       for (let row = range.rowStart; row <= range.rowEnd; row += 1) {
+        if (filterHiddenRows.has(row)) continue
+        if (firstEmittedRow === -1) firstEmittedRow = row
         const fields: string[] = []
         for (let col = range.colStart; col <= range.colEnd; col += 1) {
           const cell = cellsByKey.get(`${row}:${col}`)
@@ -2434,7 +2454,13 @@ export function SpreadsheetGrid(props: SpreadsheetGridProps) {
       }
 
       text = serializeClipboardTsv({
-        originAddr,
+        // The marker anchors relative-formula shifting on paste, so it names
+        // the first EMITTED row. Identical to `originAddr` whenever nothing
+        // is filter-hidden.
+        originAddr:
+          firstEmittedRow === -1
+            ? originAddr
+            : `${getColumnLabel(range.colStart)}${firstEmittedRow + 1}`,
         cells,
       })
 

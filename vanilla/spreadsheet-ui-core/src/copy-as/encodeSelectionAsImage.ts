@@ -1,6 +1,7 @@
 import type { CellRange } from '../shared'
 import type { SpreadsheetBackend } from '../backend/types'
 import type { CopyAsRect } from './types'
+import { copyAsVisibleRows } from './visible-rows'
 
 /**
  * Soft cap on the estimated output pixel count (width × height) that
@@ -67,6 +68,17 @@ export interface EncodeSelectionAsImageInput {
    * `MAX_EXPORT_PIXELS` by default.
    */
   maxPixels?: number
+  /**
+   * FILTER-hidden rows inside `rect`, sourced from `viewportFilterHiddenAtom`
+   * — never `effectiveHiddenAtom` (§8.2). Forwarded verbatim to
+   * `exportRangeAsImage` so the host renderer skips both the paint AND the
+   * geometry for those rows, and excluded from the pre-flight pixel
+   * estimate below so a heavily filtered selection is not rejected as
+   * `too-large` over rows it will never render.
+   *
+   * Always empty until the S5 adapter flip populates the atom.
+   */
+  hiddenRows?: ReadonlySet<number> | readonly number[]
 }
 
 export interface EncodeSelectionAsImageSuccess {
@@ -124,7 +136,11 @@ export async function encodeSelectionAsImage(
   const rowHeight = input.estimatedRowHeightPx ?? DEFAULT_ESTIMATE_ROW_HEIGHT_PX
   const scale = input.scale ?? 1
   const cols = Math.max(0, input.rect.endCol - input.rect.startCol + 1)
-  const rows = Math.max(0, input.rect.endRow - input.rect.startRow + 1)
+  // Only rows that will actually be painted count towards the cap — a
+  // 100k-row selection with 99k rows filtered away renders as 1k rows and
+  // must not be rejected for a size it never reaches. Degrades to the full
+  // span when `hiddenRows` is omitted or empty, which is today's behaviour.
+  const rows = copyAsVisibleRows(input.rect, input.hiddenRows).length
   const estimatedPixels = cols * colWidth * scale * rows * rowHeight * scale
   const limit = input.maxPixels ?? MAX_EXPORT_PIXELS
   if (estimatedPixels > limit) {
@@ -144,6 +160,7 @@ export async function encodeSelectionAsImage(
     range,
     format: 'png',
     scale: input.scale,
+    hiddenRows: input.hiddenRows,
   })
 
   if (!result.bytes || result.bytes.byteLength === 0) {

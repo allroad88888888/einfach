@@ -211,6 +211,110 @@ describe('encodeSelectionAsImage', () => {
     expect(result.ok).toBe(true)
     expect(spy).toHaveBeenCalledTimes(1)
   })
+
+  // --- #27 S7 proper — filter-hidden rows on the image port ---------------
+  //
+  // The PNG flavour was the last copy path with no way to learn what the
+  // filter hid, so after the S5 flip "Copy" would have forked on FLAVOUR the
+  // same way it forked on SIZE: text drops filtered rows, image keeps them.
+
+  test('forwards hiddenRows to the backend port', async () => {
+    const spy = jest.fn(
+      async (req: RangeImageExportRequest): Promise<RangeImageExportResult> => ({
+        kind: 'range-image',
+        sheetId: req.sheetId,
+        range: req.range,
+        bytes: FAKE_PNG_BYTES,
+        width: 10,
+        height: 10,
+        mimeType: 'image/png',
+      }),
+    )
+    const backend = makeMinimalBackend({ exportRangeAsImage: spy })
+    await encodeSelectionAsImage(
+      {
+        sheetId: 'sheet-x',
+        rect: { startRow: 0, startCol: 0, endRow: 4, endCol: 1 },
+        hiddenRows: [1, 3],
+      },
+      backend,
+    )
+    // UI core owns the fact; the port is the executor and must receive it
+    // verbatim rather than look it up itself.
+    expect(spy).toHaveBeenCalledTimes(1)
+    expect(spy.mock.calls[0]![0].hiddenRows).toEqual([1, 3])
+  })
+
+  test('omitting hiddenRows leaves the port argument undefined', async () => {
+    const spy = jest.fn(
+      async (req: RangeImageExportRequest): Promise<RangeImageExportResult> => ({
+        kind: 'range-image',
+        sheetId: req.sheetId,
+        range: req.range,
+        bytes: FAKE_PNG_BYTES,
+        width: 10,
+        height: 10,
+        mimeType: 'image/png',
+      }),
+    )
+    const backend = makeMinimalBackend({ exportRangeAsImage: spy })
+    await encodeSelectionAsImage(
+      { sheetId: 'sheet-x', rect: { startRow: 0, startCol: 0, endRow: 4, endCol: 1 } },
+      backend,
+    )
+    expect(spy.mock.calls[0]![0].hiddenRows).toBeUndefined()
+  })
+
+  test('the too-large estimate counts visible rows only', async () => {
+    const spy = jest.fn(
+      async (req: RangeImageExportRequest): Promise<RangeImageExportResult> => ({
+        kind: 'range-image',
+        sheetId: req.sheetId,
+        range: req.range,
+        bytes: FAKE_PNG_BYTES,
+        width: 1,
+        height: 1,
+        mimeType: 'image/png',
+      }),
+    )
+    const backend = makeMinimalBackend({ exportRangeAsImage: spy })
+    const rect = { startRow: 0, startCol: 0, endRow: 9, endCol: 0 }
+
+    // COUNTER-EXAMPLE: all 10 rows counted → 10 × 1 × 1 × 1 = 10 pixels,
+    // which trips a cap of 5.
+    const unguarded = await encodeSelectionAsImage(
+      {
+        sheetId: 'sheet-x',
+        rect,
+        estimatedColWidthPx: 1,
+        estimatedRowHeightPx: 1,
+        maxPixels: 5,
+      },
+      backend,
+    )
+    expect(unguarded.ok).toBe(false)
+    if (unguarded.ok) throw new Error('expected ok=false')
+    expect(unguarded.reason).toBe('too-large')
+    expect(unguarded.estimatedPixels).toBe(10)
+    expect(spy).not.toHaveBeenCalled()
+
+    // With 6 of those rows filtered away only 4 will ever be painted, so the
+    // export must go through. Counting rows the renderer will never draw
+    // would reject an export for a size it does not reach.
+    const guarded = await encodeSelectionAsImage(
+      {
+        sheetId: 'sheet-x',
+        rect,
+        estimatedColWidthPx: 1,
+        estimatedRowHeightPx: 1,
+        maxPixels: 5,
+        hiddenRows: [1, 2, 3, 5, 7, 9],
+      },
+      backend,
+    )
+    expect(guarded.ok).toBe(true)
+    expect(spy).toHaveBeenCalledTimes(1)
+  })
 })
 
 describe('lastCopyAsAtom — image variant', () => {

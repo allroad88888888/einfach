@@ -112,6 +112,7 @@ import {
   keyFor,
   nextConditionalFormatRuleId,
   namedRangeIdentity,
+  normalizeCopyAsHiddenRows,
   normalizeDimensionSize,
   normalizeFormat,
   normalizeNamedRangeName,
@@ -159,7 +160,7 @@ import {
   type ResolvedSortKey,
   type SortValue,
 } from './sort-order'
-import { filterHiddenRowsFromDisplayRows } from './filter-hidden-rows'
+import { filterHiddenRowsFromDisplayRows, filterTsvBandRows } from './filter-hidden-rows'
 
 function isObject(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null
@@ -1011,7 +1012,18 @@ function exportRangeTsvFromState(
     .filter((cell) => isCellInsideRange(cell, request.range))
     .sort(compareCells)
     .map(displayCellToSparseTsvCell)
-  const text = sparseCellsToTsv(cells, request.range)
+
+  // Filter-hidden rows never reach the clipboard (§8.2). The set is an INPUT
+  // from UI-core, not something this backend looks up — it holds a
+  // `setFilterSort` snapshot of its own, and consulting that would make the
+  // large-range copy answer from a staler authority than the small-range one.
+  const band = filterTsvBandRows(
+    sparseCellsToTsv(cells, request.range),
+    request.range.rowStart,
+    request.range.rowEnd,
+    normalizeCopyAsHiddenRows(request.hiddenRows),
+  )
+  const text = band.text
 
   return {
     kind: 'range-tsv',
@@ -1024,7 +1036,11 @@ function exportRangeTsvFromState(
       colStart: request.range.colStart,
       colEnd: request.range.colEnd,
     },
-    originAddr: toA1(request.range.rowStart, request.range.colStart),
+    // The marker names the first EMITTED row — it is the anchor paste uses to
+    // shift relative references, so pointing it at a row that was filtered
+    // away would offset every formula in the paste. Falls back to the raw
+    // start when nothing survived (the text is empty, so it anchors nothing).
+    originAddr: toA1(band.firstVisibleRow ?? request.range.rowStart, request.range.colStart),
     text,
     estimatedBytes: estimateUtf8Bytes(text),
   }

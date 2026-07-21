@@ -411,6 +411,36 @@ export interface RangeTsvExportRequest extends SheetRef {
   requestId?: ProjectionRequestId
   revision?: ProjectionRevision
   rowsPerChunk?: number
+  /**
+   * FILTER-hidden source rows the export must NOT emit (§8.2 of
+   * `solid/excel/docs/online-excel-parity/design-filter-hidden-rows.md`).
+   *
+   * Why this is an INPUT rather than something the adapter looks up:
+   * filter visibility is a UI-core view fact (CANONICAL_OWNERSHIP §2 —
+   * "UI-core 是唯一权威；backend 端口降级为可选持久化钩子"). The port is an
+   * executor, never the authority. An adapter that consulted its own
+   * `setFilterSort` snapshot would become a second source of truth and
+   * could disagree with the live atom the small-range copy path reads —
+   * which is precisely the size-dependent divergence this parameter
+   * exists to remove.
+   *
+   * Contract for implementors:
+   *   - Omitted / empty means "emit every row in the range", which is the
+   *     pre-hardening behaviour and the only behaviour reachable until the
+   *     S5 adapter flip stops compacting filtered rows out of the range.
+   *   - Rows are 0-based SOURCE rows in the same coordinate space as
+   *     `range`. Rows outside `range` are simply irrelevant.
+   *   - `originAddr` in the result must name the first EMITTED row, not
+   *     `range.rowStart` — it anchors relative-formula shifting on paste.
+   *   - Chunked implementations must not emit a chunk that filters down to
+   *     zero rows; the caller joins chunk texts with `\n` and an empty
+   *     chunk would inject a blank line.
+   *
+   * This carries the FILTER subset only, never the manual ∪ filter union:
+   * Excel skips filtered-out rows on copy but copies manually hidden rows
+   * normally.
+   */
+  hiddenRows?: ReadonlySet<number> | readonly number[]
 }
 
 /**
@@ -431,6 +461,17 @@ export interface RangeImageExportRequest extends SheetRef {
   scale?: number
   requestId?: ProjectionRequestId
   revision?: ProjectionRevision
+  /**
+   * FILTER-hidden source rows the render must skip — same ownership
+   * contract and same coordinate space as `RangeTsvExportRequest.hiddenRows`.
+   *
+   * An image renderer has one obligation the text encoders do not: the
+   * output GEOMETRY must shrink too. Skipping the paint while still summing
+   * every row height into the canvas size yields a PNG with a blank band at
+   * the bottom exactly as tall as the hidden rows. Implementors must drop
+   * hidden rows from the height sum as well as from the paint.
+   */
+  hiddenRows?: ReadonlySet<number> | readonly number[]
 }
 
 export interface RangeImageExportResult extends SheetRef {

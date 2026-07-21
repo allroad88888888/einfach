@@ -716,6 +716,12 @@ describe('vNext SpreadsheetContextMenu', () => {
         sheetId: 'sheet-1',
         range,
         requestId: 1,
+        // #27 S7 proper: the export request now carries the FILTER-hidden set
+        // so the large-range copy drops the same rows the small-range
+        // encoders do. Empty today — nothing populates
+        // `viewportFilterHiddenAtom` until the S5 flip — which is why the
+        // emitted text asserted below is unchanged.
+        hiddenRows: new Set(),
       },
     ])
     expect(exportRangeTsvRequests).toEqual([])

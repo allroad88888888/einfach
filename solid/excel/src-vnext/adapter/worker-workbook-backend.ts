@@ -104,6 +104,7 @@ import {
   keyFor,
   namedRangeIdentity,
   nextConditionalFormatRuleId,
+  normalizeCopyAsHiddenRows,
   normalizeDimensionSize,
   normalizeFormat,
   normalizeNamedRangeName,
@@ -146,7 +147,7 @@ import {
   pasteRangeGeometry,
   pasteSourceCoord,
 } from './paste-range-plan'
-import { filterHiddenRowsFromDisplayRows } from './filter-hidden-rows'
+import { filterHiddenRowsFromDisplayRows, filterTsvBandRows } from './filter-hidden-rows'
 
 export interface WorkerWorkbookBackendSheetInput {
   id?: string
@@ -2424,6 +2425,38 @@ export function createWorkerWorkbookSpreadsheetBackend(
     let chunkCount = 0
     let estimatedBytes = 0
 
+    // Filter-hidden rows are dropped HERE, on the main thread, from the
+    // already-serialised band each chunk carries (§8.2). This one insertion
+    // point covers all three ways TSV leaves this adapter — the streaming
+    // session, the single-shot fallback below, and `exportRangeTsv`, which
+    // delegates to this function — so no path can be forgotten.
+    //
+    // The set never crosses `postMessage`: it is a UI-core view fact and the
+    // worker owns data facts. That also makes the fix runtime-agnostic (WASM,
+    // TS runtime, any wasm-pkg version) instead of gated on an engine export
+    // an older build might not have.
+    const hidden = normalizeCopyAsHiddenRows(request.hiddenRows)
+    let firstEmittedRow: number | null = null
+
+    async function emitBand(startRow: number, endRow: number, text: string): Promise<void> {
+      const band = filterTsvBandRows(text, startRow, endRow, hidden)
+      // A band that FILTERING emptied must not be emitted: callers join chunk
+      // texts with '\n', so an empty chunk would inject a blank line — exactly
+      // the artefact this guard exists to prevent.
+      //
+      // Conditioned on `hidden.size > 0` on purpose. The WASM runtime's
+      // exhausted-session sentinel is a legitimately zero-row band
+      // (`endRow = startRow - 1`, `chunk: ''`) that today IS forwarded; with
+      // no filter active this branch must not start swallowing it, or the
+      // change would not be the identity it claims to be.
+      if (hidden.size > 0 && band.rowCount === 0) return
+      if (firstEmittedRow === null) firstEmittedRow = band.firstVisibleRow
+      if (chunkCount > 0) estimatedBytes += 1
+      estimatedBytes += estimateUtf8Bytes(band.text)
+      chunkCount += 1
+      await onChunk({ startRow, endRow, text: band.text })
+    }
+
     // Chunked sessions are only used when the runtime really streams
     // them (`tsvChunkExport`); otherwise fall back to the single-shot
     // 'exportRangeTsv' command, which honest runtimes DO implement —
@@ -2435,25 +2468,13 @@ export function createWorkerWorkbookSpreadsheetBackend(
       await client.consumeExportRangeTsvChunks(
         sparseRange,
         async (chunk) => {
-          if (chunkCount > 0) estimatedBytes += 1
-          estimatedBytes += estimateUtf8Bytes(chunk.chunk)
-          chunkCount += 1
-          await onChunk({
-            startRow: chunk.startRow,
-            endRow: chunk.endRow,
-            text: chunk.chunk,
-          })
+          await emitBand(chunk.startRow, chunk.endRow, chunk.chunk)
         },
         request.rowsPerChunk,
       )
     } else {
       const text = await client.exportRangeTsv(sparseRange)
-      estimatedBytes = estimateUtf8Bytes(text)
-      await onChunk({
-        startRow: request.range.rowStart,
-        endRow: request.range.rowEnd,
-        text,
-      })
+      await emitBand(request.range.rowStart, request.range.rowEnd, text)
     }
 
     return {
@@ -2462,7 +2483,10 @@ export function createWorkerWorkbookSpreadsheetBackend(
       requestId: request.requestId,
       revision: request.revision ?? revision,
       range: { ...request.range },
-      originAddr: toA1(request.range.rowStart, request.range.colStart),
+      // First EMITTED row, not `range.rowStart` — the marker anchors relative
+      // reference shifting on paste, so naming a filtered-away row would
+      // offset every pasted formula.
+      originAddr: toA1(firstEmittedRow ?? request.range.rowStart, request.range.colStart),
       estimatedBytes,
     }
   }

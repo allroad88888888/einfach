@@ -18,6 +18,7 @@
  */
 
 import {
+  copyAsVisibleRows,
   encodeSelectionAsHtml,
   type CellRange,
   type DisplayCell,
@@ -50,6 +51,25 @@ export interface RenderRangeAsImageInput extends SheetRef {
    * `columnWidths` — keyed by absolute row number.
    */
   rowHeights?: ReadonlyMap<number, number>
+  /**
+   * FILTER-hidden source rows inside `range` (§8.2). Forwarded from
+   * `RangeImageExportRequest.hiddenRows`, which UI-core populates from
+   * `viewportFilterHiddenAtom`.
+   *
+   * A hidden row must vanish from the PNG in THREE places, and missing any
+   * one of them leaves a visible artefact:
+   *
+   *   1. the SVG path — `encodeSelectionAsHtml` already honours `hiddenRows`
+   *      (landed in S7) but was never handed the set from here, so it emitted
+   *      a blank `<tr>` per filtered row;
+   *   2. the canvas fallback (`paintCellsToCanvasPng`) — a separate painter
+   *      S7 never touched, which drew an empty bordered band per filtered row;
+   *   3. the GEOMETRY. This one has no analogue in any text encoder: the
+   *      canvas height is the sum of the row heights, so fixing only 1 and 2
+   *      yields a correctly-drawn table followed by blank space exactly as
+   *      tall as the hidden rows.
+   */
+  hiddenRows?: ReadonlySet<number> | readonly number[]
 }
 
 /**
@@ -141,14 +161,34 @@ function resolveColumnWidths(input: RenderRangeAsImageInput): Map<number, number
   return out
 }
 
+/**
+ * Per-row heights for the rows that will actually be painted. Filter-hidden
+ * rows are absent from the map entirely, which is what makes the geometry
+ * shrink: `renderRangeAsImage` sums this map for the canvas height, and both
+ * painters iterate the same visible row list. Degrades to the full span when
+ * `hiddenRows` is empty or omitted.
+ */
 function resolveRowHeights(input: RenderRangeAsImageInput): Map<number, number> {
   const fallback = input.rowHeightPx ?? DEFAULT_ROW_HEIGHT_PX
   const out = new Map<number, number>()
-  for (let row = input.range.rowStart; row <= input.range.rowEnd; row += 1) {
+  for (const row of visibleRowsOf(input)) {
     const measured = input.rowHeights?.get(row)
     out.set(row, Math.max(1, measured ?? fallback))
   }
   return out
+}
+
+/** Rows of `range` the render must emit, ascending. */
+function visibleRowsOf(input: RenderRangeAsImageInput): number[] {
+  return copyAsVisibleRows(
+    {
+      startRow: input.range.rowStart,
+      startCol: input.range.colStart,
+      endRow: input.range.rowEnd,
+      endCol: input.range.colEnd,
+    },
+    input.hiddenRows,
+  )
 }
 
 function sumMap(values: Iterable<number>): number {
@@ -183,6 +223,10 @@ export function buildRangeSvg(input: RenderRangeAsImageInput, width: number, hei
     },
     columnWidths: colWidths,
     rowHeights: rowHeights,
+    // The HTML encoder has honoured `hiddenRows` since S7 (it also re-clips
+    // merge `rowspan` to the visible row count); it was simply never given
+    // the set from the image path.
+    hiddenRows: input.hiddenRows,
   })
 
   return [
@@ -328,7 +372,10 @@ async function paintCellsToCanvasPng(
   }
 
   let y = 0
-  for (let row = input.range.rowStart; row <= input.range.rowEnd; row += 1) {
+  // Visible rows only, and consecutively — a filter-hidden row must leave no
+  // empty bordered band behind. This painter is separate from the HTML
+  // encoder S7 hardened, so it needs its own guard.
+  for (const row of visibleRowsOf(input)) {
     const rh = rowHeights.get(row) ?? 24
     let x = 0
     for (let col = input.range.colStart; col <= input.range.colEnd; col += 1) {

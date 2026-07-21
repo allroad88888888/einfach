@@ -397,6 +397,11 @@ function withHostImageRenderer(backend: SpreadsheetBackend): SpreadsheetBackend 
         rowHeights,
         colWidthPx,
         rowHeightPx,
+        // Filter-hidden rows are dropped from the paint AND the geometry
+        // (§8.2). Without this the PNG flavour would keep exporting rows the
+        // text flavours already skip — the same "copy" forking on flavour
+        // instead of on size.
+        hiddenRows: request.hiddenRows,
       })
     },
   }
@@ -504,6 +509,10 @@ export async function dispatchCopyAsImage(
         },
         estimatedColWidthPx,
         estimatedRowHeightPx,
+        // FILTER subset, never `effectiveHiddenAtom` — Excel skips filtered
+        // rows on copy but copies manually hidden ones. Mirrors what
+        // `dispatchCopyAs` already feeds the text flavours (S7).
+        hiddenRows: getFilterHiddenRowsForSheet(store.getter(viewportFilterHiddenAtom), sheetId),
       },
       renderingBackend,
     )
