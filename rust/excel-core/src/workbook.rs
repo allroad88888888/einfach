@@ -2590,6 +2590,20 @@ impl Workbook {
             }
         }
         self.remap_tables_after_shift(sheet_index, edit);
+        // Hidden-row eval inputs are row-indexed too, so a row edit must
+        // displace the numbers inside each set exactly as it displaced the
+        // cells. Column edits displace nothing in a row set. See
+        // `WorkbookAtomContext::shift_hidden_rows_after_row_edit` for why this
+        // cannot double-shift against the host's own re-push.
+        match edit {
+            crate::shift::ShiftEdit::RowInsert { at, count } => self
+                .atom_context
+                .shift_hidden_rows_after_row_edit(sheet_index, at, count, true),
+            crate::shift::ShiftEdit::RowDelete { at, count } => self
+                .atom_context
+                .shift_hidden_rows_after_row_edit(sheet_index, at, count, false),
+            crate::shift::ShiftEdit::ColInsert { .. } | crate::shift::ShiftEdit::ColDelete { .. } => {}
+        }
     }
 
     /// Follow every Table anchored to `sheet_index` through a structural

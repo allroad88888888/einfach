@@ -953,6 +953,57 @@ fn remap_index_keyed_rows(
     changed
 }
 
+/// Displace the ROW numbers inside ONE sheet's entry of an index-keyed
+/// hidden-row store, mirroring `ShiftEdit`'s row-axis address arithmetic:
+///
+///   - insert at or before a row  → the row moves down by `count`
+///   - delete strictly before it  → the row moves up by `count`
+///   - delete covering it         → the row is DROPPED (it no longer exists)
+///
+/// Sibling of `remap_index_keyed_rows` above on the other axis: that one
+/// rewrites the map's KEYS (sheet indices) after a sheet reorder, this one
+/// rewrites a single entry's VALUES after a row insert/delete on that sheet.
+///
+/// Emptying out drops the entry rather than storing an empty set, upholding
+/// the store's "a lookup miss and an empty set are the same no-filtering
+/// signal" contract. Returns true only when the set actually changed, so the
+/// caller can skip an epoch bump that would dirty SUBTOTAL formulas for
+/// nothing (a `count` of 0, or an edit entirely below every hidden row).
+fn shift_rows_for_sheet(
+    store: &RefCell<HashMap<usize, Rc<HashSet<u32>>>>,
+    sheet_index: usize,
+    at: u32,
+    count: u32,
+    insert: bool,
+) -> bool {
+    let mut map = store.borrow_mut();
+    let Some(rows) = map.get(&sheet_index).cloned() else {
+        return false;
+    };
+    let mut next: HashSet<u32> = HashSet::with_capacity(rows.len());
+    for &row in rows.iter() {
+        if insert {
+            next.insert(if row >= at { row.saturating_add(count) } else { row });
+        } else if row >= at.saturating_add(count) {
+            next.insert(row - count);
+        } else if row < at {
+            next.insert(row);
+        }
+        // else: the row sat inside the deleted band — it is gone, not moved.
+    }
+    // Set equality: same cardinality plus containment. A no-op edit must not
+    // bump the epoch.
+    if next.len() == rows.len() && next.iter().all(|row| rows.contains(row)) {
+        return false;
+    }
+    if next.is_empty() {
+        map.remove(&sheet_index);
+    } else {
+        map.insert(sheet_index, Rc::new(next));
+    }
+    true
+}
+
 pub(crate) struct WorkbookAtomContext {
     store: Store,
     topology: RefCell<WorkbookAtomTopology>,
@@ -1238,6 +1289,38 @@ impl WorkbookAtomContext {
             self.bump_epoch(&self.manual_hidden_epoch, &self.manual_hidden_revision);
         }
         if remap_index_keyed_rows(&self.eval_filter_hidden_rows, &remap) {
+            self.bump_epoch(&self.filter_hidden_epoch, &self.filter_hidden_revision);
+        }
+    }
+
+    /// Follow both hidden-row side stores through a ROW insert/delete on
+    /// `sheet_index`, displacing the row numbers INSIDE each set (the twin of
+    /// `remap_hidden_rows`, which moves the map's sheet-index keys).
+    ///
+    /// Without this the sets keep pre-shift row numbers while every other
+    /// row-indexed fact on the sheet — cells, formulas, spills, formats,
+    /// dimensions, Tables — has already moved, so SUBTOTAL 1-11 / 101-111
+    /// excludes a row the host never hid and aggregates one it did.
+    ///
+    /// This does NOT double-shift against the host's own maintenance. Both
+    /// public setters are whole-set REPLACE of absolute row indices — they
+    /// insert a fresh set and never merge a delta — so a host that re-pushes
+    /// its already-displaced snapshot simply overwrites with the same answer.
+    /// The engine shift is what keeps the engine correct on its own, in the
+    /// window before a re-push arrives or when no host re-push exists at all.
+    ///
+    /// Column edits never reach here: they displace nothing in a row set.
+    pub(crate) fn shift_hidden_rows_after_row_edit(
+        &self,
+        sheet_index: usize,
+        at: u32,
+        count: u32,
+        insert: bool,
+    ) {
+        if shift_rows_for_sheet(&self.eval_hidden_rows, sheet_index, at, count, insert) {
+            self.bump_epoch(&self.manual_hidden_epoch, &self.manual_hidden_revision);
+        }
+        if shift_rows_for_sheet(&self.eval_filter_hidden_rows, sheet_index, at, count, insert) {
             self.bump_epoch(&self.filter_hidden_epoch, &self.filter_hidden_revision);
         }
     }
