@@ -2454,16 +2454,18 @@ impl Workbook {
         occupied
     }
 
-    /// Push the host's per-sheet hidden-row set as read-only evaluation input
-    /// for SUBTOTAL 101-111 (design doc #32 §6, CANONICAL_OWNERSHIP §7-1).
+    /// Push the host's per-sheet MANUALLY-hidden row set as read-only
+    /// evaluation input for SUBTOTAL 101-111 (design doc #32 §6,
+    /// CANONICAL_OWNERSHIP §7-1).
     ///
-    /// The engine models NO hidden state and never infers the source (manual
-    /// hide vs filter — the host merges them into one set). Semantics are
+    /// The engine models NO hidden state and never infers the source: the host
+    /// decides which rows are "manually hidden" (this port) and which are
+    /// "filter hidden" (`set_eval_filter_hidden_rows`). Semantics are
     /// full-replace (idempotent whole-set push): `rows` becomes the complete
-    /// hidden set for `sheet_index`; an empty slice clears it. The paired
-    /// `hidden_epoch` bump re-derives precisely the 101-111 formulas that
-    /// consumed the referenced sheet's set, leaving 1-11 and every unrelated
-    /// formula undisturbed.
+    /// manual hidden set for `sheet_index`; an empty slice clears it. The
+    /// paired `manual_hidden_epoch` bump re-derives precisely the 101-111
+    /// formulas that consumed the referenced sheet's set, leaving 1-11 (which
+    /// never read this set) and every unrelated formula undisturbed.
     ///
     /// No-op when `sheet_index` is out of range, or during a host
     /// custom-formula callback (a `store.set` there would mutate the
@@ -2475,6 +2477,30 @@ impl Workbook {
         }
         let set: HashSet<u32> = rows.iter().copied().collect();
         self.atom_context.set_eval_hidden_rows(sheet_index, set);
+    }
+
+    /// Push the host's per-sheet FILTER-hidden row set as read-only evaluation
+    /// input (`design-filter-hidden-rows` §6.2). Additive twin of
+    /// `set_eval_hidden_rows` — that port and its whole chain are untouched.
+    ///
+    /// Excel's rule this exists to express: `SUBTOTAL(1-11)` excludes
+    /// filter-hidden rows but INCLUDES manually hidden ones, while
+    /// `SUBTOTAL(101-111)` excludes both. Only two independently addressable
+    /// sets can carry that distinction.
+    ///
+    /// Identical contract to `set_eval_hidden_rows`: full-replace, idempotent,
+    /// empty slice clears, per-sheet keyed, out-of-range sheet is a silent
+    /// no-op, no-op during a host custom-formula callback, and the engine never
+    /// infers a row's hidden source. The paired `filter_hidden_epoch` bump
+    /// re-derives BOTH SUBTOTAL layers (both read this set) without touching
+    /// the manual epoch.
+    pub fn set_eval_filter_hidden_rows(&mut self, sheet_index: usize, rows: &[u32]) {
+        if self.is_inside_custom_call() || sheet_index >= self.sheets.len() {
+            return;
+        }
+        let set: HashSet<u32> = rows.iter().copied().collect();
+        self.atom_context
+            .set_eval_filter_hidden_rows(sheet_index, set);
     }
 
     /// Current value of the Table invalidation broadcast counter (design
@@ -3340,6 +3366,14 @@ impl<'a> EvalProvider for WorkbookEvalProvider<'a> {
         // design doc #32 §6.2). The live formula-inner path is
         // `AtomFormulaProvider::hidden_rows`.
         self.wb.atom_context.hidden_rows_untracked(sheet_index?)
+    }
+
+    fn filter_hidden_rows(&self, sheet_index: Option<usize>) -> Option<Rc<HashSet<u32>>> {
+        // Untracked twin of `hidden_rows` against the filter side store
+        // (`design-filter-hidden-rows` §6.2).
+        self.wb
+            .atom_context
+            .filter_hidden_rows_untracked(sheet_index?)
     }
 
     fn sheet_count(&self) -> usize {

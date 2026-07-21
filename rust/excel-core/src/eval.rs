@@ -974,6 +974,23 @@ pub trait EvalProvider {
         None
     }
 
+    /// Host-pushed per-sheet FILTER-hidden row set
+    /// (`design-filter-hidden-rows` §6.2). Same shape and per-argument
+    /// sheet-resolution contract as `hidden_rows`, but a SEPARATE source: Excel
+    /// excludes filter-hidden rows from BOTH SUBTOTAL layers (1-11 and
+    /// 101-111), while manually hidden rows are excluded only by 101-111. A
+    /// merged set could not express that rule, so the engine keeps two
+    /// independent read-only inputs and still models no hidden state of its
+    /// own.
+    ///
+    /// Workbook-backed live providers do a *tracked* read of the
+    /// `filter_hidden_epoch` atom (distinct from the manual one) inside this
+    /// method, so a `set_eval_filter_hidden_rows` push re-derives both layers
+    /// while a manual push leaves the 1-11 formulas alone.
+    fn filter_hidden_rows(&self, _sheet_index: Option<usize>) -> Option<Rc<HashSet<u32>>> {
+        None
+    }
+
     // ===== EVAL_PROVIDER TRAIT METHODS: ADD NEW METHODS BEFORE THIS LINE =====
     // Sentinel for parallel-agent merges — when a new feature needs a new
     // EvalProvider hook, add it BEFORE this marker (with a sensible default)
@@ -19662,21 +19679,68 @@ fn stat_phi(args: &[Expr], provider: &dyn EvalProvider) -> Value {
     stat_finite((-0.5 * x * x).exp() / two_pi.sqrt())
 }
 
-/// Hidden-row set a single SUBTOTAL 101-111 data argument must exclude
-/// (design doc #32 §6.2). Resolves the argument's referenced sheet ONCE:
-/// a cross-sheet ref (`Sheet2!A1:A10`, a cross-sheet `Table`) consults the
-/// referenced sheet's set; a bare ref consults the current sheet. `None`
-/// for 1-11 (`ignore_hidden == false`, never filters) or when the host
-/// pushed no hidden rows for that sheet. Registering the arg's sheet edge
-/// only in the 101-111 branch is what keeps 1-11 formulas from holding a
-/// hidden dependency and thus undisturbed by a hidden-set change.
+/// Which host-pushed hidden-row sources a SUBTOTAL/AGGREGATE run excludes
+/// (`design-filter-hidden-rows` §6.3). Excel's two-layer rule:
+///
+/// - `SUBTOTAL(1-11)` excludes FILTER-hidden rows but INCLUDES manually
+///   hidden ones → [`ExcludeFilter`](Self::ExcludeFilter).
+/// - `SUBTOTAL(101-111)` excludes both → [`ExcludeFilterAndManual`].
+/// - `AGGREGATE` currently honours neither (its ignore-hidden option bits are
+///   parsed but not applied — TODO #32 §6.3) → [`IncludeAll`](Self::IncludeAll),
+///   which touches no provider hook and therefore registers no epoch edge,
+///   preserving that function's existing behaviour byte-for-byte.
+///
+/// [`ExcludeFilterAndManual`]: Self::ExcludeFilterAndManual
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SubtotalHiddenPolicy {
+    IncludeAll,
+    ExcludeFilter,
+    ExcludeFilterAndManual,
+}
+
+/// The (up to two) hidden-row sets a single SUBTOTAL data argument must
+/// exclude. Kept as two independent `Option<Rc<..>>` handles rather than a
+/// merged set: building a union would cost a `HashSet` allocation per
+/// argument and destroy the source distinction the two-layer rule needs
+/// (`design-filter-hidden-rows` §6.3 — "do not construct a union").
+#[derive(Default)]
+struct SubtotalHiddenSets {
+    filter: Option<Rc<HashSet<u32>>>,
+    manual: Option<Rc<HashSet<u32>>>,
+}
+
+impl SubtotalHiddenSets {
+    /// Streaming membership test across both sets — two hash probes, no
+    /// intermediate allocation. A row present in both is simply skipped once.
+    fn contains(&self, row: u32) -> bool {
+        self.filter.as_ref().is_some_and(|h| h.contains(&row))
+            || self.manual.as_ref().is_some_and(|h| h.contains(&row))
+    }
+
+    fn is_empty(&self) -> bool {
+        self.filter.is_none() && self.manual.is_none()
+    }
+}
+
+/// Hidden-row sets a single SUBTOTAL data argument must exclude (design doc
+/// #32 §6.2 + `design-filter-hidden-rows` §6.3). Resolves the argument's
+/// referenced sheet ONCE: a cross-sheet ref (`Sheet2!A1:A10`, a cross-sheet
+/// `Table`) consults the referenced sheet's sets; a bare ref consults the
+/// current sheet.
+///
+/// The provider hooks are called SELECTIVELY, because calling one is what
+/// registers its invalidation epoch edge:
+/// - `ExcludeFilter` (1-11) reads only `filter_hidden_rows`, so a manual
+///   hide/unhide never dirties a 1-11 formula.
+/// - `ExcludeFilterAndManual` (101-111) reads both.
+/// - `IncludeAll` reads neither and holds no edge at all.
 fn subtotal_hidden_for_arg(
     arg: &Expr,
     provider: &dyn EvalProvider,
-    ignore_hidden: bool,
-) -> Option<Rc<HashSet<u32>>> {
-    if !ignore_hidden {
-        return None;
+    policy: SubtotalHiddenPolicy,
+) -> SubtotalHiddenSets {
+    if policy == SubtotalHiddenPolicy::IncludeAll {
+        return SubtotalHiddenSets::default();
     }
     let sheet_index = match runtime_ref_from_expr(arg, provider) {
         Ok(r) => match r.sheet {
@@ -19688,25 +19752,33 @@ fn subtotal_hidden_for_arg(
         // no row is ever filtered regardless.
         Err(_) => provider.current_sheet_index(),
     };
-    provider.hidden_rows(sheet_index)
+    SubtotalHiddenSets {
+        filter: provider.filter_hidden_rows(sheet_index),
+        manual: match policy {
+            SubtotalHiddenPolicy::ExcludeFilterAndManual => provider.hidden_rows(sheet_index),
+            _ => None,
+        },
+    }
 }
 
 /// Stream one SUBTOTAL data argument through `for_each_arg_value`, dropping
-/// any cell whose row is in `hidden` (the 101-111 exclusion). Delegates to
-/// the shared streaming path so materialization / cross-sheet / spill
-/// semantics stay byte-for-byte identical to 1-11; only the row filter is
+/// any cell whose row is in either hidden set. Delegates to the shared
+/// streaming path so materialization / cross-sheet / spill semantics stay
+/// byte-for-byte identical to the unfiltered case; only the row filter is
 /// layered on top. The callback is value-only because every SUBTOTAL
 /// accumulator ignores the address.
 fn for_each_subtotal_value(
     arg: &Expr,
     provider: &dyn EvalProvider,
-    hidden: Option<&Rc<HashSet<u32>>>,
+    hidden: &SubtotalHiddenSets,
     f: &mut dyn FnMut(Value),
 ) {
     for_each_arg_value(arg, provider, &mut |addr, v| {
-        if let (Some(hidden), Some(addr)) = (hidden, addr) {
-            if hidden.contains(&addr.row) {
-                return;
+        if !hidden.is_empty() {
+            if let Some(addr) = addr {
+                if hidden.contains(addr.row) {
+                    return;
+                }
             }
         }
         f(v);
@@ -19715,15 +19787,15 @@ fn for_each_subtotal_value(
 
 /// Shared body for SUBTOTAL function_num ∈ 1..=11. Walks every
 /// `data_args` element via `for_each_subtotal_value` so streaming numeric
-/// accumulators match the standalone SUM/AVERAGE/etc. arms. When
-/// `ignore_hidden` (the caller normalized a 101-111 function number), each
-/// argument additionally excludes its sheet's host-pushed hidden rows
-/// (design doc #32 §6); 1-11 pass `false` and behave exactly as before.
+/// accumulators match the standalone SUM/AVERAGE/etc. arms. `policy` selects
+/// which host-pushed hidden-row sources each argument excludes — see
+/// [`SubtotalHiddenPolicy`]; the accumulator logic itself is identical across
+/// all three policies.
 fn run_subtotal(
     fn_num: u32,
     data_args: &[Expr],
     provider: &dyn EvalProvider,
-    ignore_hidden: bool,
+    policy: SubtotalHiddenPolicy,
 ) -> Value {
     match fn_num {
         // 1: AVERAGE
@@ -19735,8 +19807,8 @@ fn run_subtotal(
                 if err.is_some() {
                     break;
                 }
-                let hidden = subtotal_hidden_for_arg(arg, provider, ignore_hidden);
-                for_each_subtotal_value(arg, provider, hidden.as_ref(), &mut |v| {
+                let hidden = subtotal_hidden_for_arg(arg, provider, policy);
+                for_each_subtotal_value(arg, provider, &hidden, &mut |v| {
                     if err.is_some() {
                         return;
                     }
@@ -19762,8 +19834,8 @@ fn run_subtotal(
         2 => {
             let mut count = 0u64;
             for arg in data_args {
-                let hidden = subtotal_hidden_for_arg(arg, provider, ignore_hidden);
-                for_each_subtotal_value(arg, provider, hidden.as_ref(), &mut |v| {
+                let hidden = subtotal_hidden_for_arg(arg, provider, policy);
+                for_each_subtotal_value(arg, provider, &hidden, &mut |v| {
                     if matches!(v, Value::Number(_)) {
                         count += 1;
                     }
@@ -19775,8 +19847,8 @@ fn run_subtotal(
         3 => {
             let mut count = 0u64;
             for arg in data_args {
-                let hidden = subtotal_hidden_for_arg(arg, provider, ignore_hidden);
-                for_each_subtotal_value(arg, provider, hidden.as_ref(), &mut |v| {
+                let hidden = subtotal_hidden_for_arg(arg, provider, policy);
+                for_each_subtotal_value(arg, provider, &hidden, &mut |v| {
                     if !matches!(v, Value::Null) {
                         count += 1;
                     }
@@ -19792,8 +19864,8 @@ fn run_subtotal(
                 if err.is_some() {
                     break;
                 }
-                let hidden = subtotal_hidden_for_arg(arg, provider, ignore_hidden);
-                for_each_subtotal_value(arg, provider, hidden.as_ref(), &mut |v| {
+                let hidden = subtotal_hidden_for_arg(arg, provider, policy);
+                for_each_subtotal_value(arg, provider, &hidden, &mut |v| {
                     if err.is_some() {
                         return;
                     }
@@ -19819,8 +19891,8 @@ fn run_subtotal(
                 if err.is_some() {
                     break;
                 }
-                let hidden = subtotal_hidden_for_arg(arg, provider, ignore_hidden);
-                for_each_subtotal_value(arg, provider, hidden.as_ref(), &mut |v| {
+                let hidden = subtotal_hidden_for_arg(arg, provider, policy);
+                for_each_subtotal_value(arg, provider, &hidden, &mut |v| {
                     if err.is_some() {
                         return;
                     }
@@ -19847,8 +19919,8 @@ fn run_subtotal(
                 if err.is_some() {
                     break;
                 }
-                let hidden = subtotal_hidden_for_arg(arg, provider, ignore_hidden);
-                for_each_subtotal_value(arg, provider, hidden.as_ref(), &mut |v| {
+                let hidden = subtotal_hidden_for_arg(arg, provider, policy);
+                for_each_subtotal_value(arg, provider, &hidden, &mut |v| {
                     if err.is_some() {
                         return;
                     }
@@ -19873,12 +19945,12 @@ fn run_subtotal(
         // 7: STDEV / 8: STDEVP / 10: VAR / 11: VARP
         7 | 8 | 10 | 11 => {
             // Inline the numeric collection (rather than `collect_numbers`) so
-            // the 101-111 hidden-row exclusion layers onto the same streaming
-            // path; 1-11 pass `ignore_hidden == false` and collect everything.
+            // the hidden-row exclusion layers onto the same streaming path;
+            // `IncludeAll` collects everything, exactly as before.
             let mut nums = Vec::new();
             for arg in data_args {
-                let hidden = subtotal_hidden_for_arg(arg, provider, ignore_hidden);
-                for_each_subtotal_value(arg, provider, hidden.as_ref(), &mut |v| {
+                let hidden = subtotal_hidden_for_arg(arg, provider, policy);
+                for_each_subtotal_value(arg, provider, &hidden, &mut |v| {
                     if let Value::Number(n) = v {
                         nums.push(n);
                     }
@@ -19907,8 +19979,8 @@ fn run_subtotal(
                 if err.is_some() {
                     break;
                 }
-                let hidden = subtotal_hidden_for_arg(arg, provider, ignore_hidden);
-                for_each_subtotal_value(arg, provider, hidden.as_ref(), &mut |v| {
+                let hidden = subtotal_hidden_for_arg(arg, provider, policy);
+                for_each_subtotal_value(arg, provider, &hidden, &mut |v| {
                     if err.is_some() {
                         return;
                     }
@@ -19945,18 +20017,19 @@ fn fn_subtotal(args: &[Expr], provider: &dyn EvalProvider) -> Value {
         return Value::Error(ValueError::InvalidValue);
     }
     let fn_int = fn_raw.trunc() as i64;
-    // 1-11 aggregate every referenced cell; 101-111 share the same
-    // accumulators but exclude the host-pushed hidden rows of each argument's
-    // sheet (design doc #32 §6). The engine reads that hidden set purely as
-    // evaluation input — it models no hidden state of its own.
-    let (fn_norm, ignore_hidden) = if (1..=11).contains(&fn_int) {
-        (fn_int as u32, false)
+    // Excel's two-layer rule (`design-filter-hidden-rows` §2/§6.3): BOTH
+    // layers exclude the host's FILTER-hidden rows; only 101-111 additionally
+    // exclude MANUALLY hidden rows. Both sets are read purely as evaluation
+    // input — the engine models no hidden state and never infers a row's
+    // source.
+    let (fn_norm, policy) = if (1..=11).contains(&fn_int) {
+        (fn_int as u32, SubtotalHiddenPolicy::ExcludeFilter)
     } else if (101..=111).contains(&fn_int) {
-        ((fn_int - 100) as u32, true)
+        ((fn_int - 100) as u32, SubtotalHiddenPolicy::ExcludeFilterAndManual)
     } else {
         return Value::Error(ValueError::InvalidValue);
     };
-    run_subtotal(fn_norm, &args[1..], provider, ignore_hidden)
+    run_subtotal(fn_norm, &args[1..], provider, policy)
 }
 
 /// AGGREGATE(function_num, options, ref1, [ref2…]).
@@ -20029,11 +20102,19 @@ fn fn_aggregate(args: &[Expr], provider: &dyn EvalProvider) -> Value {
             if !ignore_errors {
                 // AGGREGATE's ignore-hidden lives in its `options` bit
                 // (1/3/5/7), NOT the 100+ SUBTOTAL convention — so hidden
-                // exclusion stays off here (`ignore_hidden = false`).
+                // exclusion stays off here (`IncludeAll`), and neither hidden
+                // epoch edge is registered.
                 // TODO(#32 §6.3): options 1/3/5/7 can reuse the SUBTOTAL
-                // `subtotal_hidden_for_arg` seam; explicitly out of the T4
-                // acceptance scope (design §3.2).
-                return run_subtotal(fn_int as u32, data_args, provider, false);
+                // `subtotal_hidden_for_arg` seam, which now carries BOTH
+                // sources (`design-filter-hidden-rows` §9.3); explicitly out
+                // of the T4 acceptance scope (design §3.2) and out of the
+                // filter-hidden S1 scope (`design-filter-hidden-rows` §12-3).
+                return run_subtotal(
+                    fn_int as u32,
+                    data_args,
+                    provider,
+                    SubtotalHiddenPolicy::IncludeAll,
+                );
             }
             let nums = match collect_nums_skip_errors(data_args) {
                 Ok(v) => v,

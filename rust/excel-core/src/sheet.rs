@@ -930,13 +930,14 @@ pub(crate) struct WorkbookAtomContext {
     /// reality makes a single atom both simpler and sufficient.)
     tables_epoch: RefCell<Option<AtomId>>,
     tables_revision: Cell<u64>,
-    /// Host-pushed per-sheet hidden-row sets consumed by SUBTOTAL 101-111
-    /// (design doc #32 §6, CANONICAL_OWNERSHIP §7-1). Keyed by 0-based sheet
-    /// index; the value is shared (`Rc`) so a resolver hands the set back to
-    /// the evaluator without cloning the rows. This is pure read-only
-    /// evaluation input — the engine never models hidden state or infers its
-    /// source (manual vs filter). Empty pushes drop the entry, so a lookup
-    /// miss and an empty set are the same "no filtering" signal.
+    /// Host-pushed per-sheet MANUALLY-hidden row sets consumed by SUBTOTAL
+    /// 101-111 (design doc #32 §6, CANONICAL_OWNERSHIP §7-1). Keyed by 0-based
+    /// sheet index; the value is shared (`Rc`) so a resolver hands the set back
+    /// to the evaluator without cloning the rows. This is pure read-only
+    /// evaluation input — the engine never models hidden state and never
+    /// infers a row's hidden source; the host decides which of the two side
+    /// stores a row lands in. Empty pushes drop the entry, so a lookup miss
+    /// and an empty set are the same "no filtering" signal.
     ///
     /// Placed here (not on `Sheet`) for the same reason as `tables`: every
     /// sheet shares one `Store`, and a cross-sheet SUBTOTAL must reach ANY
@@ -944,16 +945,32 @@ pub(crate) struct WorkbookAtomContext {
     /// per-`Sheet` field + per-sheet epoch predates the shared-Store reality
     /// (same as the `tables_epoch` note above).
     eval_hidden_rows: RefCell<HashMap<usize, Rc<HashSet<u32>>>>,
-    /// Reactive invalidation seam for hidden-row pushes (design doc #32 §6.2).
-    /// A SUBTOTAL 101-111 formula's `hidden_rows` resolve does a tracked read
-    /// of this epoch (`depend_hidden`); `set_eval_hidden_rows` `store.set(+1)`s
-    /// it so ONLY the formulas that consumed a hidden set re-derive. 1-11 never
-    /// touch this path, hold no edge, and stay undisturbed. One shared atom
-    /// (per the shared-Store reality) — cross-sheet over-invalidation is a
-    /// documented coarseness, identical to `tables_epoch`'s single-atom choice;
-    /// results stay correct because the side storage is per-sheet keyed.
-    hidden_epoch: RefCell<Option<AtomId>>,
-    hidden_revision: Cell<u64>,
+    /// Host-pushed per-sheet FILTER-hidden row sets (`design-filter-hidden-rows`
+    /// §6.2). Structurally identical to `eval_hidden_rows` above — same keying,
+    /// same `Rc` sharing, same whole-set-replace / empty-clears contract — but
+    /// kept as an INDEPENDENT store because Excel's two SUBTOTAL layers need
+    /// the source distinction: 1-11 exclude filter-hidden rows only, 101-111
+    /// exclude both. A merged set could not express that rule.
+    eval_filter_hidden_rows: RefCell<HashMap<usize, Rc<HashSet<u32>>>>,
+    /// Reactive invalidation seam for MANUAL hidden-row pushes (design doc #32
+    /// §6.2). A SUBTOTAL 101-111 formula's `hidden_rows` resolve does a tracked
+    /// read of this epoch (`depend_manual_hidden`); `set_eval_hidden_rows`
+    /// `store.set(+1)`s it so ONLY the formulas that consumed a manual hidden
+    /// set re-derive. 1-11 never touch this path, hold no edge, and stay
+    /// undisturbed by a manual hide/unhide. One shared atom (per the
+    /// shared-Store reality) — cross-sheet over-invalidation is a documented
+    /// coarseness, identical to `tables_epoch`'s single-atom choice; results
+    /// stay correct because the side storage is per-sheet keyed.
+    manual_hidden_epoch: RefCell<Option<AtomId>>,
+    manual_hidden_revision: Cell<u64>,
+    /// Reactive invalidation seam for FILTER hidden-row pushes
+    /// (`design-filter-hidden-rows` §6.4). Deliberately a SEPARATE atom from
+    /// `manual_hidden_epoch`: under the new two-layer rule BOTH 1-11 and
+    /// 101-111 read the filter set, so sharing one epoch would make every
+    /// manual hide/unhide dirty every 1-11 SUBTOTAL in the workbook — a pure
+    /// new re-computation cost. With the split, 1-11 hold only the filter edge.
+    filter_hidden_epoch: RefCell<Option<AtomId>>,
+    filter_hidden_revision: Cell<u64>,
     custom_functions: RefCell<Option<Arc<dyn CustomFunctionRegistry>>>,
     custom_epoch: RefCell<Option<AtomId>>,
     custom_revision: Cell<u64>,
@@ -979,8 +996,11 @@ impl WorkbookAtomContext {
             tables_epoch: RefCell::new(None),
             tables_revision: Cell::new(0),
             eval_hidden_rows: RefCell::new(HashMap::new()),
-            hidden_epoch: RefCell::new(None),
-            hidden_revision: Cell::new(0),
+            eval_filter_hidden_rows: RefCell::new(HashMap::new()),
+            manual_hidden_epoch: RefCell::new(None),
+            manual_hidden_revision: Cell::new(0),
+            filter_hidden_epoch: RefCell::new(None),
+            filter_hidden_revision: Cell::new(0),
             custom_functions: RefCell::new(None),
             custom_epoch: RefCell::new(None),
             custom_revision: Cell::new(0),
@@ -1036,32 +1056,55 @@ impl WorkbookAtomContext {
         self.bump_epoch(&self.tables_epoch, &self.tables_revision);
     }
 
-    /// Tracked read of the hidden-row invalidation epoch (design doc #32
+    /// Tracked read of the MANUAL hidden-row invalidation epoch (design doc #32
     /// §6.2). Consulted by `hidden_rows_for_sheet` — including its miss
     /// branch — so a SUBTOTAL 101-111 formula that currently sees NO hidden
     /// rows still re-derives once the host pushes a set (mirrors
     /// `depend_tables`'s pre-probe placement).
-    fn depend_hidden(&self, args: &ReadArgs) {
-        let id = self.epoch_atom(&self.hidden_epoch, self.hidden_revision.get());
+    fn depend_manual_hidden(&self, args: &ReadArgs) {
+        let id = self.epoch_atom(&self.manual_hidden_epoch, self.manual_hidden_revision.get());
         let _ = args.get(id);
     }
 
-    /// Resolve the host-pushed hidden-row set for `sheet_index` as a *tracked*
-    /// read (the live formula-inner path). Registers the `hidden_epoch` edge
-    /// before the probe so the 101-111 formula re-derives on any future push,
-    /// then returns the per-sheet set (`None` when empty/absent, or when
-    /// `sheet_index` is `None`).
+    /// Tracked read of the FILTER hidden-row invalidation epoch
+    /// (`design-filter-hidden-rows` §6.4). Same pre-probe placement as
+    /// `depend_manual_hidden`, but on its own atom so a manual hide/unhide
+    /// never dirties the 1-11 formulas that only hold this edge.
+    fn depend_filter_hidden(&self, args: &ReadArgs) {
+        let id = self.epoch_atom(&self.filter_hidden_epoch, self.filter_hidden_revision.get());
+        let _ = args.get(id);
+    }
+
+    /// Resolve the host-pushed MANUAL hidden-row set for `sheet_index` as a
+    /// *tracked* read (the live formula-inner path). Registers the
+    /// `manual_hidden_epoch` edge before the probe so the 101-111 formula
+    /// re-derives on any future push, then returns the per-sheet set (`None`
+    /// when empty/absent, or when `sheet_index` is `None`).
     pub(crate) fn hidden_rows_for_sheet(
         &self,
         sheet_index: Option<usize>,
         args: &ReadArgs,
     ) -> Option<Rc<HashSet<u32>>> {
-        self.depend_hidden(args);
+        self.depend_manual_hidden(args);
         let sheet_index = sheet_index?;
         self.eval_hidden_rows.borrow().get(&sheet_index).cloned()
     }
 
-    /// Untracked hidden-row lookup for the eager `WorkbookEvalProvider`
+    /// Resolve the host-pushed FILTER hidden-row set for `sheet_index` as a
+    /// *tracked* read. Twin of `hidden_rows_for_sheet` against the independent
+    /// filter side store and the independent `filter_hidden_epoch`; read by
+    /// BOTH SUBTOTAL layers (`design-filter-hidden-rows` §6.3).
+    pub(crate) fn filter_hidden_rows_for_sheet(
+        &self,
+        sheet_index: Option<usize>,
+        args: &ReadArgs,
+    ) -> Option<Rc<HashSet<u32>>> {
+        self.depend_filter_hidden(args);
+        let sheet_index = sheet_index?;
+        self.eval_filter_hidden_rows.borrow().get(&sheet_index).cloned()
+    }
+
+    /// Untracked MANUAL hidden-row lookup for the eager `WorkbookEvalProvider`
     /// (`define_name` / `get_cell` of a non-formula cell). That path does not
     /// participate in reactive invalidation, so it reads the side storage
     /// directly without an epoch edge.
@@ -1069,8 +1112,17 @@ impl WorkbookAtomContext {
         self.eval_hidden_rows.borrow().get(&sheet_index).cloned()
     }
 
-    /// Full-replace the hidden-row set for `sheet_index` (design doc #32 §6.1
-    /// — idempotent whole-set push) and fire the epoch so every SUBTOTAL
+    /// Untracked FILTER hidden-row lookup for the eager
+    /// `WorkbookEvalProvider`. Twin of `hidden_rows_untracked`.
+    pub(crate) fn filter_hidden_rows_untracked(
+        &self,
+        sheet_index: usize,
+    ) -> Option<Rc<HashSet<u32>>> {
+        self.eval_filter_hidden_rows.borrow().get(&sheet_index).cloned()
+    }
+
+    /// Full-replace the MANUAL hidden-row set for `sheet_index` (design doc #32
+    /// §6.1 — idempotent whole-set push) and fire the epoch so every SUBTOTAL
     /// 101-111 formula that consumed this sheet's set re-derives. An empty set
     /// drops the entry. The side storage is updated BEFORE the epoch bump so
     /// the eager re-derivation the `store.set` triggers reads the new set.
@@ -1083,7 +1135,24 @@ impl WorkbookAtomContext {
                 map.insert(sheet_index, Rc::new(rows));
             }
         }
-        self.bump_epoch(&self.hidden_epoch, &self.hidden_revision);
+        self.bump_epoch(&self.manual_hidden_epoch, &self.manual_hidden_revision);
+    }
+
+    /// Full-replace the FILTER hidden-row set for `sheet_index`
+    /// (`design-filter-hidden-rows` §6.2). Byte-for-byte the same contract as
+    /// `set_eval_hidden_rows` against the independent side store, firing the
+    /// independent `filter_hidden_epoch` — so BOTH SUBTOTAL layers re-derive
+    /// while the manual store and its epoch stay untouched.
+    pub(crate) fn set_eval_filter_hidden_rows(&self, sheet_index: usize, rows: HashSet<u32>) {
+        {
+            let mut map = self.eval_filter_hidden_rows.borrow_mut();
+            if rows.is_empty() {
+                map.remove(&sheet_index);
+            } else {
+                map.insert(sheet_index, Rc::new(rows));
+            }
+        }
+        self.bump_epoch(&self.filter_hidden_epoch, &self.filter_hidden_revision);
     }
 
     fn bump_epoch(&self, slot: &RefCell<Option<AtomId>>, revision: &Cell<u64>) {
@@ -1877,11 +1946,18 @@ impl<'a, 'r> EvalProvider for AtomFormulaProvider<'a, 'r> {
     }
 
     fn hidden_rows(&self, sheet_index: Option<usize>) -> Option<Rc<HashSet<u32>>> {
-        // Live formula-inner path: the tracked read of `hidden_epoch` inside
-        // `hidden_rows_for_sheet` is what makes a `set_eval_hidden_rows` push
-        // precisely re-derive this SUBTOTAL 101-111 formula (design §6.2).
+        // Live formula-inner path: the tracked read of `manual_hidden_epoch`
+        // inside `hidden_rows_for_sheet` is what makes a `set_eval_hidden_rows`
+        // push precisely re-derive this SUBTOTAL 101-111 formula (design §6.2).
         self.workbook_context()?
             .hidden_rows_for_sheet(sheet_index, self.args)
+    }
+
+    fn filter_hidden_rows(&self, sheet_index: Option<usize>) -> Option<Rc<HashSet<u32>>> {
+        // Twin of `hidden_rows` on the independent `filter_hidden_epoch`; read
+        // by both SUBTOTAL layers (`design-filter-hidden-rows` §6.3).
+        self.workbook_context()?
+            .filter_hidden_rows_for_sheet(sheet_index, self.args)
     }
 
     fn sheet_index_of(&self, name: &str) -> Option<usize> {

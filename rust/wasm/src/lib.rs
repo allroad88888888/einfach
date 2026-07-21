@@ -2476,16 +2476,33 @@ impl WasmWorkbook {
             .map_err(|err| JsValue::from_str(&err))
     }
 
-    /// Push the host's per-sheet hidden-row set as read-only SUBTOTAL 101-111
-    /// evaluation input (design doc #32 §6, CANONICAL_OWNERSHIP §7-1). `rows`
-    /// is a `number[]` of 0-based hidden row indices; full-replace semantics
-    /// (an empty array clears the sheet's set). The engine models no hidden
-    /// state — it consumes this purely as evaluation input, and the paired
-    /// epoch bump re-derives only the 101-111 formulas that read it.
+    /// Push the host's per-sheet MANUALLY-hidden row set as read-only SUBTOTAL
+    /// 101-111 evaluation input (design doc #32 §6, CANONICAL_OWNERSHIP §7-1).
+    /// `rows` is a `number[]` of 0-based hidden row indices; full-replace
+    /// semantics (an empty array clears the sheet's set). The engine models no
+    /// hidden state — it consumes this purely as evaluation input, and the
+    /// paired epoch bump re-derives only the 101-111 formulas that read it.
+    /// SUBTOTAL 1-11 deliberately ignore this set (Excel includes manually
+    /// hidden rows in 1-11); filter-hidden rows go through
+    /// `setEvalFilterHiddenRows` instead.
     #[wasm_bindgen(js_name = "setEvalHiddenRows")]
     pub fn set_eval_hidden_rows(&mut self, sheet_idx: u32, rows: Vec<u32>) {
         self.workbook
             .set_eval_hidden_rows(sheet_idx as usize, &rows);
+    }
+
+    /// Push the host's per-sheet FILTER-hidden row set as read-only evaluation
+    /// input (`design-filter-hidden-rows` §6.5). Additive twin of
+    /// `setEvalHiddenRows` — that method is unchanged — carrying the source
+    /// distinction Excel's two SUBTOTAL layers need: `SUBTOTAL(1-11)` excludes
+    /// THIS set but includes manually hidden rows, `SUBTOTAL(101-111)` excludes
+    /// both. Same shape and contract as `setEvalHiddenRows`: `rows` is a
+    /// `number[]` of 0-based row indices, full-replace, empty array clears,
+    /// out-of-range `sheet_idx` is a silent no-op, never throws.
+    #[wasm_bindgen(js_name = "setEvalFilterHiddenRows")]
+    pub fn set_eval_filter_hidden_rows(&mut self, sheet_idx: u32, rows: Vec<u32>) {
+        self.workbook
+            .set_eval_filter_hidden_rows(sheet_idx as usize, &rows);
     }
 
     /// Toggle a Table's totals row (design doc #32 §7). `enabled == true`
