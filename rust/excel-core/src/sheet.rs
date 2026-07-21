@@ -1,4 +1,5 @@
 use std::cell::{Cell, RefCell};
+use std::cmp::Ordering;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::hash::Hash;
 use std::rc::{Rc, Weak};
@@ -903,6 +904,55 @@ impl ProjectedTable {
     }
 }
 
+/// Where the sheet at `idx` ends up after a sheet moves `from` → `to`.
+///
+/// Mirrors the wasm layer's identically-named helper, which remaps subscription
+/// tokens across the same rotation. Both exist because sheet ORDER is the
+/// engine's only sheet identity — there is no stable sheet id — so every piece
+/// of index-keyed side state has to ride the rotation explicitly.
+fn remap_sheet_index_after_move(idx: usize, from: usize, to: usize) -> usize {
+    if from == to {
+        return idx;
+    }
+    if idx == from {
+        return to;
+    }
+    if from < to && idx > from && idx <= to {
+        return idx - 1;
+    }
+    if to < from && idx >= to && idx < from {
+        return idx + 1;
+    }
+    idx
+}
+
+/// Rebuild an index-keyed hidden-row store under `remap`, dropping entries the
+/// closure maps to `None`. Returns whether anything actually moved or was
+/// dropped, so the caller can skip a redundant epoch bump.
+fn remap_index_keyed_rows(
+    store: &RefCell<HashMap<usize, Rc<HashSet<u32>>>>,
+    remap: impl Fn(usize) -> Option<usize>,
+) -> bool {
+    let mut map = store.borrow_mut();
+    if map.is_empty() {
+        return false;
+    }
+    let mut changed = false;
+    let mut next: HashMap<usize, Rc<HashSet<u32>>> = HashMap::with_capacity(map.len());
+    for (key, rows) in map.drain() {
+        match remap(key) {
+            Some(new_key) => {
+                changed |= new_key != key;
+                next.insert(new_key, rows);
+            }
+            // Dropped: the owning sheet is gone.
+            None => changed = true,
+        }
+    }
+    *map = next;
+    changed
+}
+
 pub(crate) struct WorkbookAtomContext {
     store: Store,
     topology: RefCell<WorkbookAtomTopology>,
@@ -1153,6 +1203,43 @@ impl WorkbookAtomContext {
             }
         }
         self.bump_epoch(&self.filter_hidden_epoch, &self.filter_hidden_revision);
+    }
+
+    /// Remap both hidden-row side stores after the sheet at `removed` was
+    /// deleted from the workbook's sheet vector: the removed sheet's own entry
+    /// dies with it, and every later key shifts down by one to track the sheet
+    /// that now occupies that index.
+    ///
+    /// Without this, a deletion silently re-attaches a hidden set to whichever
+    /// sheet slid into the vacated index (or orphans it entirely), and SUBTOTAL
+    /// 1-11 / 101-111 filter against the wrong sheet's rows. It cannot
+    /// self-heal: the host bridge subscribes to `viewportHiddenAtom`, which a
+    /// sheet deletion never touches, so no corrective re-push ever arrives.
+    pub(crate) fn remap_hidden_rows_after_sheet_remove(&self, removed: usize) {
+        self.remap_hidden_rows(|key| match key.cmp(&removed) {
+            Ordering::Equal => None,
+            Ordering::Greater => Some(key - 1),
+            Ordering::Less => Some(key),
+        });
+    }
+
+    /// Remap both hidden-row side stores after a sheet moved from `from` to
+    /// `to`, applying the same rotation the sheet vector just underwent.
+    pub(crate) fn remap_hidden_rows_after_sheet_move(&self, from: usize, to: usize) {
+        self.remap_hidden_rows(|key| Some(remap_sheet_index_after_move(key, from, to)));
+    }
+
+    /// Apply `remap` to the keys of BOTH index-keyed hidden-row stores, firing
+    /// each store's epoch only if that store actually changed — so a sheet
+    /// reorder does not needlessly dirty SUBTOTAL formulas on the layer that
+    /// held no sets.
+    fn remap_hidden_rows(&self, remap: impl Fn(usize) -> Option<usize>) {
+        if remap_index_keyed_rows(&self.eval_hidden_rows, &remap) {
+            self.bump_epoch(&self.manual_hidden_epoch, &self.manual_hidden_revision);
+        }
+        if remap_index_keyed_rows(&self.eval_filter_hidden_rows, &remap) {
+            self.bump_epoch(&self.filter_hidden_epoch, &self.filter_hidden_revision);
+        }
     }
 
     fn bump_epoch(&self, slot: &RefCell<Option<AtomId>>, revision: &Cell<u64>) {

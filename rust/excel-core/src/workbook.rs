@@ -1093,6 +1093,9 @@ impl Workbook {
         let name = self.names.remove(from);
         self.sheets.insert(to, sheet);
         self.names.insert(to, name);
+        // The index-keyed hidden-row side stores must ride the same rotation
+        // the sheet vector just underwent (see `remove_sheet`).
+        self.atom_context.remap_hidden_rows_after_sheet_move(from, to);
         self.rebuild_name_lookup();
         self.sync_atom_topology();
         true
@@ -1772,6 +1775,11 @@ impl Workbook {
         if self.tables.len() != before {
             self.bump_tables_epoch();
         }
+        // Hidden-row maintenance: the Table registry above is keyed by NAME and
+        // so is immune to the index shift, but the two hidden-row side stores
+        // are keyed by sheet INDEX and must be shifted down explicitly, or
+        // SUBTOTAL 1-11 / 101-111 start filtering against another sheet's rows.
+        self.atom_context.remap_hidden_rows_after_sheet_remove(idx);
         self.rebuild_name_lookup();
         self.sync_atom_topology();
         Some(sheet)
