@@ -80,6 +80,25 @@ export interface RemoveDuplicatesScanInput {
   excludeHeader?: boolean
   /** See {@link RemoveDuplicatesComparison}. Default `'exact'`. */
   comparison?: RemoveDuplicatesComparison
+  /**
+   * Sheet-absolute row indices the scan must skip outright — neither
+   * compared, nor counted in `scannedRows`, nor eligible to become the
+   * first-seen occupant of a tuple.
+   *
+   * This exists because the dense `[startRow..endRow]` walk cannot tell
+   * "row present in the projection and genuinely blank" apart from "row
+   * absent from the projection because it is not rendered". The former is
+   * a real duplicate candidate (Excel treats all-blank rows as duplicates
+   * of each other); the latter is invisible data that must never be handed
+   * to `removeRows`.
+   *
+   * Populate with FILTER-hidden rows only. Manually hidden rows still carry
+   * their real values in the projection and, per Excel, still take part in
+   * Remove Duplicates — passing them here would silently shrink the
+   * operation. Omitted / empty means "scan everything", the pre-hardening
+   * behaviour.
+   */
+  hiddenRows?: ReadonlySet<number> | readonly number[]
 }
 
 export interface RemoveDuplicatesScanResult {

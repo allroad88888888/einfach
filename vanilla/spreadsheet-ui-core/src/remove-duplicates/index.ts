@@ -23,6 +23,10 @@ import {
   viewportFreezeAtom,
 } from '../viewport/freeze'
 import {
+  getFilterHiddenRowsForSheet,
+  viewportFilterHiddenAtom,
+} from '../viewport/effective-hidden'
+import {
   applyViewportHiddenStructuralShiftAtom,
   getHiddenColumnsForSheet,
   getHiddenRowsForSheet,
@@ -403,6 +407,14 @@ export const removeDuplicatesPreviewAtom: Atom<RemoveDuplicatesScanResult | null
         noKeyColumns: true,
       })
     }
+    // Filter-hidden rows only. Manually hidden rows keep their real values in
+    // the projection and, per Excel, still take part in Remove Duplicates —
+    // excluding them here would silently shrink the operation. Filter-hidden
+    // rows contribute no cells at all, so the dense walk would read them as
+    // all-blank duplicates and delete data the user cannot see (§8.1).
+    const sheetId = get(removeDuplicatesLifecycleAtom).sheetId
+    const hiddenRows =
+      sheetId === null ? [] : getFilterHiddenRowsForSheet(get(viewportFilterHiddenAtom), sheetId)
     return snapshotScanResult(
       findDuplicateRows({
         cells: get(removeDuplicatesScanInputCellsAtom),
@@ -410,6 +422,7 @@ export const removeDuplicatesPreviewAtom: Atom<RemoveDuplicatesScanResult | null
         keyColumns,
         comparison: get(removeDuplicatesComparisonAtom),
         excludeHeader,
+        hiddenRows,
       }),
     )
   },

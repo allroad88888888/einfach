@@ -146,7 +146,7 @@ return getWindowIndexes(window.rowStart, window.rowEnd).filter((row) => !hiddenR
 
 改为读一个 UI-core 侧的派生原子 `effectiveHiddenRowsAtom(sheetId) = manual ∪ filter`（派生，非新真值），`getHiddenRowSet()`（`:673-675`）与 `getRenderedVisibleWindow()` 喂给 `getVisibleWindowWithHidden` 的入参同源替换。**行号跳号因此零成本落地**——行头本来就渲染 `{row + 1}`（`:3806-3823`）。
 
-同一个并集派生原子同时供给：`go-to` 的 `hiddenRows` 上下文（`go-to/index.ts:575`）、`remove-duplicates` 与 `text-to-columns` 的扫描跳过（§8.1）、复制的可见性过滤（§8.2）。**并集只在"渲染与可见性"语义下使用；凡是要区分来源的消费者（SUBTOTAL 推送、复制）必须读两个源子集。**
+并集派生原子供给 `go-to` 的 `hiddenRows` 上下文（`go-to/index.ts:575`）。**并集只在"渲染与导航可见性"语义下使用；凡是要动数据的消费者必须读源子集** —— `remove-duplicates` / `text-to-columns` 的扫描跳过（§8.1）、复制的可见性过滤（§8.2）、SUBTOTAL 推送都只读**筛选**子集。（初稿把前两者列为并集消费者，2026-07-21 已按 §8.1 主控裁定二更正。）
 
 ---
 
@@ -360,7 +360,7 @@ if let Some(addr) = addr {
 | UI-core 状态   | `vanilla/spreadsheet-ui-core/src/filter-sort/filter-hidden.ts`（新）             | `filterHiddenAtom`（source）、`setFilterHiddenRowsAtom` / `clearFilterHiddenRowsAtom`（command）、`applyFilterHiddenStructuralShiftAtom`（command）、`effectiveHiddenRowsForSheet`（derived helper）。README 按仓内惯例分类原子 |
 | UI-core 筛选   | `vanilla/spreadsheet-ui-core/src/filter-sort/index.ts`                           | `runFilterSortMutationAtom` 消费 ACK 的 `hiddenRowIndices`；新增 `reapplyFilterAtom`；**删** `deriveFilterHiddenRows`；`buildSortExcludedRows` 改读两集                                                                         |
 | UI-core 网关   | `vanilla/spreadsheet-ui-core/src/editing/mutation-gateway.ts`                    | 回映射半边全删、protection 半边全留（§5）                                                                                                                                                                                       |
-| UI-core 消费者 | `go-to/`、`remove-duplicates/`、`text-to-columns/`、`clipboard/`、`operations/`  | 并集隐藏集接入；稠密扫描跳过隐藏行（§8.1）；复制只取可见（§8.2）；删除行只删可见（§8.3）                                                                                                                                        |
+| UI-core 消费者 | `go-to/`、`remove-duplicates/`、`text-to-columns/`、`clipboard/`、`operations/`  | `go-to` 接**并集**；稠密扫描跳过**筛选**隐藏行（§8.1 裁定二）；复制只取可见（§8.2）；删除行只删可见（§8.3）                                                                                                                     |
 | 投影 helper    | `vanilla/spreadsheet-ui-core/src/backend/projection-helpers.ts`                  | `buildFilterSortDisplayRows` → `computeFilterHiddenRows(state, options, readValue): Set<number>`；`cloneCell` 去字段                                                                                                            |
 | static adapter | `solid/excel/src-vnext/adapter/static-backend.ts`                                | 投影塌回恒等分支；`setFilterSort` 回传隐藏集；`evalFilterHiddenRowsBySheetId` + 端口；**解除** filter 期 merge 抑制                                                                                                             |
 | worker adapter | `solid/excel/src-vnext/adapter/worker-workbook-backend.ts`                       | `readFilteredRange` 与 `MappedDisplayRow` 删除、overlay 去 `?? cell.row`；扫描载荷改隐藏集；`filterSortDisplayRowsBySheetId` 缓存删除；`setEvalFilterHiddenRowsThroughWorker`                                                   |
@@ -381,7 +381,7 @@ if let Some(addr) = addr {
 - 压缩下安全：被筛行**根本不在** display 区间内，循环永远访问不到。
 - 隐藏下**危险**：隐藏行**就在** `[startRow..endRow]` 区间内，但稀疏投影不产它的 cell → 每个隐藏行被当作全空行 → 隐藏行 2..N 被判为隐藏行 1 的**重复行**并喂给 `backend.removeRows` → **静默数据丢失**。
 
-**裁决**：`remove-duplicates` 的扫描必须显式跳过并集隐藏行（照 `go-to/locator-engine.ts:160-185` 的 `scanVisibleCellsOnly` 样板），且**必须先于 adapter 翻转落地**：切片序 S3 早于 S5（§10）。
+**裁决**（2026-07-21 修订，见下方两条更正）：`remove-duplicates` 的扫描必须显式跳过**筛选隐藏行（不是并集）**，且**必须先于 adapter 翻转落地**：切片序 S3 早于 S5（§10）。
 
 > **主控更正（2026-07-21，核实后写入）**：本节初稿称"今天对手动隐藏行就存在同一 bug 的弱化版"，
 > **该论断不成立，已删除**。核实：手动隐藏在 `ca2d27a` 后是 UI-core 视图事实，后端投影并不知道
@@ -394,7 +394,25 @@ if let Some(addr) = addr {
 >
 > 教训：设计稿里的推断性论断，实施前必须逐条回到代码验证再引用。
 
-`text-to-columns/index.ts:784-787` 有同形状的稠密构行。危害较低（按列拆分，隐藏行写回的是空拆分结果），但同样按"跳过隐藏行"加固，一并归入 S3。
+> **主控裁定二（2026-07-21，S3 实施者提出，核实后采纳）**：本节初稿要求"跳过**并集**隐藏行"，
+> **该口径已改为"只跳过筛选隐藏行"**。三条理由，任一独立成立：
+>
+> 1. **Excel 语义**：删除重复项作用于整个选区，**包含手动隐藏行**。跳过手动隐藏行会主动制造与
+>    Excel 的分歧 —— 而本轮改造的目的正是消除分歧。
+> 2. **危害面的准确定义**：真正的风险不是"行被隐藏了"，而是"行落在 `[startRow..endRow]` 内却
+>    贡献不出任何 cell（没进投影）"。S5 之后只有**筛选**隐藏行具备这个性质；手动隐藏行的 cell
+>    照常带真实值进 `byRow`（见上条更正）。对手动隐藏行设防既无必要，也防不到点上。
+> 3. **与 S3 自身的硬约束冲突**：S3 的验收条件是**行为零变化**（§10）。若接并集，用户今天只要
+>    手动隐藏任意一行，删除重复项的结果就会立刻改变 —— 并集读法在 S3 的约束下**根本不可实现**。
+>
+> 连带修正：§3 末段把 `remove-duplicates` / `text-to-columns` 列为"并集消费者"同样是错的，
+> 二者读**筛选子集**；并集的真实消费者只剩 `go-to`（渲染与可见性导航语义）。这与 §8.2 复制侧
+> 已经选筛选子集的裁决自洽 —— 凡是**要动数据**的消费者都读筛选子集，只有**导航/渲染**读并集。
+>
+> 记账：此裁定由 S3 实施者在动工前提出并拒绝按初稿实现，属于我在任务书中明确要求的行为
+> （"若确实冲突，在报告里提出并给建议，不要擅自选一个实现了事"）。
+
+`text-to-columns/index.ts:784-787` 有同形状的稠密构行。危害较低（按列拆分，隐藏行写回的是空拆分结果），但同样按"跳过**筛选**隐藏行"加固（同上裁定），一并归入 S3。
 
 ### 8.2 复制只复制可见单元格
 

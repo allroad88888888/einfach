@@ -85,6 +85,27 @@ Behaviour:
    index is reported there so callers can hand the result straight to
    `backend.removeRows` without remapping.
 
+6. `input.hiddenRows` lists sheet-absolute rows the scan skips outright:
+   not compared, not counted in `scannedRows`, never the first-seen
+   occupant of a tuple, never reported in `duplicateRows`. Omitting it
+   (or passing an empty set) scans everything.
+
+   The scan walks `[startRow .. endRow]` densely while the projection is
+   sparse, so "row present and genuinely blank" and "row absent because
+   it is not rendered" look identical at this layer. Point 4 says the
+   former are duplicates of each other — correct, and Excel parity. The
+   latter must never be touched: an unrendered row's real values are
+   simply not in the payload, and reporting it would hand invisible data
+   to `backend.removeRows`.
+
+   **Populate with filter-hidden rows only.** Manually hidden rows still
+   carry their real values in the projection, and Excel's Remove
+   Duplicates operates on the whole selection including hidden rows — so
+   they take part exactly like visible rows. The atom layer feeds
+   `viewportFilterHiddenAtom` (not the `effectiveHiddenAtom` union) for
+   this reason. See
+   `solid/excel/docs/online-excel-parity/design-filter-hidden-rows.md` §8.1.
+
 Empty range (`startRow > endRow` or `startCol > endCol`) returns zero
 scanned rows and never throws.
 

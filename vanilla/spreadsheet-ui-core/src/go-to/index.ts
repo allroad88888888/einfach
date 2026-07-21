@@ -9,7 +9,7 @@ import {
 } from '../selection'
 import { sheetTabsSheetsAtom } from '../sheet-tabs'
 import type { CellRange } from '../shared'
-import { viewportHiddenAtom, viewportMetricsAtom } from '../viewport'
+import { effectiveHiddenAtom, viewportMetricsAtom } from '../viewport'
 import { workspaceActiveSheetAuthorityWitnessAtom, workspaceSessionAtom } from '../workspace'
 import { runGoToSpecialScan } from './locator-engine'
 import {
@@ -557,7 +557,11 @@ export const runGoToSpecialScanAtom = atom(
         return
       }
 
-      const hidden = get(viewportHiddenAtom)
+      // Union (manual ∪ filter): `Go To Special → Visible cells only` asks a
+      // pure visibility question, and a row is invisible whichever set put it
+      // there. Excluding filter-hidden rows here is what keeps the locator
+      // from selecting rows the user cannot see.
+      const hidden = get(effectiveHiddenAtom)
       const activeCell = differenceLocator
         ? {
             row: range.rowStart,

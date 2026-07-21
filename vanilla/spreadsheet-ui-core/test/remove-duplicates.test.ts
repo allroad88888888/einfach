@@ -8,6 +8,7 @@ import type {
 } from '../src/backend/types'
 import { historyStackAtom } from '../src/history'
 import { selectionAtom } from '../src/selection'
+import { setViewportFilterHiddenRowsAtom } from '../src/viewport/effective-hidden'
 import { setFreezeConfigAtom, viewportFreezeAtom } from '../src/viewport/freeze'
 import { hideRowsAtom, viewportHiddenAtom } from '../src/viewport/hidden'
 import {
@@ -1219,5 +1220,128 @@ describe('remove-duplicates structural remap of local view facts', () => {
     expect(entries[0]?.localSidePayloads).toBeUndefined()
     expect(store.getter(viewportFreezeAtom).rowsBySheet[SHEET_ID]).toBeUndefined()
     expect(store.getter(viewportHiddenAtom).rowsBySheet[SHEET_ID]).toBeUndefined()
+  })
+})
+
+// Slice S3 hardening (design-filter-hidden-rows.md §8.1 / §11).
+//
+// The scan walks `[startRow..endRow]` densely while the projection is sparse,
+// so "row absent from the projection" and "row present and blank" are
+// indistinguishable at that layer. Once filter-hidden rows stop being
+// projected (S5), every hidden row would materialise as an all-blank tuple,
+// duplicate its hidden peers, and be handed to `removeRows` — silent data
+// loss. `hiddenRows` closes that hole ahead of the flip.
+describe('remove-duplicates × hidden rows (§8.1 data-safety hardening)', () => {
+  // Rows 0 (header) and 1, 4 are projected; rows 2, 3, 5 contribute no
+  // cells — exactly what a filter-hidden row looks like post-S5.
+  const SPARSE_CELLS: DisplayCell[] = [cell(0, 0, 'header'), cell(1, 0, 'a'), cell(4, 0, 'b')]
+
+  test('counter-example: unprojected rows become all-blank duplicates without the guard', () => {
+    // The hazard itself, pinned so the guard below is provably load-bearing.
+    const result = findDuplicateRows({
+      cells: SPARSE_CELLS,
+      range: range(0, 0, 5, 0),
+      keyColumns: new Set([0]),
+    })
+    expect(result.duplicateRows).toEqual([3, 5])
+    expect(result.scannedRows).toBe(5)
+  })
+
+  test('hidden rows are never reported as duplicates', () => {
+    const result = findDuplicateRows({
+      cells: SPARSE_CELLS,
+      range: range(0, 0, 5, 0),
+      keyColumns: new Set([0]),
+      hiddenRows: [2, 3, 5],
+    })
+    expect(result.duplicateRows).toEqual([])
+    expect(result.scannedRows).toBe(2)
+    expect(result.uniqueRows).toBe(2)
+  })
+
+  test('a hidden row never becomes the first-seen occupant of a tuple', () => {
+    // Even if a hidden row somehow carries cells, it must not shadow a
+    // visible row: the visible row owns the tuple and survives.
+    const result = findDuplicateRows({
+      cells: [cell(1, 0, 'x'), cell(2, 0, 'x')],
+      range: range(1, 0, 2, 0),
+      keyColumns: new Set([0]),
+      excludeHeader: false,
+      hiddenRows: [1],
+    })
+    expect(result.duplicateRows).toEqual([])
+    expect(result.scannedRows).toBe(1)
+  })
+
+  test('hidden rows in the header slot or outside the range are inert', () => {
+    const result = findDuplicateRows({
+      cells: SPARSE_CELLS,
+      range: range(0, 0, 5, 0),
+      keyColumns: new Set([0]),
+      hiddenRows: new Set([0, 99]),
+    })
+    // Row 0 is already excluded as the header; 99 is out of range.
+    expect(result.duplicateRows).toEqual([3, 5])
+    expect(result.scannedRows).toBe(5)
+  })
+
+  test('omitting hiddenRows preserves the pre-hardening scan exactly', () => {
+    const withUndefined = findDuplicateRows({
+      cells: SESSION_CELLS,
+      range: range(0, 0, 4, 1),
+      keyColumns: new Set([0]),
+    })
+    const withEmpty = findDuplicateRows({
+      cells: SESSION_CELLS,
+      range: range(0, 0, 4, 1),
+      keyColumns: new Set([0]),
+      hiddenRows: [],
+    })
+    expect(withUndefined).toEqual(withEmpty)
+    expect(withUndefined.duplicateRows).toEqual([3])
+  })
+
+  test('preview atom excludes filter-hidden rows from the scan', async () => {
+    const store = createStore()
+    const source: RemoveDuplicatesControllerPort = {
+      async readRangeProjection(request) {
+        return rangeAcknowledgement(request)
+      },
+      async removeRowsExact(request) {
+        return mutationAcknowledgement(request)
+      },
+    }
+    await hydrate(store, source)
+    // Row 3 ('North') duplicates row 1 on column 0 while both are visible.
+    store.setter(dispatchRemoveDuplicatesIntentAtom, { kind: 'toggle-key-column', column: 1 })
+    expect(store.getter(removeDuplicatesPreviewAtom)?.duplicateRows).toEqual([3])
+
+    store.setter(setViewportFilterHiddenRowsAtom, { sheetId: SHEET_ID, rows: [3] })
+    const preview = store.getter(removeDuplicatesPreviewAtom)!
+    expect(preview.duplicateRows).toEqual([])
+    expect(preview.scannedRows).toBe(3)
+  })
+
+  test('manually hidden rows still take part — Excel dedupes the whole selection', () => {
+    // Excel's Remove Duplicates operates on the entire selection, hidden
+    // rows included; manual hides are a pure view fact and the projection
+    // still carries their real values. Only filter-hidden rows (which stop
+    // being projected at all) are excluded.
+    const store = createStore()
+    const source: RemoveDuplicatesControllerPort = {
+      async readRangeProjection(request) {
+        return rangeAcknowledgement(request)
+      },
+      async removeRowsExact(request) {
+        return mutationAcknowledgement(request)
+      },
+    }
+    return hydrate(store, source).then(() => {
+      store.setter(dispatchRemoveDuplicatesIntentAtom, { kind: 'toggle-key-column', column: 1 })
+      store.setter(hideRowsAtom, { sheetId: SHEET_ID, indices: [3] })
+      const preview = store.getter(removeDuplicatesPreviewAtom)!
+      expect(preview.duplicateRows).toEqual([3])
+      expect(preview.scannedRows).toBe(4)
+    })
   })
 })

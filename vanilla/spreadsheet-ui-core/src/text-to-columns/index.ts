@@ -41,6 +41,10 @@ import type {
 } from './types'
 import type { CellCoord, CellRange } from '../shared'
 import {
+  getFilterHiddenRowsForSheet,
+  viewportFilterHiddenAtom,
+} from '../viewport/effective-hidden'
+import {
   workspaceActiveSheetAuthorityWitnessAtom,
   workspaceSessionAtom,
   type WorkspaceActiveSheetAuthorityWitness,
@@ -735,9 +739,21 @@ function textToColumnsEntrypointAuthorityIsCurrent(
   )
 }
 
+/**
+ * Materialise the source column as one entry per row in the requested range.
+ *
+ * `hiddenRows` carries the FILTER-hidden rows for the sheet and is skipped
+ * outright. The walk below is dense over `[rowStart..rowEnd]` while the
+ * projection is sparse, so a row that is not rendered would be materialised
+ * as `text: ''` and later written back as an empty split — clobbering data
+ * the user cannot see. Manually hidden rows are NOT passed here: they carry
+ * real values in the projection and Excel splits them like any other row.
+ * See design-filter-hidden-rows.md §8.1.
+ */
 function textToColumnsSourceRowsFromResult(
   result: unknown,
   ticket: TextToColumnsEntrypointTicket,
+  hiddenRows: ReadonlySet<number>,
 ): readonly TextToColumnsSourceRow[] | null {
   try {
     if (typeof result !== 'object' || result === null) return null
@@ -784,6 +800,7 @@ function textToColumnsSourceRowsFromResult(
 
     const rows: TextToColumnsSourceRow[] = []
     for (let row = ticket.target.range.rowStart; row <= ticket.target.range.rowEnd; row += 1) {
+      if (hiddenRows.has(row)) continue
       rows.push(Object.freeze({ sourceRow: row, text: byRow.get(row) ?? '' }))
     }
     return Object.freeze(rows)
@@ -1178,7 +1195,11 @@ export const runTextToColumnsEntrypointAtom = atom(
       return 'stale'
     }
 
-    const rows = textToColumnsSourceRowsFromResult(projection, ticket)
+    const rows = textToColumnsSourceRowsFromResult(
+      projection,
+      ticket,
+      new Set(getFilterHiddenRowsForSheet(get(viewportFilterHiddenAtom), ticket.target.sheetId)),
+    )
     if (rows === null) {
       set(activeTextToColumnsEntrypointAtom, null)
       set(

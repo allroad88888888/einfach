@@ -53,6 +53,7 @@ import type {
 } from '../src/backend/types'
 import { historyStackAtom } from '../src/history'
 import { selectionAtom } from '../src/selection'
+import { hideRowsAtom, setViewportFilterHiddenRowsAtom } from '../src/viewport'
 import { setWorkspaceActiveSheetAtom } from '../src/workspace'
 
 function makeSource(rows: readonly string[], startRow = 0): readonly TextToColumnsSourceRow[] {
@@ -1724,5 +1725,90 @@ describe('text-to-columns', () => {
         sheetId: 'right-sheet',
       })
     })
+  })
+})
+
+// Slice S3 hardening (design-filter-hidden-rows.md §8.1 / §11).
+//
+// `textToColumnsSourceRowsFromResult` builds one entry per row across the
+// requested range while the projection is sparse. Once filter-hidden rows
+// stop being projected (S5), each one would materialise as `text: ''` and
+// be written back as an empty split, clobbering invisible data.
+describe('text-to-columns × hidden rows (§8.1 dense-build hardening)', () => {
+  test('counter-example: an unprojected row is materialised as a blank source row', async () => {
+    // The hazard, pinned: with no guard the missing row 3 becomes '' and
+    // would later be split into nothing and written back over real data.
+    const store = createStore()
+    setupEntrypointTarget(store)
+    const source: TextToColumnsEntrypointPort = {
+      async readRangeProjection(request) {
+        return matchingEntrypointProjection(request, [
+          { row: 2, col: 3, displayValue: 'a,b' },
+          { row: 4, col: 3, displayValue: 'c,d' },
+        ])
+      },
+    }
+    await expect(store.setter(runTextToColumnsEntrypointAtom, { source })).resolves.toBe('opened')
+    expect(store.getter(textToColumnsSessionAtom)?.rows).toEqual([
+      { sourceRow: 2, text: 'a,b' },
+      { sourceRow: 3, text: '' },
+      { sourceRow: 4, text: 'c,d' },
+    ])
+  })
+
+  test('filter-hidden rows are dropped from the source instead of becoming blanks', async () => {
+    const store = createStore()
+    setupEntrypointTarget(store)
+    store.setter(setViewportFilterHiddenRowsAtom, { sheetId: 'sheet-1', rows: [3] })
+    const source: TextToColumnsEntrypointPort = {
+      async readRangeProjection(request) {
+        return matchingEntrypointProjection(request, [
+          { row: 2, col: 3, displayValue: 'a,b' },
+          { row: 4, col: 3, displayValue: 'c,d' },
+        ])
+      },
+    }
+    await expect(store.setter(runTextToColumnsEntrypointAtom, { source })).resolves.toBe('opened')
+    const session = store.getter(textToColumnsSessionAtom)
+    expect(session?.rows).toEqual([
+      { sourceRow: 2, text: 'a,b' },
+      { sourceRow: 4, text: 'c,d' },
+    ])
+    // The source range still spans the selection; only the row entry is gone.
+    expect(session?.sourceRange).toEqual({ rowStart: 2, rowEnd: 4, colStart: 3, colEnd: 3 })
+  })
+
+  test("another sheet's filter-hidden rows do not leak into this sheet", async () => {
+    const store = createStore()
+    setupEntrypointTarget(store)
+    store.setter(setViewportFilterHiddenRowsAtom, { sheetId: 'other-sheet', rows: [3] })
+    const source: TextToColumnsEntrypointPort = {
+      async readRangeProjection(request) {
+        return matchingEntrypointProjection(request, [{ row: 2, col: 3, displayValue: 'a,b' }])
+      },
+    }
+    await expect(store.setter(runTextToColumnsEntrypointAtom, { source })).resolves.toBe('opened')
+    expect(store.getter(textToColumnsSessionAtom)?.rows).toHaveLength(3)
+  })
+
+  test('manually hidden rows are still split — parity with Excel and with today', async () => {
+    const store = createStore()
+    setupEntrypointTarget(store)
+    store.setter(hideRowsAtom, { sheetId: 'sheet-1', indices: [3] })
+    const source: TextToColumnsEntrypointPort = {
+      async readRangeProjection(request) {
+        return matchingEntrypointProjection(request, [
+          { row: 2, col: 3, displayValue: 'a,b' },
+          { row: 3, col: 3, displayValue: 'hidden,but,real' },
+          { row: 4, col: 3, displayValue: 'c,d' },
+        ])
+      },
+    }
+    await expect(store.setter(runTextToColumnsEntrypointAtom, { source })).resolves.toBe('opened')
+    expect(store.getter(textToColumnsSessionAtom)?.rows).toEqual([
+      { sourceRow: 2, text: 'a,b' },
+      { sourceRow: 3, text: 'hidden,but,real' },
+      { sourceRow: 4, text: 'c,d' },
+    ])
   })
 })

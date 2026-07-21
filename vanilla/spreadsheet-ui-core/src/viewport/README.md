@@ -36,10 +36,14 @@ slices entirely.
   `spreadsheet.viewport.freezeSeededSheets` (private; one-shot hydration ownership),
   `spreadsheet.viewport.freezeDiagnosticBacking` (private; last persistence failure),
   `spreadsheet.viewport.hiddenBacking` (private; per-sheet sorted hidden index sets),
-  `spreadsheet.viewport.hiddenSeededSheets` / `hiddenDiagnosticBacking` (private).
+  `spreadsheet.viewport.hiddenSeededSheets` / `hiddenDiagnosticBacking` (private),
+  `spreadsheet.viewport.filterHiddenBacking` (private; per-sheet sorted FILTER-hidden
+  row sets — see "Two hidden-row sets" below).
 - Derived atoms: `visibleWindowAtom`, `viewportFreezeAtom` and `viewportHiddenAtom`
   (read-only projections — names and shapes unchanged across the canonical flips;
   `viewportHiddenAtom` now serves the FULL per-sheet truth, not a windowed mirror),
+  `viewportFilterHiddenAtom` (read-only projection of the filter-hidden sets),
+  `effectiveHiddenAtom` (manual ∪ filter, `ViewportHiddenState`-shaped),
   `viewportFreezeDiagnosticAtom`, `viewportHiddenDiagnosticAtom`.
 - Commands: `setViewportMetricsAtom`, `scrollToCellAtom`, `setViewportRowHeightAtom`,
   `setViewportColumnWidthAtom`, `setFreezeConfigAtom` (synchronous local commit +
@@ -47,7 +51,9 @@ slices entirely.
   `applyViewportFreezeStructuralShiftAtom` (structural remap, no history);
   `hideRowsAtom` / `unhideRowsAtom` / `hideColumnsAtom` / `unhideColumnsAtom`,
   `unhideViewportSelectionAtom` (selection∩hidden), `hydrateViewportHiddenAtom`,
-  `applyViewportHiddenStructuralShiftAtom` (structural remap, no history).
+  `applyViewportHiddenStructuralShiftAtom` (structural remap, no history);
+  `setViewportFilterHiddenRowsAtom` (whole-set replace per sheet, no history —
+  the filter rules are the authority) / `clearViewportFilterHiddenRowsAtom`.
 - Scale bound: visible window and sparse dimension metadata only; freeze state is two
   integers per sheet plus a per-sheet ownership set; hidden state is bounded by the
   user's actually-hidden indices per sheet (sorted `number[]`, no dense arrays).
@@ -56,4 +62,30 @@ slices entirely.
 - Per-cell/per-row/per-col atom risk: no unbounded row/col atoms or dense dimension arrays;
   row/column size overrides are sparse records keyed only by user-adjusted rows/columns per sheet.
 - Tests: `test/viewport.test.ts`, `test/frozen-panes.test.ts`,
-  `test/hidden-rows-columns.test.ts`, `test/menu-hidden-context.test.ts`.
+  `test/hidden-rows-columns.test.ts`, `test/menu-hidden-context.test.ts`,
+  `test/effective-hidden.test.ts`.
+
+## Two hidden-row sets
+
+`viewportHiddenAtom` holds MANUAL hide/unhide — a user command, with its own history
+entries. `viewportFilterHiddenAtom` holds FILTER-hidden rows — a derived consequence of
+the active filter rules, whole-set replaced when those rules change, with no history
+entry of its own (its undo is the filter rules' undo).
+
+They are deliberately not merged, because three rules cannot be expressed on one set:
+
+1. `SUBTOTAL(1-11)` excludes filter-hidden rows but INCLUDES manually hidden ones
+   (`101-111` excludes both).
+2. Copy skips filter-hidden rows but copies manually hidden ones.
+3. `Unhide Rows` over a filtered region must not cancel the filter.
+
+`effectiveHiddenAtom` is the union and answers exactly one question: *is this row
+painted?* Use it for rendering, window expansion, and `Go To Special → Visible cells
+only`. Anything that must tell the two origins apart (SUBTOTAL pushes, copy, and the
+`remove-duplicates` / `text-to-columns` dense scans, which must keep splitting and
+de-duplicating manually hidden rows for Excel parity) reads the two source atoms.
+
+Slice S3 ships this shape with an always-empty filter set — the population path
+(`SetFilterSortResult.hiddenRowIndices`) lands in S4, so every derivation currently
+degrades to the manual set by reference. See
+`solid/excel/docs/online-excel-parity/design-filter-hidden-rows.md` §3 and §8.1.

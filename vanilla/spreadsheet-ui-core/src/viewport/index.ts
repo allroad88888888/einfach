@@ -1,6 +1,7 @@
 export * from './types'
 export * from './window'
 export * from './hidden'
+export * from './effective-hidden'
 export * from './freeze'
 export * from './chrome'
 export * from './structural-remap'

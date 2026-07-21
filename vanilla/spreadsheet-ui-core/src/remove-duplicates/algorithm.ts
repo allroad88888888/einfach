@@ -5,6 +5,8 @@ import type {
   RemoveDuplicatesScanResult,
 } from './types'
 
+const EMPTY_HIDDEN_ROWS: readonly number[] = Object.freeze([])
+
 function normaliseValue(
   value: string,
   comparison: RemoveDuplicatesComparison,
@@ -69,6 +71,12 @@ function buildTupleKey(values: readonly string[]): string {
  *    with Excel).
  * 4. The first occurrence of any tuple wins; later rows with the same
  *    tuple land in `duplicateRows`.
+ * 4b. Rows listed in `input.hiddenRows` are skipped entirely — not
+ *    compared, not counted, never a first-seen occupant, never reported.
+ *    A row that is not rendered contributes no cells to the sparse
+ *    projection, so the dense walk would otherwise read it as an all-blank
+ *    tuple and mark it (or its peers) duplicate — deleting rows the user
+ *    could not see. See design-filter-hidden-rows.md §8.1.
  * 5. When the projection carries `originalRow` (filter/sort active),
  *    `duplicateRows` contains those source-row indices — NOT the
  *    visual iteration indices. This is what
@@ -105,6 +113,11 @@ export function findDuplicateRows(
 
   const headerRow: number | null =
     excludeHeader && startRow <= endRow ? startRow : null
+
+  const hiddenRows: ReadonlySet<number> =
+    input.hiddenRows instanceof Set
+      ? input.hiddenRows
+      : new Set(input.hiddenRows ?? EMPTY_HIDDEN_ROWS)
 
   if (inRangeKeyCols.length === 0) {
     // Match the derived atom's "noKeyColumns" behaviour — never throw
@@ -185,6 +198,10 @@ export function findDuplicateRows(
   const valueBuf: string[] = new Array(inRangeKeyCols.length)
   const firstScanRow = headerRow !== null ? startRow + 1 : startRow
   for (let row = firstScanRow; row <= endRow; row += 1) {
+    // Hidden rows drop out before anything else: an unrendered row supplies
+    // no cells, so scanning it would compare an all-blank tuple that says
+    // nothing about the data actually stored there.
+    if (hiddenRows.has(row)) continue
     scannedRows += 1
     const rowMap = byRow.get(row)
     for (let i = 0; i < inRangeKeyCols.length; i += 1) {

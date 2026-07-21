@@ -47,7 +47,12 @@ import {
 import { setSheetTabsSheetsAtom } from '../src/sheet-tabs'
 import type { CellRange } from '../src/shared'
 import type { SelectionState } from '../src/selection'
-import { hideColumnsAtom, hideRowsAtom, setViewportMetricsAtom } from '../src/viewport'
+import {
+  hideColumnsAtom,
+  hideRowsAtom,
+  setViewportFilterHiddenRowsAtom,
+  setViewportMetricsAtom,
+} from '../src/viewport'
 import { setWorkspaceActiveSheetAtom } from '../src/workspace'
 import type { RangeProjectionRequest, RangeProjectionResult } from '../src/backend'
 
@@ -1519,5 +1524,55 @@ describe('go-to special × UI-core canonical hidden state', () => {
         expect(2 < region.anchor.col || 2 > region.focus.col).toBe(true)
       }
     }
+  })
+
+  // Slice S3 hardening (design-filter-hidden-rows.md §8.1 / §11).
+  // `Visible cells only` is a pure visibility question, so it reads the
+  // UNION of both hidden sets — a row is invisible whichever set put it
+  // there. Manual-only remains exactly the behaviour pinned above.
+  test('visible-cells-only excludes filter-hidden rows too, not just manual ones', async () => {
+    const store = createStore()
+    prepareSpecialStore(store)
+    store.setter(hideRowsAtom, { sheetId: 'sheet1', indices: [3] })
+    store.setter(setViewportFilterHiddenRowsAtom, { sheetId: 'sheet1', rows: [3, 11] })
+    store.setter(setGoToLocatorAtom, { kind: 'visible-cells-only' })
+
+    await store.setter(runGoToSpecialScanAtom, {
+      port: {
+        async readRangeProjection(request) {
+          return projectionFor(request)
+        },
+      },
+    })
+
+    const regions = store.getter(selectionRegionsAtom)
+    // Rows 3 and 11 drop out; the overlapping row 3 is not double-counted.
+    expect(coveredCellCount(regions)).toBe(18 * 8)
+    for (const region of regions) {
+      for (const hiddenRow of [3, 11]) {
+        if (region.kind === 'cell') {
+          expect(region.anchor.row).not.toBe(hiddenRow)
+        } else if (region.kind === 'range') {
+          expect(hiddenRow < region.anchor.row || hiddenRow > region.focus.row).toBe(true)
+        }
+      }
+    }
+  })
+
+  test("another sheet's filter-hidden rows do not affect this sheet's scan", async () => {
+    const store = createStore()
+    prepareSpecialStore(store)
+    store.setter(setViewportFilterHiddenRowsAtom, { sheetId: 'other-sheet', rows: [3, 11] })
+    store.setter(setGoToLocatorAtom, { kind: 'visible-cells-only' })
+
+    await store.setter(runGoToSpecialScanAtom, {
+      port: {
+        async readRangeProjection(request) {
+          return projectionFor(request)
+        },
+      },
+    })
+
+    expect(coveredCellCount(store.getter(selectionRegionsAtom))).toBe(20 * 8)
   })
 })
