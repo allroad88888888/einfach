@@ -8,8 +8,12 @@ import type {
 } from '../backend/types'
 import type { CellRange } from '../shared'
 import { pushHistoryAtom } from '../history'
-import { projectionSnapshotAtom } from '../projection'
 import { getHiddenRowsForSheet, viewportHiddenAtom } from '../viewport/hidden'
+import {
+  getFilterHiddenRowsForSheet,
+  setViewportFilterHiddenRowsAtom,
+  viewportFilterHiddenAtom,
+} from '../viewport/effective-hidden'
 import {
   selectionAuthorityWitnessAtom,
   selectionSnapshotAtom,
@@ -926,6 +930,23 @@ export const updateFilterSortAvailableValuesAtom = atom(
 )
 updateFilterSortAvailableValuesAtom.debugLabel = 'spreadsheet.filterSort.updateAvailableValues'
 
+/**
+ * Filter-hidden source rows carried by a `setFilterSort` ACK, or `[]`.
+ *
+ * Defensive by construction: the acknowledgement crosses a host boundary, and
+ * a malformed payload must degrade to "nothing hidden" (rules recorded, every
+ * row painted) rather than hide rows on garbage. Entry-level sanitation is left
+ * to `setViewportFilterHiddenRowsAtom`, which owns the canonical shape.
+ */
+function readAckHiddenRowIndices(acknowledgement: unknown): readonly number[] {
+  try {
+    const rows = (acknowledgement as { hiddenRowIndices?: unknown }).hiddenRowIndices
+    return Array.isArray(rows) ? (rows as readonly number[]) : []
+  } catch {
+    return []
+  }
+}
+
 export const runFilterSortMutationAtom = atom(
   null,
   async (get, set, input: RunFilterSortMutationInput): Promise<void> => {
@@ -1075,6 +1096,19 @@ export const runFilterSortMutationAtom = atom(
 
     const stateBeforeCommit = get(filterSortStateBackingAtom)
     set(filterSortStateBackingAtom, stateStoreWith(stateBeforeCommit, sheetId, ticket.next))
+    // Visibility commits with the rules, in the same tick and only on a matched
+    // ACK (`design-filter-hidden-rows` §4.2). This is the ONLY production writer
+    // of the filter-hidden set: it is a whole-set replace taken from the host's
+    // whole-column scan, and a SNAPSHOT — editing a cell afterwards does not
+    // move a row in or out of view, which is Excel's model (`Data → Reapply`).
+    //
+    // A host that returns no `hiddenRowIndices` CLEARS the set instead of
+    // keeping a stale one: after the rules change, yesterday's answer is not a
+    // conservative fallback, it hides the wrong rows.
+    set(setViewportFilterHiddenRowsAtom, {
+      sheetId,
+      rows: readAckHiddenRowIndices(acknowledgement),
+    })
     set(
       filterSortDraftBackingAtom,
       draftFromState(
@@ -1339,63 +1373,36 @@ function sheetHasActiveFilterRules(get: Getter, sheetId: string): boolean {
 }
 
 /**
- * Filtered-out SOURCE rows the physical sort must leave in place, derived from
- * the visible projection UI core ALREADY consumes — no adapter port, no engine
- * hidden model (design §6.1, mirrors the SUBTOTAL "host feeds visibility as an
- * input" rule). Each `DisplayCell` carries `originalRow` (its source row) when
- * filter is active; a row a column filter compresses away has NO display slot,
- * so its `originalRow` never appears among the projected cells. We can only
- * judge the rows the current projection window actually covers, so we reason
- * strictly inside the observed source-row span `[minObserved..maxObserved]`:
- * a source row in that span (and in the sort range) that no projected cell
- * reports is filtered out. Rows beyond the observed span sit outside the
- * bounded projection window and are left in the reorder set — a documented v1
- * gap when the data region exceeds the viewport (design §2.2 / §6.1). Whole-row
- * physical moves keep each row's filter-column value co-located, so the VISIBLE
- * post-sort result is correct regardless; only the resting position of an
- * unobserved filtered row can differ from Excel.
- */
-function deriveFilterHiddenRows(get: Getter, sheetId: string, range: CellRange): number[] {
-  if (!sheetHasActiveFilterRules(get, sheetId)) return []
-  const result = get(projectionSnapshotAtom).result
-  if (result === undefined || result.sheetId !== sheetId) return []
-
-  const observed = new Set<number>()
-  let minObserved = Number.POSITIVE_INFINITY
-  let maxObserved = Number.NEGATIVE_INFINITY
-  for (const cell of result.cells) {
-    const source = cell.originalRow ?? cell.row
-    if (!Number.isSafeInteger(source) || source < range.rowStart || source > range.rowEnd) continue
-    observed.add(source)
-    if (source < minObserved) minObserved = source
-    if (source > maxObserved) maxObserved = source
-  }
-  if (maxObserved < minObserved) return []
-
-  const filteredOut: number[] = []
-  for (let row = minObserved; row <= maxObserved; row += 1) {
-    if (!observed.has(row)) filteredOut.push(row)
-  }
-  return filteredOut
-}
-
-/**
  * Excluded rows (0-based SOURCE space) the host hands the engine so they stay
- * in place while the visible rows reorder. The set is the union of two
- * UI-core canonical facts, both clipped to the sort range:
- *   1. manually hidden rows (`viewportHiddenAtom`, flip step 2);
- *   2. filter-hidden rows derived from the consumed visible projection
- *      (`deriveFilterHiddenRows`, flip step 3).
- * Summary-row pinning needs cell reads UI core does not own and is a known v1
- * gap (design §6.1).
+ * in place while the visible rows reorder. The union of two UI-core canonical
+ * facts, both clipped to the sort range:
+ *   1. manually hidden rows (`viewportHiddenAtom`);
+ *   2. filter-hidden rows (`viewportFilterHiddenAtom`).
+ *
+ * Both are now READ, not inferred. The predecessor derived the filter half by
+ * looking for gaps in the projected `originalRow` values, which could only ever
+ * judge the rows the current viewport happened to cover — a filtered row below
+ * the fold stayed in the reorder set and moved when Excel would have pinned it
+ * (the documented v1 bounded-window gap). The host's whole-column scan now
+ * answers for the whole extent, so that gap is closed rather than narrowed, and
+ * the two halves are finally the same shape.
+ *
+ * Summary-row pinning needs cell reads UI core does not own and remains a known
+ * v1 gap (design §6.1).
  */
 export function buildSortExcludedRows(get: Getter, sheetId: string, range: CellRange): number[] {
   const excluded = new Set<number>()
-  const hidden = getHiddenRowsForSheet(get(viewportHiddenAtom), sheetId)
-  for (const row of hidden) {
-    if (row >= range.rowStart && row <= range.rowEnd) excluded.add(row)
+  const clip = (rows: readonly number[]): void => {
+    for (const row of rows) {
+      if (row >= range.rowStart && row <= range.rowEnd) excluded.add(row)
+    }
   }
-  for (const row of deriveFilterHiddenRows(get, sheetId, range)) excluded.add(row)
+  clip(getHiddenRowsForSheet(get(viewportHiddenAtom), sheetId))
+  // Guarded on the rules, not just on the set: a stale set left behind by a
+  // cleared filter must never pin rows the user can see.
+  if (sheetHasActiveFilterRules(get, sheetId)) {
+    clip(getFilterHiddenRowsForSheet(get(viewportFilterHiddenAtom), sheetId))
+  }
   return [...excluded].sort((a, b) => a - b)
 }
 

@@ -11,14 +11,15 @@ import {
 
 /**
  * Filter on the worker demos (worker adapter serves filter/sort
- * projections, phase 2/3).
+ * projections, phase 2/3), under Excel HIDDEN-ROW semantics (#27 S5).
  *
- * The toolbar filter button is enabled on both worker backends. Applying
- * an equals rule compresses the visible rows to the matching source rows,
- * clearing the rule restores them, and editing a display row while the
- * filter is active writes through the W2 mutation gateway to the source
- * row. Seeded sheet1 column A: A1 'Sheet1' (header row), A2 'cell1',
- * A4 'cell4'; row 4 also holds B4=10, C4='source'.
+ * The toolbar filter button is enabled on both worker backends. Applying an
+ * equals rule HIDES the non-matching rows — it no longer compresses the
+ * survivors into consecutive slots — so a matching row keeps its own address
+ * and the row header skips. Hidden rows are unmounted, not blanked, which is
+ * why absence is asserted with `toHaveCount(0)` rather than an empty string.
+ * Clearing the rule restores them. Seeded sheet1 column A: A1 'Sheet1' (header
+ * row), A2 'cell1', A4 'cell4'; row 4 also holds B4=10, C4='source'.
  */
 
 async function gotoWorkerDemo(page: Page) {
@@ -61,12 +62,17 @@ test.describe('vNext filter real-backend evidence', () => {
 
     await applyEqualsFilterOnColumnA(page, 'cell4')
 
-    // Display compresses: the first data row now shows source row 4.
-    await expect(cellDisplay(page, 'A2')).toHaveText('cell4')
-    await expect(cellDisplay(page, 'B2')).toHaveText('10')
-    await expect(cellDisplay(page, 'C2')).toHaveText('source')
-    // The next display row is blank — 'cell1' is filtered out entirely.
-    await expect(cellDisplay(page, 'A3')).toHaveText('')
+    // The matching row STAYS at A4. Under the retired compaction it moved up
+    // into A2, which is the single most visible difference of this flip.
+    await expect(cellDisplay(page, 'A4')).toHaveText('cell4')
+    await expect(cellDisplay(page, 'B4')).toHaveText('10')
+    await expect(cellDisplay(page, 'C4')).toHaveText('source')
+    // Non-matching rows are unmounted, not blanked.
+    await expect(cell(page, 'A2')).toHaveCount(0)
+    await expect(cell(page, 'A3')).toHaveCount(0)
+    // Excel's row-number skip: the header goes 1, 4 with nothing between.
+    await expect(page.locator('th.spreadsheet-grid-row-header[data-row="1"]')).toHaveCount(0)
+    await expect(page.locator('th.spreadsheet-grid-row-header[data-row="3"]')).toHaveCount(1)
 
     // The filtered column carries its chevron affordance.
     await expect(page.getByTestId('filter-chevron-0')).toBeVisible()
@@ -81,24 +87,23 @@ test.describe('vNext filter real-backend evidence', () => {
     await expect(filterDropdown(page)).toBeHidden()
   })
 
-  test('editing a display row under an active filter writes to the source row', async ({
-    page,
-  }) => {
+  test('an edit under an active filter writes the row the user sees', async ({ page }) => {
     await gotoWorkerDemo(page)
 
     await applyEqualsFilterOnColumnA(page, 'cell4')
-    await expect(cellDisplay(page, 'A2')).toHaveText('cell4')
+    await expect(cellDisplay(page, 'A4')).toHaveText('cell4')
     await page.getByTestId('filter-close').click()
     await expect(filterDropdown(page)).toBeHidden()
 
-    // Display row 2 is source row 4 → the edit must land on D4.
-    await cell(page, 'D2').dblclick()
-    const editor = cellInput(page, 'D2')
+    // What used to need a gateway remap (edit display row 2 -> write source
+    // row 4) is now a plain write: D4 on screen is D4 in the engine.
+    await cell(page, 'D4').dblclick()
+    const editor = cellInput(page, 'D4')
     await expect(editor).toBeVisible()
     await editor.fill('via-filter')
     await editor.press('Enter')
     await expect(editor).toHaveCount(0)
-    await expect(cellDisplay(page, 'D2')).toHaveText('via-filter')
+    await expect(cellDisplay(page, 'D4')).toHaveText('via-filter')
 
     // Clear the filter through the column chevron.
     await page.getByTestId('filter-chevron-0').click()
@@ -106,8 +111,45 @@ test.describe('vNext filter real-backend evidence', () => {
     await page.getByTestId('filter-clear-filter').click()
     await page.getByTestId('filter-close').click()
 
-    // The value lives on the source row, not the display row.
+    // The value stayed where it was written; the rows that come back are
+    // untouched.
     await expect(cellDisplay(page, 'D4')).toHaveText('via-filter')
     await expect(cellDisplay(page, 'D2')).toHaveText('')
+  })
+
+  // The manual-hide defect from the design's §9.3 smoke, pinned end to end:
+  // a manually hidden row must keep meaning the SAME row when a filter is
+  // applied on top of it. Before the flip, compaction silently re-pointed the
+  // stored row number and the wrong row reappeared.
+  test('a manually hidden row does not change what it refers to when a filter changes', async ({
+    page,
+  }) => {
+    await gotoWorkerDemo(page)
+
+    await expect(cellDisplay(page, 'A2')).toHaveText('cell1')
+    await expect(cellDisplay(page, 'A4')).toHaveText('cell4')
+
+    // Manually hide source row 3 (0-based row 2) through the row header menu.
+    await page.locator('th.spreadsheet-grid-row-header[data-row="2"]').click({ button: 'right' })
+    const hideItem = page.getByTestId('context-menu-command-row.hide')
+    await expect(hideItem).toBeVisible()
+    await hideItem.click()
+    await expect(page.locator('th.spreadsheet-grid-row-header[data-row="2"]')).toHaveCount(0)
+    await expect(cellDisplay(page, 'A4')).toHaveText('cell4')
+
+    // Now filter to 'cell4'. Row 1 goes away because the filter hid it; row 2
+    // stays away because the USER hid it; row 3 survives both.
+    await applyEqualsFilterOnColumnA(page, 'cell4')
+    await expect(cell(page, 'A2')).toHaveCount(0)
+    await expect(cell(page, 'A3')).toHaveCount(0)
+    await expect(cellDisplay(page, 'A4')).toHaveText('cell4')
+
+    // Clearing the filter must NOT unhide the manually hidden row: the two sets
+    // are independent, and a filter change never rewrites the manual one.
+    await page.getByTestId('filter-clear-filter').click()
+    await page.getByTestId('filter-close').click()
+    await expect(cellDisplay(page, 'A2')).toHaveText('cell1')
+    await expect(page.locator('th.spreadsheet-grid-row-header[data-row="2"]')).toHaveCount(0)
+    await expect(cellDisplay(page, 'A4')).toHaveText('cell4')
   })
 })

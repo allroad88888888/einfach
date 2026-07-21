@@ -22,6 +22,7 @@ import {
   openFilterDropdownAtom,
   selectionAtom,
   setFilterSortAtom,
+  setViewportFilterHiddenRowsAtom,
   setWorkspaceActiveSheetAtom,
 } from '@einfach/spreadsheet-ui-core'
 import { SpreadsheetFilterDropdown } from '../src-vnext/filter-sort'
@@ -592,40 +593,19 @@ describe('vNext SpreadsheetFilterDropdown — physical sort (design-engine-sort 
     await waitFor(() => expect(store.getter(filterDropdownAtom).status).toBe('closed'))
   })
 
-  it('carries filter-hidden rows in excludedRows, derived from the projection', async () => {
+  it('carries filter-hidden rows in excludedRows, read from the canonical set', async () => {
     const store = createStore()
     const sortRequests: SortRangeRequest[] = []
     const filterRequests: SetFilterSortRequest[] = []
-    const window = { rowStart: 0, rowEnd: 5, colStart: 0, colEnd: 3 }
-    // Filter is active on column 0; the projection compresses source rows 2
-    // and 4 away (display rows carry originalRow 0,1,3,5).
+    // Filter is active on column 0 and the host reported source rows 2 and 4 as
+    // filtered out. UI core holds that answer directly now — it is no longer
+    // reverse-engineered from gaps in the projected rows, so no projection is
+    // needed here and rows outside the viewport are covered just as well.
     store.setter(setFilterSortAtom, {
       sheetId: 'sheet-1',
       state: { rules: [equalsRule(0, 'x')] },
     })
-    seedReadyVisibleProjection(store, {
-      status: 'ready',
-      request: createVisibleProjectionRequest({
-        sheetId: 'sheet-1',
-        requestId: 1,
-        reason: 'viewport',
-        window,
-      }),
-      result: {
-        kind: 'visible-window',
-        sheetId: 'sheet-1',
-        requestId: 1,
-        revision: 1,
-        window,
-        cells: [
-          { row: 0, col: 0, displayValue: 'head', originalRow: 0 },
-          { row: 1, col: 0, displayValue: 'x', originalRow: 1 },
-          { row: 2, col: 0, displayValue: 'x', originalRow: 3 },
-          { row: 3, col: 0, displayValue: 'x', originalRow: 5 },
-        ],
-      },
-      error: undefined,
-    })
+    store.setter(setViewportFilterHiddenRowsAtom, { sheetId: 'sheet-1', rows: [2, 4] })
     store.setter(setWorkspaceActiveSheetAtom, { sheetId: 'sheet-1' })
     store.setter(openFilterDropdownAtom, { sheetId: 'sheet-1', colIndex: 1 })
     const backend = createPhysicalBackend(sortRequests, filterRequests)

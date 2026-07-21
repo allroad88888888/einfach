@@ -408,15 +408,15 @@ describe('audit D-4 · P-D · FIXED — worker backend deleteSheet drops per-she
   })
 })
 
-describe('audit D-7 · P-A · FLIPPED — worker filter visibility is a supported bounded permutation', () => {
+describe('audit D-7 · P-A · FLIPPED — worker filter visibility is a bounded scan that withholds rows', () => {
   // Was: the adapter omitted `setFilterSort` and the projection stayed
-  // canonical. Parity slice #29 lands the port: the adapter mirrors the
-  // ui-core canonical rules, computes the VISIBILITY permutation at
-  // projection time with the shared pure helper, and reads stay explicitly
-  // bounded — a single-column predicate scan per predicate column plus a
-  // window-bounded `readCells` batch. Engine data is never reordered, and
-  // sort is not part of this path at all (#24).
-  test('implements the port with bounded predicate scans and originalRow projections', async () => {
+  // canonical. Parity slice #29 landed the port; #27 S5 then replaced display
+  // compaction with Excel's hidden-row semantics. The scan stays bounded — one
+  // single-column predicate read per predicate column, once, when the rules are
+  // applied — and the projection read goes back to a plain rectangular range
+  // read, because survivors no longer scatter across a bounding box. Engine data
+  // is never reordered, and sort is not part of this path at all (#24).
+  test('implements the port with bounded predicate scans and identity projections', async () => {
     const client = createWorkerWorkbook({ workerFactory: () => createInProcessWorker() })
     const readRanges: SparseRangeWire[] = []
     const spyClient: typeof client = {
@@ -455,8 +455,8 @@ describe('audit D-7 · P-A · FLIPPED — worker filter visibility is a supporte
     const ack = await backend.setFilterSort!({
       kind: 'set-filter-sort',
       sheetId: 'sheet-1',
-      // Keep only values <= 90, i.e. source rows 10..30 — the compression
-      // pushes source row 10 into display row 1.
+      // Keep only values <= 90, i.e. source rows 10..30. Rows 1..9 are hidden
+      // and every survivor keeps the row number it already had.
       rules: [{ kind: 'range', colIndex: 0, max: 90 }],
       requestId: 2,
     })
@@ -466,22 +466,24 @@ describe('audit D-7 · P-A · FLIPPED — worker filter visibility is a supporte
       createVisibleProjectionRequest({ sheetId: 'sheet-1', requestId: 3, window }),
     )
 
-    // Exactly two sparse-range reads: the unfiltered window read and ONE
-    // single-column predicate scan (col 0 doubles as the summary probe).
-    // The filtered window read itself goes through a bounded readCells
-    // batch, never a widened sparse read.
+    // Three sparse-range reads: the unfiltered window read, ONE single-column
+    // predicate scan (col 0 doubles as the summary probe), and the post-filter
+    // window read — which is a plain rectangle again. The compacted path used a
+    // cell-by-cell `readCells` batch over a bounding box instead.
     expect(readRanges).toEqual([
       { sheet: 0, startRow: 0, endRow: 20, startCol: 0, endCol: 5 },
       { sheet: 0, startRow: 0, endRow: 30, startCol: 0, endCol: 0 },
+      { sheet: 0, startRow: 0, endRow: 20, startCol: 0, endCol: 5 },
     ])
-    // Header row 0 passes through; filtered-out rows compress away, so
-    // display row 1 is source row 10 (value 90) with its originalRow fact.
-    // Row ORDER stays source order — the sort branch is gone (#24).
+    // Header row 0 passes through; rows 1..9 are withheld outright, so the
+    // first surviving data row is source row 10 AT row 10 — the compacted path
+    // reported it at display row 1. Row ORDER stays source order (#24).
     expect(after.cells.find((cell) => cell.row === 0 && cell.col === 0)?.displayValue).toBe('100')
-    expect(after.cells.find((cell) => cell.row === 1 && cell.col === 0)).toMatchObject({
+    expect(after.cells.some((cell) => cell.row >= 1 && cell.row <= 9)).toBe(false)
+    expect(after.cells.find((cell) => cell.row === 10 && cell.col === 0)).toMatchObject({
       displayValue: '90',
-      originalRow: 10,
     })
+    expect(after.cells.every((cell) => cell.originalRow === undefined)).toBe(true)
     // The mutation ACK bumped the revision; the engine rows themselves
     // did not move (clearing the state restores the canonical order).
     expect(after.revision).not.toBe(before.revision)

@@ -19,6 +19,7 @@ import {
   runPhysicalSortAtom,
   selectionAtom,
   setFilterSortAtom,
+  setViewportFilterHiddenRowsAtom,
   setWorkspaceActiveSheetAtom,
   sortRangeSupportedAtom,
 } from '../src'
@@ -224,15 +225,10 @@ describe('runPhysicalSortAtom — fail-closed capability gate', () => {
       sheetId: 'sheet-1',
       state: { rules: [{ kind: 'equals', colIndex: 0, value: 'x' }] },
     })
-    // Filter compresses source rows 2 and 4 away: display rows carry
-    // originalRow 0 (header), 1, 3, 5. The gaps inside the observed span are
-    // the filtered-out rows.
-    publishProjection(store, [
-      { row: 0, col: 0, displayValue: 'head', originalRow: 0 },
-      { row: 1, col: 0, displayValue: 'x', originalRow: 1 },
-      { row: 2, col: 0, displayValue: 'x', originalRow: 3 },
-      { row: 3, col: 0, displayValue: 'x', originalRow: 5 },
-    ])
+    // The host's whole-column scan reported source rows 2 and 4 as filtered
+    // out; UI core stores that verbatim. Nothing is inferred from the
+    // projection any more, so no projection needs publishing here.
+    store.setter(setViewportFilterHiddenRowsAtom, { sheetId: 'sheet-1', rows: [2, 4] })
     const { source, sortRequests } = makePhysicalSource()
 
     await store.setter(runPhysicalSortAtom, {
@@ -263,15 +259,10 @@ describe('runPhysicalSortAtom — filter-hidden excluded rows', () => {
       sheetId: 'sheet-1',
       state: { rules: [{ kind: 'equals', colIndex: 0, value: 'x' }] },
     })
-    // Manually hide row 5 (inside the range); filter compresses row 3 away.
+    // Manually hide row 5 (inside the range); the filter hid row 3. Two
+    // separate sets, and excludedRows is the only place they are unioned.
     store.setter(hideRowsAtom, { sheetId: 'sheet-1', indices: [5] })
-    publishProjection(store, [
-      { row: 0, col: 0, displayValue: 'head', originalRow: 0 },
-      { row: 1, col: 0, displayValue: 'x', originalRow: 1 },
-      { row: 2, col: 0, displayValue: 'x', originalRow: 2 },
-      { row: 3, col: 0, displayValue: 'x', originalRow: 4 },
-      { row: 4, col: 0, displayValue: 'x', originalRow: 5 },
-    ])
+    store.setter(setViewportFilterHiddenRowsAtom, { sheetId: 'sheet-1', rows: [3] })
     const { source, sortRequests } = makePhysicalSource()
 
     await store.setter(runPhysicalSortAtom, {
@@ -282,26 +273,28 @@ describe('runPhysicalSortAtom — filter-hidden excluded rows', () => {
       refreshProjection: noRefresh,
     })
 
-    // Observed span 1..5 (row 5 present but also manually hidden); gap 3 is
-    // filtered out; union with hidden row 5, sorted ascending.
     expect(sortRequests[0].excludedRows).toEqual([3, 5])
   })
 
-  test('reasons only inside the observed span (bounded projection window)', async () => {
+  test('excludes filtered rows the projection window never covered', async () => {
     const store = makeStore()
     setActiveCell(store, 'sheet-1', 2, 1)
     store.setter(setFilterSortAtom, {
       sheetId: 'sheet-1',
       state: { rules: [{ kind: 'equals', colIndex: 0, value: 'x' }] },
     })
-    // Projection window only observes source rows 2 and 4 (scrolled). Row 3 is
-    // a gap inside [2..4] → excluded; rows 1 and 5 are outside the observed
-    // span → left in the reorder set (bounded-window semantics).
+    // The bounded-window gap this replaces: excluded rows used to be inferred
+    // from holes in the projected originalRow values, so only rows the viewport
+    // happened to cover could ever be judged. Here the window shows rows 0..1
+    // only, while rows 1, 3 and 5 are filtered out — the old derivation
+    // answered [] for 1 and 5 (outside the observed span) and they moved under
+    // the sort. The host's whole-column answer covers the whole extent.
+    store.setter(setViewportFilterHiddenRowsAtom, { sheetId: 'sheet-1', rows: [1, 3, 5] })
     publishProjection(
       store,
       [
-        { row: 0, col: 0, displayValue: 'x', originalRow: 2 },
-        { row: 1, col: 0, displayValue: 'x', originalRow: 4 },
+        { row: 0, col: 0, displayValue: 'x' },
+        { row: 1, col: 0, displayValue: 'x' },
       ],
       'sheet-1',
       { rowStart: 0, rowEnd: 1, colStart: 0, colEnd: 3 },
@@ -316,10 +309,10 @@ describe('runPhysicalSortAtom — filter-hidden excluded rows', () => {
       refreshProjection: noRefresh,
     })
 
-    expect(sortRequests[0].excludedRows).toEqual([3])
+    expect(sortRequests[0].excludedRows).toEqual([1, 3, 5])
   })
 
-  test('a filter with no consumed projection excludes nothing derived', async () => {
+  test('a filter whose host reported no hidden rows excludes nothing', async () => {
     const store = makeStore()
     setActiveCell(store, 'sheet-1', 2, 1)
     store.setter(setFilterSortAtom, {
@@ -336,27 +329,20 @@ describe('runPhysicalSortAtom — filter-hidden excluded rows', () => {
       refreshProjection: noRefresh,
     })
 
-    // Still physical, but with no projection to read the
-    // filtered-out rows cannot be derived — excludedRows is empty.
+    // Rules recorded, visibility set never populated (a host that cannot
+    // compute it degrades exactly here) — excludedRows is empty, not guessed.
     expect(sortRequests).toHaveLength(1)
     expect(sortRequests[0].excludedRows).toEqual([])
   })
 
-  test('ignores a projection published for a different sheet', async () => {
+  test('ignores filter-hidden rows recorded for a different sheet', async () => {
     const store = makeStore()
     setActiveCell(store, 'sheet-1', 2, 1)
     store.setter(setFilterSortAtom, {
       sheetId: 'sheet-1',
       state: { rules: [{ kind: 'equals', colIndex: 0, value: 'x' }] },
     })
-    publishProjection(
-      store,
-      [
-        { row: 0, col: 0, displayValue: 'x', originalRow: 1 },
-        { row: 1, col: 0, displayValue: 'x', originalRow: 4 },
-      ],
-      'other-sheet',
-    )
+    store.setter(setViewportFilterHiddenRowsAtom, { sheetId: 'other-sheet', rows: [1, 4] })
     const { source, sortRequests } = makePhysicalSource()
 
     await store.setter(runPhysicalSortAtom, {

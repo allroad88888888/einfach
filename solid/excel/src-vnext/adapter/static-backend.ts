@@ -55,6 +55,7 @@ import type {
   SetColumnWidthRequest,
   SetConditionalFormatRuleRequest,
   SetFilterSortRequest,
+  SetFilterSortResult,
   SetEvalHiddenRowsRequest,
   SetFormatRangeRequest,
   SetNamedRangeRequest,
@@ -1320,17 +1321,19 @@ function addFormatOnlyCells(
   range: { rowStart: number; rowEnd: number; colStart: number; colEnd: number },
   cellFormats: Map<string, SpreadsheetCellFormat>,
   rangeFormats: RangeFormatLayer[],
-  displayRows: readonly number[] | null = null,
+  filterHiddenRows: ReadonlySet<number> | undefined,
 ) {
-  const filterSortActive = displayRows !== null
   for (let row = range.rowStart; row <= range.rowEnd; row += 1) {
-    const sourceRow = filterSortActive ? displayRows[row] : row
-    if (sourceRow === undefined) continue
+    // A filter-hidden row must contribute NOTHING to the projection, not even a
+    // format-only blank: "in range but with no cells" is exactly the property
+    // downstream visible-cell consumers (status-bar aggregates, the hardened
+    // dense scans) rely on to tell filtered-away rows from empty ones.
+    if (filterHiddenRows?.has(row)) continue
 
     for (let col = range.colStart; col <= range.colEnd; col += 1) {
       const key = keyFor(row, col)
       const existing = resultCells.get(key)
-      const format = getEffectiveFormat(sourceRow, col, cellFormats, rangeFormats)
+      const format = getEffectiveFormat(row, col, cellFormats, rangeFormats)
 
       if (existing) {
         if (format) existing.format = format
@@ -1341,7 +1344,6 @@ function addFormatOnlyCells(
           displayValue: '',
           valueKind: 'blank',
           format,
-          ...(filterSortActive ? { originalRow: sourceRow } : {}),
         })
       }
     }
@@ -1445,27 +1447,23 @@ function projectSourceCell(
   options: {
     displayRow: number
     displayCol: number
-    sourceRow: number
     lookup: EvalCellLookup
     cellFormats: Map<string, SpreadsheetCellFormat>
     rangeFormats: RangeFormatLayer[]
     workbookLocale: string
-    filterSortActive: boolean
   },
 ): DisplayCell {
   const clone = cloneCell(cell)
   clone.row = options.displayRow
   clone.col = options.displayCol
-  if (options.filterSortActive) {
-    clone.originalRow = options.sourceRow
-  }
 
   if (clone.formula) {
     delete clone.numericValue
-    // Anchor on the SOURCE coordinates: a `[@Col]` must intersect the row the
-    // formula physically lives in, not the (filter-shifted) display row.
+    // Display row IS the source row now, so the old "anchor the formula on the
+    // source row while the cell reports a display row" split is gone, and with
+    // it the whole class of `[@Col]` mis-anchoring it existed to work around.
     const result = evaluateFormula(clone.formula, options.lookup, new Set(), {
-      row: options.sourceRow,
+      row: options.displayRow,
       col: cell.col,
     })
     const formatted = formatEvalResult(result)
@@ -1491,7 +1489,7 @@ function projectSourceCell(
   }
 
   const format = getEffectiveFormat(
-    options.sourceRow,
+    options.displayRow,
     options.displayCol,
     options.cellFormats,
     options.rangeFormats,
@@ -1666,63 +1664,41 @@ function buildProjectionResult(
   const cellFormats = getOrCreateCellFormats(state, request.sheetId)
   const rangeFormats = getOrCreateRangeFormats(state, request.sheetId)
   const conditionalRules = state.conditionalFormatRulesBySheetId.get(request.sheetId) ?? []
-  const filterSortState = state.filterSortBySheetId.get(request.sheetId)
   const workbookLocale = state.workbookLocale ?? DEFAULT_WORKBOOK_LOCALE
 
+  const filterHiddenRows = filterHiddenRowsForSheet(state, request.sheetId)
   const lookup: EvalCellLookup = {
     get(row: number, col: number) {
       return sheetCells.get(keyFor(row, col))
     },
     resolveStructuredRef: makeStructuredRefResolver(state, request.sheetId),
     hiddenRows: evalHiddenRowsForSheet(state, request.sheetId),
-    filterHiddenRows: filterHiddenRowsForSheet(state, request.sheetId),
-  }
-  const displayRows = buildFilterSortDisplayRows(sheetCells, lookup, filterSortState)
-  const filterSortActive = displayRows !== null
-
-  if (filterSortActive) {
-    for (let displayRow = range.rowStart; displayRow <= range.rowEnd; displayRow += 1) {
-      const sourceRow = displayRows[displayRow]
-      if (sourceRow === undefined) continue
-
-      for (let col = range.colStart; col <= range.colEnd; col += 1) {
-        const cell = sheetCells.get(keyFor(sourceRow, col))
-        if (!cell) continue
-        const clone = projectSourceCell(cell, {
-          displayRow,
-          displayCol: col,
-          sourceRow,
-          lookup,
-          cellFormats,
-          rangeFormats,
-          workbookLocale,
-          filterSortActive,
-        })
-        resultCellMap.set(keyFor(clone.row, clone.col), clone)
-      }
-    }
-  } else {
-    for (const cell of sheetCells.values()) {
-      if (!isCellInsideRange(cell, range)) continue
-      const clone = projectSourceCell(cell, {
-        displayRow: cell.row,
-        displayCol: cell.col,
-        sourceRow: cell.row,
-        lookup,
-        cellFormats,
-        rangeFormats,
-        workbookLocale,
-        filterSortActive,
-      })
-      resultCellMap.set(keyFor(clone.row, clone.col), clone)
-    }
+    filterHiddenRows,
   }
 
-  addFormatOnlyCells(resultCellMap, range, cellFormats, rangeFormats, displayRows)
+  // Excel hidden-row semantics: display row IS source row. A filter no longer
+  // compacts survivors into consecutive slots; it withholds the hidden rows and
+  // leaves every other row at its own index, which is what makes the row header
+  // skip (1, 4, 5) and what removes the second coordinate system that
+  // `originalRow` existed to translate between.
+  for (const cell of sheetCells.values()) {
+    if (!isCellInsideRange(cell, range)) continue
+    if (filterHiddenRows?.has(cell.row)) continue
+    const clone = projectSourceCell(cell, {
+      displayRow: cell.row,
+      displayCol: cell.col,
+      lookup,
+      cellFormats,
+      rangeFormats,
+      workbookLocale,
+    })
+    resultCellMap.set(keyFor(clone.row, clone.col), clone)
+  }
+
+  addFormatOnlyCells(resultCellMap, range, cellFormats, rangeFormats, filterHiddenRows)
   for (const [cellKey, cell] of resultCellMap) {
-    const sourceRow = cell.originalRow ?? cell.row
     const conditionalFormat = getConditionalFormatForCell(
-      sourceRow,
+      cell.row,
       cell.col,
       cell,
       conditionalRules,
@@ -1737,11 +1713,13 @@ function buildProjectionResult(
       })
     }
   }
-  applyMergeMetadata(
-    resultCellMap,
-    range,
-    filterSortActive ? [] : (state.mergeRangesBySheetId.get(request.sheetId) ?? []),
-  )
+  // #04 x #29: merge metadata used to be suppressed WHOLESALE under an active
+  // filter, because merge coordinates are source facts and the projection emitted
+  // a permuted row space — a span drawn across non-adjacent surviving rows was a
+  // lie, so the honest answer was to draw nothing. Identity mapping removes the
+  // permutation, so the suppression goes with it and merged cells stay visible
+  // inside a filtered region, as Excel draws them.
+  applyMergeMetadata(resultCellMap, range, state.mergeRangesBySheetId.get(request.sheetId) ?? [])
   const resultCells = [...resultCellMap.values()].sort(compareCells)
 
   if (request.kind === 'visible-window') {
@@ -4855,9 +4833,10 @@ export function createStaticSpreadsheetBackend(
      * read, which is both Excel's model (`Data → Reapply`) and the worker
      * adapter's push point, so the two hosts stay observationally identical.
      */
-    async setFilterSort(request: SetFilterSortRequest): Promise<BackendMutationResult> {
+    async setFilterSort(request: SetFilterSortRequest): Promise<SetFilterSortResult> {
       const nextRevision = nextRevisionOrThrow(state.revision)
       const next = cloneFilterSortState({ rules: request.rules })
+      let hiddenRowIndices: readonly number[] = []
       if (filterSortHasEffect(next)) {
         state.filterSortBySheetId.set(request.sheetId, next)
         const sheetCells = getOrCreateSheetCells(state, request.sheetId)
@@ -4878,6 +4857,7 @@ export function createStaticSpreadsheetBackend(
           displayRows,
           getMaxSourceRow(sheetCells) + 1,
         )
+        hiddenRowIndices = hidden
         if (hidden.length > 0) {
           state.filterHiddenRowsBySheetId.set(request.sheetId, new Set(hidden))
         } else {
@@ -4890,7 +4870,10 @@ export function createStaticSpreadsheetBackend(
         state.filterHiddenRowsBySheetId.delete(request.sheetId)
       }
       state.revision = nextRevision
-      return mutationResult(request, state.revision)
+      // The set travels back to UI core on the ACK, where it becomes the
+      // canonical answer for rendering, navigation and sort exclusion — one
+      // scan, three consumers, no second derivation to drift from this one.
+      return { ...mutationResult(request, state.revision), hiddenRowIndices }
     },
     async sortRange(request: SortRangeRequest): Promise<SortRangeResult> {
       return applyStaticSortRange(state, request)

@@ -798,6 +798,26 @@ export interface BackendMutationResult extends SheetRef {
   structuralShift?: BackendStructuralShift
 }
 
+/**
+ * ACK for `setFilterSort`, carrying the visibility answer back to UI core
+ * (`design-filter-hidden-rows` §4.2, slice S5).
+ *
+ * The rules are applied by a WHOLE-COLUMN predicate scan the host already
+ * runs; `hiddenRowIndices` is that scan's other projection. It must be the
+ * complete answer for the scanned extent — never a window-bounded subset —
+ * because UI core stores it as canonical view truth and never re-derives it.
+ */
+export interface SetFilterSortResult extends BackendMutationResult {
+  /**
+   * 0-based SOURCE rows the rules filtered out. ABSENT means the host cannot
+   * compute visibility at all: UI core then clears its filter-hidden set
+   * rather than guessing, so the feature degrades to "rules recorded, nothing
+   * hidden" instead of hiding the wrong rows. An empty array is the distinct
+   * (and normal) statement "the rules hid nothing".
+   */
+  hiddenRowIndices?: readonly number[]
+}
+
 export interface SpreadsheetSheetMetadata {
   id: string
   name: string
@@ -1055,7 +1075,12 @@ export interface SpreadsheetBackend {
   subscribePresence?(handler: (update: PresenceUpdate) => void): SubscribePresenceUnsubscribe
   publishLocalPresence?(request: PublishLocalPresenceRequest): Promise<void>
   // filter-sort
-  setFilterSort?(request: SetFilterSortRequest): Promise<BackendMutationResult>
+  // Resolves the ordinary mutation ACK PLUS the filter-hidden row set the
+  // rule scan produced (`SetFilterSortResult.hiddenRowIndices`). Widening the
+  // result is backward compatible: a host that returns a bare
+  // `BackendMutationResult` still satisfies this signature, and UI core reads
+  // the missing field as "cannot compute visibility" and hides nothing.
+  setFilterSort?(request: SetFilterSortRequest): Promise<SetFilterSortResult>
   // engine physical sort — design-engine-sort. Optional capability: host
   // adapters whose runtime cannot physically reorder workbook data omit
   // this port (the TS worker declares `sortRange: false`), which hides

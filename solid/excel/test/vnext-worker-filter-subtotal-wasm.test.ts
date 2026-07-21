@@ -234,6 +234,123 @@ describe('worker adapter: an active filter reaches the engine (#27 S4)', () => {
     backend.dispose()
   })
 
+  /**
+   * The manual-hide defect found by hand in a UI smoke after S4, reproduced
+   * exactly as the design records it (§9.3) — no automated test caught it.
+   *
+   * Repro: E1='Val', E2..E5 = 10/20/30/40, three probes on row 0; manually hide
+   * SOURCE row 3 (value 20); then filter E1:E5 unchecking the value 10.
+   *
+   * What it did BEFORE the flip: the visible values became 20 and 40. The
+   * manually hidden row came BACK and a row nobody had hidden (30) vanished,
+   * because the manual set stored a bare row number captured in selection
+   * coordinates. At capture time display order == source order so it read 3
+   * either way; compaction then silently re-pointed that same 3 at a different
+   * row for the Grid while the engine kept reading it as source row 3. The
+   * giveaway was `SUBTOTAL(109,…)` answering 70 while the values on screen
+   * summed to 60 — a function that claims to count only visible rows reporting
+   * a number the screen cannot produce.
+   *
+   * Identity mapping does not fix that bug so much as make it unstateable, so
+   * this test asserts the invariant rather than the symptom: a bare row number
+   * means the same row to the view and to the engine, whatever the filter does.
+   */
+  test('a manual hide keeps pointing at the same row when a filter is applied', async () => {
+    const backend = createBackend!()
+    await backend.ready()
+
+    // Column E (col 4) as in the smoke; probes on row 0 alongside.
+    for (const [row, col, input] of [
+      [0, 4, 'Val'],
+      [1, 4, '10'],
+      [2, 4, '20'],
+      [3, 4, '30'],
+      [4, 4, '40'],
+      [0, 6, '=SUBTOTAL(9,E2:E5)'],
+      [0, 7, '=SUBTOTAL(109,E2:E5)'],
+      [0, 8, '=SUM(E2:E5)'],
+    ] as ReadonlyArray<readonly [number, number, string]>) {
+      await backend.setCellInput({
+        kind: 'set-cell-input',
+        sheetId: SHEET,
+        row,
+        col,
+        input,
+        requestId: requestId++,
+      })
+    }
+
+    const probes = async (): Promise<{ s9: string; s109: string; sum: string }> => {
+      const result = await backend.readRangeProjection({
+        kind: 'range',
+        sheetId: SHEET,
+        reason: 'test',
+        requestId: requestId++,
+        range: { rowStart: 0, rowEnd: 0, colStart: 6, colEnd: 8 },
+      })
+      const at = (col: number): string =>
+        result.cells.find((cell: DisplayCell) => cell.row === 0 && cell.col === col)
+          ?.displayValue ?? ''
+      return { s9: at(6), s109: at(7), sum: at(8) }
+    }
+
+    expect(await probes()).toEqual({ s9: '100', s109: '100', sum: '100' })
+
+    // Step 2 of the repro: manually hide SOURCE row 2 (0-based) — the value 20.
+    const manualHidden = [2]
+    await backend.setEvalHiddenRows!({
+      kind: 'set-eval-hidden-rows',
+      sheetId: SHEET,
+      rows: manualHidden,
+    })
+    expect(await probes()).toEqual({ s9: '100', s109: '80', sum: '100' })
+
+    // Step 3: filter column E to drop the value 10 (source row 1).
+    const ack = await backend.setFilterSort!({
+      kind: 'set-filter-sort',
+      sheetId: SHEET,
+      rules: [{ kind: 'range', colIndex: 4, min: 20 }],
+      requestId: requestId++,
+    })
+    expect(ack.hiddenRowIndices).toEqual([1])
+
+    // The acceptance numbers from the design, all three at once.
+    const after = await probes()
+    expect(after).toEqual({ s9: '90', s109: '70', sum: '100' })
+
+    // And the row identity claim itself. The projection withholds only the
+    // FILTER-hidden row; the Grid additionally withholds the manual one, so
+    // the union is what the user sees.
+    const window = await backend.readRangeProjection({
+      kind: 'range',
+      sheetId: SHEET,
+      reason: 'test',
+      requestId: requestId++,
+      range: { rowStart: 0, rowEnd: 4, colStart: 4, colEnd: 4 },
+    })
+    expect(window.cells.some((cell: DisplayCell) => cell.row === 1)).toBe(false)
+    const visible = window.cells
+      .filter((cell: DisplayCell) => !manualHidden.includes(cell.row) && cell.row > 0)
+      .sort((left: DisplayCell, right: DisplayCell) => left.row - right.row)
+    // Rows 3 and 4 (0-based) survive => header rows 1, 4, 5 on screen, and the
+    // values are 30 and 40. Before the flip this read 20 and 40.
+    expect(visible.map((cell: DisplayCell) => [cell.row, cell.displayValue])).toEqual([
+      [3, '30'],
+      [4, '40'],
+    ])
+
+    // The self-contradiction that exposed the defect, asserted as an identity:
+    // SUBTOTAL(109) must equal the sum of what is actually on screen.
+    const onScreenSum = visible.reduce(
+      (total: number, cell: DisplayCell) => total + Number(cell.displayValue),
+      0,
+    )
+    expect(onScreenSum).toBe(70)
+    expect(Number(after.s109)).toBe(onScreenSum)
+
+    backend.dispose()
+  })
+
   test('a re-applied filter replaces the previous set rather than accumulating', async () => {
     const backend = createBackend!()
     await backend.ready()

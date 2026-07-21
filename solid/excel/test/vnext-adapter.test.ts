@@ -1146,7 +1146,97 @@ describe('vnext adapter', () => {
     expect(projected.cells.some((cell) => cell.displayValue === 'East')).toBe(false)
   })
 
-  it('applies worker filter visibility as a bounded display permutation carrying originalRow', async () => {
+  // Companion to the case above, which passed under BOTH semantics by luck: its
+  // one surviving data row sits at source row 1, and compaction also puts the
+  // first survivor at display row 1. Keeping a survivor further down is what
+  // actually distinguishes hiding from compacting.
+  it('keeps surviving static rows at their own index instead of compacting them up', async () => {
+    const backend = createStaticSpreadsheetBackend({
+      revision: 1,
+      matrix: [
+        ['Region', 'Q1'],
+        ['North', 120],
+        ['South', 80],
+        ['East', 200],
+        ['West', 140],
+      ],
+    })
+
+    await backend.setFilterSort?.({
+      kind: 'set-filter-sort',
+      sheetId: 'sheet-1',
+      rules: [{ kind: 'equals', colIndex: 1, value: '200' }],
+    })
+
+    const projected = await backend.readVisibleProjection(
+      createVisibleProjectionRequest({
+        sheetId: 'sheet-1',
+        requestId: 27,
+        window: { rowStart: 0, rowEnd: 4, colStart: 0, colEnd: 1 },
+      }),
+    )
+
+    const east = projected.cells.find((cell) => cell.displayValue === 'East')
+    // Source row 3 stays at row 3. Compaction would have reported row 1.
+    expect(east?.row).toBe(3)
+    expect(east?.originalRow).toBeUndefined()
+    // Rows 1, 2 and 4 are withheld outright, not blanked.
+    expect(projected.cells.map((cell) => cell.row).sort()).toEqual([0, 0, 3, 3])
+  })
+
+  // Blind spot: filter x merge had no static coverage at all, on either side of
+  // the flip. The suppression being lifted here is silent otherwise.
+  it('keeps merge metadata under an active static filter', async () => {
+    const backend = createStaticSpreadsheetBackend({
+      revision: 1,
+      matrix: [
+        ['Region', 'Q1'],
+        ['North', 120],
+        ['South', 80],
+        ['East', 200],
+      ],
+    })
+    await backend.mergeRange?.({
+      kind: 'merge-range',
+      sheetId: 'sheet-1',
+      range: { rowStart: 0, rowEnd: 0, colStart: 0, colEnd: 1 },
+    })
+
+    const before = await backend.readVisibleProjection(
+      createVisibleProjectionRequest({
+        sheetId: 'sheet-1',
+        requestId: 28,
+        window: { rowStart: 0, rowEnd: 3, colStart: 0, colEnd: 1 },
+      }),
+    )
+    expect(before.cells.find((cell) => cell.row === 0 && cell.col === 0)?.mergedSpan).toEqual({
+      rows: 1,
+      cols: 2,
+    })
+
+    await backend.setFilterSort?.({
+      kind: 'set-filter-sort',
+      sheetId: 'sheet-1',
+      rules: [{ kind: 'equals', colIndex: 1, value: '120' }],
+    })
+
+    const during = await backend.readVisibleProjection(
+      createVisibleProjectionRequest({
+        sheetId: 'sheet-1',
+        requestId: 29,
+        window: { rowStart: 0, rowEnd: 3, colStart: 0, colEnd: 1 },
+      }),
+    )
+    // Merges used to be suppressed WHOLESALE while a filter was active, because
+    // a span drawn across a permuted row space was a lie. Identity mapping
+    // removes the permutation, so the span survives and stays truthful.
+    expect(during.cells.find((cell) => cell.row === 0 && cell.col === 0)?.mergedSpan).toEqual({
+      rows: 1,
+      cols: 2,
+    })
+  })
+
+  it('applies worker filter visibility by withholding rows, not permuting them', async () => {
     const client = createFakeWorkerWorkbookClient()
     const backend = createWorkerWorkbookSpreadsheetBackend({
       client,
@@ -1185,7 +1275,13 @@ describe('vnext adapter', () => {
       rules: [{ kind: 'equals', colIndex: 1, value: '120' }],
       requestId: 100,
     })
-    expect(ack).toMatchObject({ sheetId: 'sheet-1', requestId: 100, revision: 8 })
+    expect(ack).toMatchObject({
+      sheetId: 'sheet-1',
+      requestId: 100,
+      revision: 8,
+      // Source rows 2 and 3 (South, East) fail the rule.
+      hiddenRowIndices: [2, 3],
+    })
     // The predicate scan is column-bounded: one single-column read per
     // predicate column (col 0 summary probe + the filter-rule column).
     expect(client.calls.readSparseRange).toEqual([
@@ -1201,19 +1297,20 @@ describe('vnext adapter', () => {
       }),
     )
 
-    // The window fetch is a readCells batch bounded by the window itself
-    // (2 mapped rows x 2 columns), never a full-sheet read.
-    expect(client.calls.readCells).toHaveLength(1)
-    expect(client.calls.readCells[0]).toHaveLength(4)
+    // The window read is a plain rectangular range read again. The compacted
+    // path had to fetch a bounding box cell-by-cell (`readCells`) because its
+    // surviving source rows were scattered; hiding rows removes that need.
+    expect(client.calls.readCells).toHaveLength(0)
     expect(projected.revision).toBe(8)
-    // Filtered-out rows are compressed away; row ORDER is always source order.
+    // Filtered-out rows are withheld and survivors keep their own index. No
+    // `originalRow`: display row IS source row.
     expect(
       projected.cells
         .filter((cell) => cell.col === 0)
-        .map((cell) => [cell.displayValue, cell.originalRow]),
+        .map((cell) => [cell.displayValue, cell.row, cell.originalRow]),
     ).toEqual([
-      ['Region', 0],
-      ['North', 1],
+      ['Region', 0, undefined],
+      ['North', 1, undefined],
     ])
     // Engine data untouched — no writes were issued.
     expect(client.calls.setCell).toHaveLength(0)

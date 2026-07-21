@@ -43,6 +43,18 @@ export interface SetFilterSortRequest extends SheetRef {
 export interface FilterSortMutationResult extends SheetRef {
   requestId?: ProjectionRequestId
   revision?: ProjectionRevision
+  /**
+   * 0-based SOURCE rows the applied rules filtered out, for the WHOLE scanned
+   * extent — never a window-bounded subset (`design-filter-hidden-rows` §4.2).
+   * UI core stores this verbatim in `viewportFilterHiddenAtom`, which is the
+   * canonical answer to "is this row painted?" from then on; nothing re-derives
+   * it from the projection.
+   *
+   * ABSENT means the host cannot compute visibility, and UI core CLEARS the set
+   * rather than guessing: rules recorded, nothing hidden. An empty array is the
+   * distinct statement "the rules hid nothing", and does the same thing.
+   */
+  hiddenRowIndices?: readonly number[]
 }
 
 /** Framework-neutral command port. The source is passed to commands and is never retained. */

@@ -103,6 +103,7 @@ import {
   type SpreadsheetCellFormat,
   type ViewportMetrics,
   getFilterHiddenRowsForSheet,
+  effectiveHiddenAtom,
   viewportFilterHiddenAtom,
   viewportFreezeAtom,
   viewportHiddenAtom,
@@ -603,6 +604,7 @@ export function SpreadsheetGrid(props: SpreadsheetGridProps) {
   let unsubscribeViewport: (() => void) | null = null
   let unsubscribeSizes: (() => void) | null = null
   let unsubscribeHidden: (() => void) | null = null
+  let unsubscribeFilterHidden: (() => void) | null = null
   let unsubscribeOutline: (() => void) | null = null
   let unsubscribeFreeze: (() => void) | null = null
   let unsubscribePointer: (() => void) | null = null
@@ -672,8 +674,16 @@ export function SpreadsheetGrid(props: SpreadsheetGridProps) {
     }
   }
 
+  // Rendering asks only "is this row painted?", and both hidden sets answer
+  // yes — so this reads the UNION (`effectiveHiddenAtom`), never either source
+  // set. Consumers that must tell a manual hide from a filtered-away row (copy,
+  // SUBTOTAL, the dense scans) read the two atoms separately and deliberately.
+  //
+  // Row numbering needs no change at all: the header has always rendered
+  // `row + 1` for whatever rows survive this filter, so Excel's 1, 4, 5 skip
+  // falls out of hiding rows instead of compacting them.
   function getHiddenRowSet(): ReadonlySet<number> {
-    return new Set(getHiddenRowsForSheet(store.getter(viewportHiddenAtom), props.sheetId))
+    return new Set(getHiddenRowsForSheet(store.getter(effectiveHiddenAtom), props.sheetId))
   }
 
   function getHiddenColSet(): ReadonlySet<number> {
@@ -754,7 +764,9 @@ export function SpreadsheetGrid(props: SpreadsheetGridProps) {
 
   function hiddenState() {
     renderTick()
-    return store.getter(viewportHiddenAtom)
+    // Union: `effectiveHiddenAtom` returns the manual state object itself while
+    // no filter hides anything, so the common case keeps referential stability.
+    return store.getter(effectiveHiddenAtom)
   }
 
   // ── Outline (grouping) gutter ─────────────────────────────────────────
@@ -1173,6 +1185,10 @@ export function SpreadsheetGrid(props: SpreadsheetGridProps) {
     unsubscribeViewport = store.sub(viewportMetricsAtom, refreshViewportProjection)
     unsubscribeSizes = store.sub(viewportSizeOverridesAtom, bumpRender)
     unsubscribeHidden = store.sub(viewportHiddenAtom, bumpRender)
+    // The filter half of the union needs its own subscription: applying or
+    // clearing a filter changes which rows are painted without touching the
+    // manual set, and would otherwise not repaint until some other atom fired.
+    unsubscribeFilterHidden = store.sub(viewportFilterHiddenAtom, bumpRender)
     unsubscribeOutline = store.sub(outlineAtom, bumpRender)
     unsubscribeFreeze = store.sub(viewportFreezeAtom, refreshEffectiveFreezeProjection)
     unsubscribePointer = store.sub(pointerSessionAtom, bumpRender)
@@ -1221,6 +1237,7 @@ export function SpreadsheetGrid(props: SpreadsheetGridProps) {
     unsubscribeViewport?.()
     unsubscribeSizes?.()
     unsubscribeHidden?.()
+    unsubscribeFilterHidden?.()
     unsubscribeOutline?.()
     unsubscribeFreeze?.()
     unsubscribePointer?.()

@@ -287,7 +287,7 @@ describe('worker adapter merge overlay — real in-process TS runtime', () => {
     backend.dispose()
   })
 
-  test('filter active drops merge metadata from the projection; clearing restores it', async () => {
+  test('filter active keeps merge metadata; the row it hides just stops rendering', async () => {
     const backend = await createTsBackend()
     // Header + data column the filter predicates on.
     await setInput(backend, 0, 0, 'H')
@@ -302,12 +302,14 @@ describe('worker adapter merge overlay — real in-process TS runtime', () => {
       rules: [{ kind: 'equals', colIndex: 0, value: 'keep' }],
     })
     const filtered = await readCells(backend, WINDOW)
-    // The permuted display rows really apply (source row 3 renders at
-    // display row 2) and NO cell carries merge metadata — merge
-    // coordinates are source facts, the filtered row space is permuted,
-    // so the overlay is disabled exactly like the static backend.
-    expect(cellAt(filtered, 2, 0)?.displayValue).toBe('keep')
-    expect(mergeMetadata(filtered)).toEqual([])
+    // Source row 3 stays at row 3 (it does NOT slide up into row 2), and row 2
+    // is withheld entirely. Merge coordinates are source facts, and source
+    // coordinates are now the only coordinates, so the span survives: the
+    // wholesale suppression existed only to avoid drawing a span across a
+    // permuted row space, and there is no permutation left to lie about.
+    expect(cellAt(filtered, 3, 0)?.displayValue).toBe('keep')
+    expect(filtered.some((cell) => cell.row === 2)).toBe(false)
+    expect(cellAt(filtered, 1, 1)?.mergedSpan).toEqual({ rows: 2, cols: 2 })
 
     await backend.setFilterSort!({
       kind: 'set-filter-sort',

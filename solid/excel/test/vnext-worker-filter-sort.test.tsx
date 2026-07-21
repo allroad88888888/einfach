@@ -3,16 +3,17 @@
 /**
  * Parity item #29 — filter/sort visibility on the WORKER path.
  *
- * The adapter mirrors the ui-core canonical rules after `setFilterSort`
- * ACKs and computes the display permutation at projection time with the
- * shared pure helper (`buildFilterSortDisplayRows`), reading predicate
- * values over existing RPCs inside a declared cap. These tests pin:
- *  - display compaction + `originalRow` on the projection,
- *  - sort as a display permutation (engine data untouched),
+ * Excel HIDDEN-ROW semantics (#27 S5): applying the rules runs one whole-column
+ * predicate scan in `setFilterSort`, and the rows it rejects are WITHHELD from
+ * the projection while every surviving row keeps its own index. Display row IS
+ * source row, so `originalRow` is never emitted and row numbers skip (1, 4, 5)
+ * exactly as they already did for manually hidden rows. These tests pin:
+ *  - identity projection + withheld rows (no compaction, no `originalRow`),
+ *  - the filter-hidden set handed to the engine and returned on the ACK,
+ *  - sort as engine data untouched (the display-permutation sort is retired),
  *  - the structured over-cap rejection (fail-closed, no truncation),
- *  - cache reuse and invalidation on mutations / cellsDirty pushes,
- *  - the W2 mutation-gateway round trip (edit a display row → the
- *    engine write lands on the source row),
+ *  - SNAPSHOT visibility: editing a cell does not re-evaluate the rules,
+ *  - edits landing on the row the user sees, with no gateway remapping,
  *  - the filter dropdown driving the worker backend end to end.
  */
 
@@ -286,7 +287,7 @@ function cellAt(result: VisibleProjectionResult, row: number, col: number) {
 }
 
 describe('worker adapter setFilterSort projection', () => {
-  it('compacts filtered rows into display rows carrying originalRow', async () => {
+  it('withholds filtered rows and leaves every other row at its own index', async () => {
     const { client, backend } = createFilterBackend()
     seedPeople(client)
 
@@ -296,19 +297,25 @@ describe('worker adapter setFilterSort projection', () => {
       rules: [{ kind: 'equals', colIndex: 0, value: 'Alpha' }],
       requestId: 7,
     })
-    expect(ack).toMatchObject({ sheetId: 'sheet-1', requestId: 7 })
+    // The ACK carries the visibility answer back to UI core, which owns
+    // rendering from here on.
+    expect(ack).toMatchObject({ sheetId: 'sheet-1', requestId: 7, hiddenRowIndices: [2] })
 
     const result = await readWindow(backend)
-    // Header row passes through.
-    expect(cellAt(result, 0, 0)).toMatchObject({ displayValue: 'Name', originalRow: 0 })
-    // Source row 1 stays at display row 1; source row 3 compacts to display row 2.
-    expect(cellAt(result, 1, 0)).toMatchObject({ displayValue: 'Alpha', originalRow: 1 })
-    expect(cellAt(result, 1, 1)).toMatchObject({ displayValue: '1', originalRow: 1 })
-    expect(cellAt(result, 2, 0)).toMatchObject({ displayValue: 'Alpha', originalRow: 3 })
-    expect(cellAt(result, 2, 1)).toMatchObject({ displayValue: '2', originalRow: 3 })
-    // The Beta row is filtered out and nothing renders past the data.
+    expect(cellAt(result, 0, 0)).toMatchObject({ displayValue: 'Name' })
+    // Source row 3 stays at row 3. Under the retired compaction it would have
+    // moved up into display row 2 — the whole point of the flip is that it
+    // does not, so the row header can keep reading 1, 2, 4.
+    expect(cellAt(result, 1, 0)).toMatchObject({ displayValue: 'Alpha' })
+    expect(cellAt(result, 1, 1)).toMatchObject({ displayValue: '1' })
+    expect(cellAt(result, 3, 0)).toMatchObject({ displayValue: 'Alpha' })
+    expect(cellAt(result, 3, 1)).toMatchObject({ displayValue: '2' })
+    // Row 2 is filtered away: withheld entirely, not blanked. "In range yet
+    // contributing no cell" is the property visible-cell consumers rely on.
+    expect(result.cells.some((cell) => cell.row === 2)).toBe(false)
     expect(result.cells.some((cell) => cell.displayValue === 'Beta')).toBe(false)
-    expect(result.cells.some((cell) => cell.row >= 3)).toBe(false)
+    // The second coordinate system is gone, so nothing needs translating back.
+    expect(result.cells.every((cell) => cell.originalRow === undefined)).toBe(true)
   })
 
   // #27 S4 — the OTHER projection of the same scan. The engine cannot see the
@@ -389,12 +396,12 @@ describe('worker adapter setFilterSort projection', () => {
     // Row ORDER is always source order — `setFilterSort` carries no sort
     // payload any more (#24 retired the display permutation for sort).
     const result = await readWindow(backend)
-    expect(cellAt(result, 1, 1)).toMatchObject({ displayValue: '1', originalRow: 1 })
-    expect(cellAt(result, 2, 1)).toMatchObject({ displayValue: '2', originalRow: 3 })
-    // Visibility-only permutation: no engine writes of any kind happened.
+    expect(cellAt(result, 1, 1)).toMatchObject({ displayValue: '1' })
+    expect(cellAt(result, 3, 1)).toMatchObject({ displayValue: '2' })
+    // Visibility only: no engine writes of any kind happened.
     expect(client.calls.setCell).toHaveLength(0)
 
-    // Clearing restores the identity projection with no originalRow facts.
+    // Clearing brings the withheld row back.
     const scans = client.calls.listNonEmpty
     await backend.setFilterSort!({
       kind: 'set-filter-sort',
@@ -429,7 +436,13 @@ describe('worker adapter setFilterSort projection', () => {
     expect(result.cells.every((cell) => cell.originalRow === undefined)).toBe(true)
   })
 
-  it('caches the permutation and recomputes after mutations and cellsDirty pushes', async () => {
+  // Visibility is a SNAPSHOT taken when the rules are applied, matching Excel:
+  // `Data → Reapply` (Ctrl+Alt+L) exists precisely because editing a cell does
+  // NOT move its row in or out of a filtered view. The predecessor of this test
+  // pinned the opposite — every mutation dropped the cached permutation and the
+  // next read re-evaluated the rules — which made our filter live and Excel's
+  // not. That behaviour is what the flip retires, so this asserts its absence.
+  it('takes visibility as a snapshot: edits never re-evaluate the rules', async () => {
     const { client, backend } = createFilterBackend()
     seedPeople(client)
 
@@ -440,12 +453,13 @@ describe('worker adapter setFilterSort projection', () => {
     })
     expect(client.calls.listNonEmpty).toBe(1)
 
-    // Cached: repeated projection reads do not rescan.
+    // Projection reads never scan: the answer was computed once, above.
     await readWindow(backend)
     await readWindow(backend)
     expect(client.calls.listNonEmpty).toBe(1)
 
-    // A host mutation invalidates: Beta becomes Alpha and joins the view.
+    // Beta now matches the rule, but the snapshot is not consulted again, so
+    // row 2 stays withheld until the rules are re-applied.
     await backend.setCellInput({
       kind: 'set-cell-input',
       sheetId: 'sheet-1',
@@ -454,14 +468,25 @@ describe('worker adapter setFilterSort projection', () => {
       input: 'Alpha',
     })
     const afterEdit = await readWindow(backend)
-    expect(client.calls.listNonEmpty).toBe(2)
-    expect(cellAt(afterEdit, 2, 0)).toMatchObject({ displayValue: 'Alpha', originalRow: 2 })
-    expect(cellAt(afterEdit, 3, 0)).toMatchObject({ displayValue: 'Alpha', originalRow: 3 })
+    expect(client.calls.listNonEmpty).toBe(1)
+    expect(afterEdit.cells.some((cell) => cell.row === 2)).toBe(false)
+    expect(cellAt(afterEdit, 3, 0)).toMatchObject({ displayValue: 'Alpha' })
 
-    // A worker-initiated cellsDirty push (async formula settle) also invalidates.
+    // Nor does a worker-initiated cellsDirty push (async formula settle).
     client.emitDirty()
     await readWindow(backend)
-    expect(client.calls.listNonEmpty).toBe(3)
+    expect(client.calls.listNonEmpty).toBe(1)
+
+    // Re-applying the same rules is the explicit recompute path, and it does
+    // rescan — so the row can always be brought back.
+    await backend.setFilterSort!({
+      kind: 'set-filter-sort',
+      sheetId: 'sheet-1',
+      rules: [{ kind: 'equals', colIndex: 0, value: 'Alpha' }],
+    })
+    expect(client.calls.listNonEmpty).toBe(2)
+    const afterReapply = await readWindow(backend)
+    expect(cellAt(afterReapply, 2, 0)).toMatchObject({ displayValue: 'Alpha' })
   })
 })
 
@@ -492,7 +517,12 @@ function gridCellText(container: HTMLElement, addr: string): string {
 }
 
 describe('worker path filter/sort UI integration', () => {
-  it('W2 gateway: editing a display row under an active filter writes the source row', async () => {
+  // The W2 gateway's display->source remap used to be load bearing here: an
+  // edit on a compacted display row had to be translated back before it reached
+  // the engine. Identity mapping removes the translation, so what this pins now
+  // is that the edit lands on the row the user is looking at — the property the
+  // remap existed to preserve, asserted directly instead of through it.
+  it('an edit under an active filter writes the row the user sees', async () => {
     const { client, backend } = createFilterBackend()
     seedPeople(client)
     await backend.setFilterSort!({
@@ -508,13 +538,14 @@ describe('worker path filter/sort UI integration', () => {
       </SpreadsheetUiProvider>
     ))
     await waitForGrid(container)
-    // Display row 2 (addr row 3) shows source row 3.
+    // Row 2 (Beta) is filtered away, so row 4 renders directly under row 2 and
+    // the header skips — but the surviving row is still addressed as A4/B4.
     await waitFor(() => {
-      expect(gridCellText(container, 'B3')).toBe('2')
+      expect(gridCellText(container, 'B4')).toBe('2')
     })
 
-    fireEvent.click(container.querySelector('[data-cell-addr="B3"] .spreadsheet-grid-cell-button')!)
-    fireEvent.dblClick(container.querySelector('[data-cell-addr="B3"]')!)
+    fireEvent.click(container.querySelector('[data-cell-addr="B4"] .spreadsheet-grid-cell-button')!)
+    fireEvent.dblClick(container.querySelector('[data-cell-addr="B4"]')!)
     const editor = (await waitFor(() => {
       const input = container.querySelector('input.cell-input')
       expect(input).not.toBeNull()
@@ -526,7 +557,7 @@ describe('worker path filter/sort UI integration', () => {
     await waitFor(() => {
       expect(client.calls.setCell).toHaveLength(1)
     })
-    // Display row 2 → source row 3 → engine address B4, not B3.
+    // B4 on screen is B4 in the engine. No coordinate translation involved.
     expect(client.calls.setCell[0]).toMatchObject({
       sheet: 0,
       addr: 'B4',
@@ -576,17 +607,19 @@ describe('worker path filter/sort UI integration', () => {
       expect(store.getter(filterSortLifecycleAtom).status).toBe('editing')
     })
     await waitFor(() => {
-      // Beta is hidden; source row 3 compacts up into display row 2 (addr row 3).
-      expect(gridCellText(container, 'A3')).toBe('Alpha')
-      expect(gridCellText(container, 'B3')).toBe('2')
-      expect(gridCellText(container, 'A4')).toBe('')
+      // Beta's row is hidden rather than compacted away: row 3 is gone from the
+      // DOM entirely and row 4 keeps both its data and its number.
+      expect(container.querySelector('[data-cell-addr="A3"]')).toBeNull()
+      expect(gridCellText(container, 'A4')).toBe('Alpha')
+      expect(gridCellText(container, 'B4')).toBe('2')
     })
 
-    // Sorting from the dropdown reorders the visible rows through the same lane.
+    // Clearing the filter brings the row back at its own index.
     fireEvent.click(container.querySelector('[data-testid="filter-clear-filter"]')!)
     await waitFor(() => {
       expect(store.getter(filterSortStateAtom)['sheet-1']?.rules).toEqual([])
       expect(gridCellText(container, 'A3')).toBe('Beta')
+      expect(gridCellText(container, 'A4')).toBe('Alpha')
     })
   })
 })

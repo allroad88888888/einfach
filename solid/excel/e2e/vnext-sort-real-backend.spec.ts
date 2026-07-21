@@ -204,16 +204,18 @@ test.describe('vNext engine physical sort real-backend evidence', () => {
     await gotoWorkerDemo(page)
     await seedFilterSortScenario(page)
 
-    // Filter column D to 'keep' → the MIDDLE data row (D3='drop') compresses
-    // out of the display. Close the dropdown to free the toolbar sort lane.
+    // Filter column D to 'keep' → the MIDDLE data row (D3='drop') is HIDDEN
+    // (#27 S5), so the rows below it keep their own numbers instead of sliding
+    // up. Close the dropdown to free the toolbar sort lane.
     await applyEqualsFilterOnColumn(page, 3, 'keep')
     await page.getByTestId('filter-close').click()
     await expect(workerFilterDropdown(page)).toBeHidden()
 
-    // Filtered display shows the visible rows in SOURCE order: E = 3, 2, 4.
+    // Row 3 is unmounted; the survivors stay at rows 2, 4, 5 in source order.
     await expect(cellDisplay(page, 'E2')).toHaveText('3')
-    await expect(cellDisplay(page, 'E3')).toHaveText('2')
-    await expect(cellDisplay(page, 'E4')).toHaveText('4')
+    await expect(cell(page, 'E3')).toHaveCount(0)
+    await expect(cellDisplay(page, 'E4')).toHaveText('2')
+    await expect(cellDisplay(page, 'E5')).toHaveText('4')
 
     // Sort ascending by column E. The sheet has an active filter and still
     // sorts PHYSICALLY, with the filtered-out row carried in excludedRows
@@ -225,16 +227,19 @@ test.describe('vNext engine physical sort real-backend evidence', () => {
     await expect(page.getByTestId('toolbar-sort-dropdown')).toBeVisible()
     await page.getByTestId('toolbar-sort-asc').click()
 
-    // Visible rows reordered ascending inside the compressed display.
+    // The visible rows reorder ascending AMONG THEMSELVES, each landing on one
+    // of the rows they already occupied (2, 4, 5); the hidden row 3 is passed
+    // over rather than written through, which is what excludedRows buys.
     await expect(cellDisplay(page, 'E2')).toHaveText('2')
-    await expect(cellDisplay(page, 'E3')).toHaveText('3')
-    await expect(cellDisplay(page, 'E4')).toHaveText('4')
+    await expect(cell(page, 'E3')).toHaveCount(0)
+    await expect(cellDisplay(page, 'E4')).toHaveText('3')
+    await expect(cellDisplay(page, 'E5')).toHaveText('4')
     // DISCRIMINATOR: a physical sort records exactly one range.sort entry.
     await expect(sortHistoryEntry(page)).toHaveCount(1)
 
     // Clear the filter through the column-D chevron. The filtered row stayed at
-    // its source position (E3=1, D3='drop'); the visible rows physically moved
-    // around it — E now reads 2, 1, 3, 4 down source rows 2..5.
+    // its source position (E3=1, D3='drop') — it was excluded from the sort,
+    // not merely undrawn — and E now reads 2, 1, 3, 4 down source rows 2..5.
     await page.getByTestId('filter-chevron-3').click()
     await expect(workerFilterDropdown(page)).toBeVisible()
     await page.getByTestId('filter-clear-filter').click()

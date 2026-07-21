@@ -120,7 +120,9 @@ test.describe('Wave 5 toolbar — filter and sort', () => {
     await expect(filterDropdown(page)).toBeVisible()
     await expect(cell(page, 'A2').locator('.cell-display')).toHaveText('North')
     await expect(cell(page, 'B2').locator('.cell-display')).toHaveText('120')
-    await expect(cell(page, 'A3').locator('.cell-display')).toHaveText('')
+    // #27 S5: non-matching rows are HIDDEN — unmounted, not blanked — so the
+    // assertion is absence of the element, not an empty string.
+    await expect(cell(page, 'A3')).toHaveCount(0)
   })
 
   test('filter dropdown applies value-list and condition filters, then clears them', async ({
@@ -134,8 +136,11 @@ test.describe('Wave 5 toolbar — filter and sort', () => {
 
     await page.getByTestId('filter-value-South').click()
     await page.getByTestId('filter-add-equals').click()
+    // South (row 3) is hidden; East does NOT slide up into its place — it keeps
+    // A4, which is the whole difference between hiding and compacting.
     await expect(cell(page, 'A2').locator('.cell-display')).toHaveText('North')
-    await expect(cell(page, 'A3').locator('.cell-display')).toHaveText('East')
+    await expect(cell(page, 'A3')).toHaveCount(0)
+    await expect(cell(page, 'A4').locator('.cell-display')).toHaveText('East')
 
     await page.getByTestId('filter-clear-filter').click()
     await expect(cell(page, 'A3').locator('.cell-display')).toHaveText('South')
@@ -143,8 +148,11 @@ test.describe('Wave 5 toolbar — filter and sort', () => {
     await page.getByTestId('filter-condition-kind').selectOption('contains')
     await page.getByTestId('filter-contains-input').fill('st')
     await page.getByTestId('filter-add-equals').click()
-    await expect(cell(page, 'A2').locator('.cell-display')).toHaveText('East')
-    await expect(cell(page, 'A3').locator('.cell-display')).toHaveText('West')
+    // 'st' matches East and West only, and both stay on their own rows.
+    await expect(cell(page, 'A2')).toHaveCount(0)
+    await expect(cell(page, 'A3')).toHaveCount(0)
+    await expect(cell(page, 'A4').locator('.cell-display')).toHaveText('East')
+    await expect(cell(page, 'A5').locator('.cell-display')).toHaveText('West')
   })
 
   test('toolbar-btn-sort is visible, labeled, and opens dropdown', async ({ page }) => {

@@ -527,6 +527,34 @@ Excel 语义（§2 已核实）：**筛选**隐藏行复制时自动跳过；**�
 >
 > 执行姿势：S5 动工前先跑全量存基线，翻转后比对失败清单与白名单，**差集非空即停**。
 >
+> > **S5 实施后回填（2026-07-21）—— 白名单本身有一处自相矛盾，这是设计稿被查出的第 5 处不符。**
+> >
+> > **本裁定块的 "14 例白名单" 与它自己的修正 2 不自洽。** 修正 1 的表格把
+> > `buildSortExcludedRows` 换源的 6 例单列为一行（"S4 或 S5"），修正 2 随后**定档归 S5**，
+> > 但"S5 当天的白名单"那句话只枚举了修正 1 的另外那一行。照字面执行的实施者会看到白名单外的红，
+> > 按"差集非空即停"停工并误报回归。**判据应为：白名单 = 修正 1 的 14 例 ∪ 修正 2 的 6 例。**
+> >
+> > **实测结果（翻转后全量）**：
+> >
+> > | 来源 | 预期 | 实际变红 | 说明 |
+> > | ---- | ---- | -------- | ---- |
+> > | 修正 1 白名单（jest） | 9 | **8** | `vnext-worker-filter-sort.test.tsx:327` 未红 —— 见下 |
+> > | 修正 1 白名单（e2e） | 5 | **5** | 全中 |
+> > | 修正 2 关联集 | 6 | **4** | `physical-sort.test.ts` 的 `:220`/`:259`/`:290` + `vnext-filter-dropdown.test.tsx:595` |
+> > | **白名单外** | 0 | **0** | 差集为空，无真回归 |
+> >
+> > 两条过度预测（均为设计稿失准，非实现问题）：
+> >
+> > - **修正 5 对 `:327` 的判断方向反了**。它说"仅 `:345` 一行 `originalRow === undefined` 会死"——
+> >   那一行断言的是**未激活筛选时不带** `originalRow`，翻转后恒等映射让它更真，只会更绿。该例全程绿。
+> > - 修正 2 的 6 例里，`physical-sort.test.ts:322`/`:345` 断言的是 `excludedRows === []`，
+> >   换源后依然是 `[]`（前者无隐藏集、后者跨表），所以不红。它们被**改写**（换掉已消失的机制描述）
+> >   而非被迫迁移。
+> >
+> > 反向信号两项均如预期：手工 fixture 那 43 例**全程绿**（ui-core 63 suites / 1567 → 1567，
+> > solid 未动网关与字段）；`vnext-grid.test.tsx:676`/`:721` 只种手动隐藏的两例**全程绿**，
+> > 并集派生正确。
+>
 > ### 修正 2：`buildSortExcludedRows` 换源的归属
 >
 > §7 把它放进 S4 的文件边界，§10 的 S6 行又列了同一项 —— 设计稿自相矛盾。**裁决：它必须与"`viewportFilterHiddenAtom` 真正被填入真实值"落在同一切片**，否则它读一个恒空集合、排序排除行静默失效，那是真回归而非迁移。由 S4 实施者回报事实后定档。
@@ -633,6 +661,19 @@ Excel 语义（§2 已核实）：**筛选**隐藏行复制时自动跳过；**�
 > **为什么 S5 结构性地消灭它**：恒等映射后 display 序 ≡ 源序**恒成立**，裸行号不再有二义性。这不是"修一个 bug"，而是让这类 bug 无法被表达 —— 与 §5 删除 `originalRow` 的动机同源。
 >
 > **S5 验收条件（必须新增）**：上述三步复现必须得到"可见值 = 30 和 40（20 因手动隐藏缺席、10 因筛选缺席），行号 1、4、5 跳号，`G1=90`、`H1=70`、`I1=100`"，且 `H1` 必须等于屏幕可见值之和。建议同时补一条 e2e 钉死"手动隐藏行不因筛选变更而改变所指"。
+>
+> > **已落地（S5 实施者，2026-07-21）**：两条都补了，验收数字逐字命中。
+> >
+> > - `vnext-worker-filter-subtotal-wasm.test.ts` 新增
+> >   `a manual hide keeps pointing at the same row when a filter is applied`：真 Rust 引擎 + 真
+> >   `worker-runtime.ts`，按 §9.3 三步逐字复现（E 列 10/20/30/40，手动隐藏源行 2，筛选 `>=20`）。
+> >   断言 `G1=90`、`H1=70`、`I1=100`，投影里源行 1 缺席、幸存行仍在 `row 3`/`row 4`（值 30、40），
+> >   并把"自相矛盾"本身写成恒等式断言：`SUBTOTAL(109) === 屏幕可见值之和 === 70`。
+> >   **差分性**：压缩语义下同一断言会读到 20 和 40（display 行 1、3）、可见和 60 ≠ 70，必红。
+> > - e2e `vnext-filter-sort-real-backend.spec.ts` 新增
+> >   `a manually hidden row does not change what it refers to when a filter changes`：
+> >   行头右键隐藏源行 2 → 加筛选 → 清筛选，钉死手动隐藏行全程不动、且**清筛选不解手动隐藏**
+> >   （§3 约束 3 的端到端佐证）。wasm / ts 两个 project 均绿。
 
 ---
 
@@ -646,7 +687,7 @@ Excel 语义（§2 已核实）：**筛选**隐藏行复制时自动跳过；**�
 | **S2 桥与协议**           | wasm 导出 + 快照重生成；协议 capability 与 client 方法；WASM runtime case；TS runtime `false` + `unsupported`                                                                                                    | `rust/wasm/src/lib.rs`；`rust/excel-core/tests/fixtures/wasm_api_signatures.txt`；`worker-protocol.ts`、`worker-runtime.ts`、`worker-runtime-ts.ts` | `npm run build:wasm`；`cargo test --test architecture_invariants`（INV-4 绿）；runtime 单测含 `UNSUPPORTED` |
 | **S3 消费者加固（前置）** | **在压缩语义下就正确的防御性改动**：`remove-duplicates` / `text-to-columns` 稠密扫描跳过隐藏行（§8.1）、`go-to` 上下文接并集、并集派生 helper 落地                                                               | `vanilla/spreadsheet-ui-core/src/remove-duplicates/`、`text-to-columns/`、`go-to/`、`viewport/`                                                     | `npx jest vanilla/spreadsheet-ui-core --no-coverage`；**行为零变化**，既有断言全绿不改                      |
 | **S4 adapter 算集合并推给引擎**（已落地，见下方"S4 重定义"） | 协议 capability `evalFilterHiddenRows` + client 可选方法；WASM runtime dispatch（缺方法回 `UNSUPPORTED`）；TS runtime `false` + `unsupported`；两个 adapter 在 `setFilterSort` 里由**同一次谓词扫描**取补集得筛选隐藏行集，worker 推 `setEvalFilterHiddenRows`、static 存进自己的求值输入。**投影压缩不动**（那是 S5） | `solid/excel/src-vnext/adapter/filter-hidden-rows.ts`（新）、`worker-workbook-backend.ts`、`static-backend.ts`、`static-formula-eval.ts`、`worker-protocol.ts`、`worker-runtime.ts`、`worker-runtime-ts.ts` | `npx jest solid/excel --no-coverage`；`npm run build:wasm`；定向 e2e。**注意：这是唯一一个有真实行为变化的前置切片** |
-| **S5 adapter 原子翻转**   | **一次性切换**：两 adapter 投影塌回恒等、停发 `originalRow`、`setFilterSort` 回传隐藏集、`evalFilterHiddenRows` 端口实现、bridge 双路、Grid 取并集、解除 merge 抑制                                              | `static-backend.ts`、`worker-workbook-backend.ts`、`projection-helpers.ts`、`eval-hidden-rows-bridge.ts`、`SpreadsheetGrid.tsx`                     | `npx jest solid/excel --no-coverage` + ui-core：**只允许 §9.2 主控裁定三的 16 例白名单变红，差集非空即停**（§9.2 原表约 43 例属 S6，S5 当天必须全绿）；playwright MCP 手工 smoke（行号跳号） |
+| **S5 adapter 原子翻转**（已落地，见下方"S5 落地记录"） | **一次性切换**：两 adapter 投影塌回恒等、停发 `originalRow`、`setFilterSort` 回传隐藏集（`SetFilterSortResult.hiddenRowIndices`）、UI-core 写入 `viewportFilterHiddenAtom`、`buildSortExcludedRows` 改读两集、Grid 取并集、解除 merge 抑制。~~bridge 双路~~（不做，理由见落地记录）                                              | `static-backend.ts`、`worker-workbook-backend.ts`、`projection-helpers.ts`、`eval-hidden-rows-bridge.ts`、`SpreadsheetGrid.tsx`                     | `npx jest solid/excel --no-coverage` + ui-core：**只允许 §9.2 主控裁定三的 16 例白名单变红，差集非空即停**（§9.2 原表约 43 例属 S6，S5 当天必须全绿）；playwright MCP 手工 smoke（行号跳号） |
 | **S6 死代码清除**         | W2 网关回映射半边、`DisplayCell.originalRow` 字段、`deriveFilterHiddenRows`、`requireIdentityMapping` 及其两调用点、`unmapped-row` 全族；`buildSortExcludedRows` 改读两集                                        | `editing/mutation-gateway.ts`、`backend/types.ts`、`filter-sort/index.ts`、`go-to/`、`remove-duplicates/`、`text-to-columns/`、`paste-special/`     | 双包 jest 全绿；`grep -r originalRow` 仅剩文档历史条目                                                      |
 | **S7 可见性语义收口**     | ~~复制只取可见（§8.2）；删除行只删可见（§8.3，先实测 Excel）~~ **已作为前置加固提前落地**（恒等，S5 后生效；§8.3 查证已定稿）。**剩余**：`exportRangeTsv` 分块复制与 `exportRangeAsImage` 两条 adapter 自产内容路径的端口扩参；`Data → Reapply` 入口 + `Ctrl+Alt+L`；粘贴/填充明确不改并加 pin                                                                                      | `clipboard/`、`copy-as/`、`operations/`、`menu-bar/SpreadsheetMenuBar.tsx`、`keyboard/`                                                             | 双包 jest + 定向 e2e；playwright MCP smoke（筛选→复制→粘贴→Reapply）                                        |
 | **S8 文档收口**           | `filter-sort.md`（仍写着 `directives` 与"backend 拥有行序"的陈旧口径）、`editing/README.md`、`remove-duplicates/README.md`、`CANONICAL_OWNERSHIP.md` #29、`CUTOVER_INVENTORY.md`、`06-tables-data-management.md` | 纯文档                                                                                                                                              | 互链一致性人工核对                                                                                          |
@@ -656,6 +697,32 @@ Excel 语义（§2 已核实）：**筛选**隐藏行复制时自动跳过；**�
 - **S3 必须早于 S5**：否则 adapter 翻转当天 `remove-duplicates` 就会静默删数据（§8.1）。这是本计划唯一的硬序约束。
 - S5 是**原子切换**，不允许"压缩与隐藏双语义共存期"——与 CANONICAL 的翻转约束一致。
 - S6 可与 S7 并行；S8 收尾。
+
+> **S5 落地记录（2026-07-21，实施后写回）**：原子翻转已落地，门禁数字见下。两点必须记账的偏离：
+>
+> 1. **`eval-hidden-rows-bridge.ts` 的"双路"没有做，是有意的。** §6.5 与 S5 派单都要求 bridge 扩为
+>    双路推送，但 S4 已经把筛选集的推送放在**两个 adapter 的 `setFilterSort` 内部**（worker 走
+>    `setEvalFilterHiddenRows` 并在 ACK **之前** await，static 直接存进自己的求值输入）。此时给
+>    bridge 再加一条筛选路会产生**第二个写者**：同一事实推两遍，且 bridge 是在 ACK **之后**才由
+>    原子变更触发，比 adapter 内推送晚一拍，投影刷新的时序保证反而变弱。核实过没有覆盖缺口——
+>    `viewportFilterHiddenAtom` 的唯一生产写者就是 `setFilterSort` 的 ACK，筛选不进 history
+>    （§3 约束 3，无独立 undo 条目），切表按 sheet 隔离且引擎侧集合按 sheet index 常驻，
+>    **不存在"原子变了但没走 setFilterSort"的路径**。因此 §6.5 的 bridge 行与 §10 的 S5 行
+>    在此项上作废，以代码为准；真要迁到 bridge，须先加 `SpreadsheetBackend.setEvalFilterHiddenRows`
+>    端口并**同时**撤掉两个 adapter 的内部推送，那是独立工作项。
+> 2. **筛选隐藏集不随 `structuralShift` 平移（已知缺口，未做）。** §3 要求筛选集复用
+>    `remapIndexSetAfterStructuralShift`，但 §10 没把它派进任何切片，S5 派单的 6 项也不含它。
+>    翻转前投影每次 revision bump 重算，插入/删除行会自我纠正；翻转后集合是快照（§4.3），
+>    于是**筛选激活期间插入或删除行会让隐藏集错位一行**。这是本切片引入的真实缺口，
+>    不是既有问题，建议在 S6/S7 补：`viewport/effective-hidden.ts` 加
+>    `applyViewportFilterHiddenStructuralShiftAtom`，在 `operations/index.ts:989` 与
+>    `remove-duplicates/index.ts:1254` 两个既有 `applyViewportHiddenStructuralShiftAtom`
+>    调用点旁并列一行即可，两个 adapter 的本地快照同样要跟随。
+>
+> 另记一条实现事实（设计稿只在 §5 的状态栏行与 §8.1 的危害描述里隐含说明，没有正面写）：
+> **两个 adapter 的投影都主动"扣掉"筛选隐藏行，不产它们的 cell**（含 format-only 空白格）。
+> 手动隐藏行则照常进投影（后端不知道它存在）。这个不对称是刻意的，也是 S3 那道加固所设防的
+> 前提、以及"状态栏聚合免费只统计可见格"这条结论成立的机制。
 
 > **S4 重定义（2026-07-21，主控派单，实施后写回）**：初稿的 S4 是"UI-core 筛选隐藏集"
 > （`filterHiddenAtom` + `SetFilterSortResult.hiddenRowIndices` + `reapplyFilterAtom`）。
