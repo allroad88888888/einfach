@@ -8,7 +8,11 @@ import type {
 } from '../src/backend/types'
 import { historyStackAtom } from '../src/history'
 import { selectionAtom } from '../src/selection'
-import { setViewportFilterHiddenRowsAtom } from '../src/viewport/effective-hidden'
+import {
+  getFilterHiddenRowsForSheet,
+  setViewportFilterHiddenRowsAtom,
+  viewportFilterHiddenAtom,
+} from '../src/viewport/effective-hidden'
 import { setFreezeConfigAtom, viewportFreezeAtom } from '../src/viewport/freeze'
 import { hideRowsAtom, viewportHiddenAtom } from '../src/viewport/hidden'
 import {
@@ -1191,6 +1195,80 @@ describe('remove-duplicates structural remap of local view facts', () => {
       sheetId: SHEET_ID,
       before: { rows: [1, 3, 6], cols: [] },
       after: { rows: [1, 3], cols: [] },
+    })
+  })
+
+  test('S5a: the exact-removal bands displace the FILTER-hidden set the same way', async () => {
+    // Same fixture as the manual-set test above, with the filter set seeded to
+    // the identical indices — the two sets must land on the same answer,
+    // because "which rows moved" is a property of the shift, not of why a row
+    // was hidden.
+    //
+    // The bands differ from that test on purpose: filter-hidden rows are
+    // skipped by the §8.1 scan, so seeding [1, 3, 6] leaves only rows 2/4/5 in
+    // play and row 5 is the single duplicate → one band (5, 1). That is also
+    // why no filter-hidden row can ever fall INSIDE a band on this path — a
+    // skipped row is never reported as a duplicate. The drop case is covered
+    // on the structure-operation path (operations.test.ts) instead.
+    const store = createStore()
+    const cells: DisplayCell[] = [
+      cell(0, 0, 'Key'),
+      cell(1, 0, 'x'),
+      cell(2, 0, 'x'),
+      cell(3, 0, 'x'),
+      cell(4, 0, 'y'),
+      cell(5, 0, 'y'),
+      cell(6, 0, 'z'),
+    ]
+    store.setter(setWorkspaceActiveSheetAtom, { sheetId: SHEET_ID })
+    store.setter(selectionAtom, {
+      kind: 'range',
+      sheetId: SHEET_ID,
+      anchor: { row: 0, col: 0 },
+      focus: { row: 6, col: 0 },
+    })
+    const source: RemoveDuplicatesControllerPort = {
+      async readRangeProjection(request) {
+        return rangeAcknowledgement(request, cells)
+      },
+      async removeRowsExact(request) {
+        return mutationAcknowledgement(request)
+      },
+    }
+    await expect(store.setter(openRemoveDuplicatesFromSelectionAtom, { source })).resolves.toBe(
+      'editing',
+    )
+    const sessionId = store.getter(removeDuplicatesSessionAtom)!.sessionId
+
+    store.setter(hideRowsAtom, { sheetId: SHEET_ID, indices: [1, 3, 6] })
+    store.setter(setViewportFilterHiddenRowsAtom, { sheetId: SHEET_ID, rows: [1, 3, 6] })
+    // Another sheet's filter set must be untouched by sheet-1 bands.
+    store.setter(setViewportFilterHiddenRowsAtom, { sheetId: 'other-sheet', rows: [1, 3, 6] })
+
+    await expect(
+      store.setter(runRemoveDuplicatesConfirmAtom, {
+        source,
+        sessionId,
+        refreshProjection: async () => {},
+      }),
+    ).resolves.toBe('completed')
+
+    const filterState = store.getter(viewportFilterHiddenAtom)
+    const filterAfter = getFilterHiddenRowsForSheet(filterState, SHEET_ID)
+    expect(filterAfter).toEqual([1, 3, 5])
+    expect(filterAfter).toEqual(store.getter(viewportHiddenAtom).rowsBySheet[SHEET_ID])
+    expect(
+      getFilterHiddenRowsForSheet(store.getter(viewportFilterHiddenAtom), 'other-sheet'),
+    ).toEqual([1, 3, 6])
+
+    const entry = store.getter(historyStackAtom).entries.at(-1)!
+    const filterPayload = entry.localSidePayloads?.find(
+      (payload) => payload.applyKey === 'viewport.filterHidden',
+    )
+    expect(filterPayload).toMatchObject({
+      sheetId: SHEET_ID,
+      before: { rows: [1, 3, 6] },
+      after: { rows: [1, 3, 5] },
     })
   })
 

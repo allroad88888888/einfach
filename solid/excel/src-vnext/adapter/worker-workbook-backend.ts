@@ -373,6 +373,19 @@ interface WorkerMergeOverlayImage {
   after: CellRange[]
 }
 
+/**
+ * Pre/post images of one sheet's FILTER-hidden snapshot (S5a), carried by
+ * structural records for the same reason the merge overlay is: the shift
+ * remaps the set in adapter memory (and in the engine), and inverting a
+ * delete cannot re-derive which rows the filter had hidden inside the
+ * deleted band — the rules are not re-run, the set IS the snapshot.
+ */
+interface WorkerFilterHiddenOverlayImage {
+  sheetId: string
+  before: number[]
+  after: number[]
+}
+
 interface WorkerTransactionRecord {
   /**
    * `'table.define'` is adapter-local (#25): UI-core's `HistoryEntryKind`
@@ -411,6 +424,12 @@ interface WorkerTransactionRecord {
    * engine images so undo restores the pre-shift merge set too.
    */
   mergeOverlay?: WorkerMergeOverlayImage
+  /**
+   * Present when the mutation displaced a sheet's FILTER-hidden snapshot
+   * (S5a). Rides next to the sparse engine images exactly like
+   * `mergeOverlay`, and is replayed after them.
+   */
+  filterHiddenOverlay?: WorkerFilterHiddenOverlayImage
   /**
    * Present when the mutation changed the Excel Table REGISTRY (#25).
    * Always carried NEXT TO the sparse cell images, never alone: replaying
@@ -1552,11 +1571,19 @@ export function createWorkerWorkbookSpreadsheetBackend(
     // the after-image post-execute. Pure adapter memory — no RPC, never
     // a reason to degrade the record.
     const mergeBefore = (mergeRangesBySheetId.get(spec.sheetId) ?? []).map(cloneRange)
+    // S5a side payload, captured on the same before/after bracket: `execute`
+    // remaps the FILTER-hidden snapshot right after the engine shift ACKs.
+    const filterHiddenBefore = filterHiddenRowsSnapshot(spec.sheetId)
     const result = await spec.execute()
     const mergeAfter = (mergeRangesBySheetId.get(spec.sheetId) ?? []).map(cloneRange)
+    const filterHiddenAfter = filterHiddenRowsSnapshot(spec.sheetId)
     const mergeOverlay =
       mergeBefore.length > 0 || mergeAfter.length > 0
         ? { sheetId: spec.sheetId, before: mergeBefore, after: mergeAfter }
+        : undefined
+    const filterHiddenOverlay =
+      filterHiddenBefore.length > 0 || filterHiddenAfter.length > 0
+        ? { sheetId: spec.sheetId, before: filterHiddenBefore, after: filterHiddenAfter }
         : undefined
     if (before === null) {
       pushTransactionRecord(notUndoableRecord(spec.kind, spec.sheet.idx, null, diagnostic))
@@ -1587,6 +1614,7 @@ export function createWorkerWorkbookSpreadsheetBackend(
             before: { cells: before, format: null },
             after: { cells: after, format: null },
             ...(mergeOverlay ? { mergeOverlay } : {}),
+            ...(filterHiddenOverlay ? { filterHiddenOverlay } : {}),
           }
         : notUndoableRecord(spec.kind, spec.sheet.idx, null, diagnostic),
     )
@@ -1895,6 +1923,17 @@ export function createWorkerWorkbookSpreadsheetBackend(
       const ranges = action === 'undo' ? record.mergeOverlay.before : record.mergeOverlay.after
       mergeRangesBySheetId.set(record.mergeOverlay.sheetId, ranges.map(cloneRange))
     }
+    if (record.filterHiddenOverlay) {
+      // S5a: whole-set restore of the FILTER-hidden snapshot, then the same
+      // whole-set replace into the engine. Inverting the shift arithmetic
+      // would not do — a delete that consumed filter-hidden rows has no
+      // inverse, which is exactly why the images are recorded.
+      const overlay = record.filterHiddenOverlay
+      const rows = action === 'undo' ? overlay.before : overlay.after
+      if (rows.length === 0) filterHiddenRowsBySheetId.delete(overlay.sheetId)
+      else filterHiddenRowsBySheetId.set(overlay.sheetId, new Set(rows))
+      await pushEvalFilterHiddenRows(record.sheetIdx, rows)
+    }
     record.boundTransactionId = request.transactionId
     source.pop()
     target.push(record)
@@ -1978,6 +2017,55 @@ export function createWorkerWorkbookSpreadsheetBackend(
     const ranges = mergeRangesBySheetId.get(sheetId)
     if (!ranges || ranges.length === 0) return
     shiftMergeRangeList(ranges, axis, index, count, direction)
+  }
+
+  /** One sheet's FILTER-hidden snapshot as an ascending array (S5a). */
+  function filterHiddenRowsSnapshot(sheetId: string): number[] {
+    return [...(filterHiddenRowsBySheetId.get(sheetId) ?? [])].sort((left, right) => left - right)
+  }
+
+  /**
+   * W3 remap of the FILTER-hidden snapshot after an ACKed ROW shift (S5a).
+   *
+   * The twin of `shiftMergeOverlay` above, and it exists for the same reason
+   * the manual hidden set has one in UI core: since the S5 flip this set is a
+   * SNAPSHOT (design §4.3), not a per-revision rederivation, so an unshifted
+   * index withholds a row the filter never judged and reveals one it did.
+   *
+   * `index` / `count` are PRE-mutation coordinates — the same frame
+   * `BackendStructuralShift` is stated in, and the same arithmetic
+   * `remapIndexSetAfterStructuralShift` applies UI-core side: on delete, rows
+   * inside the band are dropped and rows past it move back; on insert, rows at
+   * or after the point move forward.
+   *
+   * ROWS ONLY: a column insert/delete displaces nothing in a row set, so there
+   * is no `axis` parameter to get wrong.
+   *
+   * Returns true when the sheet had a set to displace — the caller then
+   * re-pushes it so the engine's copy follows the same displacement and
+   * SUBTOTAL does not aggregate over a stale band.
+   */
+  function shiftFilterHiddenOverlay(
+    sheetId: string,
+    index: number,
+    count: number,
+    direction: 1 | -1,
+  ): boolean {
+    const rows = filterHiddenRowsBySheetId.get(sheetId)
+    if (!rows || rows.size === 0) return false
+    const deleteEnd = index + count - 1
+    const next = new Set<number>()
+    for (const row of rows) {
+      if (direction === 1) {
+        next.add(row >= index ? row + count : row)
+        continue
+      }
+      if (row >= index && row <= deleteEnd) continue
+      next.add(row > deleteEnd ? row - count : row)
+    }
+    if (next.size === 0) filterHiddenRowsBySheetId.delete(sheetId)
+    else filterHiddenRowsBySheetId.set(sheetId, next)
+    return true
   }
 
   /**
@@ -2194,7 +2282,7 @@ export function createWorkerWorkbookSpreadsheetBackend(
    */
   let evalFilterHiddenRowsUnavailable = false
   async function pushEvalFilterHiddenRows(
-    sheet: WorkerWorkbookBackendSheet,
+    sheetIdx: number,
     rows: readonly number[],
   ): Promise<void> {
     if (evalFilterHiddenRowsUnavailable) return
@@ -2205,7 +2293,7 @@ export function createWorkerWorkbookSpreadsheetBackend(
       return
     }
     try {
-      await push.call(client, sheet.idx, rows)
+      await push.call(client, sheetIdx, rows)
     } catch (error) {
       const code = (error as Error & { code?: string }).code
       if (code === 'UNSUPPORTED' || code === 'UNKNOWN_COMMAND') {
@@ -2539,6 +2627,7 @@ export function createWorkerWorkbookSpreadsheetBackend(
 
     const successfullyRemoved: number[] = []
     let failureCause: unknown = null
+    let filterHiddenDisplaced = false
     for (const band of bands) {
       try {
         const accepted = await client.deleteRows(sheet.idx, band.startRow, band.count)
@@ -2558,9 +2647,26 @@ export function createWorkerWorkbookSpreadsheetBackend(
         // coordinates until their own turn. On partial failure the
         // overlay matches the bands the engine really deleted.
         shiftMergeOverlay(request.sheetId, 'row', band.startRow, band.count, -1)
+        // Same bottom-up composition argument for the S5a filter-hidden
+        // snapshot; the engine push is deferred to one whole-set replace
+        // after the loop so a multi-band removal costs one RPC, not N.
+        filterHiddenDisplaced =
+          shiftFilterHiddenOverlay(request.sheetId, band.startRow, band.count, -1) ||
+          filterHiddenDisplaced
       } catch (error) {
         failureCause = error
         break
+      }
+    }
+    if (filterHiddenDisplaced) {
+      try {
+        await pushEvalFilterHiddenRows(sheet.idx, filterHiddenRowsSnapshot(request.sheetId))
+      } catch (pushError) {
+        // A failed eval-input push must never MASK a band failure: the delete
+        // error is the one the user has to reconcile, and it is reported with
+        // the partial extent attached below. With no band failure the push
+        // error still propagates.
+        if (failureCause === null) throw pushError
       }
     }
 
@@ -2697,6 +2803,9 @@ export function createWorkerWorkbookSpreadsheetBackend(
       execute: async () => {
         await client.insertRows(sheet.idx, request.rowIndex, request.count)
         shiftMergeOverlay(request.sheetId, 'row', request.rowIndex, request.count, 1)
+        if (shiftFilterHiddenOverlay(request.sheetId, request.rowIndex, request.count, 1)) {
+          await pushEvalFilterHiddenRows(sheet.idx, filterHiddenRowsSnapshot(request.sheetId))
+        }
         return structuralMutationResult(request, bumpRevision())
       },
     })
@@ -2713,6 +2822,9 @@ export function createWorkerWorkbookSpreadsheetBackend(
       execute: async () => {
         await client.deleteRows(sheet.idx, request.rowIndex, request.count)
         shiftMergeOverlay(request.sheetId, 'row', request.rowIndex, request.count, -1)
+        if (shiftFilterHiddenOverlay(request.sheetId, request.rowIndex, request.count, -1)) {
+          await pushEvalFilterHiddenRows(sheet.idx, filterHiddenRowsSnapshot(request.sheetId))
+        }
         return structuralMutationResult(request, bumpRevision())
       },
     })
@@ -4035,7 +4147,7 @@ export function createWorkerWorkbookSpreadsheetBackend(
         const nextRevision = bumpRevision()
         // Clearing the filter must clear the engine's set too, or SUBTOTAL
         // would keep excluding rows that are visible again.
-        await pushEvalFilterHiddenRows(sheet, [])
+        await pushEvalFilterHiddenRows(sheet.idx, [])
         return {
           sheetId: request.sheetId,
           requestId: request.requestId,
@@ -4058,7 +4170,7 @@ export function createWorkerWorkbookSpreadsheetBackend(
       // ledger: the push is idempotent, a filter application is a user-paced
       // action (never a hot path), and a ledger would go stale against engine
       // state the adapter does not own (snapshot restore, workbook reload).
-      await pushEvalFilterHiddenRows(sheet, hiddenRows)
+      await pushEvalFilterHiddenRows(sheet.idx, hiddenRows)
       return {
         sheetId: request.sheetId,
         requestId: request.requestId,

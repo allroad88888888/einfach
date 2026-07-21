@@ -27,7 +27,19 @@
 
 import { beforeAll, describe, expect, jest, test } from '@jest/globals'
 
+import { createStore } from '@einfach/core'
 import type { DisplayCell } from '@einfach/spreadsheet-ui-core'
+import {
+  createInsertRowsOperation,
+  getFilterHiddenRowsForSheet,
+  getHiddenRowsForSheet,
+  hideRowsAtom,
+  runStructureOperationAtom,
+  runUndoHistoryAtom,
+  setViewportFilterHiddenRowsAtom,
+  viewportFilterHiddenAtom,
+  viewportHiddenAtom,
+} from '@einfach/spreadsheet-ui-core'
 import type { WorkerLike, WorkerWorkbookSpreadsheetBackend } from '../src-vnext/adapter'
 
 jest.mock('../wasm-pkg/einfach_wasm.js', () => {
@@ -347,6 +359,163 @@ describe('worker adapter: an active filter reaches the engine (#27 S4)', () => {
     )
     expect(onScreenSum).toBe(70)
     expect(Number(after.s109)).toBe(onScreenSum)
+
+    backend.dispose()
+  })
+
+  /**
+   * #27 S5a — inserting a row while a filter is ACTIVE.
+   *
+   * Continues the repro above with its fourth step: right-click row 1 → Insert
+   * Row. Everything below moves down one, and BOTH hidden sets have to move
+   * with it. The manual set already did (UI core remaps it off the
+   * `structuralShift` ACK and the host bridge re-pushes it); the filter set did
+   * not, in any of its three copies — UI core's canonical set, the adapter's
+   * projection snapshot, and the engine's `eval_filter_hidden_rows`.
+   *
+   * DIFFERENTIAL, not tautological. Every post-insert number below is one the
+   * unshifted path cannot produce, and the pre-insert values are pinned first:
+   *
+   *   fixed    SUBTOTAL(9) = 90   SUBTOTAL(109) = 70   projection hides row 2
+   *   unfixed  SUBTOTAL(9) = 100  SUBTOTAL(109) = 80   projection hides row 1
+   *
+   * The unfixed column is exactly the reported symptom: stale index 1 points at
+   * the header row after the shift, so 'Val' is swallowed and the filtered-out
+   * 10 comes back.
+   */
+  test('S5a: an insert above an active filter moves the filter set, not just the manual one', async () => {
+    const backend = createBackend!()
+    await backend.ready()
+    const store = createStore()
+
+    for (const [row, col, input] of [
+      [0, 4, 'Val'],
+      [1, 4, '10'],
+      [2, 4, '20'],
+      [3, 4, '30'],
+      [4, 4, '40'],
+      [0, 6, '=SUBTOTAL(9,E2:E5)'],
+      [0, 7, '=SUBTOTAL(109,E2:E5)'],
+      [0, 8, '=SUM(E2:E5)'],
+    ] as ReadonlyArray<readonly [number, number, string]>) {
+      await backend.setCellInput({
+        kind: 'set-cell-input',
+        sheetId: SHEET,
+        row,
+        col,
+        input,
+        requestId: requestId++,
+      })
+    }
+
+    const probes = async (probeRow: number): Promise<{ s9: string; s109: string; sum: string }> => {
+      const result = await backend.readRangeProjection({
+        kind: 'range',
+        sheetId: SHEET,
+        reason: 'test',
+        requestId: requestId++,
+        range: { rowStart: probeRow, rowEnd: probeRow, colStart: 6, colEnd: 8 },
+      })
+      const at = (col: number): string =>
+        result.cells.find((cell: DisplayCell) => cell.row === probeRow && cell.col === col)
+          ?.displayValue ?? ''
+      return { s9: at(6), s109: at(7), sum: at(8) }
+    }
+
+    /** Stand-in for the provider's `eval-hidden-rows-bridge`: mirror manual → engine. */
+    const pushManualToEngine = async () => {
+      await backend.setEvalHiddenRows!({
+        kind: 'set-eval-hidden-rows',
+        sheetId: SHEET,
+        rows: getHiddenRowsForSheet(store.getter(viewportHiddenAtom), SHEET),
+      })
+    }
+    const filterRows = () =>
+      getFilterHiddenRowsForSheet(store.getter(viewportFilterHiddenAtom), SHEET)
+    /** Source rows the projection actually emits in column E. */
+    const projectedColumnE = async (rowEnd: number) => {
+      const window = await backend.readRangeProjection({
+        kind: 'range',
+        sheetId: SHEET,
+        reason: 'test',
+        requestId: requestId++,
+        range: { rowStart: 0, rowEnd, colStart: 4, colEnd: 4 },
+      })
+      return window.cells
+        .filter((cell: DisplayCell) => cell.col === 4)
+        .sort((left: DisplayCell, right: DisplayCell) => left.row - right.row)
+        .map((cell: DisplayCell) => [cell.row, cell.displayValue] as const)
+    }
+
+    // Steps 2-3 of the repro: manually hide source row 2 (the 20), then filter
+    // the 10 away. Both sets are driven through UI core, which is canonical.
+    store.setter(hideRowsAtom, { sheetId: SHEET, indices: [2] })
+    await pushManualToEngine()
+    const ack = await backend.setFilterSort!({
+      kind: 'set-filter-sort',
+      sheetId: SHEET,
+      rules: [{ kind: 'range', colIndex: 4, min: 20 }],
+      requestId: requestId++,
+    })
+    expect(ack.hiddenRowIndices).toEqual([1])
+    store.setter(setViewportFilterHiddenRowsAtom, { sheetId: SHEET, rows: ack.hiddenRowIndices! })
+
+    // Baseline. Rows 1, 4, 5 on screen (1-based); 30 and 40 visible.
+    expect(await probes(0)).toEqual({ s9: '90', s109: '70', sum: '100' })
+    expect(await projectedColumnE(4)).toEqual([
+      [0, 'Val'],
+      [2, '20'],
+      [3, '30'],
+      [4, '40'],
+    ])
+
+    // Step 4: insert one row at the very top, through the real dispatcher.
+    await expect(
+      store.setter(runStructureOperationAtom, {
+        intent: createInsertRowsOperation({ sheetId: SHEET, rowIndex: 0, count: 1 }),
+        source: backend,
+        refreshProjection: async () => {},
+      }),
+    ).resolves.toBe('completed')
+    await pushManualToEngine()
+
+    // Both UI-core sets moved by exactly one, in lockstep.
+    expect(filterRows()).toEqual([2])
+    expect(getHiddenRowsForSheet(store.getter(viewportHiddenAtom), SHEET)).toEqual([3])
+
+    // The engine copy moved with them: 90 / 70 are unreachable from a set
+    // still holding index 1 (that answers 100 / 80).
+    expect(await probes(1)).toEqual({ s9: '90', s109: '70', sum: '100' })
+
+    // The adapter's projection snapshot moved too: the header survives at its
+    // new row 1 and the filtered-out 10 stays withheld. This is the assertion
+    // the reported symptom fails — unfixed, row 1 is missing and row 2 is back.
+    expect(await projectedColumnE(5)).toEqual([
+      [1, 'Val'],
+      [3, '20'],
+      [4, '30'],
+      [5, '40'],
+    ])
+
+    // Undo restores every copy from the recorded images — a shift inverse
+    // would not be enough, which is why they are recorded at all.
+    await expect(
+      store.setter(runUndoHistoryAtom, {
+        source: backend,
+        refreshProjection: async () => {},
+      }),
+    ).resolves.toBe('completed')
+    await pushManualToEngine()
+
+    expect(filterRows()).toEqual([1])
+    expect(getHiddenRowsForSheet(store.getter(viewportHiddenAtom), SHEET)).toEqual([2])
+    expect(await probes(0)).toEqual({ s9: '90', s109: '70', sum: '100' })
+    expect(await projectedColumnE(4)).toEqual([
+      [0, 'Val'],
+      [2, '20'],
+      [3, '30'],
+      [4, '40'],
+    ])
 
     backend.dispose()
   })

@@ -418,6 +418,13 @@ interface FullSheetCapture {
   colWidths: Map<number, number>
   hiddenRows: Set<number>
   hiddenCols: Set<number>
+  /**
+   * FILTER-hidden rows (S5a). Captured alongside the manual set because a
+   * structural mutation now REMAPS it: undoing an insert/delete has to put
+   * the pre-shift snapshot back, exactly as it does for `hiddenRows`. The
+   * filter RULES are not part of the capture — they are not displaced.
+   */
+  filterHiddenRows: Set<number>
   /** null preserves an absent map entry; `{ rows: 0, cols: 0 }` is canonical data. */
   freeze: ViewportFreezeConfig | null
 }
@@ -627,6 +634,7 @@ function captureFullSheet(state: StaticBackendState, sheetId: string): FullSheet
     colWidths: new Map(state.colWidthsBySheetId.get(sheetId) ?? []),
     hiddenRows: new Set(state.hiddenRowsBySheetId.get(sheetId) ?? []),
     hiddenCols: new Set(state.hiddenColsBySheetId.get(sheetId) ?? []),
+    filterHiddenRows: new Set(state.filterHiddenRowsBySheetId.get(sheetId) ?? []),
     freeze: state.freezeBySheetId.has(sheetId) ? { ...state.freezeBySheetId.get(sheetId)! } : null,
   }
 }
@@ -654,6 +662,11 @@ function restoreFullSheet(
     state.hiddenColsBySheetId.delete(sheetId)
   } else {
     state.hiddenColsBySheetId.set(sheetId, new Set(capture.hiddenCols))
+  }
+  if (capture.filterHiddenRows.size === 0) {
+    state.filterHiddenRowsBySheetId.delete(sheetId)
+  } else {
+    state.filterHiddenRowsBySheetId.set(sheetId, new Set(capture.filterHiddenRows))
   }
   if (capture.freeze === null) {
     state.freezeBySheetId.delete(sheetId)
@@ -1276,6 +1289,30 @@ function filterHiddenRowsForSheet(
 ): ReadonlySet<number> | undefined {
   const rows = state.filterHiddenRowsBySheetId.get(sheetId)
   return rows?.size ? rows : undefined
+}
+
+/**
+ * W3 remap of the FILTER-hidden snapshot after a ROW insert/delete (S5a).
+ *
+ * Same displacement as the manual twin two call sites up (`shiftHiddenIndexSet`
+ * on `hiddenRowsBySheetId`) and for the same reason: since the S5 flip this set
+ * is a SNAPSHOT, not a per-revision rederivation, so an unshifted index would
+ * withhold a row the filter never judged — and, because this backend also feeds
+ * the set to its evaluator as `filterHiddenRows`, make SUBTOTAL exclude it too.
+ *
+ * ROWS ONLY: a column insert/delete displaces nothing in a row set.
+ */
+function shiftFilterHiddenRows(
+  state: StaticBackendState,
+  sheetId: string,
+  rowIndex: number,
+  count: number,
+  direction: 1 | -1,
+): void {
+  const rows = state.filterHiddenRowsBySheetId.get(sheetId)
+  if (!rows || rows.size === 0) return
+  shiftHiddenIndexSet(rows, rowIndex, count, direction)
+  if (rows.size === 0) state.filterHiddenRowsBySheetId.delete(sheetId)
 }
 
 function getDimensionMap(
@@ -2837,6 +2874,7 @@ function applyStaticRowsRemoval(
     shiftRows(cells, cellFormats, rangeFormats, rowIndex, 1, -1)
     shiftDimensionMap(rowHeights, rowIndex, 1, -1)
     if (hiddenRows) shiftHiddenIndexSet(hiddenRows, rowIndex, 1, -1)
+    shiftFilterHiddenRows(state, sheetId, rowIndex, 1, -1)
     shiftMergeRanges(state, sheetId, 'row', rowIndex, 1, -1)
     shiftFreezeConfig(state, sheetId, 'row', rowIndex, 1, -1)
     applyTableShift(state, sheetId, 'row', rowIndex, 1, -1)
@@ -4362,6 +4400,7 @@ export function createStaticSpreadsheetBackend(
       )
       const hiddenRows = state.hiddenRowsBySheetId.get(request.sheetId)
       if (hiddenRows) shiftHiddenIndexSet(hiddenRows, request.rowIndex, request.count, 1)
+      shiftFilterHiddenRows(state, request.sheetId, request.rowIndex, request.count, 1)
       shiftMergeRanges(state, request.sheetId, 'row', request.rowIndex, request.count, 1)
       shiftFreezeConfig(state, request.sheetId, 'row', request.rowIndex, request.count, 1)
       applyTableShift(state, request.sheetId, 'row', request.rowIndex, request.count, 1)
@@ -4390,6 +4429,7 @@ export function createStaticSpreadsheetBackend(
         shiftHiddenIndexSet(hiddenRows, request.rowIndex, request.count, -1)
         if (hiddenRows.size === 0) state.hiddenRowsBySheetId.delete(request.sheetId)
       }
+      shiftFilterHiddenRows(state, request.sheetId, request.rowIndex, request.count, -1)
       shiftMergeRanges(state, request.sheetId, 'row', request.rowIndex, request.count, -1)
       shiftFreezeConfig(state, request.sheetId, 'row', request.rowIndex, request.count, -1)
       applyTableShift(state, request.sheetId, 'row', request.rowIndex, request.count, -1)

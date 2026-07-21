@@ -1,5 +1,8 @@
 import { atom, type Atom } from '@einfach/core'
+import type { BackendStructuralShift } from '../backend/types'
+import { registerHistoryLocalReplayApplier } from '../history'
 import { viewportHiddenAtom } from './hidden'
+import { remapIndexSetAfterStructuralShift } from './structural-remap'
 import type { ViewportFilterHiddenState, ViewportHiddenState } from './types'
 
 // Two hidden-row sets, one union view.
@@ -99,6 +102,90 @@ export const clearViewportFilterHiddenRowsAtom = atom(
     set(setViewportFilterHiddenRowsAtom, { sheetId, rows: [] }),
 )
 clearViewportFilterHiddenRowsAtom.debugLabel = 'spreadsheet.viewport.clearFilterHiddenRows'
+
+/** History local-replay applier key for the filter-hidden row set. */
+export const VIEWPORT_FILTER_HIDDEN_REPLAY_KEY = 'viewport.filterHidden'
+
+/** Snapshot shape carried by filter-hidden structural side payloads. */
+export interface ViewportFilterHiddenReplaySnapshot {
+  readonly rows: readonly number[]
+}
+
+export interface ApplyViewportFilterHiddenStructuralShiftInput {
+  readonly sheetId: string
+  readonly shift: BackendStructuralShift
+}
+
+/**
+ * Command: consume a `BackendMutationResult.structuralShift` so the
+ * filter-hidden row set moves with inserted/deleted rows — the exact twin of
+ * `applyViewportHiddenStructuralShiftAtom` (viewport/hidden.ts), and for the
+ * same reason: `shift.index` / `shift.count` are stated in PRE-mutation
+ * coordinates, so the stored set (also pre-mutation) is remapped by the same
+ * pure helper both sets share. Rows inside a deleted band drop out.
+ *
+ * Why the filter set needs this at all: before the S5 flip the projection
+ * recomputed filter visibility on every revision bump, so a structural edit
+ * self-corrected. After the flip the set is a SNAPSHOT (design §4.3), so an
+ * insert/delete during an active filter would leave every recorded index
+ * pointing one band off — hiding a row the filter never judged and revealing
+ * one it did.
+ *
+ * Rows only: the set is a row set, so a COLUMN shift displaces nothing in it
+ * and is inert here. (The manual twin holds both axes and therefore branches.)
+ *
+ * Part of the enclosing structural operation — records no history entry of its
+ * own; the caller carries the pre/post snapshots as a side payload. Returns
+ * true when the stored set actually changed.
+ */
+export const applyViewportFilterHiddenStructuralShiftAtom = atom(
+  null,
+  (get, set, input: ApplyViewportFilterHiddenStructuralShiftInput): boolean => {
+    const sheetId = typeof input?.sheetId === 'string' ? input.sheetId : ''
+    const shift = input?.shift
+    if (
+      !sheetId ||
+      typeof shift !== 'object' ||
+      shift === null ||
+      shift.axis !== 'row' ||
+      (shift.kind !== 'insert' && shift.kind !== 'delete')
+    ) {
+      return false
+    }
+    const state = get(viewportFilterHiddenBackingAtom)
+    const current = state.rowsBySheet[sheetId] ?? []
+    if (current.length === 0) return false
+    const remapped = sanitizeRows([...remapIndexSetAfterStructuralShift(new Set(current), shift)])
+    if (sameRows(current, remapped)) return false
+    // Route through the whole-set command so the "empty clears the sheet"
+    // invariant stays in exactly one place.
+    return set(setViewportFilterHiddenRowsAtom, { sheetId, rows: remapped })
+  },
+)
+applyViewportFilterHiddenStructuralShiftAtom.debugLabel =
+  'spreadsheet.viewport.applyFilterHiddenShift'
+
+/**
+ * Local replay for the structural side payload above. Undoing a delete cannot
+ * re-derive which rows the filter had hidden inside the deleted band (the
+ * rules are not re-run — the set is a snapshot), so undo/redo restores the
+ * exact recorded set instead, the same way the manual twin does.
+ */
+registerHistoryLocalReplayApplier(
+  VIEWPORT_FILTER_HIDDEN_REPLAY_KEY,
+  (_get, set, payload, direction) => {
+    const sheetId = typeof payload.sheetId === 'string' ? payload.sheetId : ''
+    if (!sheetId) return false
+    const target = direction === 'undo' ? payload.before : payload.after
+    if (typeof target !== 'object' || target === null) return false
+    const { rows } = target as { rows?: unknown }
+    if (!Array.isArray(rows) || rows.some((row) => !Number.isSafeInteger(row) || row < 0)) {
+      return false
+    }
+    set(setViewportFilterHiddenRowsAtom, { sheetId, rows: rows as number[] })
+    return true
+  },
+)
 
 export function getFilterHiddenRowsForSheet(
   state: ViewportFilterHiddenState,

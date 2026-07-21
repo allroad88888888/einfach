@@ -133,6 +133,34 @@
 **共性复用**（两集同构，代码可共享而状态分离）：
 
 - 结构位移：`filterHiddenAtom` 同样消费 `structuralShift`，复用 `remapIndexSetAfterStructuralShift`。理由：插入/删除行后重扫全列代价与正确性都不如平移；且与手动隐藏行为一致。
+  **归属：S5a（补记，2026-07-21）。** §10 的切片表从未把这条派进任何切片，S5 落地后成为实测回归
+  （筛选激活时插入行 → 陈旧索引指向表头行，表头被吞、被筛掉的值重现）。S5a 补齐，落点三层：
+  1. **UI-core**：`viewport/effective-hidden.ts` 的 `applyViewportFilterHiddenStructuralShiftAtom`
+     （**仅 row 轴**——筛选集是行集合，列位移对它恒为 no-op；手动集持双轴故需分支），
+     在 `operations/index.ts` 与 `remove-duplicates/index.ts` 两个既有
+     `applyViewportHiddenStructuralShiftAtom` 调用点旁并列，并各自补一条
+     `VIEWPORT_FILTER_HIDDEN_REPLAY_KEY` 的 `localSidePayloads`（删除带内的成员没有逆运算，
+     undo 只能重放录下的快照——与手动集同一理由）。
+  2. **两个 adapter 的本地快照**：`static-backend.ts` 的 `filterHiddenRowsBySheetId`
+     （insertRows / deleteRows / removeRowsExact 三处，并入 `captureFullSheet`
+     / `restoreFullSheet` 以支持 undo）、`worker-workbook-backend.ts` 的同名 Map
+     （`shiftFilterHiddenOverlay`，并按 `mergeOverlay` 的样板在结构记录里挂
+     `filterHiddenOverlay` 前后像）。**这一层不是可选的**：投影主动扣掉筛选隐藏行，
+     只修 UI-core 会让表头行"可见但空白"。
+  3. **引擎副本**：worker 侧在位移后重推 `setEvalFilterHiddenRows`（static 侧的
+     `filterHiddenRowsForSheet` 本身就是求值输入，随 Map 自动跟随），否则
+     `SUBTOTAL(1-11)` / `(101-111)` 会按错位的集合聚合。
+
+  > **顺带勘误 S5 落地记录第 2 条**：那里写"筛选激活期间插入或删除行会让隐藏集**错位一行**"，
+  > 低估了严重性——错位的索引会**指向另一行真实数据**（表头或相邻数据行），是"藏错行 + 露出被筛行"，
+  > 不是渲染偏移。同时那条只点了 `viewport/effective-hidden.ts` 与两个调用点，
+  > 附带一句"两个 adapter 的本地快照同样要跟随"；按代码核实，adapter 与引擎两层的工作量
+  > 大于 UI-core 层，且缺任一层复现都不算修好。
+  >
+  > **两处不可达路径（核实所得，非遗漏）**：`remove-duplicates` 与右键 `row.delete` 都
+  > 按 §8.1/§8.3 跳过筛选隐藏行，所以在这两条路径上**筛选隐藏行永远不会落在删除带内**——
+  > "被删的行本身在集合里"这个场景只能从 `runStructureOperationAtom` 直接驱动，
+  > 单测在那里覆盖，e2e 不必（也无法）复现。
 - `sanitizeIndices` / `sameIndices` / 每 sheet `number[]` 存储形状，直接复用 `hidden.ts` 的既有私有函数（提取为共享模块，或 `filter-hidden.ts` 内复制 12 行——按 §10 切片 S3 的实现者裁量）。
 - 上限：与 `MAX_FILTER_SORT_SHEETS = 256` 同级按 sheet 数有界；单 sheet 隐藏行数受 §4 的 50k 扫描上限天然界定，**不设第二个 cap**。
 

@@ -428,3 +428,184 @@ describe('static backend removeRowsExact structural remap', () => {
     expect(await readFreeze(backend)).toEqual({ rows: 3, cols: 0 })
   })
 })
+
+// ---------------------------------------------------------------------------
+// #27 S5a — the FILTER-hidden snapshot is displaced by the same shift.
+//
+// Since the S5 flip this backend keeps `filterHiddenRowsBySheetId` as a
+// SNAPSHOT: it withholds those rows from every projection AND feeds them to
+// its evaluator as the SUBTOTAL filter lane. Nothing recomputes it per
+// revision any more, so a row insert/delete has to remap it — the twin of the
+// `hiddenRowsBySheetId` remap two lines up in `insertRows` / `deleteRows`.
+//
+// Differential, not tautological: the pre-insert numbers are pinned first, and
+// they are exactly what an unshifted snapshot keeps answering afterwards.
+// ---------------------------------------------------------------------------
+
+describe('static backend structural remap of the FILTER-hidden snapshot (S5a)', () => {
+  async function filterBackend() {
+    const backend = createStaticSpreadsheetBackend({
+      revision: 1,
+      sheets: [{ id: SHEET, name: 'Sheet1' }],
+      // A1 'Val', A2:A5 = 10/20/30/40.
+      matrix: [['Val'], [10], [20], [30], [40]],
+    })
+    // Three probes on the header row. Formulas have to arrive through
+    // setCellInput — a seed matrix stores display values verbatim.
+    // Whole-column ranges on purpose: this backend does not rewrite formula
+    // references across a structural shift, so a bounded A2:A5 would move
+    // relative to the data and muddy the differential this test is making.
+    const probeInputs = ['=SUBTOTAL(9,A1:A10)', '=SUBTOTAL(109,A1:A10)', '=SUM(A1:A10)']
+    for (let offset = 0; offset < probeInputs.length; offset += 1) {
+      await backend.setCellInput({
+        kind: 'set-cell-input',
+        sheetId: SHEET,
+        row: 0,
+        col: 2 + offset,
+        input: probeInputs[offset]!,
+        requestId: 900 + offset,
+      })
+    }
+    return backend
+  }
+
+  async function probes(
+    backend: Awaited<ReturnType<typeof filterBackend>>,
+    probeRow: number,
+  ): Promise<{ s9: string; s109: string; sum: string }> {
+    const cells = await readCells(backend, {
+      rowStart: probeRow,
+      rowEnd: probeRow,
+      colStart: 2,
+      colEnd: 4,
+    })
+    const at = (col: number) =>
+      cells.find((cell) => cell.row === probeRow && cell.col === col)?.displayValue ?? ''
+    return { s9: at(2), s109: at(3), sum: at(4) }
+  }
+
+  async function columnA(backend: Awaited<ReturnType<typeof filterBackend>>, rowEnd: number) {
+    const cells = await readCells(backend, { rowStart: 0, rowEnd, colStart: 0, colEnd: 0 })
+    return cells
+      .filter((cell) => cell.col === 0)
+      .sort((left, right) => left.row - right.row)
+      .map((cell) => [cell.row, cell.displayValue] as const)
+  }
+
+  it('an insert above an active filter moves the snapshot, the projection and SUBTOTAL', async () => {
+    const backend = await filterBackend()
+    // Manually hide source row 2 (the 20) and filter the 10 away, as in the
+    // reported repro. The two lanes must stay independently addressable.
+    await backend.hideRows?.({ kind: 'hide-rows', sheetId: SHEET, rowIndices: [2] })
+    const ack = await backend.setFilterSort?.({
+      kind: 'set-filter-sort',
+      sheetId: SHEET,
+      rules: [{ kind: 'range', colIndex: 0, min: 20 }],
+      requestId: 1,
+    })
+    expect(ack?.hiddenRowIndices).toEqual([1])
+
+    expect(await probes(backend, 0)).toEqual({ s9: '90', s109: '70', sum: '100' })
+    expect(await columnA(backend, 4)).toEqual([
+      [0, 'Val'],
+      [2, '20'],
+      [3, '30'],
+      [4, '40'],
+    ])
+
+    await backend.insertRows?.({ kind: 'insert-rows', sheetId: SHEET, rowIndex: 0, count: 1 })
+
+    // Header at its new row 1, the filtered-out 10 still withheld. An
+    // unshifted snapshot swallows row 1 and paints the 10 at row 2.
+    expect(await columnA(backend, 5)).toEqual([
+      [1, 'Val'],
+      [3, '20'],
+      [4, '30'],
+      [5, '40'],
+    ])
+    // 90 / 70 are unreachable from a snapshot still holding index 1: that one
+    // points at the (non-numeric) header after the shift, so it excludes
+    // nothing and the two SUBTOTAL bands answer 100 / 80 instead.
+    expect(await probes(backend, 1)).toEqual({ s9: '90', s109: '70', sum: '100' })
+  })
+
+  it('a delete band consuming filter-hidden rows drops them and shifts the rest', async () => {
+    const backend = await filterBackend()
+    await backend.setFilterSort?.({
+      kind: 'set-filter-sort',
+      sheetId: SHEET,
+      rules: [{ kind: 'range', colIndex: 0, min: 30 }],
+      requestId: 1,
+    })
+    // Rows 1 (10) and 2 (20) are filter-hidden.
+    expect(await columnA(backend, 4)).toEqual([
+      [0, 'Val'],
+      [3, '30'],
+      [4, '40'],
+    ])
+
+    // Delete rows 1..2 — the whole filter-hidden band. It must LEAVE the set,
+    // not slide onto the rows that took its place.
+    await backend.deleteRows?.({ kind: 'delete-rows', sheetId: SHEET, rowIndex: 1, count: 2 })
+    expect(await columnA(backend, 2)).toEqual([
+      [0, 'Val'],
+      [1, '30'],
+      [2, '40'],
+    ])
+    expect(await probes(backend, 0)).toEqual({ s9: '70', s109: '70', sum: '70' })
+  })
+
+  it('undo restores the pre-shift snapshot', async () => {
+    const backend = await filterBackend()
+    await backend.setFilterSort?.({
+      kind: 'set-filter-sort',
+      sheetId: SHEET,
+      rules: [{ kind: 'range', colIndex: 0, min: 20 }],
+      requestId: 1,
+    })
+    await backend.insertRows?.({ kind: 'insert-rows', sheetId: SHEET, rowIndex: 0, count: 1 })
+    expect(await columnA(backend, 5)).toEqual([
+      [1, 'Val'],
+      [3, '20'],
+      [4, '30'],
+      [5, '40'],
+    ])
+
+    const undone = await backend.undoTransaction?.({
+      kind: 'undo-transaction',
+      transactionId: 'static-s5a-undo',
+      requestId: 2,
+    })
+    expect(undone?.applied).not.toBe(false)
+    expect(await columnA(backend, 4)).toEqual([
+      [0, 'Val'],
+      [2, '20'],
+      [3, '30'],
+      [4, '40'],
+    ])
+  })
+
+  it('a COLUMN insert leaves the row snapshot alone', async () => {
+    const backend = await filterBackend()
+    await backend.setFilterSort?.({
+      kind: 'set-filter-sort',
+      sheetId: SHEET,
+      rules: [{ kind: 'range', colIndex: 0, min: 20 }],
+      requestId: 1,
+    })
+    await backend.insertColumns?.({ kind: 'insert-columns', sheetId: SHEET, colIndex: 0, count: 1 })
+    // Everything moved one column right; the withheld ROW is unchanged.
+    const cells = await readCells(backend, { rowStart: 0, rowEnd: 4, colStart: 1, colEnd: 1 })
+    expect(
+      cells
+        .filter((cell) => cell.col === 1)
+        .sort((left, right) => left.row - right.row)
+        .map((cell) => [cell.row, cell.displayValue] as const),
+    ).toEqual([
+      [0, 'Val'],
+      [2, '20'],
+      [3, '30'],
+      [4, '40'],
+    ])
+  })
+})

@@ -5,10 +5,15 @@ import type {
   StructureOperationControllerPort,
   StructureOperationRequest,
 } from '../src'
-import { historyStackAtom } from '../src/history'
+import type { HistoryControllerPort } from '../src/history'
+import { historyStackAtom, runRedoHistoryAtom, runUndoHistoryAtom } from '../src/history'
 import { setFreezeConfigAtom, viewportFreezeAtom } from '../src/viewport/freeze'
 import { hideRowsAtom, viewportHiddenAtom } from '../src/viewport/hidden'
-import { setViewportFilterHiddenRowsAtom } from '../src/viewport/effective-hidden'
+import {
+  getFilterHiddenRowsForSheet,
+  setViewportFilterHiddenRowsAtom,
+  viewportFilterHiddenAtom,
+} from '../src/viewport/effective-hidden'
 import {
   createAddSheetOperation,
   createDeleteColumnsOperation,
@@ -626,6 +631,171 @@ describe('structural shift → local view facts + history side payloads', () => 
     expect(store.getter(viewportHiddenAtom).rowsBySheet['sheet-1']).toEqual([3])
     const entries = store.getter(historyStackAtom).entries
     expect(entries[entries.length - 1]?.localSidePayloads).toBeUndefined()
+  })
+
+  // -------------------------------------------------------------------------
+  // S5a — the FILTER-hidden set takes the same displacement as the manual one.
+  // -------------------------------------------------------------------------
+
+  function filterRowsOf(store: ReturnType<typeof createStore>, sheetId = 'sheet-1'): number[] {
+    return getFilterHiddenRowsForSheet(store.getter(viewportFilterHiddenAtom), sheetId)
+  }
+
+  test('COUNTER-EXAMPLE: an unwired filter applier leaves the set one band off', async () => {
+    // The exact pre-S5a state: only the manual applier is wired, so an insert
+    // above an active filter leaves every filter index stale. Driven through
+    // the real structural operation, seeding ONLY the manual set — which is
+    // what the code did before this slice, and what the assertion below is
+    // measured against.
+    const store = createStore()
+    store.setter(hideRowsAtom, { sheetId: 'sheet-1', indices: [2] })
+    const staleFilterRows = [1]
+
+    await runShiftedOperation(
+      store,
+      createInsertRowsOperation({ sheetId: 'sheet-1', rowIndex: 0, count: 1 }),
+      { axis: 'row', kind: 'insert', index: 0, count: 1 },
+    )
+
+    // Manual moved. An unshifted filter set would now hide row 1 — the header
+    // that just slid down into it — while row 2, the row the filter actually
+    // removed, would be painted again.
+    expect(store.getter(viewportHiddenAtom).rowsBySheet['sheet-1']).toEqual([3])
+    expect(staleFilterRows).not.toEqual([2])
+    expect(staleFilterRows).toContain(1)
+  })
+
+  test('insert above an active filter shifts the set and records a payload', async () => {
+    const store = createStore()
+    store.setter(hideRowsAtom, { sheetId: 'sheet-1', indices: [2] })
+    store.setter(setViewportFilterHiddenRowsAtom, { sheetId: 'sheet-1', rows: [1] })
+
+    await runShiftedOperation(
+      store,
+      createInsertRowsOperation({ sheetId: 'sheet-1', rowIndex: 0, count: 1 }),
+      { axis: 'row', kind: 'insert', index: 0, count: 1 },
+    )
+
+    expect(filterRowsOf(store)).toEqual([2])
+    expect(store.getter(viewportHiddenAtom).rowsBySheet['sheet-1']).toEqual([3])
+
+    const entries = store.getter(historyStackAtom).entries
+    const payloads = entries[entries.length - 1]!.localSidePayloads!
+    expect(payloads.map((payload) => payload.applyKey)).toEqual([
+      'viewport.hidden',
+      'viewport.filterHidden',
+    ])
+    expect(payloads[1]).toMatchObject({
+      applyKey: 'viewport.filterHidden',
+      sheetId: 'sheet-1',
+      before: { rows: [1] },
+      after: { rows: [2] },
+    })
+  })
+
+  test('a delete band consuming filter-hidden rows drops them from the set', async () => {
+    const store = createStore()
+    store.setter(setViewportFilterHiddenRowsAtom, { sheetId: 'sheet-1', rows: [2, 3, 7] })
+
+    await runShiftedOperation(
+      store,
+      createDeleteRowsOperation({ sheetId: 'sheet-1', rowIndex: 2, count: 2 }),
+      { axis: 'row', kind: 'delete', index: 2, count: 2 },
+    )
+
+    // 2 and 3 died with the band; 7 moved back two.
+    expect(filterRowsOf(store)).toEqual([5])
+  })
+
+  test('a COLUMN shift leaves the filter set alone and records no filter payload', async () => {
+    const store = createStore()
+    store.setter(hideRowsAtom, { sheetId: 'sheet-1', indices: [2] })
+    store.setter(setViewportFilterHiddenRowsAtom, { sheetId: 'sheet-1', rows: [1, 4] })
+
+    const source: StructureOperationControllerPort = {
+      async insertColumns(request) {
+        return {
+          sheetId: request.sheetId,
+          requestId: request.requestId,
+          revision: 92,
+          structuralShift: { axis: 'column', kind: 'insert', index: 0, count: 2 },
+        }
+      },
+    }
+    await expect(
+      store.setter(runStructureOperationAtom, {
+        intent: createInsertColumnsOperation({ sheetId: 'sheet-1', colIndex: 0, count: 2 }),
+        source,
+        refreshProjection: async () => undefined,
+      }),
+    ).resolves.toBe('completed')
+
+    expect(filterRowsOf(store)).toEqual([1, 4])
+    const entries = store.getter(historyStackAtom).entries
+    const payloads = entries[entries.length - 1]?.localSidePayloads ?? []
+    expect(payloads.some((payload) => payload.applyKey === 'viewport.filterHidden')).toBe(false)
+  })
+
+  test('a structural op on one sheet never displaces another sheet filter set', async () => {
+    const store = createStore()
+    store.setter(setViewportFilterHiddenRowsAtom, { sheetId: 'sheet-1', rows: [2, 5] })
+    store.setter(setViewportFilterHiddenRowsAtom, { sheetId: 'sheet-2', rows: [2, 5] })
+
+    await runShiftedOperation(
+      store,
+      createInsertRowsOperation({ sheetId: 'sheet-1', rowIndex: 0, count: 3 }),
+      { axis: 'row', kind: 'insert', index: 0, count: 3 },
+    )
+
+    expect(filterRowsOf(store, 'sheet-1')).toEqual([5, 8])
+    expect(filterRowsOf(store, 'sheet-2')).toEqual([2, 5])
+  })
+
+  test('undo/redo of the structural entry round-trips the filter set exactly', async () => {
+    const store = createStore()
+    store.setter(setViewportFilterHiddenRowsAtom, { sheetId: 'sheet-1', rows: [2, 3, 7] })
+
+    await runShiftedOperation(
+      store,
+      createDeleteRowsOperation({ sheetId: 'sheet-1', rowIndex: 2, count: 2 }),
+      { axis: 'row', kind: 'delete', index: 2, count: 2 },
+    )
+    expect(filterRowsOf(store)).toEqual([5])
+
+    const historySource: HistoryControllerPort = {
+      async undoTransaction(request) {
+        return {
+          transactionId: request.transactionId,
+          requestId: request.requestId,
+          revision: 200,
+        }
+      },
+      async redoTransaction(request) {
+        return {
+          transactionId: request.transactionId,
+          requestId: request.requestId,
+          revision: 201,
+        }
+      },
+    }
+
+    await expect(
+      store.setter(runUndoHistoryAtom, {
+        source: historySource,
+        refreshProjection: async () => undefined,
+      }),
+    ).resolves.toBe('completed')
+    // Membership inside a deleted band has no inverse — only the recorded
+    // snapshot can bring 2 and 3 back.
+    expect(filterRowsOf(store)).toEqual([2, 3, 7])
+
+    await expect(
+      store.setter(runRedoHistoryAtom, {
+        source: historySource,
+        refreshProjection: async () => undefined,
+      }),
+    ).resolves.toBe('completed')
+    expect(filterRowsOf(store)).toEqual([5])
   })
 })
 

@@ -34,7 +34,9 @@ import {
   viewportHiddenAtom,
 } from '../viewport/hidden'
 import {
+  applyViewportFilterHiddenStructuralShiftAtom,
   getFilterHiddenRowsForSheet,
+  VIEWPORT_FILTER_HIDDEN_REPLAY_KEY,
   viewportFilterHiddenAtom,
 } from '../viewport/effective-hidden'
 
@@ -978,6 +980,7 @@ async function runStructureOperation(
   const hiddenStateBefore = get(viewportHiddenAtom)
   const hiddenRowsBefore = getHiddenRowsForSheet(hiddenStateBefore, sheetId)
   const hiddenColsBefore = getHiddenColumnsForSheet(hiddenStateBefore, sheetId)
+  const filterHiddenRowsBefore = getFilterHiddenRowsForSheet(get(viewportFilterHiddenAtom), sheetId)
   const outlineStateBefore = get(outlineAtom)
   const outlineRowsBefore = getOutlineGroupsForSheet(outlineStateBefore, sheetId, 'row')
   const outlineColsBefore = getOutlineGroupsForSheet(outlineStateBefore, sheetId, 'column')
@@ -987,6 +990,10 @@ async function runStructureOperation(
       shift: acknowledgement.structuralShift,
     })
     set(applyViewportHiddenStructuralShiftAtom, {
+      sheetId,
+      shift: acknowledgement.structuralShift,
+    })
+    set(applyViewportFilterHiddenStructuralShiftAtom, {
       sheetId,
       shift: acknowledgement.structuralShift,
     })
@@ -1022,6 +1029,15 @@ async function runStructureOperation(
       sheetId,
       before: { rows: [...hiddenRowsBefore], cols: [...hiddenColsBefore] },
       after: { rows: [...hiddenRowsAfter], cols: [...hiddenColsAfter] },
+    })
+  }
+  const filterHiddenRowsAfter = getFilterHiddenRowsForSheet(get(viewportFilterHiddenAtom), sheetId)
+  if (!sameIndexArrays(filterHiddenRowsBefore, filterHiddenRowsAfter)) {
+    localSidePayloads.push({
+      applyKey: VIEWPORT_FILTER_HIDDEN_REPLAY_KEY,
+      sheetId,
+      before: { rows: [...filterHiddenRowsBefore] },
+      after: { rows: [...filterHiddenRowsAfter] },
     })
   }
   const outlineStateAfter = get(outlineAtom)
