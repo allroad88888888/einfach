@@ -55,6 +55,7 @@ import type {
   SetColumnWidthRequest,
   SetConditionalFormatRuleRequest,
   SetFilterSortRequest,
+  SetEvalHiddenRowsRequest,
   SetFormatRangeRequest,
   SetNamedRangeRequest,
   SetRowHeightRequest,
@@ -346,6 +347,14 @@ interface StaticBackendState {
   colWidthsBySheetId: Map<string, Map<number, number>>
   hiddenRowsBySheetId: Map<string, Set<number>>
   hiddenColsBySheetId: Map<string, Set<number>>
+  /**
+   * Host-pushed SUBTOTAL 101-111 evaluation input (`setEvalHiddenRows`,
+   * design-excel-table §6.1) — NOT a view fact and NOT this backend's own
+   * hidden-row state. Stored verbatim, exactly like the engine's
+   * `Sheet::eval_hidden_rows`: whole-set REPLACE, never shifted by row
+   * insert/delete (the host re-pushes), never inferring a row's source.
+   */
+  evalHiddenRowsBySheetId: Map<string, Set<number>>
   freezeBySheetId: Map<string, ViewportFreezeConfig>
   sheets: SpreadsheetSheetMetadata[]
   revision: ProjectionRevision
@@ -925,6 +934,7 @@ function buildState(
     colWidthsBySheetId: new Map(),
     hiddenRowsBySheetId: new Map(),
     hiddenColsBySheetId: new Map(),
+    evalHiddenRowsBySheetId: new Map(),
     freezeBySheetId: new Map(sheets.map((sheet) => [sheet.id, { rows: 0, cols: 0 }])),
     sheets,
     revision,
@@ -1173,6 +1183,45 @@ function shiftHiddenIndexSet(
 
   hiddenIndices.clear()
   for (const hiddenIndex of next) hiddenIndices.add(hiddenIndex)
+}
+
+/**
+ * The row set SUBTOTAL 101-111 excludes on `sheetId` — the union of this
+ * backend's two host-declared hidden lanes (design-excel-table §6.1):
+ *
+ *  1. `hiddenRowsBySheetId` — rows hidden through this backend's own
+ *     `hideRows` / `unhideRows` ports;
+ *  2. `evalHiddenRowsBySheetId` — the whole-set REPLACE pushed through
+ *     `setEvalHiddenRows` by the host's eval-hidden bridge.
+ *
+ * A union rather than a precedence rule, because the two lanes carry the SAME
+ * canonical fact from different directions: the real host drives both for one
+ * hide (UI-core hide command → `hideRows`; `eval-hidden-rows-bridge` →
+ * `setEvalHiddenRows`), while the WASM backend exposes only lane 2 and older
+ * static callers only lane 1. Unioning lets either lane alone be sufficient,
+ * so both hosts observe the same exclusion.
+ *
+ * Filter-hidden rows are deliberately NOT merged in. They are not part of the
+ * pushed set on the worker/WASM side either — design §6.1 pins the MVP push
+ * source to `viewportHiddenAtom` (manual rows only) and defers filter
+ * visibility to the #29 filter-canonical flip, so merging them here would
+ * CREATE a static⇄WASM divergence rather than close one. The filter rules stay
+ * the UI-core canonical view fact and never become an evaluation truth source.
+ * Covered by the `filterHidden` phase of vnext-table-totals-static-wasm-parity.
+ */
+function evalHiddenRowsForSheet(
+  state: StaticBackendState,
+  sheetId: string,
+): ReadonlySet<number> | undefined {
+  const manual = state.hiddenRowsBySheetId.get(sheetId)
+  const pushed = state.evalHiddenRowsBySheetId.get(sheetId)
+  // The common cases stay allocation-free: at most one lane is ever populated
+  // unless a host drives both, and then the sets are usually identical.
+  if (!pushed?.size) return manual
+  if (!manual?.size) return pushed
+  const union = new Set<number>(manual)
+  for (const row of pushed) union.add(row)
+  return union
 }
 
 function getDimensionMap(
@@ -1572,7 +1621,7 @@ function buildProjectionResult(
       return sheetCells.get(keyFor(row, col))
     },
     resolveStructuredRef: makeStructuredRefResolver(state, request.sheetId),
-    hiddenRows: state.hiddenRowsBySheetId.get(request.sheetId),
+    hiddenRows: evalHiddenRowsForSheet(state, request.sheetId),
   }
   const displayRows = buildFilterSortDisplayRows(sheetCells, lookup, filterSortState)
   const filterSortActive = displayRows !== null
@@ -3345,7 +3394,7 @@ function applyStaticSortRange(
       return sheetCells.get(keyFor(row, col))
     },
     resolveStructuredRef: makeStructuredRefResolver(state, request.sheetId),
-    hiddenRows: state.hiddenRowsBySheetId.get(request.sheetId),
+    hiddenRows: evalHiddenRowsForSheet(state, request.sheetId),
   }
   const keys = toResolvedSortKeys(request.keys)
   const plan = planPhysicalSort(
@@ -3450,6 +3499,20 @@ export function sparseCellsToRangeProjectionResult(
 //     qualifiers `[[#Data],[Col]]` (the engine grammar defers them too) and
 //     cross-sheet Table refs (the static evaluator reads a single sheet).
 //     See TODO(einfach-static-structured-refs).
+//
+//     TODO(einfach-static-unsupported-ref-axis): both hosts refuse these forms,
+//     but on different axes — the engine's parser rejects them at WRITE time
+//     (`setCellInput` throws "formula could not be parsed or installed"),
+//     while this backend accepts the write and reports `#ERROR!` at EVAL time.
+//     Neither invents a value, so no wrong number can reach a user; aligning
+//     them means adding a write-path rejection here, which changes the mutation
+//     contract (callers must handle a thrown/rejected input) rather than the
+//     evaluator, so it is deliberately deferred. Both behaviours are pinned by
+//     the "unsupported structured-reference forms" test in
+//     vnext-table-totals-static-wasm-parity.test.ts, so the boundary cannot
+//     drift silently. Combined qualifiers should stay deferred on BOTH sides
+//     until the engine grammar grows them (keeping one host ahead of the other
+//     is what creates dialects).
 
 const TABLE_RESERVED_NAMES: ReadonlySet<string> = new Set(ENGINE_BUILTIN_FORMULA_NAMES)
 
@@ -3542,7 +3605,7 @@ function tableHeaderText(
       {
         get: (r, c) => sheetCells?.get(keyFor(r, c)),
         resolveStructuredRef: makeStructuredRefResolver(state, sheetId),
-        hiddenRows: state.hiddenRowsBySheetId.get(sheetId),
+        hiddenRows: evalHiddenRowsForSheet(state, sheetId),
       },
       new Set(),
       { row, col },
@@ -4396,14 +4459,32 @@ export function createStaticSpreadsheetBackend(
         revision: state.revision,
       }
     },
-    // parity #23 — `setEvalHiddenRows` is deliberately NOT implemented here.
-    // This in-memory backend's formula evaluator has no SUBTOTAL 101-111
-    // variant to feed a hidden-row eval input, so omitting the optional port
-    // lets UI core silently skip the push (the standard degradation).
-    // TODO(einfach-static-subtotal): if the static evaluator ever grows the
-    // 101-111 SUBTOTAL family, implement this port to exclude
-    // `hiddenRowsBySheetId` at eval time; until then static-host SUBTOTAL
-    // 101-111 does not exclude hidden rows.
+    /**
+     * SUBTOTAL 101-111 hidden-row evaluation input (parity #23,
+     * design-excel-table §6.1). The port used to be omitted on the grounds
+     * that this evaluator had no 101-111 family — that stopped being true when
+     * the totals row landed, and omitting it left the static host deaf to the
+     * ONLY lane the WASM backend offers (it exposes no `hideRows`), so a host
+     * driving the documented eval lane got no exclusion here while WASM
+     * excluded correctly.
+     *
+     * Semantics copied from `Workbook::set_eval_hidden_rows`: whole-set
+     * REPLACE, stored verbatim as pure evaluation input. An empty set drops
+     * the sheet from the ledger. Out-of-range and duplicate rows are harmless
+     * — the evaluator only ever tests membership. Not undoable and does not
+     * bump the revision: this is a view-derived eval input, not workbook data,
+     * and the host re-pushes it whenever its canonical hidden set changes
+     * (including after row insert/delete, which is why the set is never
+     * shifted here — the engine does not shift its copy either).
+     */
+    setEvalHiddenRows(request: SetEvalHiddenRowsRequest): void {
+      const rows = request.rows.filter((row) => Number.isSafeInteger(row) && row >= 0)
+      if (rows.length === 0) {
+        state.evalHiddenRowsBySheetId.delete(request.sheetId)
+        return
+      }
+      state.evalHiddenRowsBySheetId.set(request.sheetId, new Set(rows))
+    },
     async setFormatRange(request: SetFormatRangeRequest) {
       beginUndoableMutation(state)
       recordCellFormatsBeforeInRange(state, request.sheetId, request.range)
@@ -5014,6 +5095,7 @@ export function createStaticSpreadsheetBackend(
       state.colWidthsBySheetId.delete(request.sheetId)
       state.hiddenRowsBySheetId.delete(request.sheetId)
       state.hiddenColsBySheetId.delete(request.sheetId)
+      state.evalHiddenRowsBySheetId.delete(request.sheetId)
       state.freezeBySheetId.delete(request.sheetId)
       // Drop every Table anchored to the deleted sheet (design §4.4). Not
       // captured by the undo delta — the registry is outside the timeline.

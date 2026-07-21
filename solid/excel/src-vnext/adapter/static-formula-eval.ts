@@ -892,11 +892,20 @@ function applyVlookup(
  * (2/3) and the deviation family (7/8/10/11) only pattern-match the value
  * kinds they care about and therefore ignore errors.
  *
- * TODO(einfach-static-subtotal-filter): `hiddenRows` carries the static
- * backend's MANUALLY hidden rows only. Rows hidden by an active filter live in
- * the filter/sort projection, not in that set, so a 101-111 aggregate does not
- * yet exclude filter-hidden rows here. The worker host merges both before
- * pushing `set_eval_hidden_rows`, so WASM does exclude them.
+ * `hiddenRows` carries MANUALLY hidden rows only — rows hidden by an active
+ * filter live in the filter/sort projection and are deliberately absent. That
+ * matches the engine exactly: design-excel-table §6.1 pins the MVP push source
+ * to `viewportHiddenAtom` (manual rows) and defers filter visibility to the
+ * #29 filter-canonical flip, so the worker host does NOT merge filter-hidden
+ * rows into `set_eval_hidden_rows` either. Excluding them here would make the
+ * static host the odd one out. Both hosts are pinned to this by the
+ * `filterHidden` phase of vnext-table-totals-static-wasm-parity.
+ *
+ * Known conformance boundary (design §6.3, shared with the engine): real Excel
+ * drops filter-hidden rows from 1-11 as well as 101-111. Under the single
+ * merged set neither engine can tell the two sources apart, so 1-11 never
+ * filters. When the #29 flip lands, filter visibility joins the SAME pushed
+ * set on both hosts and the port shape does not change.
  */
 function applySubtotal(
   args: Array<Value | RangeRef>,

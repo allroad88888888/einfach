@@ -22,7 +22,11 @@
 
 import { beforeAll, describe, expect, jest, test } from '@jest/globals'
 
-import type { DisplayCell, TableTotalsFunction } from '@einfach/spreadsheet-ui-core'
+import type {
+  ColumnFilterRule,
+  DisplayCell,
+  TableTotalsFunction,
+} from '@einfach/spreadsheet-ui-core'
 import type { WorkerLike, WorkerWorkbookSpreadsheetBackend } from '../src-vnext/adapter'
 import { createStaticSpreadsheetBackend } from '../src-vnext/adapter/static-backend'
 
@@ -125,6 +129,29 @@ interface TableBackend {
   listTables?: (request: { kind: 'list-tables' }) => Promise<{
     tables: Array<{ name: string; range: string; hasTotals: boolean; columns: string[] }>
   }>
+  hideRows?: (request: {
+    kind: 'hide-rows'
+    sheetId: string
+    rowIndices: number[]
+    requestId?: number
+  }) => Promise<unknown>
+  unhideRows?: (request: {
+    kind: 'unhide-rows'
+    sheetId: string
+    rowIndices: number[]
+    requestId?: number
+  }) => Promise<unknown>
+  setEvalHiddenRows?: (request: {
+    kind: 'set-eval-hidden-rows'
+    sheetId: string
+    rows: readonly number[]
+  }) => Promise<void> | void
+  setFilterSort?: (request: {
+    kind: 'set-filter-sort'
+    sheetId: string
+    rules: readonly ColumnFilterRule[]
+    requestId?: number
+  }) => Promise<unknown>
 }
 
 /** Region | Q1 | Q2 | Calc over three data rows — `Calc` is a spare in-table column. */
@@ -188,6 +215,19 @@ const OUTSIDE_FORMULAS: readonly string[] = [
   '=SUBTOTAL(12,Table1[Q1])',
 ]
 
+/**
+ * Structured-reference forms NEITHER engine resolves — combined qualifiers
+ * (`[[#Data],[Col]]`) and cross-sheet Table refs. They are kept OUT of the
+ * strict diff above because the two hosts reject them on different axes, and
+ * that boundary is asserted explicitly in its own test below rather than
+ * silently averaged away.
+ */
+const UNSUPPORTED_FORMULAS: readonly string[] = [
+  '=SUM(Table1[[#Data],[Q1]])',
+  '=SUM(Table1[[#Headers],[Q1]])',
+  '=SUM(Sheet1!Table1[Q1])',
+]
+
 /** Forms probed from INSIDE the Table (this-row + table-less resolution). */
 const INSIDE_FORMULAS: readonly string[] = [
   '=Table1[@Q1]',
@@ -249,14 +289,18 @@ async function probe(
   at: { row: number; col: number },
   formula: string,
 ): Promise<string> {
-  await backend.setCellInput({
-    kind: 'set-cell-input',
-    sheetId: SHEET,
-    row: at.row,
-    col: at.col,
-    input: formula,
-    requestId: probeRequestId++,
-  })
+  try {
+    await backend.setCellInput({
+      kind: 'set-cell-input',
+      sheetId: SHEET,
+      row: at.row,
+      col: at.col,
+      input: formula,
+      requestId: probeRequestId++,
+    })
+  } catch (e) {
+    return `THROW:${(e as Error).message}`
+  }
   const cell = await readCell(backend, at.row, at.col)
   await backend.setCellInput({
     kind: 'set-cell-input',
@@ -413,6 +457,161 @@ async function runScript(backend: TableBackend): Promise<Observation[]> {
   return out
 }
 
+// === Script 2: SUBTOTAL hidden-row semantics ================================
+//
+// The first script never hides a row, so it cannot see the hidden-row half of
+// SUBTOTAL. This one drives the SAME host-level hidden declaration into both
+// engines and compares 1-11 against 101-111 at every phase.
+//
+// Host contract under test (design-excel-table §6.1): the engine models NO
+// hidden state and never infers a row's source — `setEvalHiddenRows` is a
+// whole-set REPLACE evaluation input the HOST pushes. The manual hide lane
+// (`hideRows`, a VIEW fact) and the eval lane are therefore both driven here,
+// exactly as the app drives them (UI-core hide command → `hideRows`;
+// `eval-hidden-rows-bridge` → `setEvalHiddenRows`).
+//
+// Filter visibility is deliberately included: per design §6.1 the MVP push
+// source is `viewportHiddenAtom` (MANUAL rows only) and filter-hidden rows
+// join the same set only after the #29 filter-canonical flip. So a filter must
+// move NEITHER engine's SUBTOTAL — and that agreement is what is asserted.
+
+const SUBTOTAL_PROBES: readonly string[] = [
+  '=SUBTOTAL(9,Table1[Q1])',
+  '=SUBTOTAL(109,Table1[Q1])',
+  '=SUBTOTAL(1,Table1[Q1])',
+  '=SUBTOTAL(101,Table1[Q1])',
+  '=SUBTOTAL(2,Table1[Q1])',
+  '=SUBTOTAL(102,Table1[Q1])',
+  '=SUBTOTAL(3,Table1[Q1])',
+  '=SUBTOTAL(103,Table1[Q1])',
+  '=SUBTOTAL(4,Table1[Q1])',
+  '=SUBTOTAL(104,Table1[Q1])',
+  '=SUBTOTAL(5,Table1[Q1])',
+  '=SUBTOTAL(105,Table1[Q1])',
+  '=SUBTOTAL(6,Table1[Q1])',
+  '=SUBTOTAL(106,Table1[Q1])',
+  // The same aggregate over a plain A1 range — hidden-row exclusion must not
+  // depend on the reference being structured.
+  '=SUBTOTAL(9,B2:B4)',
+  '=SUBTOTAL(109,B2:B4)',
+]
+
+/**
+ * Declare exactly `rows` hidden on the sheet, through BOTH host lanes, with
+ * whole-set REPLACE semantics (an empty array clears). A backend that omits a
+ * lane simply skips it — and the recorded port availability makes that visible
+ * rather than silent.
+ */
+async function declareHiddenRows(backend: TableBackend, rows: readonly number[]): Promise<void> {
+  if (backend.hideRows && backend.unhideRows) {
+    // REPLACE, not merge: clear the data band first, then hide the target set.
+    await backend.unhideRows({
+      kind: 'unhide-rows',
+      sheetId: SHEET,
+      rowIndices: [1, 2, 3],
+      requestId: probeRequestId++,
+    })
+    if (rows.length > 0) {
+      await backend.hideRows({
+        kind: 'hide-rows',
+        sheetId: SHEET,
+        rowIndices: [...rows],
+        requestId: probeRequestId++,
+      })
+    }
+  }
+  await backend.setEvalHiddenRows?.({
+    kind: 'set-eval-hidden-rows',
+    sheetId: SHEET,
+    rows: [...rows],
+  })
+}
+
+async function runHiddenScript(backend: TableBackend): Promise<Observation[]> {
+  const out: Observation[] = []
+  const record = (step: string, value: unknown): void => {
+    out.push({ step, value: String(value) })
+  }
+
+  await seed(backend)
+  await backend.createTable!({ kind: 'create-table', sheetId: SHEET, range: TABLE_RANGE })
+  await backend.setTableTotalsRow!({ kind: 'set-table-totals-row', name: 'Table1', enabled: true })
+  await backend.setTableTotalFunction!({
+    kind: 'set-table-total-function',
+    name: 'Table1',
+    column: 'Q1',
+    func: 'sum',
+  })
+
+  // The eval lane is itself a parity observable: `setEvalHiddenRows` is the
+  // ONLY hidden lane the WASM backend offers (the engine models no hidden
+  // state, so that backend exposes no `hideRows`), so a backend missing it is
+  // deaf to the documented host push no matter what its own hide ports do.
+  record('port.setEvalHiddenRows', typeof backend.setEvalHiddenRows === 'function')
+  record('port.setFilterSort', typeof backend.setFilterSort === 'function')
+
+  const probeAll = async (phase: string): Promise<void> => {
+    for (const formula of SUBTOTAL_PROBES) {
+      record(`${phase} ${formula}`, await probe(backend, OUTSIDE_PROBE, formula))
+    }
+    // The Table's own generated totals cell IS a `SUBTOTAL(109,…)`, so it must
+    // track the 101-111 column above.
+    record(
+      `${phase} totalsCell`,
+      normalizeDisplay((await readCell(backend, 4, 1))?.displayValue ?? ''),
+    )
+  }
+
+  // Q1 = 120 / 80 / 200 over source rows 1 / 2 / 3.
+  await probeAll('baseline')
+
+  // Manually hide South (source row 2, Q1 = 80): 101-111 drops it, 1-11 keeps it.
+  await declareHiddenRows(backend, [2])
+  await probeAll('manualHidden')
+
+  // Two hidden rows, to catch an "only the first hidden row is excluded" bug.
+  await declareHiddenRows(backend, [1, 3])
+  await probeAll('manualHiddenPair')
+
+  // Whole-set REPLACE must fully restore the baseline.
+  await declareHiddenRows(backend, [])
+  await probeAll('afterUnhide')
+
+  // The eval lane ALONE — no `hideRows` call at all. This is exactly what the
+  // host's `eval-hidden-rows-bridge` drives, and the only lane the WASM
+  // backend has. A backend that infers exclusion solely from its own hide-port
+  // state reads the unhidden baseline here instead of excluding, which is the
+  // divergence this phase exists to catch.
+  await backend.setEvalHiddenRows?.({
+    kind: 'set-eval-hidden-rows',
+    sheetId: SHEET,
+    rows: [2],
+  })
+  await probeAll('evalLaneOnly')
+  await declareHiddenRows(backend, [])
+
+  // Filter-hidden rows: keep only North, which filters OUT source rows 2 and 3.
+  // Per design §6.1 this is NOT yet part of the pushed eval-hidden set, so both
+  // engines must read exactly their baseline values here.
+  await backend.setFilterSort?.({
+    kind: 'set-filter-sort',
+    sheetId: SHEET,
+    rules: [{ kind: 'equals', colIndex: 0, value: 'North' }],
+    requestId: probeRequestId++,
+  })
+  await probeAll('filterHidden')
+
+  await backend.setFilterSort?.({
+    kind: 'set-filter-sort',
+    sheetId: SHEET,
+    rules: [],
+    requestId: probeRequestId++,
+  })
+  await probeAll('afterFilterClear')
+
+  return out
+}
+
 describe('static ⇄ WASM Table totals + structured-reference parity', () => {
   test('both engines answer the identical script identically', async () => {
     const wasm = createWasmBackend!()
@@ -464,5 +663,124 @@ describe('static ⇄ WASM Table totals + structured-reference parity', () => {
     // the seeded SUM over an empty column).
     expect(value('preTotals.outside =SUM(Table1[#Totals])')).toBe('#REF!')
     expect(value('postTotals.outside =SUM(Table1[#Totals])')).toBe('3733.333333')
+  })
+
+  /**
+   * KNOWN DIVERGENCE (design-excel-table §11.2 `known-divergence`), pinned so
+   * it cannot drift unnoticed. Both engines refuse combined qualifiers and
+   * cross-sheet Table refs, but on DIFFERENT axes:
+   *
+   *  - WASM refuses at WRITE time — the engine grammar defers these forms, so
+   *    the parser rejects the input and `setCellInput` throws.
+   *  - The static host accepts the write and surfaces `#ERROR!` at EVAL time
+   *    (its tokenizer treats an unresolvable `Table[...]` as a hard failure,
+   *    deliberately never faking a value).
+   *
+   * Neither host invents a value, so no wrong number can reach a user, and
+   * closing the gap is a WRITE-path change (static would have to reject the
+   * input), not an evaluator change — see the TODO in `static-backend.ts`.
+   */
+  test('unsupported structured-reference forms: refused by both, on different axes', async () => {
+    const wasm = createWasmBackend!()
+    await wasm.ready()
+    const staticBackend = createStaticSpreadsheetBackend({
+      revision: 1,
+      sheets: [{ id: SHEET, name: 'Sheet1' }],
+    })
+
+    for (const backend of [wasm, staticBackend] as unknown as TableBackend[]) {
+      await seed(backend)
+      await backend.createTable!({ kind: 'create-table', sheetId: SHEET, range: TABLE_RANGE })
+    }
+
+    for (const formula of UNSUPPORTED_FORMULAS) {
+      const asTable = staticBackend as unknown as TableBackend
+      const wasmAnswer = await probe(wasm as unknown as TableBackend, OUTSIDE_PROBE, formula)
+      const staticAnswer = await probe(asTable, OUTSIDE_PROBE, formula)
+      // Neither engine ever returns a number for these.
+      expect(wasmAnswer).toBe('THROW:formula could not be parsed or installed')
+      expect(staticAnswer).toBe('#ERROR!')
+    }
+    wasm.dispose()
+  })
+
+  test('both engines answer the identical hidden-row script identically', async () => {
+    const wasm = createWasmBackend!()
+    await wasm.ready()
+    const staticBackend = createStaticSpreadsheetBackend({
+      revision: 1,
+      sheets: [{ id: SHEET, name: 'Sheet1' }],
+    })
+
+    const wasmObservations = await runHiddenScript(wasm as unknown as TableBackend)
+    const staticObservations = await runHiddenScript(staticBackend as unknown as TableBackend)
+    wasm.dispose()
+
+    const mismatches = wasmObservations
+      .map((observation, index) => ({
+        step: observation.step,
+        wasm: observation.value,
+        static: staticObservations[index]?.value,
+      }))
+      .filter((row) => row.wasm !== row.static)
+    expect(mismatches).toEqual([])
+
+    // Anti-vacuity: pin the values that carry the hidden-row semantics, so a
+    // future "neither engine excludes anything" regression cannot pass.
+    const value = (step: string): string | undefined =>
+      wasmObservations.find((o) => o.step === step)?.value
+
+    // The documented eval lane must exist on BOTH engines — its absence on the
+    // static host is precisely the divergence this script was added to catch.
+    expect(value('port.setEvalHiddenRows')).toBe('true')
+
+    // The view lane is asymmetric BY DESIGN and is therefore asserted per
+    // backend rather than diffed: the engine models no hidden state at all
+    // (design §2.2), so the WASM backend exposes no `hideRows` — hidden rows
+    // reach it only as the pushed eval input. The static backend doubles as
+    // its own view host, so it does own that port.
+    expect(typeof (wasm as unknown as TableBackend).hideRows).toBe('undefined')
+    expect(typeof (staticBackend as unknown as TableBackend).hideRows).toBe('function')
+
+    // Baseline: nothing hidden, so 9 and 109 agree. Q1 = 120 + 80 + 200.
+    expect(value('baseline =SUBTOTAL(9,Table1[Q1])')).toBe('400')
+    expect(value('baseline =SUBTOTAL(109,Table1[Q1])')).toBe('400')
+    expect(value('baseline totalsCell')).toBe('400')
+
+    // South (80) hidden: 1-11 unchanged, 101-111 drops it. This inequality IS
+    // the feature — if these two ever match again the exclusion has regressed.
+    expect(value('manualHidden =SUBTOTAL(9,Table1[Q1])')).toBe('400')
+    expect(value('manualHidden =SUBTOTAL(109,Table1[Q1])')).toBe('320')
+    expect(value('manualHidden totalsCell')).toBe('320')
+    expect(value('manualHidden =SUBTOTAL(1,Table1[Q1])')).toBe('133.333333')
+    expect(value('manualHidden =SUBTOTAL(101,Table1[Q1])')).toBe('160') // (120+200)/2
+    expect(value('manualHidden =SUBTOTAL(2,Table1[Q1])')).toBe('3')
+    expect(value('manualHidden =SUBTOTAL(102,Table1[Q1])')).toBe('2')
+    expect(value('manualHidden =SUBTOTAL(5,Table1[Q1])')).toBe('80')
+    expect(value('manualHidden =SUBTOTAL(105,Table1[Q1])')).toBe('120')
+    // A plain A1 range excludes the same rows as the structured form.
+    expect(value('manualHidden =SUBTOTAL(9,B2:B4)')).toBe('400')
+    expect(value('manualHidden =SUBTOTAL(109,B2:B4)')).toBe('320')
+
+    // Both ends of the data band hidden, only South (80) left.
+    expect(value('manualHiddenPair =SUBTOTAL(109,Table1[Q1])')).toBe('80')
+    expect(value('manualHiddenPair =SUBTOTAL(9,Table1[Q1])')).toBe('400')
+
+    // Whole-set REPLACE with an empty set restores the baseline exactly.
+    expect(value('afterUnhide =SUBTOTAL(109,Table1[Q1])')).toBe('400')
+    expect(value('afterUnhide totalsCell')).toBe('400')
+
+    // The pushed eval input alone is sufficient on BOTH hosts — no `hideRows`
+    // involved. This is the assertion the static backend failed before it
+    // implemented `setEvalHiddenRows`.
+    expect(value('evalLaneOnly =SUBTOTAL(109,Table1[Q1])')).toBe('320')
+    expect(value('evalLaneOnly =SUBTOTAL(9,Table1[Q1])')).toBe('400')
+    expect(value('evalLaneOnly totalsCell')).toBe('320')
+
+    // Filter-hidden rows are NOT in the pushed eval set yet (design §6.1), so
+    // an active filter moves neither 1-11 nor 101-111 on EITHER engine.
+    expect(value('filterHidden =SUBTOTAL(9,Table1[Q1])')).toBe('400')
+    expect(value('filterHidden =SUBTOTAL(109,Table1[Q1])')).toBe('400')
+    expect(value('afterFilterClear =SUBTOTAL(109,Table1[Q1])')).toBe('400')
   })
 })

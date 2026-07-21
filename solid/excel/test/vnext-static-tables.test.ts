@@ -712,6 +712,62 @@ describe('static backend — SUBTOTAL semantics', () => {
     expect(await evalAt(backend, '=SUBTOTAL(104,A1:A6)')).toBe('30')
   })
 
+  // `setEvalHiddenRows` is the hidden lane the ENGINE offers (the WASM backend
+  // exposes no `hideRows` at all), so the static host must honour it too or a
+  // host driving only that lane silently loses the exclusion.
+  it('101-111 exclude rows pushed through setEvalHiddenRows alone', async () => {
+    const backend = subtotalBackend()
+    backend.setEvalHiddenRows!({ kind: 'set-eval-hidden-rows', sheetId: SHEET, rows: [1, 5] })
+    expect(await evalAt(backend, '=SUBTOTAL(109,A1:A6)')).toBe('40') // 10 + 30
+    expect(await evalAt(backend, '=SUBTOTAL(9,A1:A6)')).toBe('100') // unchanged
+    expect(await evalAt(backend, '=SUBTOTAL(102,A1:A6)')).toBe('2')
+  })
+
+  it('unions the pushed eval set with the manually hidden rows', async () => {
+    const backend = subtotalBackend()
+    await backend.hideRows!({ kind: 'hide-rows', sheetId: SHEET, rowIndices: [1] }) // A2 = 20
+    // A6 = 40
+    backend.setEvalHiddenRows!({ kind: 'set-eval-hidden-rows', sheetId: SHEET, rows: [5] })
+    // Neither lane alone would drop both rows.
+    expect(await evalAt(backend, '=SUBTOTAL(109,A1:A6)')).toBe('40') // 10 + 30
+  })
+
+  it('setEvalHiddenRows is a whole-set REPLACE and an empty push clears it', async () => {
+    const backend = subtotalBackend()
+    backend.setEvalHiddenRows!({ kind: 'set-eval-hidden-rows', sheetId: SHEET, rows: [1, 5] })
+    expect(await evalAt(backend, '=SUBTOTAL(109,A1:A6)')).toBe('40')
+    // REPLACE, not merge: row 1 comes back, row 3 goes away.
+    backend.setEvalHiddenRows!({ kind: 'set-eval-hidden-rows', sheetId: SHEET, rows: [3] })
+    expect(await evalAt(backend, '=SUBTOTAL(109,A1:A6)')).toBe('70') // 10 + 20 + 40
+    backend.setEvalHiddenRows!({ kind: 'set-eval-hidden-rows', sheetId: SHEET, rows: [] })
+    expect(await evalAt(backend, '=SUBTOTAL(109,A1:A6)')).toBe('100')
+  })
+
+  it('scopes the pushed set per sheet and ignores rows outside the reference', async () => {
+    const backend = subtotalBackend()
+    backend.setEvalHiddenRows!({ kind: 'set-eval-hidden-rows', sheetId: 'other-sheet', rows: [1] })
+    expect(await evalAt(backend, '=SUBTOTAL(109,A1:A6)')).toBe('100')
+    // Row 99 is not in A1:A6 — membership-only, so it is simply never met.
+    backend.setEvalHiddenRows!({ kind: 'set-eval-hidden-rows', sheetId: SHEET, rows: [99] })
+    expect(await evalAt(backend, '=SUBTOTAL(109,A1:A6)')).toBe('100')
+  })
+
+  // Conformance boundary shared with the engine (design-excel-table §6.1/§6.3):
+  // the MVP push source is `viewportHiddenAtom` (MANUAL rows), and filter
+  // visibility joins the same set only after the #29 filter-canonical flip.
+  // Excluding filter-hidden rows here would make the static host diverge from
+  // WASM, so an active filter must move NEITHER band.
+  it('does not treat filter-hidden rows as an evaluation truth source', async () => {
+    const backend = subtotalBackend()
+    await backend.setFilterSort!({
+      kind: 'set-filter-sort',
+      sheetId: SHEET,
+      rules: [{ kind: 'range', colIndex: 0, min: 30 }],
+    })
+    expect(await evalAt(backend, '=SUBTOTAL(9,A1:A6)')).toBe('100')
+    expect(await evalAt(backend, '=SUBTOTAL(109,A1:A6)')).toBe('100')
+  })
+
   it('rejects out-of-band function numbers and short arg lists', async () => {
     const backend = subtotalBackend()
     expect(await evalAt(backend, '=SUBTOTAL(12,A1:A6)')).toBe('#VALUE!')
