@@ -672,10 +672,39 @@ pub struct Sheet {
     /// persistence-v1, which already walks sheets, can serialize it without
     /// a new keying scheme.
     ///
-    /// Filter-hidden rows are deliberately NOT here: they stay a host-pushed
-    /// evaluation input until E3, because the two SUBTOTAL layers need the
-    /// manual/filter distinction and only the manual half is owned yet.
+    /// Filter-hidden rows live in the SEPARATE `filter` field below, not
+    /// merged in here: Excel's two SUBTOTAL layers need the manual/filter
+    /// distinction (1-11 exclude filter-hidden rows only, 101-111 exclude
+    /// both), and a merged set could not express that rule.
     hidden_rows: BTreeSet<u32>,
+    /// The sheet's AutoFilter — committed RULES plus the row set they
+    /// DERIVED (E3 of `design-engine-hidden-rows.md`). `None` means no
+    /// filter is active, which is the same observable state as an empty
+    /// rule list: nothing hidden.
+    ///
+    /// Beside `hidden_rows` for the same reason `hidden_rows` is beside
+    /// `row_heights`, and it inherits the same three freebies: structural
+    /// displacement, sheet lifecycle, persistence-by-sheet-walk.
+    ///
+    /// The derived set is STORED rather than recomputed on demand, and that
+    /// is load-bearing rather than an optimisation. #27 ruled that editing a
+    /// cell does NOT recompute visibility (Excel snapshot semantics; the
+    /// pre-#27 implementation recomputed on every revision bump, which made
+    /// filtering *more live than Excel's*). A getter that re-ran the
+    /// predicate would be live by construction. Only `apply_filter` /
+    /// `reapply_filter` / `clear_filter` ever write this set — every other
+    /// path (cell writes, structural edits, formats) at most DISPLACES the
+    /// rows already in it.
+    filter: Option<crate::filter::SheetAutoFilter>,
+    /// How many predicate scans this sheet has run. `Cell` because the scan
+    /// itself runs behind `&self` (it must, so it can read cell values
+    /// through the eager provider while `apply_filter` holds `&mut self`).
+    ///
+    /// Exists purely so tests can assert the negative that matters: that a
+    /// cell write, a structural edit, or a hidden-row epoch bump does NOT
+    /// re-run the predicate. "The count did not move" is the only direct
+    /// evidence that visibility is a snapshot and not a derivation.
+    filter_scan_count: Cell<u64>,
     /// Cumulative count of completed formula-inner evaluations. Read-only
     /// debug counter used by the Phase 1 scale tests to assert laziness —
     /// `bulk_load` of N formulas
@@ -1317,14 +1346,37 @@ impl WorkbookAtomContext {
         removed
     }
 
-    /// Full-replace the FILTER hidden-row set for `sheet_index`
-    /// (`design-filter-hidden-rows` §6.2). Byte-for-byte the same contract as
-    /// `set_eval_hidden_rows` against the independent side store, firing the
-    /// independent `filter_hidden_epoch` — so BOTH SUBTOTAL layers re-derive
-    /// while the manual store and its epoch stay untouched.
-    pub(crate) fn set_eval_filter_hidden_rows(&self, sheet_index: usize, rows: HashSet<u32>) {
+    /// Republish `Workbook`'s engine-owned FILTER-derived set for
+    /// `sheet_index` into the evaluation mirror (E3 of
+    /// `design-engine-hidden-rows.md`). Exact twin of
+    /// `publish_eval_hidden_rows` against the independent side store, firing
+    /// the independent `filter_hidden_epoch` — so BOTH SUBTOTAL layers
+    /// re-derive while the manual store and its epoch stay untouched.
+    ///
+    /// **Idempotent**, and §3 asks for the two sets to be judged
+    /// SEPARATELY: a manual hide must not dirty the 1-11 formulas that hold
+    /// only the filter edge, and a filter apply must not dirty anything if
+    /// it produced the same answer. Owning the state puts this publisher on
+    /// hot paths — every structural edit republishes both halves — so
+    /// without the equality check a plain `insert_rows` on a sheet with
+    /// nothing filtered would dirty every SUBTOTAL in the workbook,
+    /// including the 1-11 half that the two-epoch split exists to protect.
+    ///
+    /// Returns whether the epoch fired.
+    pub(crate) fn publish_eval_filter_hidden_rows(
+        &self,
+        sheet_index: usize,
+        rows: HashSet<u32>,
+    ) -> bool {
         {
             let mut map = self.eval_filter_hidden_rows.borrow_mut();
+            let unchanged = match map.get(&sheet_index) {
+                Some(existing) => **existing == rows,
+                None => rows.is_empty(),
+            };
+            if unchanged {
+                return false;
+            }
             if rows.is_empty() {
                 map.remove(&sheet_index);
             } else {
@@ -1332,6 +1384,23 @@ impl WorkbookAtomContext {
             }
         }
         self.bump_epoch(&self.filter_hidden_epoch, &self.filter_hidden_revision);
+        true
+    }
+
+    /// Twin of `drop_eval_hidden_rows_above` for the filter mirror: drop
+    /// entries keyed past the end of the sheet vector after a topology
+    /// change.
+    pub(crate) fn drop_eval_filter_hidden_rows_above(&self, sheet_count: usize) -> bool {
+        let removed = {
+            let mut map = self.eval_filter_hidden_rows.borrow_mut();
+            let before = map.len();
+            map.retain(|key, _| *key < sheet_count);
+            map.len() != before
+        };
+        if removed {
+            self.bump_epoch(&self.filter_hidden_epoch, &self.filter_hidden_revision);
+        }
+        removed
     }
 
     /// Remap both hidden-row side stores after the sheet at `removed` was
@@ -2273,6 +2342,8 @@ impl Sheet {
             row_heights: BTreeMap::new(),
             col_widths: BTreeMap::new(),
             hidden_rows: BTreeSet::new(),
+            filter: None,
+            filter_scan_count: Cell::new(0),
             formula_eval_count: Rc::new(Cell::new(0)),
             imported_formula_count: Cell::new(0),
             reverse_dep_visit_count: Cell::new(0),
@@ -2436,6 +2507,121 @@ impl Sheet {
             .iter()
             .filter_map(|&row| shift_hidden_row(row, at, count, insert))
             .collect();
+    }
+
+    // --- Engine-owned FILTER state (E3, `design-engine-hidden-rows`) ------
+    //
+    // Same `pub(crate)` reasoning as the manual half above: `Workbook` is
+    // the only entry point, because every mutation has to be followed by a
+    // `republish_hidden` that refreshes the evaluation mirror.
+
+    /// The committed AutoFilter, if one is active.
+    pub(crate) fn filter(&self) -> Option<&crate::filter::SheetAutoFilter> {
+        self.filter.as_ref()
+    }
+
+    /// The rows the committed filter hid, ascending. Empty when no filter
+    /// is active — a lookup miss and an empty set are the same "nothing is
+    /// filtered out" signal, exactly as in the evaluation mirror.
+    pub(crate) fn filter_hidden_rows(&self) -> Vec<u32> {
+        self.filter
+            .as_ref()
+            .map(crate::filter::SheetAutoFilter::hidden_rows)
+            .unwrap_or_default()
+    }
+
+    /// Borrow the derived set for republishing into the evaluation mirror.
+    pub(crate) fn filter_hidden_set(&self) -> Option<&BTreeSet<u32>> {
+        self.filter.as_ref().map(|f| f.hidden_set())
+    }
+
+    /// Commit a completed predicate run. `rules` empty drops the filter
+    /// entirely rather than storing a vacuous one, so "no rules" has one
+    /// representation instead of two. Returns whether anything changed.
+    pub(crate) fn commit_filter(
+        &mut self,
+        rules: Vec<crate::filter::ColumnFilterRule>,
+        hidden: BTreeSet<u32>,
+    ) -> bool {
+        let next = if rules.is_empty() && hidden.is_empty() {
+            None
+        } else {
+            Some(crate::filter::SheetAutoFilter::new(rules, hidden))
+        };
+        if self.filter == next {
+            return false;
+        }
+        self.filter = next;
+        true
+    }
+
+    /// Replace ONLY the derived set, leaving the rules alone.
+    ///
+    /// Backs `Workbook::set_eval_filter_hidden_rows`, the host port whose
+    /// contract has always been "here is the answer, I computed it myself"
+    /// — it carries a row set and no rules. While the host is still the
+    /// writer (through E4), that is the shape the engine has to accept, and
+    /// the rows it pushes are the same rows `apply_filter` would derive.
+    pub(crate) fn replace_filter_hidden_rows(&mut self, rows: BTreeSet<u32>) -> bool {
+        match self.filter.as_mut() {
+            Some(filter) => {
+                if *filter.hidden_set() == rows {
+                    return false;
+                }
+                if rows.is_empty() && filter.rules().is_empty() {
+                    self.filter = None;
+                    return true;
+                }
+                filter.set_hidden(rows);
+                true
+            }
+            None => {
+                if rows.is_empty() {
+                    return false;
+                }
+                self.filter = Some(crate::filter::SheetAutoFilter::new(Vec::new(), rows));
+                true
+            }
+        }
+    }
+
+    /// Drop the filter entirely. Returns whether anything changed.
+    pub(crate) fn clear_filter(&mut self) -> bool {
+        self.filter.take().is_some()
+    }
+
+    /// Displace the DERIVED set through a ROW insert/delete, through the
+    /// same shared [`shift_hidden_row`] arithmetic the manual set uses.
+    ///
+    /// Displacement, never re-derivation: this is what keeps snapshot
+    /// semantics true across structural edits. A row that was hidden stays
+    /// hidden at its new index; a row inside a deleted band stops existing.
+    /// The RULES are untouched — the answer moves, it is not recomputed.
+    fn shift_filter_hidden_rows(&mut self, at: u32, count: u32, insert: bool) {
+        let Some(filter) = self.filter.as_mut() else {
+            return;
+        };
+        if count == 0 || filter.hidden_set().is_empty() {
+            return;
+        }
+        let next: BTreeSet<u32> = filter
+            .hidden_set()
+            .iter()
+            .filter_map(|&row| shift_hidden_row(row, at, count, insert))
+            .collect();
+        *filter.hidden_set_mut() = next;
+    }
+
+    /// Cumulative predicate-scan count — see the field doc for why this is
+    /// the observable that matters.
+    #[doc(hidden)]
+    pub(crate) fn debug_filter_scan_count(&self) -> u64 {
+        self.filter_scan_count.get()
+    }
+
+    pub(crate) fn note_filter_scan(&self) {
+        self.filter_scan_count
+            .set(self.filter_scan_count.get().saturating_add(1));
     }
 
     fn shift_dimension_insert(dimensions: &mut BTreeMap<u32, u32>, at: u32, count: u32) {
@@ -5795,10 +5981,16 @@ impl Sheet {
                     // single `shift_hidden_row` arithmetic the evaluation
                     // mirror uses, which is why the two cannot drift.
                     sheet.shift_hidden_rows(at, count, true);
+                    // The FILTER-derived set rides the same pass (E3). It
+                    // is DISPLACED, never re-derived: re-running the
+                    // predicate here is precisely the "more live than
+                    // Excel" behaviour #27 removed.
+                    sheet.shift_filter_hidden_rows(at, count, true);
                 }
                 crate::shift::ShiftEdit::RowDelete { at, count } => {
                     Self::shift_dimension_delete(&mut sheet.row_heights, at, count);
                     sheet.shift_hidden_rows(at, count, false);
+                    sheet.shift_filter_hidden_rows(at, count, false);
                 }
                 crate::shift::ShiftEdit::ColInsert { at, count } => {
                     Self::shift_dimension_insert(&mut sheet.col_widths, at, count);

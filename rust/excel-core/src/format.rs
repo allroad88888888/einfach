@@ -137,6 +137,53 @@ fn default_number_string(n: f64) -> String {
     }
 }
 
+/// Collapse a spill anchor's `Value::Array` to its top-left scalar. Twin of
+/// `sheet::collapse_array_for_eval` on the display side: the boundary never
+/// shows the `Array` variant, it shows what Excel shows when you look at an
+/// array-formula anchor.
+fn collapse_array_for_display(val: &Value) -> std::borrow::Cow<'_, Value> {
+    match val {
+        Value::Array(arr) => std::borrow::Cow::Owned(arr.get(0, 0).cloned().unwrap_or(Value::Null)),
+        _ => std::borrow::Cow::Borrowed(val),
+    }
+}
+
+/// The UNFORMATTED display string of a value — no `NumberFormat` applied.
+///
+/// THE single definition of "what this cell looks like as text" at the
+/// engine boundary. `rust/wasm`'s private `value_to_display` delegates to
+/// it, which is what makes it the exact string the `readSparseRange` /
+/// `getCellDisplay` wire carries, and therefore the exact string the host's
+/// TypeScript filter predicate (`solid/excel/src-vnext/adapter/
+/// filter-predicate.ts`) compares against today.
+///
+/// That identity is the whole reason the E3 filter sink-down is
+/// behaviour-preserving on the worker path: `Workbook::apply_filter` feeds
+/// its predicate from here, so the Rust predicate reads byte-identical
+/// input to what the TypeScript predicate reads over the wire. A second,
+/// separately-maintained formatter in the engine would have re-opened
+/// exactly the drift the port exists to close.
+///
+/// Number formats are deliberately NOT applied: neither side applies them
+/// on this path either (`applyNumberFormatsToCells` runs on the projection
+/// read, not on the predicate scan).
+pub fn value_to_display(val: &Value) -> String {
+    let val = collapse_array_for_display(val);
+    match &*val {
+        Value::Number(n) => default_number_string(*n),
+        Value::Text(s) => s.clone(),
+        Value::Boolean(b) => if *b { "TRUE" } else { "FALSE" }.into(),
+        Value::Null => String::new(),
+        Value::Error(e) => format!("{}", e),
+        // Unreachable: collapsed above. Defensive fallback.
+        Value::Array(_) => String::new(),
+        // Lambdas are transient evaluator state — they never get persisted
+        // into a cell. A defensive empty string keeps the boundary safe if
+        // one ever leaks through.
+        Value::Lambda(_) => String::new(),
+    }
+}
+
 fn format_fixed(n: f64, digits: u8, thousands: bool, suffix: &str) -> String {
     let formatted = format!("{:.*}", digits as usize, n);
     let body = if thousands {

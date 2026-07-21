@@ -10,6 +10,7 @@ use crate::eval::{
     eval_expr_with_provider, is_builtin_function_name, CustomFunctionRegistry, EvalProvider,
     ExcelLambda, ResolvedTable,
 };
+use crate::filter::{ColumnFilterRule, FilterApplyReport, FilterError};
 use crate::formula::{parse_formula, Expr, RangeBounds, TableArea};
 use crate::range::CellRange;
 use crate::sheet::{
@@ -345,6 +346,66 @@ impl HiddenRowsSnapshot {
 
     /// Whether nothing was hidden anywhere. Restoring an empty snapshot
     /// CLEARS every sheet — it is not a no-op.
+    pub fn is_empty(&self) -> bool {
+        self.sheets.is_empty()
+    }
+}
+
+/// One sheet's filter state inside a [`FilterSnapshot`] — the committed
+/// rules AND the rows they hid.
+///
+/// Both halves, deliberately. Restoring rules alone would force a
+/// re-derivation against whatever the cells say at restore time, which is
+/// live evaluation wearing an undo costume; #27's snapshot semantics
+/// requires that an undo puts back the rows that WERE hidden.
+#[derive(Clone, Debug, PartialEq)]
+pub struct SheetFilterState {
+    /// 0-based sheet index at capture time.
+    pub sheet_index: usize,
+    /// The committed rules.
+    pub rules: Vec<ColumnFilterRule>,
+    /// The rows those rules hid, ascending and deduplicated.
+    pub hidden_rows: Vec<u32>,
+}
+
+/// Undo / persistence primitive for the engine-owned filter state (E3 of
+/// `design-engine-hidden-rows.md` §6.2). Shaped after
+/// [`HiddenRowsSnapshot`], which is itself shaped after
+/// [`TableRegistrySnapshot`]: pure read on capture, whole-workbook REPLACE
+/// on restore.
+///
+/// Sheets with no filter are omitted, so an unfiltered workbook snapshots
+/// to an empty vector — which is what lets the persistence-v1 wire field
+/// stay `skip_serializing_if = "Vec::is_empty"` and keep byte-identical
+/// output for payloads that predate it.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct FilterSnapshot {
+    sheets: Vec<SheetFilterState>,
+}
+
+impl FilterSnapshot {
+    /// Build a snapshot from entries a host previously serialized. Order is
+    /// irrelevant; [`Workbook::restore_filters`] applies them by index.
+    pub fn from_sheets(sheets: Vec<SheetFilterState>) -> Self {
+        FilterSnapshot { sheets }
+    }
+
+    /// The captured per-sheet entries, for serialization by a host.
+    pub fn sheets(&self) -> &[SheetFilterState] {
+        &self.sheets
+    }
+
+    pub(crate) fn into_sheets(self) -> Vec<SheetFilterState> {
+        self.sheets
+    }
+
+    /// Number of sheets with a filter.
+    pub fn len(&self) -> usize {
+        self.sheets.len()
+    }
+
+    /// Whether no sheet had a filter. Restoring an empty snapshot CLEARS
+    /// every sheet's filter — it is not a no-op.
     pub fn is_empty(&self) -> bool {
         self.sheets.is_empty()
     }
@@ -1228,6 +1289,19 @@ impl Workbook {
             .get(sheet_idx)
             .map(|sheet| sheet.debug_formula_cache_state(addr_str))
             .unwrap_or("missing-sheet")
+    }
+
+    /// Live sheet-owned core atoms. Exposed at the workbook level so the E3
+    /// suite can assert the negative that matters: a whole `apply_filter`
+    /// materializes NO atom, which is how "the derived filter set is not a
+    /// derived atom, and the scan registers no dependency edge" is checked
+    /// directly rather than inferred.
+    #[doc(hidden)]
+    pub fn debug_total_atom_count(&self, sheet_idx: usize) -> usize {
+        self.sheets
+            .get(sheet_idx)
+            .map(Sheet::debug_total_atom_count)
+            .unwrap_or(0)
     }
 
     #[doc(hidden)]
@@ -2630,21 +2704,35 @@ impl Workbook {
         true
     }
 
-    /// Copy one sheet's owned hidden set into the evaluation mirror. THE only
-    /// writer of the manual mirror (design §2.1).
+    /// Copy one sheet's owned hidden sets into the evaluation mirrors. THE
+    /// only writer of either mirror (design §2.1). Manual at E2, filter as
+    /// well since E3.
     ///
-    /// Call sites are finite and enumerable: the host push, `hide_rows` /
-    /// `unhide_rows`, the structural-shift wrappers, `restore_hidden`, and
-    /// the sheet-lifecycle reconciliation in `republish_hidden_all`. Cheap
-    /// and idempotent — `publish_eval_hidden_rows` compares before it writes,
-    /// so republishing an unchanged set costs one set comparison and fires no
-    /// epoch.
+    /// Call sites are finite and enumerable: the two host push ports,
+    /// `hide_rows` / `unhide_rows`, `apply_filter` / `reapply_filter` /
+    /// `clear_filter`, the structural-shift wrappers, `restore_hidden` /
+    /// `restore_filters`, and the sheet-lifecycle reconciliation in
+    /// `republish_hidden_all`. Cheap and idempotent — both publishers
+    /// compare before they write, so republishing unchanged sets costs two
+    /// set comparisons and fires no epoch.
+    ///
+    /// The two halves are judged INDEPENDENTLY (§3), which is what keeps the
+    /// #27 two-epoch split worth having: a manual hide must not dirty the
+    /// `SUBTOTAL(1-11)` formulas that hold only the filter edge, and vice
+    /// versa.
     fn republish_hidden(&self, sheet_index: usize) {
         let Some(sheet) = self.sheets.get(sheet_index) else {
             return;
         };
-        let rows: HashSet<u32> = sheet.hidden_row_set().iter().copied().collect();
-        self.atom_context.publish_eval_hidden_rows(sheet_index, rows);
+        let manual: HashSet<u32> = sheet.hidden_row_set().iter().copied().collect();
+        self.atom_context
+            .publish_eval_hidden_rows(sheet_index, manual);
+        let filtered: HashSet<u32> = sheet
+            .filter_hidden_set()
+            .map(|set| set.iter().copied().collect())
+            .unwrap_or_default();
+        self.atom_context
+            .publish_eval_filter_hidden_rows(sheet_index, filtered);
     }
 
     /// Reconcile the whole mirror against the sheet vector. Used after a
@@ -2659,6 +2747,8 @@ impl Workbook {
     fn republish_hidden_all(&self) {
         self.atom_context
             .drop_eval_hidden_rows_above(self.sheets.len());
+        self.atom_context
+            .drop_eval_filter_hidden_rows_above(self.sheets.len());
         for sheet_index in 0..self.sheets.len() {
             self.republish_hidden(sheet_index);
         }
@@ -2741,19 +2831,341 @@ impl Workbook {
     /// `SUBTOTAL(101-111)` excludes both. Only two independently addressable
     /// sets can carry that distinction.
     ///
-    /// Identical contract to `set_eval_hidden_rows`: full-replace, idempotent,
-    /// empty slice clears, per-sheet keyed, out-of-range sheet is a silent
-    /// no-op, no-op during a host custom-formula callback, and the engine never
-    /// infers a row's hidden source. The paired `filter_hidden_epoch` bump
+    /// Signature and contract are verbatim what they have always been (INV-4
+    /// fingerprints parameters, so changing one counts as a removal):
+    /// full-replace, empty slice clears, per-sheet keyed, out-of-range sheet
+    /// is a silent no-op, refused during a host custom-formula callback. What
+    /// changed underneath at E3 is the destination — the rows now land in the
+    /// owned `Sheet::filter`, and the evaluation mirror is refreshed from
+    /// there by `republish_hidden`.
+    ///
+    /// The rows arrive WITHOUT rules, because that is what this port has
+    /// always carried: the host computed the answer with its own predicate
+    /// and is handing over the result. Any rules already committed by
+    /// `apply_filter` are left alone. The paired `filter_hidden_epoch` bump
     /// re-derives BOTH SUBTOTAL layers (both read this set) without touching
     /// the manual epoch.
+    ///
+    /// One consequence is visible only through a recomputation counter: a
+    /// byte-identical re-push no longer bumps `filter_hidden_epoch`, because
+    /// the de-duplication moved into `publish_eval_filter_hidden_rows` (§3).
+    /// Values are unaffected — a skipped bump only skips re-deriving formulas
+    /// that would have produced the same answer. The manual half took the
+    /// same change at E2.
     pub fn set_eval_filter_hidden_rows(&mut self, sheet_index: usize, rows: &[u32]) {
-        if self.is_inside_custom_call() || sheet_index >= self.sheets.len() {
+        if self.is_inside_custom_call() {
             return;
         }
-        let set: HashSet<u32> = rows.iter().copied().collect();
-        self.atom_context
-            .set_eval_filter_hidden_rows(sheet_index, set);
+        let Some(sheet) = self.sheets.get_mut(sheet_index) else {
+            return;
+        };
+        sheet.replace_filter_hidden_rows(rows.iter().copied().collect());
+        self.republish_hidden(sheet_index);
+    }
+
+    // === Engine-owned FILTER (E3) =======================================
+    //
+    // E3 of `solid/excel/docs/online-excel-parity/design-engine-hidden-rows.md`.
+    //
+    // The engine now owns the RULES and evaluates the PREDICATE itself,
+    // instead of receiving a row set the host derived. Same staging as E2:
+    // the host is still the writer in this slice (it keeps calling
+    // `set_eval_filter_hidden_rows` above), so the product's behaviour is
+    // unchanged. The engine has become the authoritative STORE for filter
+    // state; it does not become the authoritative SOURCE until the host
+    // switches to calling `apply_filter`.
+    //
+    // THE ONE INVARIANT THIS SECTION EXISTS TO PROTECT: predicate evaluation
+    // is IMPERATIVE and happens at exactly three entry points. It is not a
+    // derived atom, and design §2.2 gives three reasons in descending
+    // severity:
+    //
+    //   1. A derived atom would close a REAL dependency cycle. `SUBTOTAL`
+    //      reads the filter set; a derived filter set would read the
+    //      predicate column's cells; put a `SUBTOTAL` in a predicate column
+    //      and the graph has a loop. The compute-then-commit shape below
+    //      dodges it the same way both host adapters do — the scan sees the
+    //      PREVIOUS filter set, never the one it is producing.
+    //   2. It would make filtering LIVE, and Excel's is not (#27: the
+    //      pre-#27 implementation recomputed on every revision bump, which
+    //      made our filter *more live than Excel's* — a divergence, not a
+    //      feature). `Data -> Reapply` is the sanctioned refresh path.
+    //   3. Cost: a whole-column rescan on every cell write.
+    //
+    // Structurally, not by convention: nothing outside these three entry
+    // points can write the derived set, and none of them registers a
+    // dependency edge, because the scan reads through the eager
+    // `for_each_sparse_range_cell` path rather than a tracked one.
+
+    /// Apply `rules` to `sheet_index`: run the predicate ONCE, commit both
+    /// the rules and the rows they hid, and republish the evaluation mirror.
+    ///
+    /// An empty `rules` slice is the same statement as `clear_filter`.
+    ///
+    /// Rejections mutate NOTHING (see [`FilterError`]) — in particular an
+    /// over-budget source leaves the previous visibility standing rather
+    /// than truncating the scan and showing a confidently wrong answer,
+    /// which is the host adapter's existing `FILTER_SORT_SOURCE_TOO_LARGE`
+    /// behaviour.
+    pub fn apply_filter(
+        &mut self,
+        sheet_index: usize,
+        rules: &[ColumnFilterRule],
+    ) -> Result<FilterApplyReport, FilterError> {
+        self.run_filter(sheet_index, rules.to_vec())
+    }
+
+    /// `Data -> Reapply` (Excel `Ctrl+Alt+L`): re-run the ALREADY COMMITTED
+    /// rules against current cell values.
+    ///
+    /// This carries no rules of its own, and that is the point — reapply can
+    /// never change WHAT is filtered, only WHICH rows currently satisfy it.
+    /// It is also the only supported way to refresh visibility after an
+    /// edit, which is what makes the snapshot semantics livable.
+    ///
+    /// A sheet with no committed filter reapplies to nothing.
+    pub fn reapply_filter(&mut self, sheet_index: usize) -> Result<FilterApplyReport, FilterError> {
+        let rules = self
+            .sheets
+            .get(sheet_index)
+            .ok_or(FilterError::InvalidSheet)?
+            .filter()
+            .map(|filter| filter.rules().to_vec())
+            .unwrap_or_default();
+        self.run_filter(sheet_index, rules)
+    }
+
+    /// Drop `sheet_index`'s filter: rules and derived rows both. Cheap and
+    /// scan-free — there is nothing to evaluate.
+    pub fn clear_filter(&mut self, sheet_index: usize) -> Result<FilterApplyReport, FilterError> {
+        if self.is_inside_custom_call() {
+            return Err(FilterError::MutationDuringCustomCall);
+        }
+        let sheet = self
+            .sheets
+            .get_mut(sheet_index)
+            .ok_or(FilterError::InvalidSheet)?;
+        if sheet.clear_filter() {
+            self.republish_hidden(sheet_index);
+        }
+        Ok(FilterApplyReport::default())
+    }
+
+    /// The committed filter rules on `sheet_index`, or empty.
+    pub fn filter_rules(&self, sheet_index: usize) -> Vec<ColumnFilterRule> {
+        self.sheets
+            .get(sheet_index)
+            .and_then(Sheet::filter)
+            .map(|filter| filter.rules().to_vec())
+            .unwrap_or_default()
+    }
+
+    /// The rows `sheet_index`'s filter currently hides, ascending.
+    pub fn filter_hidden_rows(&self, sheet_index: usize) -> Vec<u32> {
+        self.sheets
+            .get(sheet_index)
+            .map(Sheet::filter_hidden_rows)
+            .unwrap_or_default()
+    }
+
+    /// Shared body of `apply_filter` / `reapply_filter`: guard, scan behind
+    /// `&self`, THEN commit.
+    ///
+    /// The two-phase split is not stylistic. The scan has to read cell
+    /// values, which needs `&self` for the eager evaluation provider, while
+    /// committing needs `&mut self`; doing them in one pass is not
+    /// expressible. It also happens to be exactly the ordering that keeps
+    /// the derivation non-circular — a `SUBTOTAL` sitting in a predicate
+    /// column resolves against the PREVIOUS filter set, because the new one
+    /// does not exist yet. Both host adapters take the same care today
+    /// ("Deliberately the PREVIOUS filter set … which keeps the derivation
+    /// non-circular on both hosts").
+    fn run_filter(
+        &mut self,
+        sheet_index: usize,
+        rules: Vec<ColumnFilterRule>,
+    ) -> Result<FilterApplyReport, FilterError> {
+        if self.is_inside_custom_call() {
+            return Err(FilterError::MutationDuringCustomCall);
+        }
+        if sheet_index >= self.sheets.len() {
+            return Err(FilterError::InvalidSheet);
+        }
+
+        // Phase 1 — scan, behind `&self`, into locals. Nothing is committed
+        // yet, so a rejection below leaves the workbook untouched.
+        let (hidden, scanned_rows, predicate_cells) = self.scan_filter(sheet_index, &rules)?;
+
+        // Phase 2 — commit, then republish the mirror from the owning side.
+        let report = FilterApplyReport {
+            hidden_rows: hidden.iter().copied().collect(),
+            scanned_rows,
+            predicate_cells,
+        };
+        if self.sheets[sheet_index].commit_filter(rules, hidden) {
+            self.republish_hidden(sheet_index);
+        }
+        Ok(report)
+    }
+
+    /// ONE predicate scan. `&self` throughout, and deliberately so: every
+    /// cell read goes through `for_each_sparse_range_cell`, the same eager
+    /// path `readSparseRange` uses at the wasm boundary, which registers no
+    /// Store dependency edge. A tracked read here would wire the predicate
+    /// columns into the reactive graph and bring liveness back through the
+    /// back door — see the section header.
+    ///
+    /// Extent, columns and budget are the host adapter's arithmetic,
+    /// transcribed so the answer cannot move:
+    ///
+    ///   - extent = `max_non_empty_row + 1` over the WHOLE sheet, from the
+    ///     same `for_each_non_empty` walk `listNonEmpty` exposes — not the
+    ///     predicate columns' own extent;
+    ///   - columns = column 0 (summary-row probe) plus each rule's column;
+    ///   - budget = `rows * columns` against [`MAX_FILTER_PREDICATE_CELLS`].
+    fn scan_filter(
+        &self,
+        sheet_index: usize,
+        rules: &[ColumnFilterRule],
+    ) -> Result<(BTreeSet<u32>, u32, u32), FilterError> {
+        let sheet = self.sheets.get(sheet_index).ok_or(FilterError::InvalidSheet)?;
+
+        // No rules means NO SCAN AT ALL — checked before the extent probe
+        // and before the budget, which is not merely an optimisation. The
+        // host short-circuits in exactly this order (`if
+        // (!filterSortHasEffect(next)) { … return }` sits above the
+        // `listNonEmpty` extent probe in `setFilterSort`), so budgeting an
+        // empty rule set here would make CLEARING a filter fail on any
+        // sheet too large to scan — a workbook could get permanently stuck
+        // filtered. Applying no rules is a pure state change.
+        if rules.is_empty() {
+            return Ok((BTreeSet::new(), 0, 0));
+        }
+
+        let cols = crate::filter::predicate_columns(rules);
+
+        let mut max_row: Option<u32> = None;
+        sheet.for_each_non_empty(|addr| {
+            max_row = Some(match max_row {
+                Some(current) if current >= addr.row => current,
+                _ => addr.row,
+            });
+        });
+        let scanned_rows = max_row.map(|row| row + 1).unwrap_or(0);
+
+        let predicate_cells = scanned_rows.saturating_mul(cols.len() as u32);
+        if predicate_cells > crate::filter::MAX_FILTER_PREDICATE_CELLS {
+            return Err(FilterError::SourceTooLarge {
+                rows: scanned_rows,
+                columns: cols.len() as u32,
+                predicate_cells,
+            });
+        }
+        if scanned_rows == 0 {
+            return Ok((BTreeSet::new(), scanned_rows, predicate_cells));
+        }
+
+        sheet.note_filter_scan();
+        let last_row = scanned_rows - 1;
+        let mut values: HashMap<(u32, u32), String> = HashMap::new();
+        for &col in &cols {
+            let range = CellRange::new(
+                CellAddress::new(0, col),
+                CellAddress::new(last_row, col),
+            );
+            self.for_each_sparse_range_cell(sheet_index, range, |addr, value| {
+                values.insert((addr.row, addr.col), crate::value_to_display(&value));
+            });
+        }
+        // A read boundary, exactly like `get_cell`'s: settle the derived
+        // states the scan parked so an unrelated later write does not
+        // inherit bookkeeping proportional to the whole scan.
+        self.store.settle_pending_reads();
+
+        // Absent cell == empty string, matching `values.get(...) ?? ''` on
+        // the host side. Sparse iteration only visits non-empty cells, so
+        // this is where blank rows acquire the `""` that `Number("")` then
+        // turns into 0 for a `range` rule.
+        let hidden = crate::filter::hidden_rows_for_scan(rules, scanned_rows, |row, col| {
+            values.get(&(row, col)).cloned().unwrap_or_default()
+        });
+        Ok((hidden, scanned_rows, predicate_cells))
+    }
+
+    /// Cumulative predicate scans on `sheet_index` — the observable that
+    /// proves visibility is a snapshot: cell writes, structural edits and
+    /// epoch bumps must all leave it alone.
+    #[doc(hidden)]
+    pub fn debug_filter_scan_count(&self, sheet_index: usize) -> u64 {
+        self.sheets
+            .get(sheet_index)
+            .map(Sheet::debug_filter_scan_count)
+            .unwrap_or(0)
+    }
+
+    /// Capture every sheet's filter state (rules AND the rows they hid) as
+    /// an undo / persistence before-image. Twin of [`Self::snapshot_hidden`]
+    /// down to the sheet-INDEX keying; sheets with no filter are omitted.
+    ///
+    /// Both halves are captured because they are not redundant: restoring
+    /// rules alone would force a re-derivation against whatever the cells
+    /// say NOW, which is precisely the liveness snapshot semantics forbids.
+    /// An undo has to restore the rows that WERE hidden.
+    pub fn snapshot_filters(&self) -> FilterSnapshot {
+        FilterSnapshot::from_sheets(
+            self.sheets
+                .iter()
+                .enumerate()
+                .filter_map(|(sheet_index, sheet)| {
+                    sheet.filter().map(|filter| SheetFilterState {
+                        sheet_index,
+                        rules: filter.rules().to_vec(),
+                        hidden_rows: filter.hidden_rows(),
+                    })
+                })
+                .collect(),
+        )
+    }
+
+    /// Replace every sheet's filter state with `snapshot`, returning how
+    /// many sheets ended up with a filter.
+    ///
+    /// Whole-workbook REPLACE, exactly like [`Self::restore_hidden`]: a
+    /// sheet the snapshot does not mention has its filter CLEARED, not left
+    /// alone, which is what makes undoing "filter a previously-unfiltered
+    /// sheet" symmetric. Entries past the end of the sheet vector are
+    /// dropped silently. Restores nothing reactive where the derived set did
+    /// not move.
+    ///
+    /// Scan-free by construction — it installs a remembered answer rather
+    /// than recomputing one.
+    pub fn restore_filters(&mut self, snapshot: FilterSnapshot) -> Result<u32, FilterError> {
+        if self.is_inside_custom_call() {
+            return Err(FilterError::MutationDuringCustomCall);
+        }
+        let sheet_count = self.sheets.len();
+        let mut wanted: Vec<Option<SheetFilterState>> = (0..sheet_count).map(|_| None).collect();
+        for entry in snapshot.into_sheets() {
+            if entry.sheet_index >= sheet_count {
+                continue; // captured against a wider workbook
+            }
+            let index = entry.sheet_index;
+            wanted[index] = Some(entry);
+        }
+        let mut restored = 0u32;
+        for (sheet_index, entry) in wanted.into_iter().enumerate() {
+            let (rules, hidden) = match entry {
+                Some(entry) => {
+                    restored += 1;
+                    (entry.rules, entry.hidden_rows.into_iter().collect())
+                }
+                None => (Vec::new(), BTreeSet::new()),
+            };
+            if self.sheets[sheet_index].commit_filter(rules, hidden) {
+                self.republish_hidden(sheet_index);
+            }
+        }
+        Ok(restored)
     }
 
     /// Current value of the Table invalidation broadcast counter (design

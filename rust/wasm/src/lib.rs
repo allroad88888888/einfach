@@ -1,10 +1,12 @@
 use einfach_core::{CellListener, Value, ValueError};
 use einfach_excel_core::{
     Align, BorderSpec, BorderStyle, CellAddress, CellBorders, CellFormat, CellRange,
-    CellSubscription, CustomFunctionRegistry, DepGraphStats, FormatRangeSnapshot,
-    HiddenRowsSnapshot, NumberFormat, RangeFormatSnapshotLayer, Rotation, Sheet, SheetError,
-    SheetHiddenRows, SortDirection, SortKey, SortRangeError, SortRangeReport, TableEntry,
-    TableError, TableRegistrySnapshot, TotalsFunction, VerticalAlign, Workbook, WorkbookError,
+    CellSubscription, ColumnFilterRule, CustomFunctionRegistry, DepGraphStats, FilterApplyReport,
+    FilterError, FilterSnapshot, FormatRangeSnapshot, HiddenRowsSnapshot, NumberFormat,
+    RangeFormatSnapshotLayer, Rotation, Sheet, SheetError, SheetFilterState, SheetHiddenRows,
+    SortDirection, SortKey, SortRangeError, SortRangeReport, TableEntry, TableError,
+    TableRegistrySnapshot, TotalsFunction, VerticalAlign, Workbook, WorkbookError,
+    MAX_FILTER_PREDICATE_CELLS,
 };
 use serde::{de, Deserialize, Serialize};
 use std::cell::Cell;
@@ -1157,6 +1159,19 @@ struct WorkbookPersistenceV1JSON {
     /// also closes an xlsx-parity gap: real workbooks persist hidden rows.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     hidden: Vec<SheetHiddenRowsJSON>,
+    /// Per-sheet AutoFilter state — rules AND the rows they hid (E3 of
+    /// `design-engine-hidden-rows.md`). Same `default` +
+    /// `skip_serializing_if` backward-compatibility argument as `hidden`
+    /// and `tables` above.
+    ///
+    /// Both halves are persisted for the same reason the undo snapshot
+    /// carries both: restoring rules alone would force a re-derivation
+    /// against whatever the restored cells say, which is exactly the
+    /// liveness #27's snapshot semantics removed. Closes the other half of
+    /// the xlsx-parity gap `hidden` opened — real workbooks persist their
+    /// autoFilter state.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    filters: Vec<SheetFilterStateJSON>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -1170,6 +1185,8 @@ struct WorkbookPersistenceRestoreStatsJSON {
     /// Sheets that came back with at least one manually hidden row (E2).
     /// Additive output key, same as `restored_tables`.
     restored_hidden_sheets: u32,
+    /// Sheets that came back with an AutoFilter (E3). Additive output key.
+    restored_filter_sheets: u32,
 }
 
 // === Engine physical sort (`sortRange`) wire — S2 of
@@ -1408,6 +1425,227 @@ impl SheetHiddenRowsJSON {
 struct HiddenRowsSnapshotJSON {
     version: u32,
     hidden: Vec<SheetHiddenRowsJSON>,
+}
+
+// === Engine-owned FILTER wire (E3 of `design-engine-hidden-rows.md`) ===
+//
+// `ColumnFilterRuleJSON` is the Rust twin of the TypeScript wire union
+// `ColumnFilterRule` (`spreadsheet-ui-core/src/filter-sort/types.ts:12-16`),
+// which is the ONE piece of predicate knowledge UI-core keeps after E4. The
+// shape is copied field for field so a host can pass its existing rule
+// objects straight through with no adapter mapping:
+//
+//   { kind: 'equals'   | 'contains', colIndex, value, caseSensitive? }
+//   { kind: 'range',    colIndex, min?, max? }
+//   { kind: 'list',     colIndex, values }
+//
+// `caseSensitive` is optional on the wire and absent means `false`, which is
+// what the TypeScript predicate does (`caseSensitive ? value : lower(value)`).
+
+/// One column filter rule, internally tagged by `kind` exactly like the
+/// TypeScript union.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "lowercase")]
+enum ColumnFilterRuleJSON {
+    Equals {
+        #[serde(rename = "colIndex")]
+        col_index: u32,
+        value: String,
+        #[serde(rename = "caseSensitive", default, skip_serializing_if = "is_false")]
+        case_sensitive: bool,
+    },
+    Contains {
+        #[serde(rename = "colIndex")]
+        col_index: u32,
+        value: String,
+        #[serde(rename = "caseSensitive", default, skip_serializing_if = "is_false")]
+        case_sensitive: bool,
+    },
+    Range {
+        #[serde(rename = "colIndex")]
+        col_index: u32,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        min: Option<f64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        max: Option<f64>,
+    },
+    List {
+        #[serde(rename = "colIndex")]
+        col_index: u32,
+        values: Vec<String>,
+    },
+}
+
+fn is_false(value: &bool) -> bool {
+    !*value
+}
+
+impl ColumnFilterRuleJSON {
+    fn from_rule(rule: &ColumnFilterRule) -> Self {
+        match rule {
+            ColumnFilterRule::Equals {
+                col_index,
+                value,
+                case_sensitive,
+            } => ColumnFilterRuleJSON::Equals {
+                col_index: *col_index,
+                value: value.clone(),
+                case_sensitive: *case_sensitive,
+            },
+            ColumnFilterRule::Contains {
+                col_index,
+                value,
+                case_sensitive,
+            } => ColumnFilterRuleJSON::Contains {
+                col_index: *col_index,
+                value: value.clone(),
+                case_sensitive: *case_sensitive,
+            },
+            ColumnFilterRule::Range {
+                col_index,
+                min,
+                max,
+            } => ColumnFilterRuleJSON::Range {
+                col_index: *col_index,
+                min: *min,
+                max: *max,
+            },
+            ColumnFilterRule::List { col_index, values } => ColumnFilterRuleJSON::List {
+                col_index: *col_index,
+                values: values.clone(),
+            },
+        }
+    }
+
+    fn into_rule(self) -> ColumnFilterRule {
+        match self {
+            ColumnFilterRuleJSON::Equals {
+                col_index,
+                value,
+                case_sensitive,
+            } => ColumnFilterRule::Equals {
+                col_index,
+                value,
+                case_sensitive,
+            },
+            ColumnFilterRuleJSON::Contains {
+                col_index,
+                value,
+                case_sensitive,
+            } => ColumnFilterRule::Contains {
+                col_index,
+                value,
+                case_sensitive,
+            },
+            ColumnFilterRuleJSON::Range {
+                col_index,
+                min,
+                max,
+            } => ColumnFilterRule::Range {
+                col_index,
+                min,
+                max,
+            },
+            ColumnFilterRuleJSON::List { col_index, values } => {
+                ColumnFilterRule::List { col_index, values }
+            }
+        }
+    }
+}
+
+/// `applyFilter` / `reapplyFilter` payload.
+#[derive(Clone, Debug, Default, Deserialize)]
+struct ApplyFilterPayloadJSON {
+    #[serde(default)]
+    rules: Vec<ColumnFilterRuleJSON>,
+}
+
+/// Success shape of the three filter commands, mirroring
+/// `SortRangeReportJSON`'s `{ ok: true, … }` convention so a host can
+/// discriminate on `ok` alone.
+#[derive(Clone, Debug, Serialize)]
+struct FilterApplyReportJSON {
+    ok: bool,
+    /// 0-based SOURCE rows the applied rules hid, for the WHOLE scanned
+    /// extent — never a window-bounded subset. This is what the host stores
+    /// verbatim as the answer to "is this row painted?".
+    #[serde(rename = "hiddenRows")]
+    hidden_rows: Vec<u32>,
+    #[serde(rename = "scannedRows")]
+    scanned_rows: u32,
+    #[serde(rename = "predicateCells")]
+    predicate_cells: u32,
+}
+
+/// One sheet's filter state. Element of both the `snapshotFilters` /
+/// `restoreFilters` undo envelope and the persistence-v1 `filters` field,
+/// so the two agree by construction. Sheet-INDEX keyed for the same reason
+/// `SheetHiddenRowsJSON` is.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct SheetFilterStateJSON {
+    sheet: u32,
+    rules: Vec<ColumnFilterRuleJSON>,
+    /// The rows those rules hid. Carried alongside the rules, not re-derived
+    /// on restore: re-deriving would evaluate against whatever the cells say
+    /// at restore time, which is live evaluation wearing an undo costume.
+    #[serde(rename = "hiddenRows")]
+    hidden_rows: Vec<u32>,
+}
+
+impl SheetFilterStateJSON {
+    fn from_entry(entry: &SheetFilterState) -> Self {
+        SheetFilterStateJSON {
+            sheet: entry.sheet_index as u32,
+            rules: entry.rules.iter().map(ColumnFilterRuleJSON::from_rule).collect(),
+            hidden_rows: entry.hidden_rows.clone(),
+        }
+    }
+
+    fn into_entry(self) -> SheetFilterState {
+        SheetFilterState {
+            sheet_index: self.sheet as usize,
+            rules: self
+                .rules
+                .into_iter()
+                .map(ColumnFilterRuleJSON::into_rule)
+                .collect(),
+            hidden_rows: self.hidden_rows,
+        }
+    }
+}
+
+/// Envelope for `snapshotFilters` / `restoreFilters`, versioned exactly
+/// like `HiddenRowsSnapshotJSON`.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct FilterSnapshotJSON {
+    version: u32,
+    filters: Vec<SheetFilterStateJSON>,
+}
+
+/// Map a [`FilterError`] to the structured `{ ok: false, code, message }`
+/// rejection object the `sortRange` wire established. Codes are kebab-case,
+/// matching the `sheet_error_to_js` family; `source-too-large` is the sunk
+/// twin of the adapter's `FILTER_SORT_SOURCE_TOO_LARGE`.
+fn filter_error_to_js(err: FilterError) -> JsValue {
+    match err {
+        FilterError::InvalidSheet => sort_error_to_js("invalid-sheet", None, None),
+        FilterError::MutationDuringCustomCall => {
+            sort_error_to_js("mutation-during-custom-call", None, None)
+        }
+        FilterError::SourceTooLarge {
+            rows,
+            columns,
+            predicate_cells,
+        } => sort_error_to_js(
+            "source-too-large",
+            None,
+            Some(&format!(
+                "filter predicate scan needs {predicate_cells} cells ({rows} rows x {columns} \
+                 columns) but the engine cap is {MAX_FILTER_PREDICATE_CELLS}; the filter was \
+                 not applied"
+            )),
+        ),
+    }
 }
 
 /// Map a `TableError` to a stable JS error string (mirrors
@@ -2618,6 +2856,110 @@ impl WasmWorkbook {
         let payload: HiddenRowsSnapshotJSON = serde_wasm_bindgen::from_value(value)
             .map_err(|err| JsValue::from_str(&format!("invalid hidden snapshot: {err}")))?;
         self.restore_hidden_json(payload)
+            .map_err(|err| JsValue::from_str(&err))
+    }
+
+    // --- Engine-owned FILTER (E3 of `design-engine-hidden-rows.md`) -------
+    //
+    // Additive. `setEvalFilterHiddenRows` above keeps its exact signature
+    // and stays the host's write path for now; these expose the state the
+    // engine has begun to own, so a later slice can flip the host from
+    // "pusher" to "caller" without another export-surface change.
+    //
+    // All three commands follow the `sortRange` convention: success and
+    // every rejection come back inside the `Ok` arm as a plain object
+    // discriminated by `ok`, so a structured refusal is never a thrown
+    // exception. Only a serialization failure throws.
+
+    /// Apply `{ rules: ColumnFilterRule[] }` to `sheetIdx`: run the
+    /// predicate ONCE and commit both the rules and the rows they hid.
+    ///
+    /// Returns `{ ok: true, hiddenRows, scannedRows, predicateCells }`, or
+    /// `{ ok: false, code, message? }`. `code: "source-too-large"` is the
+    /// engine-side twin of the adapter's `FILTER_SORT_SOURCE_TOO_LARGE` —
+    /// the filter does NOT activate and nothing is truncated.
+    ///
+    /// Visibility is a SNAPSHOT taken here. Later cell edits do not move
+    /// it; `reapplyFilter` is the refresh path.
+    #[wasm_bindgen(js_name = "applyFilter")]
+    pub fn apply_filter(&mut self, sheet_idx: u32, payload: JsValue) -> Result<JsValue, JsValue> {
+        let payload: ApplyFilterPayloadJSON = match serde_wasm_bindgen::from_value(payload) {
+            Ok(payload) => payload,
+            Err(err) => {
+                return Ok(sort_error_to_js("invalid-payload", None, Some(&err.to_string())))
+            }
+        };
+        let rules: Vec<ColumnFilterRule> = payload
+            .rules
+            .into_iter()
+            .map(ColumnFilterRuleJSON::into_rule)
+            .collect();
+        Self::filter_result_to_js(self.workbook.apply_filter(sheet_idx as usize, &rules))
+    }
+
+    /// `Data -> Reapply` (Excel `Ctrl+Alt+L`): re-run `sheetIdx`'s ALREADY
+    /// COMMITTED rules against current cell values. Carries no rules of its
+    /// own, so it can never change WHAT is filtered — only which rows
+    /// currently satisfy it.
+    #[wasm_bindgen(js_name = "reapplyFilter")]
+    pub fn reapply_filter(&mut self, sheet_idx: u32) -> Result<JsValue, JsValue> {
+        Self::filter_result_to_js(self.workbook.reapply_filter(sheet_idx as usize))
+    }
+
+    /// Drop `sheetIdx`'s filter — rules and derived rows both. Scan-free.
+    #[wasm_bindgen(js_name = "clearFilter")]
+    pub fn clear_filter(&mut self, sheet_idx: u32) -> Result<JsValue, JsValue> {
+        Self::filter_result_to_js(self.workbook.clear_filter(sheet_idx as usize))
+    }
+
+    /// Read `sheetIdx`'s committed filter as
+    /// `{ rules: ColumnFilterRule[], hiddenRows: number[] }`.
+    ///
+    /// A WHOLE-SHEET read, deliberately not window-bounded: a host has to
+    /// know about hidden rows OUTSIDE the visible window to expand that
+    /// window correctly, so answering with a windowed subset would be
+    /// circular. Called on sheet activation and after a restore — never per
+    /// frame, per scroll, or per revision.
+    #[wasm_bindgen(js_name = "getFilter")]
+    pub fn get_filter(&self, sheet_idx: u32) -> Result<JsValue, JsValue> {
+        let sheet_idx = sheet_idx as usize;
+        let entry = SheetFilterStateJSON {
+            sheet: sheet_idx as u32,
+            rules: self
+                .workbook
+                .filter_rules(sheet_idx)
+                .iter()
+                .map(ColumnFilterRuleJSON::from_rule)
+                .collect(),
+            hidden_rows: self.workbook.filter_hidden_rows(sheet_idx),
+        };
+        serde_wasm_bindgen::to_value(&entry)
+            .map_err(|err| JsValue::from_str(&format!("serialize filter: {err}")))
+    }
+
+    /// Capture every sheet's filter state as an undo before-image. Twin of
+    /// `snapshotHidden`: pure read, no epoch bump, whole-workbook REPLACE on
+    /// the way back through `restoreFilters`. Sheets with no filter are
+    /// omitted.
+    #[wasm_bindgen(js_name = "snapshotFilters")]
+    pub fn snapshot_filters(&self) -> Result<JsValue, JsValue> {
+        serde_wasm_bindgen::to_value(&FilterSnapshotJSON {
+            version: 1,
+            filters: self.filters_json(),
+        })
+        .map_err(|err| JsValue::from_str(&format!("serialize filter snapshot: {err}")))
+    }
+
+    /// Replace every sheet's filter state with a `snapshotFilters` payload,
+    /// returning how many sheets ended up with a filter. Restoring an empty
+    /// `filters` array CLEARS everything — that is the point of REPLACE, not
+    /// a no-op. Entries for sheets that no longer exist are dropped
+    /// silently, and no predicate is re-run.
+    #[wasm_bindgen(js_name = "restoreFilters")]
+    pub fn restore_filters(&mut self, value: JsValue) -> Result<u32, JsValue> {
+        let payload: FilterSnapshotJSON = serde_wasm_bindgen::from_value(value)
+            .map_err(|err| JsValue::from_str(&format!("invalid filter snapshot: {err}")))?;
+        self.restore_filters_json(payload)
             .map_err(|err| JsValue::from_str(&err))
     }
 
@@ -4006,6 +4348,7 @@ impl WasmWorkbook {
             sizes,
             tables: self.tables_json(),
             hidden: self.hidden_rows_json(),
+            filters: self.filters_json(),
         }
     }
 
@@ -4018,6 +4361,50 @@ impl WasmWorkbook {
             .iter()
             .map(SheetHiddenRowsJSON::from_entry)
             .collect()
+    }
+
+    /// The engine-owned filter state as wire elements, shared by
+    /// `snapshotFilters` and the persistence-v1 envelope.
+    fn filters_json(&self) -> Vec<SheetFilterStateJSON> {
+        self.workbook
+            .snapshot_filters()
+            .sheets()
+            .iter()
+            .map(SheetFilterStateJSON::from_entry)
+            .collect()
+    }
+
+    fn filter_snapshot_from_json(filters: Vec<SheetFilterStateJSON>) -> FilterSnapshot {
+        FilterSnapshot::from_sheets(
+            filters
+                .into_iter()
+                .map(SheetFilterStateJSON::into_entry)
+                .collect(),
+        )
+    }
+
+    fn restore_filters_json(&mut self, payload: FilterSnapshotJSON) -> Result<u32, String> {
+        if payload.version != 1 {
+            return Err("unsupported-snapshot-version".into());
+        }
+        self.workbook
+            .restore_filters(Self::filter_snapshot_from_json(payload.filters))
+            .map_err(|_| "mutation-during-custom-call".to_string())
+    }
+
+    fn filter_result_to_js(
+        result: Result<FilterApplyReport, FilterError>,
+    ) -> Result<JsValue, JsValue> {
+        match result {
+            Ok(report) => serde_wasm_bindgen::to_value(&FilterApplyReportJSON {
+                ok: true,
+                hidden_rows: report.hidden_rows,
+                scanned_rows: report.scanned_rows,
+                predicate_cells: report.predicate_cells,
+            })
+            .map_err(|err| JsValue::from_str(&format!("serialize filter report: {err}"))),
+            Err(err) => Ok(filter_error_to_js(err)),
+        }
     }
 
     fn hidden_snapshot_from_json(hidden: Vec<SheetHiddenRowsJSON>) -> HiddenRowsSnapshot {
@@ -4110,6 +4497,7 @@ impl WasmWorkbook {
         // failures rather than stranding a half-restored workbook.
         let table_snapshot = Self::table_snapshot_from_json(payload.tables)?;
         let hidden_snapshot = Self::hidden_snapshot_from_json(payload.hidden);
+        let filter_snapshot = Self::filter_snapshot_from_json(payload.filters);
 
         let mut workbook = Workbook::new();
         let first_name = payload.sheets[0].name.clone();
@@ -4185,12 +4573,22 @@ impl WasmWorkbook {
             .restore_hidden(hidden_snapshot)
             .map_err(|_| "persistence restore hidden rows failed".to_string())?;
 
+        // Filters last, for the same reason as the registry and the hidden
+        // sets: every sheet must exist first. REPLACE is exact against the
+        // fresh workbook, and it installs the REMEMBERED visibility rather
+        // than re-running the predicate — a restore must not evaluate.
+        let restored_filter_sheets = self
+            .workbook
+            .restore_filters(filter_snapshot)
+            .map_err(|_| "persistence restore filters failed".to_string())?;
+
         let stats = WorkbookPersistenceRestoreStatsJSON {
             restored_cells,
             restored_formats,
             sheets: payload.sheets.len() as u32,
             restored_tables,
             restored_hidden_sheets,
+            restored_filter_sheets,
         };
         Ok(stats)
     }
@@ -4545,27 +4943,18 @@ fn collapse_array_for_js(val: &Value) -> std::borrow::Cow<'_, Value> {
     }
 }
 
+/// Delegates to `einfach_excel_core::value_to_display`.
+///
+/// The body used to live here. E3 moved it into the engine and left this
+/// one-liner behind on purpose: `Workbook::apply_filter` has to compare its
+/// predicate against the SAME string this boundary emits, because that
+/// string is what the host's TypeScript predicate
+/// (`solid/excel/src-vnext/adapter/filter-predicate.ts`) reads today over
+/// `readSparseRange`. Two separately-maintained formatters would have been
+/// a silent drift channel between the two engines; delegation makes them
+/// the same function, not merely the same intent.
 fn value_to_display(val: &Value) -> String {
-    let val = collapse_array_for_js(val);
-    match &*val {
-        Value::Number(n) => {
-            if *n == n.floor() && n.abs() < 1e15 {
-                format!("{}", *n as i64)
-            } else {
-                format!("{}", n)
-            }
-        }
-        Value::Text(s) => s.clone(),
-        Value::Boolean(b) => if *b { "TRUE" } else { "FALSE" }.into(),
-        Value::Null => String::new(),
-        Value::Error(e) => format!("{}", e),
-        // Unreachable: collapsed above. Defensive fallback.
-        Value::Array(_) => String::new(),
-        // Lambdas are transient evaluator state — they never get
-        // persisted into a cell. A defensive empty string keeps the
-        // boundary safe if one ever leaks through.
-        Value::Lambda(_) => String::new(),
-    }
+    einfach_excel_core::value_to_display(val)
 }
 
 fn value_to_cell_type(val: &Value) -> String {
@@ -4929,6 +5318,311 @@ mod tests {
         assert!(!wb.hide_rows(99, vec![0]));
         assert!(!wb.unhide_rows(99, vec![0]));
         assert!(wb.list_hidden_rows(99).is_empty());
+    }
+
+    // === Engine-owned FILTER (E3 of `design-engine-hidden-rows.md`) ===
+
+    /// A1:A5 = 1..5 (row 0 is the filter layout's header) with
+    /// `C1 = SUBTOTAL(9, A1:A5)` — the 1-11 layer, which reads the FILTER
+    /// set — plus a second sheet so per-sheet keying is exercised.
+    fn workbook_with_filter() -> WasmWorkbook {
+        let mut wb = WasmWorkbook::new();
+        let _ = wb.add_sheet("Second");
+        for i in 0..5u32 {
+            wb.set_number(0, &format!("A{}", i + 1), (i + 1) as f64);
+        }
+        assert!(wb.set_formula(0, "C1", "=SUBTOTAL(9, A1:A5)"));
+        wb
+    }
+
+    fn keep_list(values: &[&str]) -> ColumnFilterRule {
+        ColumnFilterRule::List {
+            col_index: 0,
+            values: values.iter().map(|v| (*v).to_string()).collect(),
+        }
+    }
+
+    /// **Counterexample.** Filter state must survive a persistence round
+    /// trip.
+    ///
+    /// `restore_persistence_v1` builds a FRESH `Workbook`, so before the
+    /// engine owned the filter there was nothing on this side of the
+    /// boundary to serialize and every save/load silently un-filtered every
+    /// row. Fails on the unfixed engine with a WRONG SUBTOTAL — 15 instead
+    /// of 9 — not with an error.
+    #[test]
+    fn wasm_persistence_v1_round_trips_filter_state() {
+        let mut source = workbook_with_filter();
+        source
+            .workbook
+            .apply_filter(0, &[keep_list(&["3", "5"])])
+            .expect("apply");
+        assert_eq!(source.workbook.filter_hidden_rows(0), vec![1, 3]); // A2 = 2, A4 = 4
+        assert_eq!(source.get_number(0, "C1"), 9.0); // 15 - 2 - 4
+
+        let envelope = source.snapshot_persistence_v1_json();
+        let filter_entries = envelope.filters.len();
+        let mut restored = WasmWorkbook::new();
+        let stats = restored
+            .restore_persistence_v1_json(envelope)
+            .expect("restore");
+        // Product consequence first: the number a user reads.
+        assert_eq!(
+            restored.get_number(0, "C1"),
+            9.0,
+            "SUBTOTAL 1-11 must still exclude the restored filter-hidden rows"
+        );
+        assert_eq!(restored.workbook.filter_hidden_rows(0), vec![1, 3]);
+        assert_eq!(
+            restored.workbook.filter_rules(0),
+            vec![keep_list(&["3", "5"])],
+            "the rules come back too, so Reapply still has something to reapply"
+        );
+        assert_eq!(stats.restored_filter_sheets, 1);
+        assert_eq!(
+            restored.workbook.debug_filter_scan_count(0),
+            0,
+            "a restore installs the remembered answer; it must not re-run the predicate"
+        );
+        assert_eq!(filter_entries, 1, "one sheet carried a filter");
+    }
+
+    /// An unfiltered workbook serializes byte-identically to a pre-E3
+    /// payload, and a payload with no `filters` key restores as "no filter"
+    /// rather than failing.
+    #[test]
+    fn wasm_persistence_v1_filters_field_is_backward_compatible_both_ways() {
+        let source = workbook_with_filter();
+        let envelope = source.snapshot_persistence_v1_json();
+        assert!(envelope.filters.is_empty());
+        let json = serde_json::to_string(&envelope).expect("serialize");
+        assert!(
+            !json.contains("\"filters\""),
+            "an unfiltered workbook must not emit the key: {json}"
+        );
+
+        let legacy: WorkbookPersistenceV1JSON =
+            serde_json::from_str(&json).expect("deserialize legacy");
+        let mut restored = WasmWorkbook::new();
+        let stats = restored
+            .restore_persistence_v1_json(legacy)
+            .expect("restore");
+        assert_eq!(stats.restored_filter_sheets, 0);
+        assert!(restored.workbook.filter_rules(0).is_empty());
+    }
+
+    /// The `snapshotFilters` / `restoreFilters` undo envelope round-trips,
+    /// and an empty one CLEARS rather than no-ops (REPLACE semantics).
+    #[test]
+    fn wasm_filter_snapshot_restore_round_trip() {
+        let mut wb = workbook_with_filter();
+        wb.workbook
+            .apply_filter(0, &[keep_list(&["3", "5"])])
+            .expect("apply");
+        assert_eq!(wb.get_number(0, "C1"), 9.0);
+
+        let before = FilterSnapshotJSON {
+            version: 1,
+            filters: wb.filters_json(),
+        };
+
+        wb.workbook.apply_filter(0, &[keep_list(&["5"])]).expect("apply");
+        // Only A5 matches; A1 stays visible as the header row.
+        assert_eq!(wb.get_number(0, "C1"), 6.0); // 15 - 2 - 3 - 4
+
+        assert_eq!(wb.restore_filters_json(before), Ok(1));
+        assert_eq!(wb.workbook.filter_hidden_rows(0), vec![1, 3]);
+        assert_eq!(wb.get_number(0, "C1"), 9.0);
+
+        let empty = FilterSnapshotJSON {
+            version: 1,
+            filters: vec![],
+        };
+        assert_eq!(wb.restore_filters_json(empty), Ok(0));
+        assert!(wb.workbook.filter_rules(0).is_empty());
+        assert_eq!(wb.get_number(0, "C1"), 15.0);
+    }
+
+    /// A future envelope version is rejected loudly, mirroring
+    /// `restoreTables` / `restoreHidden`.
+    #[test]
+    fn wasm_filter_restore_rejects_unsupported_version_without_mutating() {
+        let mut wb = workbook_with_filter();
+        wb.workbook.apply_filter(0, &[keep_list(&["3"])]).expect("apply");
+        let bad = FilterSnapshotJSON {
+            version: 2,
+            filters: vec![],
+        };
+        assert_eq!(
+            wb.restore_filters_json(bad),
+            Err("unsupported-snapshot-version".into())
+        );
+        assert_eq!(
+            wb.workbook.filter_rules(0),
+            vec![keep_list(&["3"])],
+            "rejected without mutating"
+        );
+    }
+
+    /// The rule wire is a cross-LANGUAGE contract: these objects are the
+    /// same shape the TypeScript `ColumnFilterRule` union already carries
+    /// (`spreadsheet-ui-core/src/filter-sort/types.ts`), so a host passes
+    /// its existing rule objects straight through with no mapping layer.
+    /// Asserted at the JSON-TEXT level because that is what actually
+    /// crosses; a struct-level check would not catch a renamed key.
+    #[test]
+    fn wasm_column_filter_rule_wire_matches_the_typescript_shape() {
+        let rules = vec![
+            ColumnFilterRuleJSON::from_rule(&ColumnFilterRule::Equals {
+                col_index: 2,
+                value: "abc".into(),
+                case_sensitive: true,
+            }),
+            ColumnFilterRuleJSON::from_rule(&ColumnFilterRule::Contains {
+                col_index: 0,
+                value: "x".into(),
+                case_sensitive: false,
+            }),
+            ColumnFilterRuleJSON::from_rule(&ColumnFilterRule::Range {
+                col_index: 1,
+                min: Some(1.0),
+                max: None,
+            }),
+            ColumnFilterRuleJSON::from_rule(&ColumnFilterRule::List {
+                col_index: 3,
+                values: vec!["a".into()],
+            }),
+        ];
+        let json = serde_json::to_string(&rules).expect("serialize");
+        assert_eq!(
+            json,
+            "[{\"kind\":\"equals\",\"colIndex\":2,\"value\":\"abc\",\"caseSensitive\":true},\
+             {\"kind\":\"contains\",\"colIndex\":0,\"value\":\"x\"},\
+             {\"kind\":\"range\",\"colIndex\":1,\"min\":1.0},\
+             {\"kind\":\"list\",\"colIndex\":3,\"values\":[\"a\"]}]",
+            "an absent `caseSensitive` means false and an absent bound means unbounded, \
+             exactly as the optional TypeScript fields do"
+        );
+
+        // ...and it reads back what the host would send, including the
+        // optional keys left out.
+        let parsed: Vec<ColumnFilterRuleJSON> = serde_json::from_str(
+            "[{\"kind\":\"equals\",\"colIndex\":2,\"value\":\"abc\"},\
+              {\"kind\":\"range\",\"colIndex\":1,\"max\":9}]",
+        )
+        .expect("deserialize");
+        let back: Vec<ColumnFilterRule> = parsed
+            .into_iter()
+            .map(ColumnFilterRuleJSON::into_rule)
+            .collect();
+        assert_eq!(
+            back,
+            vec![
+                ColumnFilterRule::Equals {
+                    col_index: 2,
+                    value: "abc".into(),
+                    case_sensitive: false,
+                },
+                ColumnFilterRule::Range {
+                    col_index: 1,
+                    min: None,
+                    max: Some(9.0),
+                },
+            ]
+        );
+    }
+
+    /// **The value-getter identity, measured rather than argued.**
+    ///
+    /// Design §5.2 names the real cross-engine fork: not the predicate but
+    /// the VALUE GETTER. On the worker path the host's TypeScript predicate
+    /// compares against `snapshot.display`, which this boundary produces
+    /// with `value_to_display`. If `Workbook::apply_filter` fed its
+    /// predicate from any other rendering, the sink-down would silently
+    /// change which rows a filter hides.
+    ///
+    /// So: for one cell of every shape the engine can hold, take the string
+    /// the WIRE emits and use it verbatim as a case-SENSITIVE `equals` rule.
+    /// Every such row must survive. A one-character difference anywhere in
+    /// the two renderings hides the row instead, and the assertion names
+    /// which shape drifted.
+    #[test]
+    fn the_predicate_compares_against_the_same_bytes_the_wire_carries() {
+        let mut wb = WasmWorkbook::new();
+        wb.set_text(0, "A1", "header");
+        // Row 1..: one cell shape each. Row 6 is deliberately left EMPTY —
+        // the sparse scan never visits it, so its "" comes from the host's
+        // `?? ''` fallback rather than from the formatter, and that is the
+        // one place the two renderings could disagree by construction.
+        wb.set_number(0, "A2", 42.0); // integer-valued double -> "42"
+        wb.set_number(0, "A3", 1.5); // fractional -> "1.5"
+        wb.set_text(0, "A4", "Mixed Case Text");
+        wb.set_boolean(0, "A5", true); // -> "TRUE"
+        assert!(wb.set_formula(0, "A7", "=1/0")); // -> "#DIV/0!"
+        assert!(wb.set_formula(0, "A8", "=2*21")); // formula result -> "42"
+        wb.set_number(0, "A9", 1e20); // beyond the integer cutoff
+        wb.set_text(0, "A10", ""); // explicitly empty text
+
+        for row in 1..10u32 {
+            let addr = format!("A{}", row + 1);
+            let wire = wb.get_cell_display(0, &addr);
+            let report = wb
+                .workbook
+                .apply_filter(
+                    0,
+                    &[ColumnFilterRule::Equals {
+                        col_index: 0,
+                        value: wire.clone(),
+                        case_sensitive: true,
+                    }],
+                )
+                .expect("apply");
+            assert!(
+                !report.hidden_rows.contains(&row),
+                "row {row} ({addr}) renders as {wire:?} on the wire, but the engine \
+                 predicate compared against something else"
+            );
+        }
+
+        // Non-vacuity: a string that is NOT any cell's rendering hides
+        // every judged row, so the loop above is not passing trivially.
+        let report = wb
+            .workbook
+            .apply_filter(
+                0,
+                &[ColumnFilterRule::Equals {
+                    col_index: 0,
+                    value: "not-a-rendering".into(),
+                    case_sensitive: true,
+                }],
+            )
+            .expect("apply");
+        assert_eq!(report.hidden_rows.len(), 9);
+    }
+
+    /// The structured rejection reaches JS as `{ ok: false, code, message }`
+    /// inside the `Ok` arm, never as a thrown exception — the `sortRange`
+    /// convention.
+    #[test]
+    fn wasm_filter_source_too_large_is_a_structured_rejection() {
+        let mut wb = workbook_with_filter();
+        wb.set_text(0, "A50001", "far");
+        let err = wb
+            .workbook
+            .apply_filter(0, &[keep_list(&["3"])])
+            .unwrap_err();
+        assert_eq!(
+            err,
+            FilterError::SourceTooLarge {
+                rows: 50_001,
+                columns: 1,
+                predicate_cells: 50_001,
+            }
+        );
+        assert!(
+            wb.workbook.filter_rules(0).is_empty(),
+            "an over-budget source must not activate the filter"
+        );
     }
 
     #[test]
@@ -5644,6 +6338,7 @@ mod tests {
             }],
             tables: vec![],
             hidden: vec![],
+            filters: vec![],
         };
 
         assert!(wb.restore_persistence_v1_json(payload).is_err());
@@ -5667,6 +6362,7 @@ mod tests {
             sizes: vec![],
             tables: vec![],
             hidden: vec![],
+            filters: vec![],
         };
         assert!(wb.restore_persistence_v1_json(payload).is_err());
     }
@@ -5696,6 +6392,7 @@ mod tests {
             sizes: vec![],
             tables: vec![],
             hidden: vec![],
+            filters: vec![],
         };
 
         let stats = wb.restore_persistence_v1_json(payload).unwrap();
@@ -5738,6 +6435,7 @@ mod tests {
             sizes: vec![],
             tables: vec![],
             hidden: vec![],
+            filters: vec![],
         };
 
         assert!(wb.restore_persistence_v1_json(payload).is_err());
@@ -5763,6 +6461,7 @@ mod tests {
             sizes: vec![],
             tables: vec![],
             hidden: vec![],
+            filters: vec![],
         };
 
         let stats = wb.restore_persistence_v1_json(payload).unwrap();
@@ -5807,6 +6506,7 @@ mod tests {
             sizes: vec![],
             tables: vec![],
             hidden: vec![],
+            filters: vec![],
         }
     }
 

@@ -34,8 +34,10 @@ impl WasmSheet :: [] :: pub fn snapshot_format_range( &self, start_row: u32, sta
 impl WasmSheet :: [] :: pub fn subscribe(&mut self, addr: &str, callback: js_sys::Function) -> u32
 impl WasmSheet :: [] :: pub fn unsubscribe(&mut self, token: u32)
 impl WasmWorkbook :: [#[wasm_bindgen(constructor)]] :: pub fn new() -> Self
+impl WasmWorkbook :: [#[wasm_bindgen(js_name = "applyFilter")]] :: pub fn apply_filter(&mut self, sheet_idx: u32, payload: JsValue) -> Result<JsValue, JsValue>
 impl WasmWorkbook :: [#[wasm_bindgen(js_name = "bulkImportCellsInstrumented")]] :: pub fn bulk_import_cells_instrumented(&mut self, cells: JsValue) -> Result<JsValue, JsValue>
 impl WasmWorkbook :: [#[wasm_bindgen(js_name = "clearCellAt")]] :: pub fn clear_cell_at(&mut self, sheet_idx: usize, addr: &str)
+impl WasmWorkbook :: [#[wasm_bindgen(js_name = "clearFilter")]] :: pub fn clear_filter(&mut self, sheet_idx: u32) -> Result<JsValue, JsValue>
 impl WasmWorkbook :: [#[wasm_bindgen(js_name = "createTable")]] :: pub fn create_table( &mut self, sheet_idx: u32, start_row: u32, start_col: u32, end_row: u32, end_col: u32, name: Option<String>, ) -> Result<String, JsValue>
 impl WasmWorkbook :: [#[wasm_bindgen(js_name = "customFormulaCount")]] :: pub fn custom_formula_count(&self) -> u32
 impl WasmWorkbook :: [#[wasm_bindgen(js_name = "customFormulaNames")]] :: pub fn custom_formula_names(&self) -> JsValue
@@ -46,15 +48,18 @@ impl WasmWorkbook :: [#[wasm_bindgen(js_name = "definedNames")]] :: pub fn defin
 impl WasmWorkbook :: [#[wasm_bindgen(js_name = "deleteTable")]] :: pub fn delete_table(&mut self, name: &str) -> Result<(), JsValue>
 impl WasmWorkbook :: [#[wasm_bindgen(js_name = "drainAsyncCustomRequests")]] :: pub fn drain_async_custom_requests(&mut self) -> JsValue
 impl WasmWorkbook :: [#[wasm_bindgen(js_name = "getCellDisplay")]] :: pub fn get_cell_display(&mut self, sheet_idx: usize, addr: &str) -> String
+impl WasmWorkbook :: [#[wasm_bindgen(js_name = "getFilter")]] :: pub fn get_filter(&self, sheet_idx: u32) -> Result<JsValue, JsValue>
 impl WasmWorkbook :: [#[wasm_bindgen(js_name = "getTable")]] :: pub fn get_table(&self, name: &str) -> Result<JsValue, JsValue>
 impl WasmWorkbook :: [#[wasm_bindgen(js_name = "hideRows")]] :: pub fn hide_rows(&mut self, sheet_idx: u32, rows: Vec<u32>) -> bool
 impl WasmWorkbook :: [#[wasm_bindgen(js_name = "listHiddenRows")]] :: pub fn list_hidden_rows(&self, sheet_idx: u32) -> Vec<u32>
 impl WasmWorkbook :: [#[wasm_bindgen(js_name = "listTables")]] :: pub fn list_tables(&self) -> Result<JsValue, JsValue>
+impl WasmWorkbook :: [#[wasm_bindgen(js_name = "reapplyFilter")]] :: pub fn reapply_filter(&mut self, sheet_idx: u32) -> Result<JsValue, JsValue>
 impl WasmWorkbook :: [#[wasm_bindgen(js_name = "registerCustomFormula")]] :: pub fn register_custom_formula(&mut self, name: String, callback: js_sys::Function)
 impl WasmWorkbook :: [#[wasm_bindgen(js_name = "registerCustomFormulaAsync")]] :: pub fn register_custom_formula_async(&mut self, name: String)
 impl WasmWorkbook :: [#[wasm_bindgen(js_name = "renameTable")]] :: pub fn rename_table(&mut self, name: &str, new_name: &str) -> Result<(), JsValue>
 impl WasmWorkbook :: [#[wasm_bindgen(js_name = "renameTableColumn")]] :: pub fn rename_table_column( &mut self, name: &str, old_column: &str, new_column: &str, ) -> Result<(), JsValue>
 impl WasmWorkbook :: [#[wasm_bindgen(js_name = "resolveAsyncCustomCall")]] :: pub fn resolve_async_custom_call(&mut self, call_id: f64, value: JsValue) -> bool
+impl WasmWorkbook :: [#[wasm_bindgen(js_name = "restoreFilters")]] :: pub fn restore_filters(&mut self, value: JsValue) -> Result<u32, JsValue>
 impl WasmWorkbook :: [#[wasm_bindgen(js_name = "restoreHidden")]] :: pub fn restore_hidden(&mut self, value: JsValue) -> Result<u32, JsValue>
 impl WasmWorkbook :: [#[wasm_bindgen(js_name = "restoreTables")]] :: pub fn restore_tables(&mut self, value: JsValue) -> Result<u32, JsValue>
 impl WasmWorkbook :: [#[wasm_bindgen(js_name = "setEvalFilterHiddenRows")]] :: pub fn set_eval_filter_hidden_rows(&mut self, sheet_idx: u32, rows: Vec<u32>)
@@ -63,6 +68,7 @@ impl WasmWorkbook :: [#[wasm_bindgen(js_name = "setFormulaAt")]] :: pub fn set_f
 impl WasmWorkbook :: [#[wasm_bindgen(js_name = "setTableTotalFunction")]] :: pub fn set_table_total_function( &mut self, name: &str, column: &str, func: &str, ) -> Result<(), JsValue>
 impl WasmWorkbook :: [#[wasm_bindgen(js_name = "setTableTotalsRow")]] :: pub fn set_table_totals_row(&mut self, name: &str, enabled: bool) -> Result<(), JsValue>
 impl WasmWorkbook :: [#[wasm_bindgen(js_name = "snapshotCell")]] :: pub fn snapshot_cell(&self, sheet_idx: u32, addr: &str) -> Result<JsValue, JsValue>
+impl WasmWorkbook :: [#[wasm_bindgen(js_name = "snapshotFilters")]] :: pub fn snapshot_filters(&self) -> Result<JsValue, JsValue>
 impl WasmWorkbook :: [#[wasm_bindgen(js_name = "snapshotHidden")]] :: pub fn snapshot_hidden(&self) -> Result<JsValue, JsValue>
 impl WasmWorkbook :: [#[wasm_bindgen(js_name = "snapshotTables")]] :: pub fn snapshot_tables(&self) -> Result<JsValue, JsValue>
 impl WasmWorkbook :: [#[wasm_bindgen(js_name = "sortRange")]] :: pub fn sort_range(&mut self, sheet_idx: u32, payload: JsValue) -> Result<JsValue, JsValue>
