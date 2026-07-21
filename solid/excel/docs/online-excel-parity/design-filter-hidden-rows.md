@@ -449,6 +449,66 @@ Excel 语义（§2 已核实）：**筛选**隐藏行复制时自动跳过；**�
 
 驱动绝大多数 DELETE 的五个符号：`unmapped-row`、`mapDisplayRangeToSourceRanges`、`requireIdentityMapping`、`buildFilterSortDisplayRows`、`buildSortExcludedRows` 的缺口反推。
 
+> ## ⚠️ 主控裁定三（2026-07-21，独立审计后写入）—— 本节以下内容按此块修正
+>
+> 一次独立只读审计逐条回源核实了本节每一个条目，并全仓扫描查漏。**本节最大的问题不是漏项，是切片归属错配**，下列修正**优先于**本节原文。
+>
+> ### 修正 1（最重要）：S5 的红只有约 16 例，不是本节的全部
+>
+> §10 的 S5 门禁写"迁移批见 §9.2"，暗示本节整张表都是 S5 翻转当天的红 —— **错**。本节列出的绝大多数测试**不经过任何真实 adapter**，而是手工构造带 `originalRow` 的 `DisplayCell` 数组直接喂 UI-core。S5 只改 adapter 与 Grid，`originalRow` 字段与网关回映射要到 **S6** 才删，所以这些测试**S5 当天全绿，S6 当天才集体变红**。
+>
+> | 切片 | 预期红 | 性质 |
+> | ---- | ------ | ---- |
+> | **S5（adapter 翻转）** | **约 16 例 / 8 文件** | 走真实 adapter 或真实浏览器的 |
+> | **S6（删字段+删网关）** | **约 43 例 / 14 文件** | 全部手工 fixture 类 |
+> | S4 或 S5（见修正 2） | 6 例 | `buildSortExcludedRows` 换源 |
+>
+> **S5 当天的 16 例白名单**（唯一允许变红的）：`vnext-worker-filter-sort.test.tsx` 的 `:270/295/327/348/411/453`（6）、`vnext-adapter.test.ts:1149`、`audit-adapter-scaling.test.ts:419`、`vnext-worker-merge-overlay.test.ts:290`、`vnext-static-tables.test.ts:760`、`vnext-table-totals-static-wasm-parity.test.ts`（`:593-605` + `:781-783`，1）、e2e `vnext-filter-sort-real-backend.spec.ts:53`/`:84`（2）、e2e `toolbar-filter-sort.spec.ts:75`/`:126`（2）、e2e `vnext-sort-real-backend.spec.ts:200`。
+>
+> **判据：S5 当天任何不在这份白名单里的红都是真回归。** 特别地——手工 fixture 那 43 例若在 S5 当天变红，说明 S5 越界动了网关或字段，违反 §10 切片边界；只种手动隐藏的 Grid 测试（`vnext-grid.test.tsx:676`/`:721`）变红 = 并集派生写错。
+>
+> 执行姿势：S5 动工前先跑全量存基线，翻转后比对失败清单与白名单，**差集非空即停**。
+>
+> ### 修正 2：`buildSortExcludedRows` 换源的归属
+>
+> §7 把它放进 S4 的文件边界，§10 的 S6 行又列了同一项 —— 设计稿自相矛盾。**裁决：它必须与"`viewportFilterHiddenAtom` 真正被填入真实值"落在同一切片**，否则它读一个恒空集合、排序排除行静默失效，那是真回归而非迁移。由 S4 实施者回报事实后定档。
+>
+> 关联 6 例：`physical-sort.test.ts` 的 `:259/290/322/345/373` + `vnext-filter-dropdown.test.tsx:595`。其中 **`physical-sort.test.ts:259` 必须 MIGRATE 不是 DELETE** —— 它断言的并集语义（`excludedRows === [3,5]`）正是要保留的行为，只是改种 `viewportFilterHiddenAtom`；删掉会丢失唯一一条"两集并入 `excludedRows`"的覆盖。`:373` 是无关的 dropdown 路径例，勿按行区间误伤。
+>
+> ### 修正 3：本节两处事实错误（已有反证）
+>
+> - **"`mutation-gateway.test.ts` 全部 protection 例不受影响" —— 不成立。** `:230`、`:313`、`:371` 三例都吃 `filteredCells()` 并按**源行 5/3** 解锁与断言；恒等后 display 行 1 → 源行 1（未解锁），结果从 allowed 翻成 blocked。**MIGRATE ×3**（门禁本身保留，fixture 与期望值必须改）。
+> - **"DELETE 7" —— 数错了。** 列出的即 9 例（3+2+1+3），加漏项实为 13。漏的是配对的 `:295-311`（`requireIdentityMapping passes through untouched targets`，字段删除后编译不过，DELETE）。
+>
+> ### 修正 4：§4.3 快照语义的测试影响面缺失
+>
+> 本节只按"压缩语义"筛测试，漏了"筛选不再实时"这条**独立的**行为变更。至少 `vnext-worker-filter-sort.test.tsx:364-380` 断言的是"编辑单元格后重扫、新行自动进入视图"，它因 §4.3 而非 §5 变红 —— 所以 `:348` 标 MIGRATE 不够，其**后半是 DELETE**。
+>
+> ### 修正 5：行号与判断的逐条订正
+>
+> - `remove-duplicates.test.ts` 实为 `:378`/`:406`（各差 1）；`text-to-columns.test.ts` 实为 `:953-964`，且**漏 `:702` fixture**；`go-to.test.ts` test 实在 `:1357`；`audit-adapter-scaling.test.ts` 注释实在 `:437-438`/`:471-476`。
+> - `physical-sort.test.ts:258-390` 区间内实含 **5** 个 test 不是 4。
+> - `vnext-worker-filter-sort.test.tsx:327` 标 MIGRATE 偏重，实为 **assertion-only**（仅 `:345` 一行 `originalRow === undefined` 会死）；`:411` 建议改 **MIGRATE 不是 DELETE**（"筛选态下编辑写到正确引擎地址"是独立于映射机制的有价值端到端钉）。
+> - `vnext-table-totals-static-wasm-parity.test.ts` 区间不全：真正要翻的断言在 **`:781-783`**（`SUBTOTAL(9,…)` 与 `(109,…)` 同为 400），那是 §9.1-5 "1-11 在筛选下变小"的**唯一断言站点**。
+> - 漏项（S6 编译期）：`vnext-adapter.test.ts:1082`/`:1113` 两处 `originalRow).toBeUndefined()`。
+>
+> ### 修正 6：`audit-structural.spec.ts:153` 不该挂在 S5 门禁上
+>
+> 本设计把它列为"复活并按隐藏语义启用"，但其 `:154-157` 的 skip 理由是"Wave5 移除 menubar 后没有筛选触发器"，**与语义无关**；且现有断言在两种语义下都成立。复活需先在 demo 接一个 header 漏斗图标 —— 独立工作项，从 S5 门禁移除。
+>
+> ### 修正 7：e2e 迁移的一条硬事实
+>
+> 隐藏行是**卸载**不是渲空（证据：`vnext-hidden-rows-real-backend.spec.ts:58` 的 `toHaveCount(0)`）。所以 e2e 里所有 `toHaveText('')` 断言会以"定位到 0 个元素"失败而非值不对，迁移时必须改成 `toHaveCount(0)`。
+>
+> ### 修正 8：覆盖缺口（不是 S5 的红，是 S5 的盲区，须补）
+>
+> - **static 侧 filter×merge 全仓无任何测试**，§9.3 的解禁将无声发生（worker 侧只有 `vnext-worker-merge-overlay.test.ts:290`）。S5 必须补一例。
+> - `vnext-adapter.test.ts:1117` 的 static 筛选例因 North 恰在源行 1 = display 行 1 而两语义同结果，属**侥幸绿**。static 投影恒等化几乎没有单测保护，须补一个源行错位用例。
+>
+> ### 另：§7 的文件规划已被 S3 超越
+>
+> §7 写的 `filter-sort/filter-hidden.ts` + `filterHiddenAtom` **不存在**。实际落于 `viewport/effective-hidden.ts`，原子名 `viewportFilterHiddenAtom` / `effectiveHiddenAtom`（§3 末段的 `effectiveHiddenRowsAtom` 亦是旧名）。按 §7 找文件会扑空 —— 以代码为准。
+
 **第一梯队（整块以压缩语义为主题）**：
 
 | 文件                                                        | 用例                                                                                                                                | 动作                                                                                                                             |
@@ -497,7 +557,7 @@ Excel 语义（§2 已核实）：**筛选**隐藏行复制时自动跳过；**�
 | **S2 桥与协议**           | wasm 导出 + 快照重生成；协议 capability 与 client 方法；WASM runtime case；TS runtime `false` + `unsupported`                                                                                                    | `rust/wasm/src/lib.rs`；`rust/excel-core/tests/fixtures/wasm_api_signatures.txt`；`worker-protocol.ts`、`worker-runtime.ts`、`worker-runtime-ts.ts` | `npm run build:wasm`；`cargo test --test architecture_invariants`（INV-4 绿）；runtime 单测含 `UNSUPPORTED` |
 | **S3 消费者加固（前置）** | **在压缩语义下就正确的防御性改动**：`remove-duplicates` / `text-to-columns` 稠密扫描跳过隐藏行（§8.1）、`go-to` 上下文接并集、并集派生 helper 落地                                                               | `vanilla/spreadsheet-ui-core/src/remove-duplicates/`、`text-to-columns/`、`go-to/`、`viewport/`                                                     | `npx jest vanilla/spreadsheet-ui-core --no-coverage`；**行为零变化**，既有断言全绿不改                      |
 | **S4 UI-core 筛选隐藏集** | `filterHiddenAtom` + 命令 + 结构位移 remap + `SetFilterSortResult.hiddenRowIndices` 端口形状 + `reapplyFilterAtom` + `setEvalFilterHiddenRows` 端口；UI 未接线                                                   | `vanilla/spreadsheet-ui-core/src/filter-sort/filter-hidden.ts`（新）、`filter-sort/index.ts`、`backend/types.ts`；`filter-sort/README.md`           | `npx jest vanilla/spreadsheet-ui-core --no-coverage`；adapter 未实现新字段即降级空集，既有 e2e 不受扰       |
-| **S5 adapter 原子翻转**   | **一次性切换**：两 adapter 投影塌回恒等、停发 `originalRow`、`setFilterSort` 回传隐藏集、`evalFilterHiddenRows` 端口实现、bridge 双路、Grid 取并集、解除 merge 抑制                                              | `static-backend.ts`、`worker-workbook-backend.ts`、`projection-helpers.ts`、`eval-hidden-rows-bridge.ts`、`SpreadsheetGrid.tsx`                     | `npx jest solid/excel --no-coverage` + ui-core 全绿（迁移批见 §9.2）；playwright MCP 手工 smoke（行号跳号） |
+| **S5 adapter 原子翻转**   | **一次性切换**：两 adapter 投影塌回恒等、停发 `originalRow`、`setFilterSort` 回传隐藏集、`evalFilterHiddenRows` 端口实现、bridge 双路、Grid 取并集、解除 merge 抑制                                              | `static-backend.ts`、`worker-workbook-backend.ts`、`projection-helpers.ts`、`eval-hidden-rows-bridge.ts`、`SpreadsheetGrid.tsx`                     | `npx jest solid/excel --no-coverage` + ui-core：**只允许 §9.2 主控裁定三的 16 例白名单变红，差集非空即停**（§9.2 原表约 43 例属 S6，S5 当天必须全绿）；playwright MCP 手工 smoke（行号跳号） |
 | **S6 死代码清除**         | W2 网关回映射半边、`DisplayCell.originalRow` 字段、`deriveFilterHiddenRows`、`requireIdentityMapping` 及其两调用点、`unmapped-row` 全族；`buildSortExcludedRows` 改读两集                                        | `editing/mutation-gateway.ts`、`backend/types.ts`、`filter-sort/index.ts`、`go-to/`、`remove-duplicates/`、`text-to-columns/`、`paste-special/`     | 双包 jest 全绿；`grep -r originalRow` 仅剩文档历史条目                                                      |
 | **S7 可见性语义收口**     | 复制只取可见（§8.2）；删除行只删可见（§8.3，先实测 Excel）；`Data → Reapply` 入口 + `Ctrl+Alt+L`；粘贴/填充明确不改并加 pin                                                                                      | `clipboard/`、`copy-as/`、`operations/`、`menu-bar/SpreadsheetMenuBar.tsx`、`keyboard/`                                                             | 双包 jest + 定向 e2e；playwright MCP smoke（筛选→复制→粘贴→Reapply）                                        |
 | **S8 文档收口**           | `filter-sort.md`（仍写着 `directives` 与"backend 拥有行序"的陈旧口径）、`editing/README.md`、`remove-duplicates/README.md`、`CANONICAL_OWNERSHIP.md` #29、`CUTOVER_INVENTORY.md`、`06-tables-data-management.md` | 纯文档                                                                                                                                              | 互链一致性人工核对                                                                                          |
