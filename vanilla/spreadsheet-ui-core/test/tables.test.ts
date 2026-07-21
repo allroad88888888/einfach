@@ -3,20 +3,41 @@ import { createStore } from '@einfach/core'
 import {
   MAX_TABLE_CATALOG_ENTRIES,
   TABLE_CAPABILITY_ERROR,
+  TABLE_COLUMN_NAME_UNCHANGED_ERROR,
+  TABLE_DELETE_CAPABILITY_ERROR,
+  TABLE_DELETE_REJECTION_MESSAGES,
+  TABLE_INVALID_NAME_ERROR,
   TABLE_INVALID_SELECTION_ERROR,
+  TABLE_MISSING_TARGET_ERROR,
+  TABLE_NAME_LIKE_CELL_REF_ERROR,
+  TABLE_NAME_MAX_LENGTH,
+  TABLE_NAME_UNCHANGED_ERROR,
   TABLE_NO_TABLE_AT_SELECTION_ERROR,
   TABLE_REJECTION_MESSAGES,
+  TABLE_RENAME_CAPABILITY_ERROR,
+  TABLE_RENAME_COLUMN_CAPABILITY_ERROR,
+  TABLE_RENAME_REJECTION_MESSAGES,
   TABLE_TOTALS_CAPABILITY_ERROR,
   allTablesAtom,
   captureTableCapabilityAtom,
   clearTableDiagnosticAtom,
   createTableSupportedAtom,
+  deleteTableSupportedAtom,
   findTableForCell,
+  isCellRefLikeTableName,
   isValidCreateTableRange,
+  isValidTableName,
   lastCreatedTableNameAtom,
+  lastDeletedTableNameAtom,
+  lastRenamedTableAtom,
   lastToggledTableTotalsAtom,
   refreshTableCatalogAtom,
+  renameTableColumnSupportedAtom,
+  renameTableSupportedAtom,
   runCreateTableAtom,
+  runDeleteTableAtom,
+  runRenameTableAtom,
+  runRenameTableColumnAtom,
   runSetTableTotalFunctionAtom,
   runToggleTableTotalsAtom,
   runToggleTableTotalsAtSelectionAtom,
@@ -28,7 +49,10 @@ import {
 import type {
   CreateTableRequest,
   CreateTableResult,
+  DeleteTableRequest,
   ListTablesResult,
+  RenameTableColumnRequest,
+  RenameTableRequest,
   SetTableTotalFunctionRequest,
   SetTableTotalsRowRequest,
   SpreadsheetTableDescriptor,
@@ -540,5 +564,453 @@ describe('tables — runSetTableTotalFunctionAtom', () => {
       code: 'no-totals-row',
       message: TABLE_REJECTION_MESSAGES['no-totals-row'],
     })
+  })
+})
+
+// --- rename / delete (design §9, parity #32 T7) -----------------------------
+
+interface LifecycleSourceOptions {
+  renameResult?: (request: RenameTableRequest) => TableMutationResult
+  renameColumnResult?: (request: RenameTableColumnRequest) => TableMutationResult
+  deleteResult?: (request: DeleteTableRequest) => TableMutationResult
+  throwOnRename?: unknown
+  throwOnDelete?: unknown
+  withoutRename?: boolean
+  withoutRenameColumn?: boolean
+  withoutDelete?: boolean
+  tables?: () => readonly SpreadsheetTableDescriptor[]
+}
+
+function makeLifecycleSource(options: LifecycleSourceOptions = {}) {
+  const renameRequests: RenameTableRequest[] = []
+  const renameColumnRequests: RenameTableColumnRequest[] = []
+  const deleteRequests: DeleteTableRequest[] = []
+  let listCalls = 0
+  const source: TablesControllerPort = {}
+  if (!options.withoutRename) {
+    source.renameTable = async (request): Promise<TableMutationResult> => {
+      renameRequests.push(request)
+      if (options.throwOnRename !== undefined) throw options.throwOnRename
+      if (options.renameResult) return options.renameResult(request)
+      return {
+        kind: 'table-mutation',
+        applied: true,
+        name: request.newName,
+        requestId: request.requestId,
+        revision: 3,
+      }
+    }
+  }
+  if (!options.withoutRenameColumn) {
+    source.renameTableColumn = async (request): Promise<TableMutationResult> => {
+      renameColumnRequests.push(request)
+      if (options.renameColumnResult) return options.renameColumnResult(request)
+      return {
+        kind: 'table-mutation',
+        applied: true,
+        name: request.name,
+        requestId: request.requestId,
+        revision: 3,
+      }
+    }
+  }
+  if (!options.withoutDelete) {
+    source.deleteTable = async (request): Promise<TableMutationResult> => {
+      deleteRequests.push(request)
+      if (options.throwOnDelete !== undefined) throw options.throwOnDelete
+      if (options.deleteResult) return options.deleteResult(request)
+      return {
+        kind: 'table-mutation',
+        applied: true,
+        name: request.name,
+        requestId: request.requestId,
+        revision: 3,
+      }
+    }
+  }
+  source.listTables = async (): Promise<ListTablesResult> => {
+    listCalls += 1
+    return { tables: [...(options.tables?.() ?? [])] }
+  }
+  return {
+    source,
+    renameRequests,
+    renameColumnRequests,
+    deleteRequests,
+    get listCalls() {
+      return listCalls
+    },
+  }
+}
+
+describe('tables — name pre-validation helpers', () => {
+  test('isValidTableName mirrors the engine name shape', () => {
+    expect(isValidTableName('Sales')).toBe(true)
+    expect(isValidTableName('_Sales_2024')).toBe(true)
+    expect(isValidTableName('  Sales  ')).toBe(true)
+    expect(isValidTableName('')).toBe(false)
+    expect(isValidTableName('   ')).toBe(false)
+    expect(isValidTableName('2Sales')).toBe(false)
+    expect(isValidTableName('Sales Table')).toBe(false)
+    expect(isValidTableName('Sales-2024')).toBe(false)
+    expect(isValidTableName('a'.repeat(TABLE_NAME_MAX_LENGTH))).toBe(true)
+    expect(isValidTableName('a'.repeat(TABLE_NAME_MAX_LENGTH + 1))).toBe(false)
+  })
+
+  test('isCellRefLikeTableName flags in-grid A1 addresses only', () => {
+    expect(isCellRefLikeTableName('Q1')).toBe(true)
+    expect(isCellRefLikeTableName('AB12')).toBe(true)
+    // `Table1`'s column label overflows the grid — legal, exactly as in the
+    // engine's `name_is_cell_ref_like`.
+    expect(isCellRefLikeTableName('Table1')).toBe(false)
+    expect(isCellRefLikeTableName('Sales')).toBe(false)
+  })
+})
+
+describe('tables — runRenameTableAtom', () => {
+  test('captureTableCapabilityAtom reflects rename / delete port presence', () => {
+    const store = makeStore()
+    expect(store.getter(renameTableSupportedAtom)).toBe(false)
+    expect(store.getter(deleteTableSupportedAtom)).toBe(false)
+    expect(store.getter(renameTableColumnSupportedAtom)).toBe(false)
+
+    store.setter(captureTableCapabilityAtom, makeLifecycleSource().source)
+    expect(store.getter(renameTableSupportedAtom)).toBe(true)
+    expect(store.getter(deleteTableSupportedAtom)).toBe(true)
+    expect(store.getter(renameTableColumnSupportedAtom)).toBe(true)
+
+    store.setter(
+      captureTableCapabilityAtom,
+      makeLifecycleSource({ withoutRename: true, withoutDelete: true, withoutRenameColumn: true })
+        .source,
+    )
+    expect(store.getter(renameTableSupportedAtom)).toBe(false)
+    expect(store.getter(deleteTableSupportedAtom)).toBe(false)
+    expect(store.getter(renameTableColumnSupportedAtom)).toBe(false)
+  })
+
+  test('no renameTable port surfaces a capability diagnostic and sends nothing', async () => {
+    const store = makeStore()
+    const harness = makeLifecycleSource({ withoutRename: true })
+
+    await store.setter(runRenameTableAtom, {
+      source: harness.source,
+      name: 'Table1',
+      newName: 'Sales',
+    })
+
+    expect(harness.renameRequests).toHaveLength(0)
+    expect(harness.listCalls).toBe(0)
+    expect(store.getter(renameTableSupportedAtom)).toBe(false)
+    expect(store.getter(tableDiagnosticAtom)).toEqual({
+      code: 'capability',
+      message: TABLE_RENAME_CAPABILITY_ERROR,
+    })
+  })
+
+  test('dispatches a rename and refreshes the catalog on apply', async () => {
+    const store = makeStore()
+    const renamed = descriptor('Sales', 'sheet-1')
+    const harness = makeLifecycleSource({ tables: () => [renamed] })
+
+    let refreshedSheet: string | undefined | null = null
+    await store.setter(runRenameTableAtom, {
+      source: harness.source,
+      name: '  Table1  ',
+      newName: '  Sales  ',
+      sheetId: 'sheet-1',
+      refreshProjection: (sheetId?: string) => {
+        refreshedSheet = sheetId
+      },
+    })
+
+    expect(harness.renameRequests).toHaveLength(1)
+    expect(harness.renameRequests[0]).toMatchObject({
+      kind: 'rename-table',
+      name: 'Table1',
+      newName: 'Sales',
+    })
+    expect(harness.renameRequests[0].requestId).toBeGreaterThan(0)
+    expect(harness.listCalls).toBe(1)
+    expect(store.getter(allTablesAtom)).toEqual([renamed])
+    expect(store.getter(lastRenamedTableAtom)).toEqual({ from: 'Table1', to: 'Sales' })
+    expect(store.getter(tableDiagnosticAtom)).toBeNull()
+    expect(refreshedSheet).toBe('sheet-1')
+  })
+
+  test.each([
+    ['an empty new name', '', 'invalid-name', TABLE_INVALID_NAME_ERROR],
+    ['a malformed new name', '2 Sales!', 'invalid-name', TABLE_INVALID_NAME_ERROR],
+    ['a cell-ref-like new name', 'Q1', 'name-like-cell-ref', TABLE_NAME_LIKE_CELL_REF_ERROR],
+    ['an unchanged name', 'Table1', 'name-unchanged', TABLE_NAME_UNCHANGED_ERROR],
+  ])('rejects %s locally with zero transport', async (_label, newName, code, message) => {
+    const store = makeStore()
+    const harness = makeLifecycleSource()
+
+    await store.setter(runRenameTableAtom, {
+      source: harness.source,
+      name: 'Table1',
+      newName,
+    })
+
+    expect(harness.renameRequests).toHaveLength(0)
+    expect(harness.listCalls).toBe(0)
+    expect(store.getter(tableDiagnosticAtom)).toEqual({ code, message })
+  })
+
+  test('rejects an empty target table locally', async () => {
+    const store = makeStore()
+    const harness = makeLifecycleSource()
+
+    await store.setter(runRenameTableAtom, { source: harness.source, name: '  ', newName: 'Sales' })
+
+    expect(harness.renameRequests).toHaveLength(0)
+    expect(store.getter(tableDiagnosticAtom)).toEqual({
+      code: 'invalid-payload',
+      message: TABLE_MISSING_TARGET_ERROR,
+    })
+  })
+
+  test('a case-only rename still reaches the engine', async () => {
+    const store = makeStore()
+    const harness = makeLifecycleSource({ tables: () => [descriptor('TABLE1', 'sheet-1')] })
+
+    await store.setter(runRenameTableAtom, {
+      source: harness.source,
+      name: 'Table1',
+      newName: 'TABLE1',
+    })
+
+    expect(harness.renameRequests).toHaveLength(1)
+    expect(store.getter(tableDiagnosticAtom)).toBeNull()
+  })
+
+  test('a structured reject maps its code to a rename-flavored diagnostic', async () => {
+    const store = makeStore()
+    const rejectionCode: TableMutationRejectionCode = 'name-conflict'
+    const harness = makeLifecycleSource({
+      tables: () => [descriptor('Table1', 'sheet-1')],
+      renameResult: (request) => ({
+        kind: 'table-mutation-not-applied',
+        applied: false,
+        code: rejectionCode,
+        requestId: request.requestId,
+        revision: 9,
+      }),
+    })
+
+    await store.setter(runRenameTableAtom, {
+      source: harness.source,
+      name: 'Table1',
+      newName: 'Sales',
+    })
+
+    // Nothing applied → no catalog refresh, no rename witness.
+    expect(harness.listCalls).toBe(0)
+    expect(store.getter(lastRenamedTableAtom)).toBeNull()
+    expect(store.getter(tableDiagnosticAtom)).toEqual({
+      code: rejectionCode,
+      message: TABLE_RENAME_REJECTION_MESSAGES[rejectionCode],
+    })
+  })
+
+  test('a thrown backend promise becomes an outcome-unknown diagnostic', async () => {
+    const store = makeStore()
+    const harness = makeLifecycleSource({ throwOnRename: new Error('worker died') })
+
+    await store.setter(runRenameTableAtom, {
+      source: harness.source,
+      name: 'Table1',
+      newName: 'Sales',
+    })
+
+    const diagnostic = store.getter(tableDiagnosticAtom)
+    expect(diagnostic?.code).toBe('outcome-unknown')
+    expect(diagnostic?.message).toContain('worker died')
+  })
+})
+
+describe('tables — runDeleteTableAtom', () => {
+  test('no deleteTable port surfaces a capability diagnostic and sends nothing', async () => {
+    const store = makeStore()
+    const harness = makeLifecycleSource({ withoutDelete: true })
+
+    await store.setter(runDeleteTableAtom, { source: harness.source, name: 'Table1' })
+
+    expect(harness.deleteRequests).toHaveLength(0)
+    expect(harness.listCalls).toBe(0)
+    expect(store.getter(deleteTableSupportedAtom)).toBe(false)
+    expect(store.getter(tableDiagnosticAtom)).toEqual({
+      code: 'capability',
+      message: TABLE_DELETE_CAPABILITY_ERROR,
+    })
+  })
+
+  test('dispatches a delete and refreshes the catalog on apply', async () => {
+    const store = makeStore()
+    const survivor = descriptor('Costs', 'sheet-2')
+    let remaining: readonly SpreadsheetTableDescriptor[] = [
+      descriptor('Table1', 'sheet-1'),
+      survivor,
+    ]
+    const harness = makeLifecycleSource({
+      tables: () => remaining,
+      deleteResult: (request) => {
+        remaining = remaining.filter((table) => table.name !== request.name)
+        return {
+          kind: 'table-mutation',
+          applied: true,
+          name: request.name,
+          requestId: request.requestId,
+          revision: 4,
+        }
+      },
+    })
+
+    await store.setter(runDeleteTableAtom, {
+      source: harness.source,
+      name: 'Table1',
+      sheetId: 'sheet-1',
+    })
+
+    expect(harness.deleteRequests).toHaveLength(1)
+    expect(harness.deleteRequests[0]).toMatchObject({ kind: 'delete-table', name: 'Table1' })
+    expect(harness.listCalls).toBe(1)
+    expect(store.getter(allTablesAtom)).toEqual([survivor])
+    expect(store.getter(lastDeletedTableNameAtom)).toBe('Table1')
+    expect(store.getter(tableDiagnosticAtom)).toBeNull()
+  })
+
+  test('rejects an empty target locally with zero transport', async () => {
+    const store = makeStore()
+    const harness = makeLifecycleSource()
+
+    await store.setter(runDeleteTableAtom, { source: harness.source, name: '   ' })
+
+    expect(harness.deleteRequests).toHaveLength(0)
+    expect(harness.listCalls).toBe(0)
+    expect(store.getter(tableDiagnosticAtom)).toEqual({
+      code: 'invalid-payload',
+      message: TABLE_MISSING_TARGET_ERROR,
+    })
+  })
+
+  test('a structured reject maps its code to a delete-flavored diagnostic', async () => {
+    const store = makeStore()
+    const harness = makeLifecycleSource({
+      tables: () => [descriptor('Table1', 'sheet-1')],
+      deleteResult: (request) => ({
+        kind: 'table-mutation-not-applied',
+        applied: false,
+        code: 'not-found',
+        requestId: request.requestId,
+        revision: 4,
+      }),
+    })
+
+    await store.setter(runDeleteTableAtom, { source: harness.source, name: 'Ghost' })
+
+    expect(harness.listCalls).toBe(0)
+    expect(store.getter(lastDeletedTableNameAtom)).toBeNull()
+    expect(store.getter(tableDiagnosticAtom)).toEqual({
+      code: 'not-found',
+      message: TABLE_DELETE_REJECTION_MESSAGES['not-found'],
+    })
+  })
+
+  test('a thrown backend promise becomes an outcome-unknown diagnostic', async () => {
+    const store = makeStore()
+    const harness = makeLifecycleSource({ throwOnDelete: 'transport gone' })
+
+    await store.setter(runDeleteTableAtom, { source: harness.source, name: 'Table1' })
+
+    const diagnostic = store.getter(tableDiagnosticAtom)
+    expect(diagnostic?.code).toBe('outcome-unknown')
+    expect(diagnostic?.message).toContain('transport gone')
+  })
+})
+
+describe('tables — runRenameTableColumnAtom', () => {
+  test('no renameTableColumn port surfaces a capability diagnostic', async () => {
+    const store = makeStore()
+    const harness = makeLifecycleSource({ withoutRenameColumn: true })
+
+    await store.setter(runRenameTableColumnAtom, {
+      source: harness.source,
+      name: 'Table1',
+      oldColumn: 'Q1',
+      newColumn: 'Quarter 1',
+    })
+
+    expect(harness.renameColumnRequests).toHaveLength(0)
+    expect(store.getter(renameTableColumnSupportedAtom)).toBe(false)
+    expect(store.getter(tableDiagnosticAtom)).toEqual({
+      code: 'capability',
+      message: TABLE_RENAME_COLUMN_CAPABILITY_ERROR,
+    })
+  })
+
+  test('forwards a trimmed column rename and refreshes the catalog', async () => {
+    const store = makeStore()
+    const renamed = descriptor('Table1', 'sheet-1', 'A1:C4', ['Name', 'Quarter 1', 'City'])
+    const harness = makeLifecycleSource({ tables: () => [renamed] })
+
+    await store.setter(runRenameTableColumnAtom, {
+      source: harness.source,
+      name: 'Table1',
+      oldColumn: ' Q1 ',
+      newColumn: ' Quarter 1 ',
+    })
+
+    expect(harness.renameColumnRequests[0]).toMatchObject({
+      kind: 'rename-table-column',
+      name: 'Table1',
+      oldColumn: 'Q1',
+      newColumn: 'Quarter 1',
+    })
+    expect(store.getter(allTablesAtom)).toEqual([renamed])
+    expect(store.getter(tableDiagnosticAtom)).toBeNull()
+  })
+
+  test('rejects an unchanged / empty column locally with zero transport', async () => {
+    const store = makeStore()
+    const harness = makeLifecycleSource()
+
+    await store.setter(runRenameTableColumnAtom, {
+      source: harness.source,
+      name: 'Table1',
+      oldColumn: 'Q1',
+      newColumn: 'Q1',
+    })
+    expect(store.getter(tableDiagnosticAtom)).toEqual({
+      code: 'name-unchanged',
+      message: TABLE_COLUMN_NAME_UNCHANGED_ERROR,
+    })
+
+    await store.setter(runRenameTableColumnAtom, {
+      source: harness.source,
+      name: 'Table1',
+      oldColumn: 'Q1',
+      newColumn: '  ',
+    })
+    expect(store.getter(tableDiagnosticAtom)?.code).toBe('invalid-column-name')
+
+    expect(harness.renameColumnRequests).toHaveLength(0)
+    expect(harness.listCalls).toBe(0)
+  })
+
+  test('a free-text column name is NOT held to the table-name shape', async () => {
+    const store = makeStore()
+    const harness = makeLifecycleSource({ tables: () => [descriptor('Table1', 'sheet-1')] })
+
+    await store.setter(runRenameTableColumnAtom, {
+      source: harness.source,
+      name: 'Table1',
+      oldColumn: 'Q1',
+      newColumn: 'Q1 2024 (net)',
+    })
+
+    expect(harness.renameColumnRequests).toHaveLength(1)
+    expect(store.getter(tableDiagnosticAtom)).toBeNull()
   })
 })

@@ -1,12 +1,13 @@
 /** @jsxImportSource solid-js */
 
-import { For, Show, createEffect, onCleanup } from 'solid-js'
+import { For, Show, createEffect, createSignal, onCleanup } from 'solid-js'
 import { useAtomValue } from '@einfach/solid'
 import { locale, useT } from '../../src/i18n'
 import {
   allTablesAtom,
   closeNameManagerAtom,
   deleteNameManagerEntryAtom,
+  lastRenamedTableAtom,
   nameManagerEditorAtom,
   nameManagerKindDraftAtom,
   nameManagerNameDraftAtom,
@@ -21,15 +22,20 @@ import {
   namedRangeRegistryStateAtom,
   openNameManagerAtom,
   refreshTableCatalogAtom,
+  runDeleteTableAtom,
+  runRenameTableAtom,
   saveNameManagerAtom,
   sheetTabsSheetsAtom,
+  tableDiagnosticAtom,
   workspaceSessionAtom,
   type NameManagerKind,
   type NamedRange,
   type NamedRangeBackendCapabilities,
   type NamedRangeScope,
+  type SpreadsheetTableDescriptor,
+  type TableDiagnosticCode,
 } from '@einfach/spreadsheet-ui-core'
-import { useSpreadsheetBackend, useSpreadsheetUiStore } from '../provider'
+import { refreshVisibleProjection, useSpreadsheetBackend, useSpreadsheetUiStore } from '../provider'
 
 export interface SpreadsheetNameManagerDialogProps {
   class?: string
@@ -92,6 +98,24 @@ const CORE_ERROR_COPY_KEY: Readonly<Record<string, StatusCopyKey>> = Object.free
   操作结果未确认: 'outcomeUnknown',
 })
 
+/**
+ * Table-diagnostic code → i18n key. UI core publishes an English fallback
+ * message on `tableDiagnosticAtom`; the dialog localizes the codes it can
+ * actually produce and falls back to the core message for the rest, so a
+ * new engine reject code is still visible rather than silently swallowed.
+ */
+const TABLE_DIAGNOSTIC_COPY_KEY: Readonly<Partial<Record<TableDiagnosticCode, string>>> =
+  Object.freeze({
+    capability: 'nameManager.tables.error.capability',
+    'invalid-name': 'nameManager.tables.error.invalidName',
+    'name-like-cell-ref': 'nameManager.tables.error.nameLikeCellRef',
+    'name-conflict': 'nameManager.tables.error.nameConflict',
+    'reserved-name': 'nameManager.tables.error.reservedName',
+    'name-unchanged': 'nameManager.tables.error.nameUnchanged',
+    'not-found': 'nameManager.tables.error.notFound',
+    'outcome-unknown': 'nameManager.tables.error.outcomeUnknown',
+  })
+
 export function SpreadsheetNameManagerDialog(props: SpreadsheetNameManagerDialogProps) {
   const t = useT()
   const store = useSpreadsheetUiStore()
@@ -111,6 +135,14 @@ export function SpreadsheetNameManagerDialog(props: SpreadsheetNameManagerDialog
   const kind = useAtomValue(nameManagerKindDraftAtom)
   const params = useAtomValue(nameManagerParamsDraftAtom)
   const allTables = useAtomValue(allTablesAtom)
+  const tableDiagnostic = useAtomValue(tableDiagnosticAtom)
+  const lastRenamedTable = useAtomValue(lastRenamedTableAtom)
+
+  // Per-row inline editors. Only one row may be in rename or delete-confirm
+  // mode at a time; both are keyed by the table's canonical name.
+  const [renamingTable, setRenamingTable] = createSignal<string | null>(null)
+  const [renameDraft, setRenameDraft] = createSignal('')
+  const [pendingDeleteTable, setPendingDeleteTable] = createSignal<string | null>(null)
 
   const isOpen = () => editor().status !== 'closed'
   // Read-only Excel Table catalog. The engine registry is canonical; the
@@ -118,6 +150,10 @@ export function SpreadsheetNameManagerDialog(props: SpreadsheetNameManagerDialog
   // presence — a backend whose engine has no Table model omits `listTables`
   // and the whole region is hidden.
   const tablesSupported = () => typeof backend.listTables === 'function'
+  // Row actions degrade independently of the listing: a backend that can
+  // list tables but not mutate their definitions renders no action buttons.
+  const renameTableSupported = () => typeof backend.renameTable === 'function'
+  const deleteTableSupported = () => typeof backend.deleteTable === 'function'
   const interactionLocked = () =>
     mutation().status === 'pending' || registry().status === 'refreshing'
 
@@ -173,15 +209,38 @@ export function SpreadsheetNameManagerDialog(props: SpreadsheetNameManagerDialog
     return null
   }
 
-  // Refresh the read-only table catalog on the closed → open edge so the
-  // list reflects the canonical engine registry each time the dialog opens.
+  function tableStatusMessage(): string | null {
+    const diagnostic = tableDiagnostic()
+    if (diagnostic === null) return null
+    const copyKey = TABLE_DIAGNOSTIC_COPY_KEY[diagnostic.code]
+    return copyKey === undefined ? diagnostic.message : t(copyKey)
+  }
+
+  // Refresh the table catalog on the closed → open edge so the list reflects
+  // the canonical engine registry each time the dialog opens, and drop any
+  // half-finished row editor from the previous session.
   createEffect<boolean>((wasOpen) => {
     const open = isOpen()
-    if (open && !wasOpen && tablesSupported()) {
-      store.setter(refreshTableCatalogAtom, backend)
+    if (open && !wasOpen) {
+      setRenamingTable(null)
+      setRenameDraft('')
+      setPendingDeleteTable(null)
+      if (tablesSupported()) store.setter(refreshTableCatalogAtom, backend)
     }
     return open
   }, false)
+
+  // Close the inline rename editor off the APPLIED witness, not off the
+  // dispatch: a structured reject never publishes a witness, so the row stays
+  // in edit mode with the draft the user typed and the diagnostic below it.
+  createEffect<{ from: string; to: string } | null>((previous) => {
+    const applied = lastRenamedTable()
+    if (applied !== null && applied !== previous && renamingTable() === applied.from) {
+      setRenamingTable(null)
+      setRenameDraft('')
+    }
+    return applied
+  }, null)
 
   createEffect(() => {
     if (!isOpen()) return
@@ -210,6 +269,43 @@ export function SpreadsheetNameManagerDialog(props: SpreadsheetNameManagerDialog
     store.setter(deleteNameManagerEntryAtom, {
       source: backend,
       sessionId: sessionId(),
+    })
+  }
+
+  function beginRenameTable(table: SpreadsheetTableDescriptor): void {
+    setPendingDeleteTable(null)
+    setRenamingTable(table.name)
+    setRenameDraft(table.name)
+  }
+
+  // Fire-and-forget dispatch: `runRenameTableAtom` owns the transport, the
+  // capability split, and the diagnostic. The inline editor closes off the
+  // applied witness (below), never off an awaited result — so a rejected
+  // rename keeps the row in edit mode with the typed draft intact.
+  function commitRenameTable(table: SpreadsheetTableDescriptor): void {
+    void store.setter(runRenameTableAtom, {
+      source: backend,
+      name: table.name,
+      newName: renameDraft(),
+      sheetId: table.sheetId,
+      refreshProjection: (sheetId?: string) =>
+        refreshVisibleProjection(store, backend, sheetId, 'toolbar'),
+    })
+  }
+
+  function cancelRenameTable(): void {
+    setRenamingTable(null)
+    setRenameDraft('')
+  }
+
+  function confirmDeleteTable(table: SpreadsheetTableDescriptor): void {
+    setPendingDeleteTable(null)
+    void store.setter(runDeleteTableAtom, {
+      source: backend,
+      name: table.name,
+      sheetId: table.sheetId,
+      refreshProjection: (sheetId?: string) =>
+        refreshVisibleProjection(store, backend, sheetId, 'toolbar'),
     })
   }
 
@@ -390,10 +486,93 @@ export function SpreadsheetNameManagerDialog(props: SpreadsheetNameManagerDialog
                           {t('nameManager.tables.hasTotals')}
                         </span>
                       </Show>
+
+                      <Show when={renamingTable() === table.name}>
+                        <span class="nm-table-rename">
+                          <input
+                            type="text"
+                            class="nm-table-rename-input"
+                            data-testid="name-manager-table-rename-input"
+                            aria-label={t('nameManager.tables.rename.label', { name: table.name })}
+                            value={renameDraft()}
+                            onInput={(event) => setRenameDraft(event.currentTarget.value)}
+                          />
+                          <button
+                            type="button"
+                            data-testid="name-manager-table-rename-save"
+                            onClick={() => commitRenameTable(table)}
+                          >
+                            {t('nameManager.tables.rename.save')}
+                          </button>
+                          <button
+                            type="button"
+                            data-testid="name-manager-table-rename-cancel"
+                            onClick={cancelRenameTable}
+                          >
+                            {t('nameManager.tables.cancel')}
+                          </button>
+                        </span>
+                      </Show>
+
+                      <Show when={pendingDeleteTable() === table.name}>
+                        <span class="nm-table-delete-confirm" role="alert">
+                          <span data-testid="name-manager-table-delete-prompt">
+                            {t('nameManager.tables.delete.prompt', { name: table.name })}
+                          </span>
+                          <button
+                            type="button"
+                            data-testid="name-manager-table-delete-confirm"
+                            onClick={() => confirmDeleteTable(table)}
+                          >
+                            {t('nameManager.tables.delete.confirm')}
+                          </button>
+                          <button
+                            type="button"
+                            data-testid="name-manager-table-delete-cancel"
+                            onClick={() => setPendingDeleteTable(null)}
+                          >
+                            {t('nameManager.tables.cancel')}
+                          </button>
+                        </span>
+                      </Show>
+
+                      <span class="nm-table-actions">
+                        <Show when={renameTableSupported() && renamingTable() !== table.name}>
+                          <button
+                            type="button"
+                            data-testid="name-manager-table-rename"
+                            onClick={() => beginRenameTable(table)}
+                          >
+                            {t('nameManager.tables.rename')}
+                          </button>
+                        </Show>
+                        <Show when={deleteTableSupported() && pendingDeleteTable() !== table.name}>
+                          <button
+                            type="button"
+                            data-testid="name-manager-table-delete"
+                            onClick={() => setPendingDeleteTable(table.name)}
+                          >
+                            {t('nameManager.tables.delete')}
+                          </button>
+                        </Show>
+                      </span>
                     </li>
                   )}
                 </For>
               </ul>
+            </Show>
+
+            <Show when={tableStatusMessage()}>
+              {(message) => (
+                <div
+                  class="nm-tables-error"
+                  data-testid="name-manager-tables-error"
+                  data-table-diagnostic-code={tableDiagnostic()?.code}
+                  role="status"
+                >
+                  {message()}
+                </div>
+              )}
             </Show>
           </section>
         </Show>

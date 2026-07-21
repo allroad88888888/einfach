@@ -48,6 +48,29 @@ backend ports gated by the same `structuredTables` witness:
 - **helper** — `findTableForCell(tables, coord)` (framework-neutral A1-range
   containment used by the totals UI entry).
 
+Rename / delete (design §9, parity #32 T7) — definition-level lifecycle on
+the `renameTable` / `renameTableColumn` / `deleteTable` ports:
+
+- **derived** — `renameTableSupportedAtom`, `renameTableColumnSupportedAtom`,
+  `deleteTableSupportedAtom` (port-presence witnesses that gate the Name
+  Manager row affordances), `lastRenamedTableAtom` (`{ from, to }` applied
+  witness), `lastDeletedTableNameAtom`.
+- **command** — `runRenameTableAtom` (`{ source, name, newName }`),
+  `runRenameTableColumnAtom` (`{ source, name, oldColumn, newColumn }`),
+  `runDeleteTableAtom` (`{ source, name }`). Each one: capability split by
+  port presence, single-flight lane, structured-reject → readable diagnostic
+  (rename/delete-flavored copy via `TABLE_RENAME_REJECTION_MESSAGES` /
+  `TABLE_DELETE_REJECTION_MESSAGES`, falling back to the shared
+  create-flavored map), throw → `outcome-unknown`, and a catalog refresh
+  from the canonical registry on apply.
+- **local pre-validation (zero transport)** — `isValidTableName` mirrors the
+  engine's `[A-Za-z_][A-Za-z0-9_]*` / 1..255 name shape and
+  `isCellRefLikeTableName` mirrors `name_is_cell_ref_like`, so an empty,
+  malformed, cell-ref-like, or unchanged (`name-unchanged`) new name is
+  rejected before a worker round-trip. The engine stays canonical and
+  re-asserts every rule; the local gate only saves the trip. Column display
+  names are free text and are NOT held to the table-name shape.
+
 Feature degradation: when the host backend omits these ports the Data-menu
 "Create table" entry hides through the standard method-presence contract —
 the TS worker runtime declares `structuredTables: false` (fail-closed) and

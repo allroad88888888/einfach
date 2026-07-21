@@ -22,6 +22,7 @@ import {
   openNameManagerAtom,
   setSheetTabsSheetsAtom,
   type DeleteNamedRangeRequest,
+  type DeleteTableRequest,
   type ListNamedRangesRequest,
   type ListTablesRequest,
   type ListTablesResult,
@@ -30,9 +31,11 @@ import {
   type NamedRangeControllerPort,
   type NamedRangeListResult,
   type NamedRangeMutationResult,
+  type RenameTableRequest,
   type SetNamedRangeRequest,
   type SpreadsheetBackend,
   type SpreadsheetTableDescriptor,
+  type TableMutationResult,
 } from '@einfach/spreadsheet-ui-core'
 import { SpreadsheetNameManagerDialog } from '../src-vnext/named-ranges'
 import { SpreadsheetUiProvider, type NamedRangeCapabilityPort } from '../src-vnext/provider'
@@ -710,5 +713,281 @@ describe('SpreadsheetNameManagerDialog tables region', () => {
     expect(view.queryByTestId('name-manager-tables')).toBeNull()
     expect(view.queryByTestId('name-manager-tables-list')).toBeNull()
     expect(view.queryByTestId('name-manager-tables-empty')).toBeNull()
+  })
+})
+
+describe('SpreadsheetNameManagerDialog table row actions', () => {
+  interface LifecycleHarness {
+    backend: NamedRangeBackend
+    listTables: jest.Mock<(request: ListTablesRequest) => Promise<ListTablesResult>>
+    renameTable: jest.Mock<(request: RenameTableRequest) => Promise<TableMutationResult>>
+    deleteTable: jest.Mock<(request: DeleteTableRequest) => Promise<TableMutationResult>>
+    catalog: () => readonly SpreadsheetTableDescriptor[]
+  }
+
+  function makeLifecycleHarness(
+    options: {
+      renameResult?: (request: RenameTableRequest) => TableMutationResult
+      withoutRename?: boolean
+      withoutDelete?: boolean
+    } = {},
+  ): LifecycleHarness {
+    let catalog: readonly SpreadsheetTableDescriptor[] = [SALES_TABLE, COSTS_TABLE]
+
+    const listTables = jest.fn(
+      async (request: ListTablesRequest): Promise<ListTablesResult> => ({
+        requestId: request.requestId,
+        revision: 1,
+        tables: [...catalog],
+      }),
+    )
+    const renameTable = jest.fn(
+      async (request: RenameTableRequest): Promise<TableMutationResult> => {
+        if (options.renameResult) return options.renameResult(request)
+        catalog = catalog.map((table) =>
+          table.name === request.name ? { ...table, name: request.newName } : table,
+        )
+        return {
+          kind: 'table-mutation',
+          applied: true,
+          name: request.newName,
+          requestId: request.requestId,
+          revision: 2,
+        }
+      },
+    )
+    const deleteTable = jest.fn(
+      async (request: DeleteTableRequest): Promise<TableMutationResult> => {
+        catalog = catalog.filter((table) => table.name !== request.name)
+        return {
+          kind: 'table-mutation',
+          applied: true,
+          name: request.name,
+          requestId: request.requestId,
+          revision: 2,
+        }
+      },
+    )
+
+    const overrides: Partial<NamedRangeBackend> = { listTables }
+    if (!options.withoutRename) overrides.renameTable = renameTable
+    if (!options.withoutDelete) overrides.deleteTable = deleteTable
+
+    return {
+      backend: makeBackend(overrides),
+      listTables,
+      renameTable,
+      deleteTable,
+      catalog: () => catalog,
+    }
+  }
+
+  async function openWithTables(harness: LifecycleHarness) {
+    const store = createStore()
+    seedSheets(store)
+    store.setter(openNameManagerAtom, { status: 'editing-new' })
+    const view = renderManager(store, harness.backend)
+    await waitUntilReady(store)
+    await waitFor(() => expect(harness.listTables).toHaveBeenCalledTimes(1))
+    await waitFor(() =>
+      expect(view.getByTestId('name-manager-tables-list').querySelectorAll('li').length).toBe(2),
+    )
+    return { store, view }
+  }
+
+  function row(view: { getByTestId: (id: string) => HTMLElement }, name: string): HTMLElement {
+    const found = view
+      .getByTestId('name-manager-tables-list')
+      .querySelector(`[data-table-name="${name}"]`)
+    expect(found).not.toBeNull()
+    return found as HTMLElement
+  }
+
+  it('renders a rename and delete affordance on every table row', async () => {
+    const harness = makeLifecycleHarness()
+    const { view } = await openWithTables(harness)
+
+    for (const name of ['SalesTable', 'CostsTable']) {
+      const target = row(view, name)
+      expect(target.querySelector('[data-testid="name-manager-table-rename"]')).not.toBeNull()
+      expect(target.querySelector('[data-testid="name-manager-table-delete"]')).not.toBeNull()
+    }
+  })
+
+  it('hides each row action when the backend omits the matching port', async () => {
+    const harness = makeLifecycleHarness({ withoutRename: true, withoutDelete: true })
+    const { view } = await openWithTables(harness)
+
+    const target = row(view, 'SalesTable')
+    expect(target.querySelector('[data-testid="name-manager-table-rename"]')).toBeNull()
+    expect(target.querySelector('[data-testid="name-manager-table-delete"]')).toBeNull()
+
+    const renameOnly = makeLifecycleHarness({ withoutDelete: true })
+    const second = await openWithTables(renameOnly)
+    const secondRow = row(second.view, 'SalesTable')
+    expect(secondRow.querySelector('[data-testid="name-manager-table-rename"]')).not.toBeNull()
+    expect(secondRow.querySelector('[data-testid="name-manager-table-delete"]')).toBeNull()
+  })
+
+  it('renames a table inline and refreshes the listing from the engine', async () => {
+    const harness = makeLifecycleHarness()
+    const { view } = await openWithTables(harness)
+
+    fireEvent.click(
+      row(view, 'SalesTable').querySelector(
+        '[data-testid="name-manager-table-rename"]',
+      ) as HTMLElement,
+    )
+
+    const input = row(view, 'SalesTable').querySelector(
+      '[data-testid="name-manager-table-rename-input"]',
+    ) as HTMLInputElement
+    expect(input.value).toBe('SalesTable')
+    fireEvent.input(input, { target: { value: 'Revenue' } })
+    fireEvent.click(
+      row(view, 'SalesTable').querySelector(
+        '[data-testid="name-manager-table-rename-save"]',
+      ) as HTMLElement,
+    )
+
+    await waitFor(() => expect(harness.renameTable).toHaveBeenCalledTimes(1))
+    expect(harness.renameTable.mock.calls[0][0]).toMatchObject({
+      kind: 'rename-table',
+      name: 'SalesTable',
+      newName: 'Revenue',
+    })
+    // Applied → the catalog is re-read from the engine and the row re-labels.
+    await waitFor(() => expect(harness.listTables).toHaveBeenCalledTimes(2))
+    await waitFor(() => expect(row(view, 'Revenue')).not.toBeNull())
+    expect(
+      view.getByTestId('name-manager-tables-list').querySelector('[data-table-name="SalesTable"]'),
+    ).toBeNull()
+    // The inline editor closes on success.
+    expect(view.queryByTestId('name-manager-table-rename-input')).toBeNull()
+    expect(view.queryByTestId('name-manager-tables-error')).toBeNull()
+  })
+
+  it('rejects an invalid rename locally, keeps the draft and shows the diagnostic', async () => {
+    const harness = makeLifecycleHarness()
+    const { view } = await openWithTables(harness)
+
+    fireEvent.click(
+      row(view, 'SalesTable').querySelector(
+        '[data-testid="name-manager-table-rename"]',
+      ) as HTMLElement,
+    )
+    const input = view.getByTestId('name-manager-table-rename-input') as HTMLInputElement
+    fireEvent.input(input, { target: { value: '2 Bad Name' } })
+    fireEvent.click(view.getByTestId('name-manager-table-rename-save'))
+
+    // Pre-validated in UI core → zero transport.
+    await waitFor(() => expect(view.getByTestId('name-manager-tables-error')).not.toBeNull())
+    expect(harness.renameTable).not.toHaveBeenCalled()
+    expect(view.getByTestId('name-manager-tables-error').dataset.tableDiagnosticCode).toBe(
+      'invalid-name',
+    )
+    // Draft survives so the user can correct it.
+    expect((view.getByTestId('name-manager-table-rename-input') as HTMLInputElement).value).toBe(
+      '2 Bad Name',
+    )
+  })
+
+  it('surfaces a structured rename reject as a localized diagnostic', async () => {
+    const harness = makeLifecycleHarness({
+      renameResult: (request) => ({
+        kind: 'table-mutation-not-applied',
+        applied: false,
+        code: 'name-conflict',
+        requestId: request.requestId,
+        revision: 3,
+      }),
+    })
+    const { view } = await openWithTables(harness)
+
+    fireEvent.click(
+      row(view, 'SalesTable').querySelector(
+        '[data-testid="name-manager-table-rename"]',
+      ) as HTMLElement,
+    )
+    fireEvent.input(view.getByTestId('name-manager-table-rename-input'), {
+      target: { value: 'CostsTable' },
+    })
+    fireEvent.click(view.getByTestId('name-manager-table-rename-save'))
+
+    await waitFor(() => expect(harness.renameTable).toHaveBeenCalledTimes(1))
+    await waitFor(() =>
+      expect(view.getByTestId('name-manager-tables-error').dataset.tableDiagnosticCode).toBe(
+        'name-conflict',
+      ),
+    )
+    expect(view.getByTestId('name-manager-tables-error').textContent).toContain(
+      'That name is already in use.',
+    )
+    // Rejected → the row keeps its old name and the editor stays open.
+    expect(row(view, 'SalesTable')).not.toBeNull()
+    expect(view.getByTestId('name-manager-table-rename-input')).not.toBeNull()
+  })
+
+  it('cancels an inline rename without touching the backend', async () => {
+    const harness = makeLifecycleHarness()
+    const { view } = await openWithTables(harness)
+
+    fireEvent.click(
+      row(view, 'SalesTable').querySelector(
+        '[data-testid="name-manager-table-rename"]',
+      ) as HTMLElement,
+    )
+    fireEvent.input(view.getByTestId('name-manager-table-rename-input'), {
+      target: { value: 'Revenue' },
+    })
+    fireEvent.click(view.getByTestId('name-manager-table-rename-cancel'))
+
+    expect(view.queryByTestId('name-manager-table-rename-input')).toBeNull()
+    expect(harness.renameTable).not.toHaveBeenCalled()
+    expect(row(view, 'SalesTable')).not.toBeNull()
+  })
+
+  it('deletes a table only after the inline confirmation step', async () => {
+    const harness = makeLifecycleHarness()
+    const { view } = await openWithTables(harness)
+
+    fireEvent.click(
+      row(view, 'CostsTable').querySelector(
+        '[data-testid="name-manager-table-delete"]',
+      ) as HTMLElement,
+    )
+    // The first click only arms the confirmation — nothing is sent.
+    expect(harness.deleteTable).not.toHaveBeenCalled()
+    const prompt = view.getByTestId('name-manager-table-delete-prompt')
+    expect(prompt.textContent).toContain('CostsTable')
+
+    fireEvent.click(view.getByTestId('name-manager-table-delete-confirm'))
+    await waitFor(() => expect(harness.deleteTable).toHaveBeenCalledTimes(1))
+    expect(harness.deleteTable.mock.calls[0][0]).toMatchObject({
+      kind: 'delete-table',
+      name: 'CostsTable',
+    })
+    await waitFor(() =>
+      expect(view.getByTestId('name-manager-tables-list').querySelectorAll('li').length).toBe(1),
+    )
+    expect(
+      view.getByTestId('name-manager-tables-list').querySelector('[data-table-name="CostsTable"]'),
+    ).toBeNull()
+  })
+
+  it('cancelling the delete confirmation sends nothing', async () => {
+    const harness = makeLifecycleHarness()
+    const { view } = await openWithTables(harness)
+
+    fireEvent.click(
+      row(view, 'CostsTable').querySelector(
+        '[data-testid="name-manager-table-delete"]',
+      ) as HTMLElement,
+    )
+    fireEvent.click(view.getByTestId('name-manager-table-delete-cancel'))
+
+    expect(view.queryByTestId('name-manager-table-delete-prompt')).toBeNull()
+    expect(harness.deleteTable).not.toHaveBeenCalled()
+    expect(row(view, 'CostsTable')).not.toBeNull()
   })
 })

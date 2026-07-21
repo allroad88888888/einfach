@@ -620,6 +620,24 @@ export const messages: Record<string, string> = {
   'nameManager.tables.location': '{sheet} · {range}',
   'nameManager.tables.columns': 'Columns: {columns}',
   'nameManager.tables.hasTotals': 'Totals row',
+  'nameManager.tables.rename': 'Rename',
+  'nameManager.tables.rename.label': 'New name for {name}',
+  'nameManager.tables.rename.save': 'Save',
+  'nameManager.tables.delete': 'Delete',
+  'nameManager.tables.delete.prompt': 'Delete {name}?',
+  'nameManager.tables.delete.confirm': 'Confirm delete',
+  'nameManager.tables.cancel': 'Cancel',
+  'nameManager.tables.error.capability': 'This table operation is unavailable for this workbook.',
+  'nameManager.tables.error.invalidName':
+    'Table names may use letters, digits and underscores, and must not start with a digit.',
+  'nameManager.tables.error.nameLikeCellRef':
+    'That name looks like a cell reference. Choose another name.',
+  'nameManager.tables.error.nameConflict': 'That name is already in use.',
+  'nameManager.tables.error.reservedName': 'That name is reserved by a built-in function.',
+  'nameManager.tables.error.nameUnchanged': 'The new name is the same as the current name.',
+  'nameManager.tables.error.notFound': 'The table could not be found. Refresh and try again.',
+  'nameManager.tables.error.outcomeUnknown':
+    'The result could not be confirmed. Refresh and try again.',
 
   // Status bar
   'status.aggregate.sum': 'Sum',

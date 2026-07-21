@@ -1,6 +1,6 @@
 import { atom } from '@einfach/core'
 import type { Atom } from '@einfach/core'
-import { parseA1Range } from '../name-box'
+import { parseA1Cell, parseA1Range } from '../name-box'
 import type { CellCoord, CellRange } from '../shared'
 import type {
   CreateTableResult,
@@ -38,6 +38,29 @@ export const TABLE_TOTALS_CAPABILITY_ERROR =
 export const TABLE_NO_TABLE_AT_SELECTION_ERROR =
   'The active cell is not inside a table. Select a cell within a table to toggle its totals row.'
 
+export const TABLE_RENAME_CAPABILITY_ERROR =
+  'Renaming a table is unavailable because this workbook does not provide renameTable.'
+
+export const TABLE_RENAME_COLUMN_CAPABILITY_ERROR =
+  'Renaming a table column is unavailable because this workbook does not provide renameTableColumn.'
+
+export const TABLE_DELETE_CAPABILITY_ERROR =
+  'Deleting a table is unavailable because this workbook does not provide deleteTable.'
+
+export const TABLE_INVALID_NAME_ERROR =
+  'The table name is invalid. Use letters, digits and underscores, ' +
+  'starting with a letter or underscore.'
+
+export const TABLE_NAME_LIKE_CELL_REF_ERROR =
+  'The table name looks like a cell reference. Choose another name.'
+
+export const TABLE_NAME_UNCHANGED_ERROR = 'The new name is the same as the current name.'
+
+export const TABLE_COLUMN_NAME_UNCHANGED_ERROR =
+  'The new column name is the same as the current name.'
+
+export const TABLE_MISSING_TARGET_ERROR = 'No table was named for this operation.'
+
 /** Structured-reject code → user-readable prompt (design §4/§10). */
 export const TABLE_REJECTION_MESSAGES: Readonly<Record<TableMutationRejectionCode, string>> =
   Object.freeze({
@@ -63,10 +86,39 @@ export const TABLE_REJECTION_MESSAGES: Readonly<Record<TableMutationRejectionCod
     'invalid-payload': 'Table operation failed: the request was malformed.',
   })
 
+/**
+ * Rename-flavored overrides for the codes a rename can actually produce —
+ * the shared {@link TABLE_REJECTION_MESSAGES} copy is create-flavored, and
+ * "Create table failed: …" is wrong prose for a rename. Codes absent here
+ * fall through to the shared map.
+ */
+export const TABLE_RENAME_REJECTION_MESSAGES: Readonly<
+  Partial<Record<TableMutationRejectionCode, string>>
+> = Object.freeze({
+  'invalid-name': 'Rename failed: the table name is invalid.',
+  'reserved-name': 'Rename failed: that name is reserved by a built-in function.',
+  'name-like-cell-ref': 'Rename failed: the name looks like a cell reference. Choose another name.',
+  'name-conflict': 'Rename failed: that name is already in use.',
+  'not-found': 'Rename failed: the table could not be found.',
+  'column-not-found': 'Rename failed: the column could not be found.',
+  'duplicate-column': 'Rename failed: that column name is already in use.',
+  'invalid-column-name': 'Rename failed: the column name is invalid.',
+  'invalid-payload': 'Rename failed: the request was malformed.',
+})
+
+/** Delete-flavored overrides (see {@link TABLE_RENAME_REJECTION_MESSAGES}). */
+export const TABLE_DELETE_REJECTION_MESSAGES: Readonly<
+  Partial<Record<TableMutationRejectionCode, string>>
+> = Object.freeze({
+  'not-found': 'Delete failed: the table could not be found.',
+  'invalid-payload': 'Delete failed: the request was malformed.',
+})
+
 export type TableDiagnosticCode =
   | TableMutationRejectionCode
   | 'invalid-selection'
   | 'no-table-at-selection'
+  | 'name-unchanged'
   | 'capability'
   | 'outcome-unknown'
 
@@ -77,6 +129,42 @@ export interface TableDiagnostic {
 
 export function tableRejectionMessage(code: TableMutationRejectionCode, fallback?: string): string {
   return TABLE_REJECTION_MESSAGES[code] ?? fallback ?? 'Table operation failed.'
+}
+
+function operationRejectionMessage(
+  overrides: Readonly<Partial<Record<TableMutationRejectionCode, string>>>,
+  code: TableMutationRejectionCode,
+  fallback?: string,
+): string {
+  return overrides[code] ?? tableRejectionMessage(code, fallback)
+}
+
+/** Table names share the engine's defined-name shape (`workbook.rs::validate_name`). */
+export const TABLE_NAME_MAX_LENGTH = 255
+const TABLE_NAME_PATTERN = /^[A-Za-z_][A-Za-z0-9_]*$/
+
+/**
+ * Local mirror of the engine's table-name shape gate (`[A-Za-z_][A-Za-z0-9_]*`,
+ * 1..=255). Used to reject a typo before it costs a worker round-trip; the
+ * engine stays canonical and re-asserts the same rule.
+ */
+export function isValidTableName(name: string): boolean {
+  const trimmed = typeof name === 'string' ? name.trim() : ''
+  return (
+    trimmed.length > 0 &&
+    trimmed.length <= TABLE_NAME_MAX_LENGTH &&
+    TABLE_NAME_PATTERN.test(trimmed)
+  )
+}
+
+/**
+ * Local mirror of the engine's `name_is_cell_ref_like` gate: a name that
+ * parses as an in-grid A1 address (`Q1`, `AB12`) would shadow a cell
+ * reference and is rejected. `Table1` is NOT cell-ref-like — its column
+ * label overflows the grid, exactly as in the engine.
+ */
+export function isCellRefLikeTableName(name: string): boolean {
+  return parseA1Cell(typeof name === 'string' ? name : '') !== null
 }
 
 function errorMessage(error: unknown): string {
@@ -137,6 +225,35 @@ function readCreateTablePort(source: TablesControllerPort): TablesControllerPort
 function readListTablesPort(source: TablesControllerPort): TablesControllerPort['listTables'] {
   try {
     const port = source?.listTables
+    return typeof port === 'function' ? port : undefined
+  } catch {
+    return undefined
+  }
+}
+
+function readRenameTablePort(source: TablesControllerPort): TablesControllerPort['renameTable'] {
+  try {
+    const port = source?.renameTable
+    return typeof port === 'function' ? port : undefined
+  } catch {
+    return undefined
+  }
+}
+
+function readRenameTableColumnPort(
+  source: TablesControllerPort,
+): TablesControllerPort['renameTableColumn'] {
+  try {
+    const port = source?.renameTableColumn
+    return typeof port === 'function' ? port : undefined
+  } catch {
+    return undefined
+  }
+}
+
+function readDeleteTablePort(source: TablesControllerPort): TablesControllerPort['deleteTable'] {
+  try {
+    const port = source?.deleteTable
     return typeof port === 'function' ? port : undefined
   } catch {
     return undefined
@@ -211,13 +328,12 @@ allTablesAtom.debugLabel = 'spreadsheet.tables.all'
  * the tables anchored to `sheetId`. Recomputed only when the catalog changes;
  * no per-sheet atom family.
  */
-export const tablesForSheetAtom: Atom<
-  (sheetId: string) => readonly SpreadsheetTableDescriptor[]
-> = atom((get) => {
-  const catalog = get(tableCatalogBackingAtom)
-  return (sheetId: string): readonly SpreadsheetTableDescriptor[] =>
-    catalog.filter((table) => table.sheetId === sheetId)
-})
+export const tablesForSheetAtom: Atom<(sheetId: string) => readonly SpreadsheetTableDescriptor[]> =
+  atom((get) => {
+    const catalog = get(tableCatalogBackingAtom)
+    return (sheetId: string): readonly SpreadsheetTableDescriptor[] =>
+      catalog.filter((table) => table.sheetId === sheetId)
+  })
 tablesForSheetAtom.debugLabel = 'spreadsheet.tables.forSheet'
 
 // --- capability witness -----------------------------------------------------
@@ -240,10 +356,41 @@ export const toggleTableTotalsSupportedAtom: Atom<boolean> = atom((get) =>
 )
 toggleTableTotalsSupportedAtom.debugLabel = 'spreadsheet.tables.totalsSupported'
 
-/** Captures the `createTable` + `setTableTotalsRow` capability witnesses without dispatching. */
+const renameTableCapabilityBackingAtom = atom<boolean>(false)
+renameTableCapabilityBackingAtom.debugLabel = 'spreadsheet.tables.renameCapabilityBacking'
+
+/** Read-only witness of the `renameTable` port — gates the rename affordance. */
+export const renameTableSupportedAtom: Atom<boolean> = atom((get) =>
+  get(renameTableCapabilityBackingAtom),
+)
+renameTableSupportedAtom.debugLabel = 'spreadsheet.tables.renameSupported'
+
+const renameTableColumnCapabilityBackingAtom = atom<boolean>(false)
+renameTableColumnCapabilityBackingAtom.debugLabel =
+  'spreadsheet.tables.renameColumnCapabilityBacking'
+
+/** Read-only witness of the `renameTableColumn` port. */
+export const renameTableColumnSupportedAtom: Atom<boolean> = atom((get) =>
+  get(renameTableColumnCapabilityBackingAtom),
+)
+renameTableColumnSupportedAtom.debugLabel = 'spreadsheet.tables.renameColumnSupported'
+
+const deleteTableCapabilityBackingAtom = atom<boolean>(false)
+deleteTableCapabilityBackingAtom.debugLabel = 'spreadsheet.tables.deleteCapabilityBacking'
+
+/** Read-only witness of the `deleteTable` port — gates the delete affordance. */
+export const deleteTableSupportedAtom: Atom<boolean> = atom((get) =>
+  get(deleteTableCapabilityBackingAtom),
+)
+deleteTableSupportedAtom.debugLabel = 'spreadsheet.tables.deleteSupported'
+
+/** Captures every table-mutation capability witness without dispatching. */
 export const captureTableCapabilityAtom = atom(null, (_get, set, source: TablesControllerPort) => {
   set(createTableCapabilityBackingAtom, readCreateTablePort(source) !== undefined)
   set(toggleTotalsCapabilityBackingAtom, readSetTotalsRowPort(source) !== undefined)
+  set(renameTableCapabilityBackingAtom, readRenameTablePort(source) !== undefined)
+  set(renameTableColumnCapabilityBackingAtom, readRenameTableColumnPort(source) !== undefined)
+  set(deleteTableCapabilityBackingAtom, readDeleteTablePort(source) !== undefined)
 })
 captureTableCapabilityAtom.debugLabel = 'spreadsheet.tables.captureCapability'
 
@@ -303,10 +450,7 @@ export const refreshTableCatalogAtom = atom(
       return
     }
     const tables = Array.isArray(result?.tables) ? result.tables : []
-    set(
-      tableCatalogBackingAtom,
-      Object.freeze(tables.slice(0, MAX_TABLE_CATALOG_ENTRIES)),
-    )
+    set(tableCatalogBackingAtom, Object.freeze(tables.slice(0, MAX_TABLE_CATALOG_ENTRIES)))
   },
 )
 refreshTableCatalogAtom.debugLabel = 'spreadsheet.tables.refreshCatalog'
@@ -362,9 +506,7 @@ export const runCreateTableAtom = atom(
     set(tableDiagnosticBackingAtom, null)
 
     const name =
-      typeof input.name === 'string' && input.name.trim().length > 0
-        ? input.name.trim()
-        : undefined
+      typeof input.name === 'string' && input.name.trim().length > 0 ? input.name.trim() : undefined
 
     let result: CreateTableResult
     try {
@@ -687,3 +829,304 @@ export const runSetTableTotalFunctionAtom = atom(
   },
 )
 runSetTableTotalFunctionAtom.debugLabel = 'spreadsheet.tables.runSetTotalFunction'
+
+// --- rename / delete (design §9, parity #32 T7) -----------------------------
+//
+// Definition-level table lifecycle. Every command follows the same shape as
+// `runCreateTableAtom`: capability split by port presence (the witness atom
+// is refreshed on every dispatch), a local pre-validation gate that rejects
+// without spending a transport round-trip, a single-flight lane, a
+// structured-reject → readable-diagnostic mapping, and a catalog refresh
+// from the canonical engine registry on apply.
+
+const activeRenameTableAtom = atom<boolean>(false)
+activeRenameTableAtom.debugLabel = 'spreadsheet.tables.activeRename'
+
+const activeDeleteTableAtom = atom<boolean>(false)
+activeDeleteTableAtom.debugLabel = 'spreadsheet.tables.activeDelete'
+
+const lastRenamedTableBackingAtom = atom<{ from: string; to: string } | null>(null)
+lastRenamedTableBackingAtom.debugLabel = 'spreadsheet.tables.lastRenamedBacking'
+
+/** Read-only witness of the most recent applied rename (`{ from, to }`). */
+export const lastRenamedTableAtom: Atom<{ from: string; to: string } | null> = atom((get) =>
+  get(lastRenamedTableBackingAtom),
+)
+lastRenamedTableAtom.debugLabel = 'spreadsheet.tables.lastRenamed'
+
+const lastDeletedTableNameBackingAtom = atom<string | null>(null)
+lastDeletedTableNameBackingAtom.debugLabel = 'spreadsheet.tables.lastDeletedNameBacking'
+
+/** Read-only canonical name of the most recently deleted table (success witness). */
+export const lastDeletedTableNameAtom: Atom<string | null> = atom((get) =>
+  get(lastDeletedTableNameBackingAtom),
+)
+lastDeletedTableNameAtom.debugLabel = 'spreadsheet.tables.lastDeletedName'
+
+function setDiagnostic(
+  set: (atomToSet: typeof tableDiagnosticBackingAtom, value: TableDiagnostic | null) => void,
+  code: TableDiagnosticCode,
+  message: string,
+): void {
+  set(tableDiagnosticBackingAtom, Object.freeze({ code, message }))
+}
+
+export interface RunRenameTableInput {
+  readonly source: TablesControllerPort
+  /** Current canonical table name. */
+  readonly name: string
+  /** Requested new name. */
+  readonly newName: string
+  /** Sheet id forwarded to `refreshProjection` after the rename lands. */
+  readonly sheetId?: string
+  /** Optional post-apply projection refresh (structured refs re-render). */
+  readonly refreshProjection?: (sheetId?: string) => Promise<unknown> | unknown
+}
+
+/**
+ * Rename a table through `renameTable`. Capability-gated: a host without the
+ * port surfaces a capability diagnostic and never touches the engine.
+ * Pre-validated locally — an empty target, an empty / malformed new name, a
+ * cell-ref-like new name, or a new name identical to the current one is
+ * rejected before any transport. On apply the bounded catalog is refreshed
+ * from the canonical registry (so every descriptor carries the new name) and
+ * the rename witness is published; a structured reject (`name-conflict` /
+ * `reserved-name` / `not-found` / …) maps to a readable diagnostic.
+ */
+export const runRenameTableAtom = atom(
+  null,
+  async (get, set, input: RunRenameTableInput): Promise<void> => {
+    if (get(activeRenameTableAtom)) return
+
+    const port = readRenameTablePort(input.source)
+    set(renameTableCapabilityBackingAtom, port !== undefined)
+    if (port === undefined) {
+      setDiagnostic(set, 'capability', TABLE_RENAME_CAPABILITY_ERROR)
+      return
+    }
+
+    const name = typeof input.name === 'string' ? input.name.trim() : ''
+    if (name.length === 0) {
+      setDiagnostic(set, 'invalid-payload', TABLE_MISSING_TARGET_ERROR)
+      return
+    }
+
+    const newName = typeof input.newName === 'string' ? input.newName.trim() : ''
+    if (!isValidTableName(newName)) {
+      setDiagnostic(set, 'invalid-name', TABLE_INVALID_NAME_ERROR)
+      return
+    }
+    if (isCellRefLikeTableName(newName)) {
+      setDiagnostic(set, 'name-like-cell-ref', TABLE_NAME_LIKE_CELL_REF_ERROR)
+      return
+    }
+    // An exact no-op is rejected locally; a case-only change is a real
+    // display-case edit and is forwarded to the engine.
+    if (newName === name) {
+      setDiagnostic(set, 'name-unchanged', TABLE_NAME_UNCHANGED_ERROR)
+      return
+    }
+
+    const requestId = nextRequestId(get(tableRequestIdBackingAtom))
+    set(tableRequestIdBackingAtom, requestId)
+    set(activeRenameTableAtom, true)
+    set(tableDiagnosticBackingAtom, null)
+
+    let result: TableMutationResult
+    try {
+      result = await port.call(input.source, { kind: 'rename-table', name, newName, requestId })
+    } catch (error) {
+      set(activeRenameTableAtom, false)
+      setDiagnostic(set, 'outcome-unknown', `Rename result is unknown: ${errorMessage(error)}`)
+      return
+    }
+
+    if (!result || result.applied === false) {
+      const code: TableMutationRejectionCode = result ? result.code : 'invalid-payload'
+      set(activeRenameTableAtom, false)
+      setDiagnostic(
+        set,
+        code,
+        operationRejectionMessage(TABLE_RENAME_REJECTION_MESSAGES, code, result?.message),
+      )
+      return
+    }
+
+    set(lastRenamedTableBackingAtom, Object.freeze({ from: name, to: result.name }))
+    await set(refreshTableCatalogAtom, input.source)
+    if (typeof input.refreshProjection === 'function') {
+      try {
+        await input.refreshProjection(input.sheetId)
+      } catch {
+        // Projection refresh failure is non-fatal; the rename landed.
+      }
+    }
+    set(activeRenameTableAtom, false)
+    set(tableDiagnosticBackingAtom, null)
+  },
+)
+runRenameTableAtom.debugLabel = 'spreadsheet.tables.runRename'
+
+export interface RunRenameTableColumnInput {
+  readonly source: TablesControllerPort
+  readonly name: string
+  readonly oldColumn: string
+  readonly newColumn: string
+  readonly sheetId?: string
+  readonly refreshProjection?: (sheetId?: string) => Promise<unknown> | unknown
+}
+
+/**
+ * Rename one table column through `renameTableColumn`. Column display names
+ * are free text (unlike the table name), so the local gate only rejects an
+ * empty target / empty new column / exact no-op; duplicate and
+ * invalid-column-name verdicts stay with the engine.
+ */
+export const runRenameTableColumnAtom = atom(
+  null,
+  async (get, set, input: RunRenameTableColumnInput): Promise<void> => {
+    const port = readRenameTableColumnPort(input.source)
+    set(renameTableColumnCapabilityBackingAtom, port !== undefined)
+    if (port === undefined) {
+      setDiagnostic(set, 'capability', TABLE_RENAME_COLUMN_CAPABILITY_ERROR)
+      return
+    }
+
+    const name = typeof input.name === 'string' ? input.name.trim() : ''
+    const oldColumn = typeof input.oldColumn === 'string' ? input.oldColumn.trim() : ''
+    if (name.length === 0 || oldColumn.length === 0) {
+      setDiagnostic(set, 'invalid-payload', TABLE_MISSING_TARGET_ERROR)
+      return
+    }
+
+    const newColumn = typeof input.newColumn === 'string' ? input.newColumn.trim() : ''
+    if (newColumn.length === 0) {
+      setDiagnostic(
+        set,
+        'invalid-column-name',
+        operationRejectionMessage(TABLE_RENAME_REJECTION_MESSAGES, 'invalid-column-name'),
+      )
+      return
+    }
+    if (newColumn === oldColumn) {
+      setDiagnostic(set, 'name-unchanged', TABLE_COLUMN_NAME_UNCHANGED_ERROR)
+      return
+    }
+
+    const requestId = nextRequestId(get(tableRequestIdBackingAtom))
+    set(tableRequestIdBackingAtom, requestId)
+    set(tableDiagnosticBackingAtom, null)
+
+    let result: TableMutationResult
+    try {
+      result = await port.call(input.source, {
+        kind: 'rename-table-column',
+        name,
+        oldColumn,
+        newColumn,
+        requestId,
+      })
+    } catch (error) {
+      setDiagnostic(
+        set,
+        'outcome-unknown',
+        `Column rename result is unknown: ${errorMessage(error)}`,
+      )
+      return
+    }
+
+    if (!result || result.applied === false) {
+      const code: TableMutationRejectionCode = result ? result.code : 'invalid-payload'
+      setDiagnostic(
+        set,
+        code,
+        operationRejectionMessage(TABLE_RENAME_REJECTION_MESSAGES, code, result?.message),
+      )
+      return
+    }
+
+    await set(refreshTableCatalogAtom, input.source)
+    if (typeof input.refreshProjection === 'function') {
+      try {
+        await input.refreshProjection(input.sheetId)
+      } catch {
+        // Projection refresh failure is non-fatal; the rename landed.
+      }
+    }
+    set(tableDiagnosticBackingAtom, null)
+  },
+)
+runRenameTableColumnAtom.debugLabel = 'spreadsheet.tables.runRenameColumn'
+
+export interface RunDeleteTableInput {
+  readonly source: TablesControllerPort
+  /** Canonical name of the table definition to drop. */
+  readonly name: string
+  readonly sheetId?: string
+  readonly refreshProjection?: (sheetId?: string) => Promise<unknown> | unknown
+}
+
+/**
+ * Delete a table definition through `deleteTable`. Capability-gated; an
+ * empty target is rejected locally. Deleting drops the definition only —
+ * the cells stay — so the catalog refresh on apply is what removes the
+ * entry from every table list. A structured reject (`not-found` /
+ * `mutation-during-custom-call` / …) maps to a readable diagnostic.
+ */
+export const runDeleteTableAtom = atom(
+  null,
+  async (get, set, input: RunDeleteTableInput): Promise<void> => {
+    if (get(activeDeleteTableAtom)) return
+
+    const port = readDeleteTablePort(input.source)
+    set(deleteTableCapabilityBackingAtom, port !== undefined)
+    if (port === undefined) {
+      setDiagnostic(set, 'capability', TABLE_DELETE_CAPABILITY_ERROR)
+      return
+    }
+
+    const name = typeof input.name === 'string' ? input.name.trim() : ''
+    if (name.length === 0) {
+      setDiagnostic(set, 'invalid-payload', TABLE_MISSING_TARGET_ERROR)
+      return
+    }
+
+    const requestId = nextRequestId(get(tableRequestIdBackingAtom))
+    set(tableRequestIdBackingAtom, requestId)
+    set(activeDeleteTableAtom, true)
+    set(tableDiagnosticBackingAtom, null)
+
+    let result: TableMutationResult
+    try {
+      result = await port.call(input.source, { kind: 'delete-table', name, requestId })
+    } catch (error) {
+      set(activeDeleteTableAtom, false)
+      setDiagnostic(set, 'outcome-unknown', `Delete result is unknown: ${errorMessage(error)}`)
+      return
+    }
+
+    if (!result || result.applied === false) {
+      const code: TableMutationRejectionCode = result ? result.code : 'invalid-payload'
+      set(activeDeleteTableAtom, false)
+      setDiagnostic(
+        set,
+        code,
+        operationRejectionMessage(TABLE_DELETE_REJECTION_MESSAGES, code, result?.message),
+      )
+      return
+    }
+
+    set(lastDeletedTableNameBackingAtom, result.name || name)
+    await set(refreshTableCatalogAtom, input.source)
+    if (typeof input.refreshProjection === 'function') {
+      try {
+        await input.refreshProjection(input.sheetId)
+      } catch {
+        // Projection refresh failure is non-fatal; the definition is gone.
+      }
+    }
+    set(activeDeleteTableAtom, false)
+    set(tableDiagnosticBackingAtom, null)
+  },
+)
+runDeleteTableAtom.debugLabel = 'spreadsheet.tables.runDelete'
