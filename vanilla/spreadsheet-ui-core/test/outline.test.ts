@@ -9,12 +9,15 @@ import {
   getOutlineGroupsForSheet,
   getOutlineLeveledGroupsForSheet,
   getOutlineMaxLevelForSheet,
+  getHistoryLocalReplayApplier,
   groupSelectionAtom,
   hideRowsAtom,
   historyStackAtom,
   OUTLINE_MAX_DEPTH,
   OUTLINE_MAX_GROUPS_PER_SHEET_AXIS,
+  OUTLINE_REPLAY_KEY,
   outlineAtom,
+  registerHistoryLocalReplayApplier,
   runRedoHistoryAtom,
   runUndoHistoryAtom,
   selectColumnsAtom,
@@ -22,6 +25,7 @@ import {
   toggleOutlineGroupCollapsedAtom,
   ungroupOutlineRangeAtom,
   ungroupSelectionAtom,
+  VIEWPORT_HIDDEN_REPLAY_KEY,
   viewportHiddenAtom,
 } from '../src'
 
@@ -281,6 +285,116 @@ describe('outline collapse ↔ hidden linkage', () => {
     expect(rowGroups(store)).toEqual([])
     await expect(store.setter(runRedoHistoryAtom, historyInput())).resolves.toBe('completed')
     expect(rowGroups(store)).toEqual([{ start: 1, end: 3, collapsed: false }])
+  })
+})
+
+// Counter-example suite. Outline used to reach into the history registry for
+// `VIEWPORT_HIDDEN_REPLAY_KEY` and apply collapse visibility through the hidden
+// module's applier. That lookup is nullable and outline ignored the result, so
+// removing the hidden applier (which the pending hidden-state-to-Rust sink-down
+// will do) would have made collapse undo a SILENT no-op — invisible to every
+// hide/unhide and filter test, because none of them exercise outline.
+//
+// These tests fail against the coupled implementation. Keep them: they are the
+// only thing that distinguishes "outline owns its replay" from "outline is
+// still borrowing the hidden one".
+describe('outline collapse visibility is outline-owned (sink-down rehearsal)', () => {
+  function withHiddenApplierRemoved<T>(run: (calls: () => number) => T): T {
+    const original = getHistoryLocalReplayApplier(VIEWPORT_HIDDEN_REPLAY_KEY)
+    if (original === null) throw new Error('hidden applier must be registered before removal')
+    let calls = 0
+    // Stand-in for the sink-down: the key is still known but the applier no
+    // longer writes anything, exactly like a registration that was deleted.
+    registerHistoryLocalReplayApplier(VIEWPORT_HIDDEN_REPLAY_KEY, () => {
+      calls += 1
+      return false
+    })
+    try {
+      return run(() => calls)
+    } finally {
+      registerHistoryLocalReplayApplier(VIEWPORT_HIDDEN_REPLAY_KEY, original)
+    }
+  }
+
+  test('collapse, expand, undo and redo all work with the hidden applier gone', async () => {
+    await withHiddenApplierRemoved(async (calls) => {
+      const store = createStore()
+      store.setter(addOutlineGroupAtom, { sheetId: 'S', axis: 'row', start: 1, end: 3 })
+
+      // Forward path: previously routed through the hidden applier.
+      store.setter(toggleOutlineGroupCollapsedAtom, { sheetId: 'S', axis: 'row', start: 1, end: 3 })
+      expect(hiddenRows(store)).toEqual([1, 2, 3])
+
+      // Replay path: previously delegated the hidden slice to the hidden applier.
+      await expect(store.setter(runUndoHistoryAtom, historyInput())).resolves.toBe('completed')
+      expect(hiddenRows(store)).toEqual([])
+      expect(rowGroups(store)).toEqual([{ start: 1, end: 3, collapsed: false }])
+
+      await expect(store.setter(runRedoHistoryAtom, historyInput())).resolves.toBe('completed')
+      expect(hiddenRows(store)).toEqual([1, 2, 3])
+      expect(rowGroups(store)).toEqual([{ start: 1, end: 3, collapsed: true }])
+
+      // The decisive assertion: not merely "it still works" but "it never asked
+      // the hidden module to do it".
+      expect(calls()).toBe(0)
+    })
+  })
+
+  test('level-button collapse and its undo work with the hidden applier gone', async () => {
+    await withHiddenApplierRemoved(async (calls) => {
+      const store = createStore()
+      store.setter(addOutlineGroupAtom, { sheetId: 'S', axis: 'row', start: 0, end: 9 })
+      store.setter(addOutlineGroupAtom, { sheetId: 'S', axis: 'row', start: 2, end: 5 })
+
+      store.setter(collapseOutlineToLevelAtom, { sheetId: 'S', axis: 'row', level: 2 })
+      expect(hiddenRows(store)).toEqual([2, 3, 4, 5])
+
+      await expect(store.setter(runUndoHistoryAtom, historyInput())).resolves.toBe('completed')
+      expect(hiddenRows(store)).toEqual([])
+      expect(calls()).toBe(0)
+    })
+  })
+
+  test('column-axis collapse and its undo work with the hidden applier gone', async () => {
+    await withHiddenApplierRemoved(async (calls) => {
+      const store = createStore()
+      store.setter(addOutlineGroupAtom, { sheetId: 'S', axis: 'column', start: 2, end: 4 })
+      store.setter(toggleOutlineGroupCollapsedAtom, {
+        sheetId: 'S',
+        axis: 'column',
+        start: 2,
+        end: 4,
+      })
+      expect(store.getter(viewportHiddenAtom).colsBySheet.S).toEqual([2, 3, 4])
+
+      await expect(store.setter(runUndoHistoryAtom, historyInput())).resolves.toBe('completed')
+      expect(store.getter(viewportHiddenAtom).colsBySheet.S).toEqual([])
+      expect(calls()).toBe(0)
+    })
+  })
+
+  test('outline replay still refuses a malformed hidden slice instead of writing it', async () => {
+    // Parity guard for the validation the hidden applier used to perform on
+    // outline's behalf: a non-index hidden payload must leave the hidden set
+    // untouched while the outline metadata still replays.
+    const applier = getHistoryLocalReplayApplier(OUTLINE_REPLAY_KEY)
+    expect(applier).not.toBeNull()
+    const store = createStore()
+    store.setter(hideRowsAtom, { sheetId: 'S', indices: [4] })
+    const applied = applier?.(
+      store.getter,
+      store.setter,
+      {
+        applyKey: OUTLINE_REPLAY_KEY,
+        sheetId: 'S',
+        before: { rows: [], hidden: { rows: ['nope'] } },
+        after: { rows: [{ start: 1, end: 3, collapsed: true }], hidden: { rows: ['nope'] } },
+      },
+      'redo',
+    )
+    expect(applied).toBe(true)
+    expect(rowGroups(store)).toEqual([{ start: 1, end: 3, collapsed: true }])
+    expect(hiddenRows(store)).toEqual([4])
   })
 })
 

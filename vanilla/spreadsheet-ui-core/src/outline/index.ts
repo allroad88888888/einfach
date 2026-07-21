@@ -1,16 +1,15 @@
 import { atom, type Atom, type Getter, type Setter } from '@einfach/core'
 import type { BackendStructuralShift } from '../backend/types'
 import {
-  getHistoryLocalReplayApplier,
   nextHistoryTransactionId,
   pushHistoryAtom,
   registerHistoryLocalReplayApplier,
 } from '../history'
 import { selectionRegionsAtom, selectionSnapshotAtom } from '../selection'
 import {
+  applyViewportHiddenReplaySnapshot,
   getHiddenColumnsForSheet,
   getHiddenRowsForSheet,
-  VIEWPORT_HIDDEN_REPLAY_KEY,
   viewportHiddenAtom,
   type ViewportHiddenReplaySnapshot,
 } from '../viewport/hidden'
@@ -31,10 +30,22 @@ export * from './types'
 
 // Outline (grouping / collapse) is UI-core canonical (#07, CANONICAL_OWNERSHIP
 // §7-2): group metadata never participates in evaluation, so the per-sheet
-// group lists below are the source of truth. Collapse visibility reuses the
-// hidden rows/columns canonical sets — collapsing replays a hide transition
-// through the hidden module's registered local-replay applier, expanding
-// replays the inverse — so the grid needs no second visibility source.
+// group lists below are the source of truth. Collapse visibility writes the
+// hidden rows/columns canonical sets — collapsing hides the newly covered
+// indices, expanding unhides them — so the grid needs no second visibility
+// source.
+//
+// Outline shares that STATE with viewport/hidden but owns its own history
+// path: the `OUTLINE_REPLAY_KEY` applier at the bottom of this file replays
+// both the group list and the hidden slice itself, calling the hidden
+// module's exported `applyViewportHiddenReplaySnapshot` write primitive.
+// It deliberately does NOT reach into the applier registry for
+// `VIEWPORT_HIDDEN_REPLAY_KEY`. That lookup is nullable and its result was
+// ignored, so once the hidden canonical set sinks into the engine and that
+// registration goes away, collapse undo would have become a SILENT no-op —
+// a failure no hide/unhide or filter test can observe, because none of them
+// exercise outline. A static import instead makes that removal a compile
+// error here. See test/outline.test.ts "sink-down rehearsal".
 //
 // TODO(outline persistence): no backend persistence port is defined yet. When
 // a host wants durable outlines, add optional `readOutlineProjection` /
@@ -64,9 +75,8 @@ export interface OutlineReplaySnapshot {
   readonly cols?: readonly OutlineGroup[]
   /**
    * Present only when the recorded transition also moved the hidden
-   * canonical sets (collapse / expand). Replayed by delegating to the
-   * hidden module's registered applier, so one user gesture stays one
-   * history entry.
+   * canonical sets (collapse / expand). Replayed by the outline applier
+   * itself, so one user gesture stays one history entry.
    */
   readonly hidden?: ViewportHiddenReplaySnapshot
 }
@@ -256,12 +266,14 @@ function hiddenSnapshotForAxis(
 }
 
 /**
- * Applies a hidden transition by delegating to the hidden module's
- * registered local-replay applier: the exact machinery outline undo/redo
- * uses, so the original command and its replay share one code path (and
- * the optional persistence mirror fires in both).
+ * Applies a collapse/expand visibility transition. Outline owns this call:
+ * it writes the hidden canonical set through the hidden module's exported
+ * write primitive rather than through that module's registered history
+ * applier, so the two features share STATE but not a history code path.
+ * The command and its replay below both funnel through here, so the
+ * optional persistence mirror fires identically in either direction.
  */
-function applyHiddenTransition(
+function applyOutlineHiddenTransition(
   get: Getter,
   set: Setter,
   sheetId: string,
@@ -269,18 +281,11 @@ function applyHiddenTransition(
   transition: OutlineHiddenTransition,
   source: unknown,
 ): void {
-  const applier = getHistoryLocalReplayApplier(VIEWPORT_HIDDEN_REPLAY_KEY)
-  if (applier === null) return
-  applier(
+  applyViewportHiddenReplaySnapshot(
     get,
     set,
-    {
-      applyKey: VIEWPORT_HIDDEN_REPLAY_KEY,
-      sheetId,
-      before: hiddenSnapshotForAxis(axis, transition.before),
-      after: hiddenSnapshotForAxis(axis, transition.after),
-    },
-    'redo',
+    sheetId,
+    hiddenSnapshotForAxis(axis, transition.after),
     source,
   )
 }
@@ -335,7 +340,7 @@ function commitOutlineTransition(
 
   writeSheetOutline(set, get(outlineBackingAtom), sheetId, axis, groupsAfter)
   if (transition !== null) {
-    applyHiddenTransition(get, set, sheetId, axis, transition, source)
+    applyOutlineHiddenTransition(get, set, sheetId, axis, transition, source)
   }
   pushOutlineHistoryEntry(
     set,
@@ -634,23 +639,18 @@ registerHistoryLocalReplayApplier(
       writeSheetOutline(set, get(outlineBackingAtom), sheetId, 'column', target.cols)
     }
 
-    // Collapse/expand entries carry the exact hidden transition; delegate
-    // it to the hidden module's applier so both facts replay atomically
-    // within this single history entry.
+    // Collapse/expand entries carry the exact hidden transition; outline
+    // writes it itself so both facts replay atomically within this single
+    // history entry. Both sides must be present — a half-recorded
+    // transition is not replayable in either direction.
     const hiddenBefore = replayHiddenPayload(payload.before)
     const hiddenAfter = replayHiddenPayload(payload.after)
     if (hiddenBefore !== null && hiddenAfter !== null) {
-      const applier = getHistoryLocalReplayApplier(VIEWPORT_HIDDEN_REPLAY_KEY)
-      applier?.(
+      applyViewportHiddenReplaySnapshot(
         get,
         set,
-        {
-          applyKey: VIEWPORT_HIDDEN_REPLAY_KEY,
-          sheetId,
-          before: hiddenBefore,
-          after: hiddenAfter,
-        },
-        direction,
+        sheetId,
+        direction === 'undo' ? hiddenBefore : hiddenAfter,
         source,
       )
     }

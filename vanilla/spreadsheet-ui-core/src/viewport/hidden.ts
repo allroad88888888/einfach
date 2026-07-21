@@ -553,23 +553,55 @@ function snapshotHiddenReplayTarget(value: unknown): ViewportHiddenReplaySnapsho
   }
 }
 
+/**
+ * Writes one absolute per-sheet hidden snapshot: validates the payload,
+ * claims the sheet against a late hydration seed, replaces the canonical
+ * set, and mirrors the resulting per-axis delta into the optional
+ * persistence hook. Absent axes keep their current indices. Returns false
+ * (writing nothing) when the sheet id or the payload is unusable.
+ *
+ * Records NO history entry — the CALLER owns the entry that replays this.
+ *
+ * This is the hidden module's write primitive for features that hide rows
+ * or columns as a side effect of their own single-entry gesture, and it is
+ * deliberately a plain exported function rather than a registry lookup:
+ * `outline` (collapse/expand) needs the seeded + persist invariants above
+ * and must not be able to obtain them by chance. When the hidden canonical
+ * set sinks into the engine, deleting this function must be a COMPILE
+ * error at every call site — a nullable applier lookup would instead have
+ * degraded those callers to a silent no-op.
+ */
+export function applyViewportHiddenReplaySnapshot(
+  get: Getter,
+  set: Setter,
+  sheetId: string,
+  value: unknown,
+  source?: unknown,
+): boolean {
+  if (!sheetId) return false
+  const target = snapshotHiddenReplayTarget(value)
+  if (target === null) return false
+
+  markViewportHiddenSeeded(get, set, sheetId)
+  const state = get(viewportHiddenBackingAtom)
+  const prevRows = state.rowsBySheet[sheetId] ?? []
+  const prevCols = state.colsBySheet[sheetId] ?? []
+  const nextRows = target.rows ?? prevRows
+  const nextCols = target.cols ?? prevCols
+  writeSheetHidden(set, state, sheetId, nextRows, nextCols)
+  persistHiddenAxisDelta(set, source, sheetId, 'row', prevRows, nextRows)
+  persistHiddenAxisDelta(set, source, sheetId, 'column', prevCols, nextCols)
+  return true
+}
+
 registerHistoryLocalReplayApplier(
   VIEWPORT_HIDDEN_REPLAY_KEY,
-  (get, set, payload, direction, source) => {
-    const sheetId = typeof payload.sheetId === 'string' ? payload.sheetId : ''
-    if (!sheetId) return false
-    const target = snapshotHiddenReplayTarget(direction === 'undo' ? payload.before : payload.after)
-    if (target === null) return false
-
-    markViewportHiddenSeeded(get, set, sheetId)
-    const state = get(viewportHiddenBackingAtom)
-    const prevRows = state.rowsBySheet[sheetId] ?? []
-    const prevCols = state.colsBySheet[sheetId] ?? []
-    const nextRows = target.rows ?? prevRows
-    const nextCols = target.cols ?? prevCols
-    writeSheetHidden(set, state, sheetId, nextRows, nextCols)
-    persistHiddenAxisDelta(set, source, sheetId, 'row', prevRows, nextRows)
-    persistHiddenAxisDelta(set, source, sheetId, 'column', prevCols, nextCols)
-    return true
-  },
+  (get, set, payload, direction, source) =>
+    applyViewportHiddenReplaySnapshot(
+      get,
+      set,
+      typeof payload.sheetId === 'string' ? payload.sheetId : '',
+      direction === 'undo' ? payload.before : payload.after,
+      source,
+    ),
 )
