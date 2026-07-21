@@ -15,9 +15,9 @@
 
 import { describe, expect, it } from '@jest/globals'
 
-import { buildFilterSortDisplayRows } from '@einfach/spreadsheet-ui-core'
 import type { FilterSortState } from '@einfach/spreadsheet-ui-core'
 import { filterHiddenRowsFromDisplayRows } from '../src-vnext/adapter/filter-hidden-rows'
+import { buildFilterSortDisplayRows } from '../src-vnext/adapter/filter-predicate'
 
 describe('filterHiddenRowsFromDisplayRows', () => {
   it('reports the scanned rows the permutation does not display', () => {

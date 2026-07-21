@@ -1174,8 +1174,11 @@ runFilterSortMutationAtom.debugLabel = 'spreadsheet.filterSort.runMutation'
 // second computer and no second writer of filter visibility.
 //
 // The rejected alternative was a UI-core-local recompute (read the column back
-// through a projection and evaluate `filterRuleMatchesValue` here). Three
-// things are wrong with it, in descending order of severity:
+// through a projection and evaluate the rule predicate here). UI-core no longer
+// even has a predicate to call: it was moved out to the adapter layer
+// (`src-vnext/adapter/filter-predicate.ts`) by the hidden-row sink-down (slice
+// E4), leaving UI-core with only the `ColumnFilterRule` wire type. Three things
+// are wrong with the alternative, in descending order of severity:
 //   1. It would be a SECOND predicate evaluator. Apply and Reapply could then
 //      disagree on the same rules over the same data — worse than no Reapply,
 //      because the divergence is silent and rule-shape dependent.

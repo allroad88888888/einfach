@@ -86,7 +86,6 @@ import type {
   VisibleProjectionResult,
 } from '@einfach/spreadsheet-ui-core'
 import {
-  buildFilterSortDisplayRows,
   cloneCell,
   cloneConditionalFormatRule,
   cloneConditionalFormatRuleEntry,
@@ -148,6 +147,7 @@ import {
   pasteSourceCoord,
 } from './paste-range-plan'
 import { filterHiddenRowsFromDisplayRows, filterTsvBandRows } from './filter-hidden-rows'
+import { buildFilterSortDisplayRows } from './filter-predicate'
 
 export interface WorkerWorkbookBackendSheetInput {
   id?: string

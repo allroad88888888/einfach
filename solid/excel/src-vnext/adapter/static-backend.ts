@@ -127,9 +127,9 @@ import {
   validationSeverityForMode,
   type RangeFormatLayer,
   getEffectiveFormat,
-  buildFilterSortDisplayRows as buildFilterSortDisplayRowsShared,
   ENGINE_BUILTIN_FORMULA_NAMES,
 } from '@einfach/spreadsheet-ui-core'
+import { buildFilterSortDisplayRows as buildFilterSortDisplayRowsShared } from './filter-predicate'
 import type {
   StaticProjectionRequest,
   StaticProjectionResult,
