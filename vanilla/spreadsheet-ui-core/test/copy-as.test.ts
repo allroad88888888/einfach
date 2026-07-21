@@ -675,3 +675,178 @@ describe('copy-as / decoration hints', () => {
     expect(html).toContain('<tr style="height: 24px">')
   })
 })
+
+// ---------------------------------------------------------------------------
+// §8.2 — copy skips FILTER-hidden rows
+//
+// See solid/excel/docs/online-excel-parity/design-filter-hidden-rows.md §8.2.
+// Every test below first drives the UNGUARDED path (no `hiddenRows`) and
+// asserts the WRONG output the encoders produce once filter-hidden rows sit
+// inside the rect, then shows the guard removing it. Without the first half
+// these would be tautologies.
+// ---------------------------------------------------------------------------
+
+describe('copy-as / filter-hidden rows (§8.2)', () => {
+  // Rows 1 and 2 are filter-hidden: they keep their indices inside the rect
+  // (what S5 makes true) but contribute no cells to the sparse projection.
+  const filteredRect = rect(0, 0, 3, 1)
+  const filteredCells = [
+    cell(0, 0, 'keep-0a'),
+    cell(0, 1, 'keep-0b'),
+    cell(3, 0, 'keep-3a'),
+    cell(3, 1, 'keep-3b'),
+  ]
+  const hiddenRows = [1, 2]
+
+  test('COUNTER-EXAMPLE: unguarded plain text emits a blank line per hidden row', () => {
+    const bad = encodeSelectionAsPlainText({ rect: filteredRect, cells: filteredCells })
+    // Two phantom all-empty lines the user never selected any content for.
+    expect(bad).toBe('keep-0a\tkeep-0b\n\t\n\t\nkeep-3a\tkeep-3b')
+    expect(bad.split('\n')).toHaveLength(4)
+  })
+
+  test('guarded plain text emits only the visible rows', () => {
+    const good = encodeSelectionAsPlainText({
+      rect: filteredRect,
+      cells: filteredCells,
+      hiddenRows,
+    })
+    expect(good).toBe('keep-0a\tkeep-0b\nkeep-3a\tkeep-3b')
+    expect(good.split('\n')).toHaveLength(2)
+  })
+
+  test('COUNTER-EXAMPLE: unguarded markdown emits blank body rows', () => {
+    const bad = encodeSelectionAsMarkdown({ rect: filteredRect, cells: filteredCells })
+    expect(bad.split('\n')).toEqual([
+      '| keep-0a | keep-0b |',
+      '| --- | --- |',
+      '|  |  |',
+      '|  |  |',
+      '| keep-3a | keep-3b |',
+    ])
+  })
+
+  test('guarded markdown drops the hidden rows and keeps the separator', () => {
+    const good = encodeSelectionAsMarkdown({
+      rect: filteredRect,
+      cells: filteredCells,
+      hiddenRows,
+    })
+    expect(good.split('\n')).toEqual([
+      '| keep-0a | keep-0b |',
+      '| --- | --- |',
+      '| keep-3a | keep-3b |',
+    ])
+  })
+
+  test('markdown promotes the first VISIBLE row to header when the top row is hidden', () => {
+    const good = encodeSelectionAsMarkdown({
+      rect: filteredRect,
+      cells: filteredCells,
+      hiddenRows: [0, 1, 2],
+    })
+    // Header must be real content, never a blank line for the hidden row 0.
+    expect(good.split('\n')).toEqual(['| keep-3a | keep-3b |', '| --- | --- |'])
+  })
+
+  test('markdown of an entirely filter-hidden selection copies nothing', () => {
+    expect(
+      encodeSelectionAsMarkdown({
+        rect: filteredRect,
+        cells: filteredCells,
+        hiddenRows: [0, 1, 2, 3],
+      }),
+    ).toBe('')
+  })
+
+  test('COUNTER-EXAMPLE: unguarded html emits an empty <tr> per hidden row', () => {
+    const bad = encodeSelectionAsHtml({ rect: filteredRect, cells: filteredCells })
+    expect(bad.match(/<tr[ >]/g)).toHaveLength(4)
+  })
+
+  test('guarded html emits no <tr> for hidden rows', () => {
+    const good = encodeSelectionAsHtml({
+      rect: filteredRect,
+      cells: filteredCells,
+      hiddenRows,
+    })
+    expect(good.match(/<tr[ >]/g)).toHaveLength(2)
+    expect(good).toContain('keep-0a')
+    expect(good).toContain('keep-3b')
+  })
+
+  test('COUNTER-EXAMPLE: an unguarded rowspan over a hidden row overruns the table', () => {
+    // A 3-row merge anchored at row 0; row 1 is filter-hidden.
+    const merged = [cell(0, 0, 'merged', { mergedSpan: { rows: 3, cols: 1 } }), cell(0, 1, 'x')]
+    const bad = encodeSelectionAsHtml({ rect: rect(0, 0, 2, 1), cells: merged })
+    expect(bad).toContain('rowspan="3"')
+    // With row 1 dropped the table would only have 2 <tr>, so rowspan="3"
+    // is structurally invalid — that is the bug the guard has to prevent.
+    expect(bad.match(/<tr[ >]/g)).toHaveLength(3)
+  })
+
+  test('guarded html re-clips rowspan to the VISIBLE rows of the merge', () => {
+    const merged = [cell(0, 0, 'merged', { mergedSpan: { rows: 3, cols: 1 } }), cell(0, 1, 'x')]
+    const good = encodeSelectionAsHtml({
+      rect: rect(0, 0, 2, 1),
+      cells: merged,
+      hiddenRows: [1],
+    })
+    expect(good).toContain('rowspan="2"')
+    expect(good).not.toContain('rowspan="3"')
+    expect(good.match(/<tr[ >]/g)).toHaveLength(2)
+  })
+
+  test('a merge whose every in-rect row is hidden disappears entirely', () => {
+    const merged = [cell(1, 0, 'gone', { mergedSpan: { rows: 2, cols: 1 } }), cell(0, 0, 'stay')]
+    const good = encodeSelectionAsHtml({
+      rect: rect(0, 0, 2, 0),
+      cells: merged,
+      hiddenRows: [1, 2],
+    })
+    expect(good).not.toContain('gone')
+    expect(good).not.toContain('rowspan')
+    expect(good.match(/<tr[ >]/g)).toHaveLength(1)
+  })
+
+  test('MANUALLY hidden rows are NOT skipped — the caller must pass filter rows only', () => {
+    // Pinning the asymmetry from §2/§8.2: this encoder has no notion of
+    // "manually hidden". Omitting a row from `hiddenRows` copies it, which
+    // is exactly what Excel does for Format > Hide Rows.
+    const withManualHiddenRowStillCopied = encodeSelectionAsPlainText({
+      rect: filteredRect,
+      cells: [...filteredCells, cell(2, 0, 'manually-hidden')],
+      hiddenRows: [1],
+    })
+    expect(withManualHiddenRowStillCopied).toContain('manually-hidden')
+  })
+
+  test('an empty / omitted hidden set is byte-identical to the pre-hardening output', () => {
+    const base = { rect: filteredRect, cells: filteredCells }
+    expect(encodeSelectionAsPlainText({ ...base, hiddenRows: [] })).toBe(
+      encodeSelectionAsPlainText(base),
+    )
+    expect(encodeSelectionAsMarkdown({ ...base, hiddenRows: new Set<number>() })).toBe(
+      encodeSelectionAsMarkdown(base),
+    )
+    expect(encodeSelectionAsHtml({ ...base, hiddenRows: [] })).toBe(encodeSelectionAsHtml(base))
+  })
+
+  test('hidden rows outside the rect are inert', () => {
+    const base = { rect: filteredRect, cells: filteredCells }
+    expect(encodeSelectionAsPlainText({ ...base, hiddenRows: [9, 10] })).toBe(
+      encodeSelectionAsPlainText(base),
+    )
+  })
+
+  test('encodeSelectionForClipboard threads the hidden set into all three flavours', () => {
+    const encoded = encodeSelectionForClipboard({
+      rect: filteredRect,
+      cells: filteredCells,
+      hiddenRows,
+    })
+    expect(encoded.plainText.split('\n')).toHaveLength(2)
+    expect(encoded.markdown.split('\n')).toHaveLength(3)
+    expect(encoded.html.match(/<tr[ >]/g)).toHaveLength(2)
+  })
+})

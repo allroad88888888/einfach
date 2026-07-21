@@ -8,6 +8,7 @@ import type {
 import { historyStackAtom } from '../src/history'
 import { setFreezeConfigAtom, viewportFreezeAtom } from '../src/viewport/freeze'
 import { hideRowsAtom, viewportHiddenAtom } from '../src/viewport/hidden'
+import { setViewportFilterHiddenRowsAtom } from '../src/viewport/effective-hidden'
 import {
   createAddSheetOperation,
   createDeleteColumnsOperation,
@@ -21,7 +22,9 @@ import {
   getOperationCellRange,
   isSheetMutationOperation,
   nextStructureOperationRequestId,
+  planFilterVisibleRowDeletions,
   resetStructureOperationLifecycleAtom,
+  runFilterVisibleRowDeleteAtom,
   retryStructureOperationRefreshAtom,
   runStructureOperationAtom,
   structureOperationCanRetryRefreshAtom,
@@ -623,5 +626,279 @@ describe('structural shift → local view facts + history side payloads', () => 
     expect(store.getter(viewportHiddenAtom).rowsBySheet['sheet-1']).toEqual([3])
     const entries = store.getter(historyStackAtom).entries
     expect(entries[entries.length - 1]?.localSidePayloads).toBeUndefined()
+  })
+})
+
+// ---------------------------------------------------------------------------
+// §8.3 — deleting a row span skips FILTER-hidden rows
+//
+// See solid/excel/docs/online-excel-parity/design-filter-hidden-rows.md §8.3.
+// Excel deletes only the visible rows of a selection spanning a filtered
+// region; manually hidden rows inside the span are deleted normally. The
+// COUNTER-EXAMPLE tests drive the unguarded single-span delete and assert the
+// data loss it causes before showing the planner removing it.
+// ---------------------------------------------------------------------------
+
+describe('operations / delete rows over a filtered region (§8.3)', () => {
+  function deleteRowsHarness() {
+    const requests: StructureOperationRequest[] = []
+    let revision = 100
+    const source: StructureOperationControllerPort = {
+      async deleteRows(request) {
+        requests.push(request as StructureOperationRequest)
+        return {
+          sheetId: request.sheetId,
+          requestId: request.requestId,
+          revision: ++revision,
+        } satisfies BackendMutationResult
+      },
+    }
+    const refreshedSheets: string[] = []
+    const refreshProjection = async (sheetId: string) => {
+      refreshedSheets.push(sheetId)
+    }
+    return { requests, source, refreshProjection, refreshedSheets }
+  }
+
+  test('COUNTER-EXAMPLE: the unguarded single-span delete destroys filtered-out rows', async () => {
+    // User sees rows 2 and 6 and drags across them. Rows 3, 4, 5 are
+    // filter-hidden and hold data the user cannot see.
+    const store = createStore()
+    const { requests, source, refreshProjection } = deleteRowsHarness()
+
+    await expect(
+      store.setter(runStructureOperationAtom, {
+        intent: createDeleteRowsOperation({ sheetId: 'sheet-1', rowIndex: 2, count: 5 }),
+        source,
+        refreshProjection,
+      }),
+    ).resolves.toBe('completed')
+
+    // One span covering 2..6 — the three invisible rows go with it.
+    expect(requests).toHaveLength(1)
+    expect(requests[0]).toMatchObject({ kind: 'delete-rows', rowIndex: 2, count: 5 })
+  })
+
+  test('the guarded command deletes only the visible rows, highest run first', async () => {
+    const store = createStore()
+    const { requests, source, refreshProjection } = deleteRowsHarness()
+    store.setter(setViewportFilterHiddenRowsAtom, { sheetId: 'sheet-1', rows: [3, 4, 5] })
+
+    await expect(
+      store.setter(runFilterVisibleRowDeleteAtom, {
+        sheetId: 'sheet-1',
+        rowIndex: 2,
+        count: 5,
+        source,
+        refreshProjection,
+      }),
+    ).resolves.toBe('completed')
+
+    // Rows 3, 4, 5 survive; 6 is deleted before 2 so 2 keeps its index.
+    expect(
+      requests.map((request) => ({
+        rowIndex: (request as { rowIndex: number }).rowIndex,
+        count: (request as { count: number }).count,
+      })),
+    ).toEqual([
+      { rowIndex: 6, count: 1 },
+      { rowIndex: 2, count: 1 },
+    ])
+  })
+
+  test('planner returns the span verbatim when nothing is filter-hidden', () => {
+    expect(planFilterVisibleRowDeletions({ rowIndex: 4, count: 3 })).toEqual([
+      { rowIndex: 4, count: 3 },
+    ])
+    expect(
+      planFilterVisibleRowDeletions({ rowIndex: 4, count: 3, filterHiddenRows: [] }),
+    ).toEqual([{ rowIndex: 4, count: 3 }])
+    expect(
+      planFilterVisibleRowDeletions({ rowIndex: 4, count: 3, filterHiddenRows: [99] }),
+    ).toEqual([{ rowIndex: 4, count: 3 }])
+  })
+
+  test('planner coalesces adjacent visible rows into maximal runs, descending', () => {
+    // Span 0..9, hidden {2,3,7}. Visible runs ascending: 0-1, 4-6, 8-9.
+    expect(
+      planFilterVisibleRowDeletions({ rowIndex: 0, count: 10, filterHiddenRows: [2, 3, 7] }),
+    ).toEqual([
+      { rowIndex: 8, count: 2 },
+      { rowIndex: 4, count: 3 },
+      { rowIndex: 0, count: 2 },
+    ])
+  })
+
+  test('planner descending order is what keeps later runs addressable', () => {
+    const runs = planFilterVisibleRowDeletions({
+      rowIndex: 0,
+      count: 10,
+      filterHiddenRows: [2, 3, 7],
+    })
+    for (let i = 1; i < runs.length; i += 1) {
+      expect(runs[i].rowIndex + runs[i].count).toBeLessThanOrEqual(runs[i - 1].rowIndex)
+    }
+  })
+
+  test('planner handles hidden rows at both edges of the span', () => {
+    expect(
+      planFilterVisibleRowDeletions({ rowIndex: 5, count: 4, filterHiddenRows: [5, 8] }),
+    ).toEqual([{ rowIndex: 6, count: 2 }])
+  })
+
+  test('planner returns nothing when every row in the span is filter-hidden', () => {
+    expect(
+      planFilterVisibleRowDeletions({ rowIndex: 2, count: 3, filterHiddenRows: [2, 3, 4] }),
+    ).toEqual([])
+  })
+
+  test('planner rejects malformed spans instead of guessing', () => {
+    expect(planFilterVisibleRowDeletions({ rowIndex: 0, count: 0 })).toEqual([])
+    expect(planFilterVisibleRowDeletions({ rowIndex: -1, count: 2 })).toEqual([])
+    expect(planFilterVisibleRowDeletions({ rowIndex: 1.5, count: 2 })).toEqual([])
+    expect(planFilterVisibleRowDeletions({ rowIndex: 0, count: 2.5 })).toEqual([])
+  })
+
+  test('an entirely filter-hidden selection launches ZERO transport', async () => {
+    const store = createStore()
+    const { requests, source, refreshProjection } = deleteRowsHarness()
+    store.setter(setViewportFilterHiddenRowsAtom, { sheetId: 'sheet-1', rows: [2, 3, 4] })
+
+    await expect(
+      store.setter(runFilterVisibleRowDeleteAtom, {
+        sheetId: 'sheet-1',
+        rowIndex: 2,
+        count: 3,
+        source,
+        refreshProjection,
+      }),
+    ).resolves.toBe('no-visible-rows')
+    // The one thing that must never happen: falling back to the raw span.
+    expect(requests).toEqual([])
+  })
+
+  test('MANUALLY hidden rows are deleted along with the visible ones', async () => {
+    // Excel parity pin (§8.3 / §8.1 adjudication 2): only the FILTER set is
+    // subtracted. `hideRowsAtom` must not shrink the deletion.
+    const store = createStore()
+    const { requests, source, refreshProjection } = deleteRowsHarness()
+    store.setter(hideRowsAtom, { sheetId: 'sheet-1', rows: [3, 4] })
+
+    await expect(
+      store.setter(runFilterVisibleRowDeleteAtom, {
+        sheetId: 'sheet-1',
+        rowIndex: 2,
+        count: 5,
+        source,
+        refreshProjection,
+      }),
+    ).resolves.toBe('completed')
+
+    expect(requests).toHaveLength(1)
+    expect(requests[0]).toMatchObject({ rowIndex: 2, count: 5 })
+  })
+
+  test('with no filter the guarded command is identical to the raw structure op', async () => {
+    const store = createStore()
+    const { requests, source, refreshProjection, refreshedSheets } = deleteRowsHarness()
+
+    await expect(
+      store.setter(runFilterVisibleRowDeleteAtom, {
+        sheetId: 'sheet-1',
+        rowIndex: 4,
+        count: 2,
+        operationSource: 'selection',
+        source,
+        refreshProjection,
+      }),
+    ).resolves.toBe('completed')
+
+    expect(requests).toHaveLength(1)
+    expect(requests[0]).toMatchObject({ kind: 'delete-rows', rowIndex: 4, count: 2 })
+    expect(refreshedSheets).toEqual(['sheet-1'])
+    expect(store.getter(structureOperationLifecycleAtom).status).toBe('completed')
+  })
+
+  test('each run is its own history entry so undo unwinds them one at a time', async () => {
+    const store = createStore()
+    const { source, refreshProjection } = deleteRowsHarness()
+    store.setter(setViewportFilterHiddenRowsAtom, { sheetId: 'sheet-1', rows: [3] })
+
+    await expect(
+      store.setter(runFilterVisibleRowDeleteAtom, {
+        sheetId: 'sheet-1',
+        rowIndex: 2,
+        count: 3,
+        source,
+        refreshProjection,
+      }),
+    ).resolves.toBe('completed')
+
+    const entries = store.getter(historyStackAtom).entries
+    expect(entries.filter((entry) => entry.kind === 'row.delete')).toHaveLength(2)
+  })
+
+  test('a failing run stops the sequence and surfaces that run outcome', async () => {
+    const store = createStore()
+    const requests: StructureOperationRequest[] = []
+    const source: StructureOperationControllerPort = {
+      async deleteRows(request) {
+        requests.push(request as StructureOperationRequest)
+        // First (highest) run succeeds, the next one never acknowledges.
+        if (requests.length === 1) {
+          return {
+            sheetId: request.sheetId,
+            requestId: request.requestId,
+            revision: 7,
+          } satisfies BackendMutationResult
+        }
+        throw new Error('backend exploded')
+      },
+    }
+    store.setter(setViewportFilterHiddenRowsAtom, { sheetId: 'sheet-1', rows: [3] })
+
+    await expect(
+      store.setter(runFilterVisibleRowDeleteAtom, {
+        sheetId: 'sheet-1',
+        rowIndex: 2,
+        count: 3,
+        source,
+        refreshProjection: async () => {},
+      }),
+    ).resolves.toBe('outcome-unknown')
+    expect(requests).toHaveLength(2)
+  })
+
+  test('rejects a missing sheet id without touching the backend', async () => {
+    const store = createStore()
+    const { requests, source, refreshProjection } = deleteRowsHarness()
+    await expect(
+      store.setter(runFilterVisibleRowDeleteAtom, {
+        sheetId: '',
+        rowIndex: 0,
+        count: 1,
+        source,
+        refreshProjection,
+      }),
+    ).resolves.toBe('rejected')
+    expect(requests).toEqual([])
+  })
+
+  test('filter-hidden sets are per sheet', async () => {
+    const store = createStore()
+    const { requests, source, refreshProjection } = deleteRowsHarness()
+    store.setter(setViewportFilterHiddenRowsAtom, { sheetId: 'sheet-2', rows: [3] })
+
+    await expect(
+      store.setter(runFilterVisibleRowDeleteAtom, {
+        sheetId: 'sheet-1',
+        rowIndex: 2,
+        count: 3,
+        source,
+        refreshProjection,
+      }),
+    ).resolves.toBe('completed')
+    expect(requests).toHaveLength(1)
+    expect(requests[0]).toMatchObject({ rowIndex: 2, count: 3 })
   })
 })

@@ -7,11 +7,11 @@ import {
   copyClipboardAtom,
   createClipboardTsvPastePlan,
   createDeleteColumnsOperation,
-  createDeleteRowsOperation,
   createInsertColumnsOperation,
   createInsertRowsOperation,
   cutClipboardAtom,
   dispatchMenuCommandAtom,
+  getFilterHiddenRowsForSheet,
   markClipboardReadyAtom,
   menuIntentAtom,
   menuStateAtom,
@@ -25,10 +25,12 @@ import {
   resolveContentMutationAtom,
   resolveProjectionAtom,
   runViewportHiddenContextMenuCommandAtom,
+  runFilterVisibleRowDeleteAtom,
   runStructureOperationAtom,
   serializeClipboardTsv,
   setClipboardErrorAtom,
   setFreezeConfigAtom,
+  viewportFilterHiddenAtom,
   viewportFreezeAtom,
   viewportHiddenContextMenuCommandAvailabilityAtom,
   type CellCoord,
@@ -214,14 +216,38 @@ function dataRangeFromOrigin(origin: CellCoord, rowCount: number, colCount: numb
   }
 }
 
-function resultToClipboardText(result: RangeProjectionResult, range: CellRange): ClipboardTextData {
+/**
+ * Materialise a range projection as the dense TSV grid `Ctrl+C` writes.
+ *
+ * `hiddenRows` carries the sheet's FILTER-hidden rows and those rows emit no
+ * line at all — Excel copies a filtered region as visible cells only. It is
+ * deliberately NOT the manual ∪ filter union: manually hidden rows are
+ * copied like any other row unless the user goes through
+ * `Go To Special → Visible cells only`, which this codebase does not
+ * implement. See §8.2 of
+ * `solid/excel/docs/online-excel-parity/design-filter-hidden-rows.md`.
+ *
+ * The walk below is dense over `[rowStart..rowEnd]` while the projection is
+ * sparse. Today a filtered-out row has no display slot and never lands in
+ * the range, so the set is always empty and this is an identity; after the
+ * S5 flip the row keeps its index, contributes no cells, and would otherwise
+ * be copied as a run of empty fields.
+ */
+function resultToClipboardText(
+  result: RangeProjectionResult,
+  range: CellRange,
+  hiddenRows: ReadonlySet<number>,
+): ClipboardTextData {
   const cellsByKey = new Map<string, RangeProjectionResult['cells'][number]>()
   for (const cell of result.cells) {
     cellsByKey.set(`${cell.row}:${cell.col}`, cell)
   }
 
   const cells: string[][] = []
+  let firstEmittedRow = -1
   for (let row = range.rowStart; row <= range.rowEnd; row += 1) {
+    if (hiddenRows.has(row)) continue
+    if (firstEmittedRow === -1) firstEmittedRow = row
     const fields: string[] = []
     for (let col = range.colStart; col <= range.colEnd; col += 1) {
       const cell = cellsByKey.get(`${row}:${col}`)
@@ -231,7 +257,13 @@ function resultToClipboardText(result: RangeProjectionResult, range: CellRange):
   }
 
   return {
-    originAddr: toA1({ row: range.rowStart, col: range.colStart }),
+    // The origin marker anchors relative-formula shifting on paste, so it
+    // must name the row the FIRST emitted line came from. Identical to
+    // `range.rowStart` whenever nothing is filter-hidden.
+    originAddr: toA1({
+      row: firstEmittedRow === -1 ? range.rowStart : firstEmittedRow,
+      col: range.colStart,
+    }),
     cells,
   }
 }
@@ -338,6 +370,16 @@ export function SpreadsheetContextMenu(props: SpreadsheetContextMenuProps) {
     return result
   }
 
+  /**
+   * The sheet's FILTER-hidden rows — never the manual ∪ filter union. Copy
+   * is the asymmetric case: Excel skips filtered-out rows automatically but
+   * copies manually hidden rows normally (§8.2). Always empty until the S5
+   * adapter flip populates `viewportFilterHiddenAtom`.
+   */
+  function filterHiddenRowsFor(sheetId: string): ReadonlySet<number> {
+    return new Set(getFilterHiddenRowsForSheet(store.getter(viewportFilterHiddenAtom), sheetId))
+  }
+
   async function copyRangeToClipboard(
     sheetId: string,
     range: CellRange,
@@ -371,7 +413,7 @@ export function SpreadsheetContextMenu(props: SpreadsheetContextMenuProps) {
       const result = await readClipboardSource(sheetId, range)
       if (!result) return false
 
-      const data = resultToClipboardText(result, range)
+      const data = resultToClipboardText(result, range, filterHiddenRowsFor(sheetId))
       text = serializeClipboardTsv(data)
       transferInput = {
         source: { sheetId, range },
@@ -588,14 +630,20 @@ export function SpreadsheetContextMenu(props: SpreadsheetContextMenuProps) {
         return
       case 'row.delete':
         if (target.kind !== 'row') return
-        await dispatchStructureOperation(
-          createDeleteRowsOperation({
-            sheetId: target.sheetId,
-            rowIndex: target.rowIndex,
-            count: 1,
-            source: 'selection',
-          }),
-        )
+        // Excel deletes only the VISIBLE rows of a selection that spans a
+        // filtered region (§8.3), so the span goes through the planner
+        // rather than straight to `delete-rows`. With no filter active the
+        // planner returns the span verbatim and this is one operation, the
+        // same one this branch always issued.
+        await store.setter(runFilterVisibleRowDeleteAtom, {
+          sheetId: target.sheetId,
+          rowIndex: target.rowIndex,
+          count: 1,
+          operationSource: 'selection',
+          source: backend,
+          refreshProjection: (sheetId) =>
+            refreshVisibleProjection(store, backend, sheetId, 'selection'),
+        })
         return
       case 'column.insert':
         if (target.kind !== 'column') return

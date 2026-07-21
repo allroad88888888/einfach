@@ -3,8 +3,10 @@ import type { DisplayCell } from '../backend/types'
 import type { CopyAsError, CopyAsInput, CopyAsResult, CopyAsTextResult } from './types'
 import { encodeSelectionAsHtml } from './html-encoder'
 import { encodeSelectionAsMarkdown } from './markdown-encoder'
+import { copyAsVisibleRows } from './visible-rows'
 
 export * from './types'
+export { copyAsVisibleRows, normalizeCopyAsHiddenRows } from './visible-rows'
 export { encodeSelectionAsHtml } from './html-encoder'
 export { encodeSelectionAsMarkdown } from './markdown-encoder'
 export { encodeSelectionAsImage, MAX_EXPORT_PIXELS } from './encodeSelectionAsImage'
@@ -91,7 +93,11 @@ export function encodeSelectionAsPlainText(input: CopyAsInput): string {
   const covered = collectMergeCovered(cells)
 
   const rowLines: string[] = []
-  for (let row = rect.startRow; row <= rect.endRow; row += 1) {
+  // Filter-hidden rows produce no TSV line at all — not even a blank one.
+  // Post-S5 they sit inside the rect while contributing no cells, so the
+  // plain `startRow..endRow` walk would emit an empty tab-run per hidden row
+  // and the pasted block would carry gaps Excel never puts there (§8.2).
+  for (const row of copyAsVisibleRows(rect, input.hiddenRows)) {
     const parts: string[] = []
     for (let col = rect.startCol; col <= rect.endCol; col += 1) {
       const key = makeKey(row, col)

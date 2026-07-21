@@ -4,9 +4,11 @@ import {
   encodeSelectionAsImage,
   encodeSelectionAsPlainText,
   encodeSelectionForClipboard,
+  getFilterHiddenRowsForSheet,
   publishCopyAsResultAtom,
   reportCopyAsStatusAtom,
   selectionSnapshotAtom,
+  viewportFilterHiddenAtom,
   type CellRange,
   type CopyAsError,
   type CopyAsResult,
@@ -187,6 +189,12 @@ export async function dispatchCopyAs(
   }
   const range = options.range ?? snap.range
 
+  // Excel copies a filtered region as VISIBLE cells only. Read the filter
+  // subset, never `effectiveHiddenAtom` — manually hidden rows are copied
+  // normally (§8.2). Empty until the S5 flip populates it, so this is an
+  // identity today.
+  const hiddenRows = getFilterHiddenRowsForSheet(store.getter(viewportFilterHiddenAtom), sheetId)
+
   const rows = range.rowEnd - range.rowStart + 1
   const cols = range.colEnd - range.colStart + 1
   const totalCells = rows * cols
@@ -214,6 +222,7 @@ export async function dispatchCopyAs(
         endRow: clipped.rowEnd,
         endCol: clipped.colEnd,
       },
+      hiddenRows,
     })
     try {
       if (typeof navigator !== 'undefined' && navigator.clipboard?.writeText) {
@@ -258,6 +267,7 @@ export async function dispatchCopyAs(
       endRow: range.rowEnd,
       endCol: range.colEnd,
     },
+    hiddenRows,
   })
 
   const tier = await multiTierWrite(encoded)

@@ -108,7 +108,7 @@
 | 粘贴到筛选区        | ✅ 粘贴**连续块写入，含隐藏行**——这是 Excel 著名的数据覆盖陷阱，不是 bug                                                               | ✓         | ✓（不改）       |
 | 填充 / 拖拽         | ✅ 填充柄**写入隐藏单元格**（默认行为，要跳过同样得走 Visible-cells-only）                                                             | ✓         | ✓（不改）       |
 | 排序                | ✅ 可见行之间重排、隐藏行留原位                                                                                                        | ✓         | ✓（已落地）     |
-| 删除行              | ⚠️ Excel 2013+ 在筛选区选中并删除行时**只删可见行**；但"选区跨隐藏行"的判定细节各版本有出入，需实测                                    | 偶然✓     | ✓（§8.3）       |
+| 删除行              | ✅ 筛选激活时选中并删除跨隐藏行的行区间**只删可见行**，被筛行存活；手动隐藏行**照样被删**（§8.3 已查证，出处见该节）                    | 偶然✓     | ✓（§8.3）       |
 | 格式化筛选区        | ⚠️ 疑似只作用于可见单元格，需实测                                                                                                      | 偶然✓     | ⚠️ 待验证       |
 | `AGGREGATE`         | ⚠️ ignore-hidden 走 `options` 位（1/3/5/7）而非 100+ 约定；"是否总是忽略筛选行"资料互相矛盾，需实测                                    | ✗         | **后续**（§11） |
 | `Data → Reapply`    | ✅ 存在（`Ctrl+Alt+L`）。**推论**：Excel 的筛选结果是**快照**，编辑单元格不会即时重算可见性                                            | ✗（实时） | ✓（§4.3）       |
@@ -420,11 +420,39 @@ Excel 语义（§2 已核实）：**筛选**隐藏行复制时自动跳过；**�
 
 **裁决**：复制路径（`clipboard/`，及 `copy-as/`）在展开选区时，从**筛选隐藏集**（不是并集）中剔除行。手动隐藏行**照旧包含**。不匹配 Excel 的 `Go To Special → Visible cells only`（那是另一条显式路径，本次不做）。
 
+> **落地记录（S7 实施者，2026-07-21，与 §8.3 同一提交前置落地）**：`CopyAsInput.hiddenRows` 落在三个编码器（plain / markdown / html）上，宿主 `copy-as-dispatch.ts` 与 `SpreadsheetContextMenu.tsx` 的 `resultToClipboardText` 从 `viewportFilterHiddenAtom` 取值喂进去。今天恒等（筛选集恒空）。三处非平凡的连带语义已实现并 pin 了测试：
+>
+> - markdown 表头取 rect 内**首个可见行**，不是 `rect.startRow`；全隐藏 rect 编码为 `''`。
+> - html `rowspan` 按交集内**可见行数**重新裁剪、锚点下移到首个可见行；整片隐藏的 merge 整体丢弃。不做这一步会产出 `rowspan` 大于实际 `<tr>` 数的坏表格。
+> - TSV origin marker 取**首个实际输出行**，因为它是粘贴时相对引用平移的锚。
+>
+> **仍未覆盖（记入 S7 正式切片）**：`backend.exportRangeTsv` / `consumeExportRangeTsvChunks` 大区间分块复制路径与 `backend.exportRangeAsImage` 图片导出路径都由 adapter 自行产出内容，端口上没有隐藏集入参，S5 之后会把被筛行一并导出。二者需扩端口，不属于本次前置加固范围。
+
 ### 8.3 删除行只删可见行
 
-⚠️ 待验证：Excel 2013+ 在筛选区删除行时只删可见行，但"选区跨隐藏行"的判定细节各版本有出入。
+**裁决（2026-07-21 查证后定稿，暂定裁决维持不变）**：删除行在筛选激活时，把选区展开成"选区 ∖ **筛选**隐藏集"，按**降序**切成若干连续 run 逐个下发。手动隐藏行**照删**（与复制同口径：筛选集，非并集）。
 
-**裁决（暂定）**：`operations/` 的 `removeRows` 在筛选激活时，把选区展开成"选区 ∖ 筛选隐藏集"再下发。与复制同口径（筛选集，非并集）。**S6 落地前先实测 Excel 再定稿**；若实测与暂定不符，改的是这一处的集合，不影响其余设计。
+> **查证结论（S7 实施者，2026-07-21）**：暂定裁决与可查到的最佳证据**一致**，因此照做。但证据强度必须如实记录 —— 详见下表。
+>
+> | 结论                                       | 出处                                                                                                                                                                                                                                                                 | 强度                                                      |
+> | ------------------------------------------ | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | --------------------------------------------------------- |
+> | 筛选激活时删除行**只删可见行**，被筛行存活 | MS Q&A 志愿版主 Vijay A. Verma（[answers/4942719](https://learn.microsoft.com/en-us/answers/questions/4942719/delete-rows-after-filtering)）："You can delete only visible rows not otherwise"；Ashish Mathur（[answers/4840720](https://learn.microsoft.com/en-us/answers/questions/4840720/delete-filtered-rows)）："only the visible cells will get deleted/copied" | 中高（版主 / MVP，非规范文档）                            |
+> | 手动隐藏 ≠ 筛选隐藏，手动隐藏行会被一起写/删 | MS Q&A Andreas Killer（[answers/4987876](https://learn.microsoft.com/en-us/answers/questions/4987876/filter-vs-hidden-how-excel-2016-treats-invisible-c)）给出可复现实验；[wmfexcel 对照表](https://wmfexcel.com/2015/06/13/hidden-rows-vs-filtered-rows/)                | 中高（但实验测的是单元格级操作，结构性删除行未见严格实验） |
+> | 复制筛选区**只复制可见**（§8.2 依据）      | [Contextures / Debra Dalgleish](https://www.contextures.com/excelcopypastefilteredlist.html) 明确区分 "can COPY from visible rows only" 与 "CANNOT PASTE into visible rows only"；Andreas Killer 同上                                                                     | 高                                                        |
+>
+> **三条必须诚实标注的缺口**：
+>
+> 1. **没有任何微软规范文档正面写过删除行的这个行为**。更糟的是，官方 [Copy visible cells only](https://support.microsoft.com/en-us/office/copy-visible-cells-only-6e3a1f01-2884-4332-b262-8b814412847e) 里那句 "By default, Excel copies hidden **or filtered** cells in addition to visible cells" 与上表第三行**直接矛盾**，且不区分 hidden 与 filtered —— 这句话很可能就是全网"删除前必须 Go To Special"那套 cargo cult 的源头。我们采信版主 / Contextures 一侧。
+> 2. **"Excel 2013+"这个版本限定词是原稿臆造的，已从 §2 表格删除**。查不到任何可信来源支持存在版本差异；唯一提出该说法的是 AI 生成的内容农场。反向证据：2010 年代的论坛帖已在描述现行行为。
+> 3. **"选区完全落在隐藏行内"这个边角没有任何来源**（§12 原文点名要查的正是它）。行头点不中零高度的隐藏行，但名称框可以选出这种区间。本实现取**保守默认**：可见集为空 ⇒ **不下发任何删除**（`'no-visible-rows'`），绝不回退到原始区间。**这是未证实的默认选择，不是已验证行为。**
+>
+> 另记两条相邻事实：Excel 在筛选区对某些结构性操作会直接报错 "Can't move cells in a filtered range or table"；粘贴与复制**不对称**（粘贴照写隐藏行），后者与 §8.4 已有裁决一致。
+
+**实现形状**（`operations/`，随 §8.2 一同前置落地）：
+
+- 纯规划函数 `planFilterVisibleRowDeletions({ rowIndex, count, filterHiddenRows })` → `RowDeletionRun[]`，**降序**、run 最大化、空结果表示"零下发"。降序是硬约束：先删高位 run，低位 run 的索引才不需要重映射。
+- 命令 `runFilterVisibleRowDeleteAtom` 读 `viewportFilterHiddenAtom`（筛选子集），逐 run 走既有 `runStructureOperationAtom`，首个非 `completed` 即中止并把该 run 的结局透出。每个 run 各自一条 history 条目，undo 逐条回退。
+- 今天恒等：压缩语义下被筛行没有 display 槽位，筛选集恒空 ⇒ 规划结果恒为原区间单 run ⇒ 与改造前逐字节相同。宿主唯一的 `row.delete` 派发点是行头右键（`count: 1`），菜单栏没有删除行入口。
 
 ### 8.4 明确**不改**的两项
 
@@ -559,7 +587,7 @@ Excel 语义（§2 已核实）：**筛选**隐藏行复制时自动跳过；**�
 | **S4 UI-core 筛选隐藏集** | `filterHiddenAtom` + 命令 + 结构位移 remap + `SetFilterSortResult.hiddenRowIndices` 端口形状 + `reapplyFilterAtom` + `setEvalFilterHiddenRows` 端口；UI 未接线                                                   | `vanilla/spreadsheet-ui-core/src/filter-sort/filter-hidden.ts`（新）、`filter-sort/index.ts`、`backend/types.ts`；`filter-sort/README.md`           | `npx jest vanilla/spreadsheet-ui-core --no-coverage`；adapter 未实现新字段即降级空集，既有 e2e 不受扰       |
 | **S5 adapter 原子翻转**   | **一次性切换**：两 adapter 投影塌回恒等、停发 `originalRow`、`setFilterSort` 回传隐藏集、`evalFilterHiddenRows` 端口实现、bridge 双路、Grid 取并集、解除 merge 抑制                                              | `static-backend.ts`、`worker-workbook-backend.ts`、`projection-helpers.ts`、`eval-hidden-rows-bridge.ts`、`SpreadsheetGrid.tsx`                     | `npx jest solid/excel --no-coverage` + ui-core：**只允许 §9.2 主控裁定三的 16 例白名单变红，差集非空即停**（§9.2 原表约 43 例属 S6，S5 当天必须全绿）；playwright MCP 手工 smoke（行号跳号） |
 | **S6 死代码清除**         | W2 网关回映射半边、`DisplayCell.originalRow` 字段、`deriveFilterHiddenRows`、`requireIdentityMapping` 及其两调用点、`unmapped-row` 全族；`buildSortExcludedRows` 改读两集                                        | `editing/mutation-gateway.ts`、`backend/types.ts`、`filter-sort/index.ts`、`go-to/`、`remove-duplicates/`、`text-to-columns/`、`paste-special/`     | 双包 jest 全绿；`grep -r originalRow` 仅剩文档历史条目                                                      |
-| **S7 可见性语义收口**     | 复制只取可见（§8.2）；删除行只删可见（§8.3，先实测 Excel）；`Data → Reapply` 入口 + `Ctrl+Alt+L`；粘贴/填充明确不改并加 pin                                                                                      | `clipboard/`、`copy-as/`、`operations/`、`menu-bar/SpreadsheetMenuBar.tsx`、`keyboard/`                                                             | 双包 jest + 定向 e2e；playwright MCP smoke（筛选→复制→粘贴→Reapply）                                        |
+| **S7 可见性语义收口**     | ~~复制只取可见（§8.2）；删除行只删可见（§8.3，先实测 Excel）~~ **已作为前置加固提前落地**（恒等，S5 后生效；§8.3 查证已定稿）。**剩余**：`exportRangeTsv` 分块复制与 `exportRangeAsImage` 两条 adapter 自产内容路径的端口扩参；`Data → Reapply` 入口 + `Ctrl+Alt+L`；粘贴/填充明确不改并加 pin                                                                                      | `clipboard/`、`copy-as/`、`operations/`、`menu-bar/SpreadsheetMenuBar.tsx`、`keyboard/`                                                             | 双包 jest + 定向 e2e；playwright MCP smoke（筛选→复制→粘贴→Reapply）                                        |
 | **S8 文档收口**           | `filter-sort.md`（仍写着 `directives` 与"backend 拥有行序"的陈旧口径）、`editing/README.md`、`remove-duplicates/README.md`、`CANONICAL_OWNERSHIP.md` #29、`CUTOVER_INVENTORY.md`、`06-tables-data-management.md` | 纯文档                                                                                                                                              | 互链一致性人工核对                                                                                          |
 
 **依赖顺序**：S1 → S2 → S5；S3 → S4 → S5；S5 → S6 → S7 → S8。
@@ -608,7 +636,7 @@ Excel 语义（§2 已核实）：**筛选**隐藏行复制时自动跳过；**�
 
 **未决 / 待验证**：
 
-1. ⚠️ 删除行在筛选区的确切 Excel 行为（§8.3）——S7 落地前实测定稿。
+1. ~~⚠️ 删除行在筛选区的确切 Excel 行为（§8.3）~~ —— **2026-07-21 已查证定稿**，暂定裁决维持，出处与三条证据缺口见 §8.3。残留未证实项仅剩"选区完全落在隐藏行内"，已按保守默认（零下发）实现并明确标注。
 2. ⚠️ 格式化筛选区是否只作用可见单元格（§2）——实测后决定是否进 §8。
 3. ⚠️ `AGGREGATE` 的 ignore-hidden 语义与本次双集合的关系——**列为后续**，`eval.rs:20029-20035` 的 TODO(#32 §6.3) 保持，seam 已由 S1 建好。
 4. `vanilla/spreadsheet-ui-core/docs/filter-sort.md` 全文是 `directives` 时代的陈旧口径（"backend 拥有行序"、`originalRow` 契约、`SortDirective` 类型），S8 整篇重写。

@@ -1,6 +1,7 @@
 import type { CellCoord } from '../shared'
 import type { DisplayCell, SpreadsheetCellFormat } from '../backend/types'
 import type { CopyAsInput, CopyAsRect } from './types'
+import { copyAsVisibleRows, normalizeCopyAsHiddenRows } from './visible-rows'
 
 const HTML_ESCAPE_RE = /[&<>"']/g
 const HTML_ESCAPE_MAP: Record<string, string> = {
@@ -273,10 +274,19 @@ interface ClippedMerge {
  *    these so the table emits a single `<td>` per merge.
  * 2. `mergesByAnchorKey` — keyed by `"row,col"` of the rect-local anchor
  *    cell, the clipped `ClippedMerge` to emit there.
+ *
+ * `hiddenRows` (filter-hidden rows, §8.2) participates in the clipping the
+ * same way the rect bounds do: a hidden row emits no `<tr>`, so counting it
+ * in a `rowspan` would make the anchor claim more rows than the table has
+ * and produce a structurally broken table. The clipped row count is
+ * therefore the number of VISIBLE rows in the intersection, and the
+ * rect-local anchor is the FIRST visible row of it. A merge whose entire
+ * in-rect slice is hidden drops out completely.
  */
 function planMerges(
   cells: ReadonlyArray<DisplayCell>,
   rect: CopyAsRect,
+  hiddenRows: ReadonlySet<number>,
 ): { coveredKeys: Set<string>; mergesByAnchorKey: Map<string, ClippedMerge> } {
   const coveredKeys = new Set<string>()
   const mergesByAnchorKey = new Map<string, ClippedMerge>()
@@ -354,9 +364,21 @@ function planMerges(
     const ixColEnd = Math.min(trueColEnd, rect.endCol)
     if (ixRowEnd < ixRowStart || ixColEnd < ixColStart) continue
 
-    const clippedRows = ixRowEnd - ixRowStart + 1
+    // Hidden rows emit no `<tr>`, so they must not be counted in `rowspan`
+    // and must not host the anchor. Both reduce to the visible-row list of
+    // the intersection; an empty list means the merge is entirely hidden.
+    let visibleRowCount = 0
+    let firstVisibleRow = -1
+    for (let r = ixRowStart; r <= ixRowEnd; r += 1) {
+      if (hiddenRows.has(r)) continue
+      if (firstVisibleRow === -1) firstVisibleRow = r
+      visibleRowCount += 1
+    }
+    if (visibleRowCount === 0) continue
+
+    const clippedRows = visibleRowCount
     const clippedCols = ixColEnd - ixColStart + 1
-    const anchorRow = ixRowStart
+    const anchorRow = firstVisibleRow
     const anchorCol = ixColStart
 
     // Every in-rect cell of the merge that isn't the clipped anchor must
@@ -383,7 +405,8 @@ function planMerges(
 export function encodeSelectionAsHtml(input: CopyAsInput): string {
   const { rect, cells } = input
   const index = indexCells(cells)
-  const { coveredKeys, mergesByAnchorKey } = planMerges(cells, rect)
+  const hiddenRows = normalizeCopyAsHiddenRows(input.hiddenRows)
+  const { coveredKeys, mergesByAnchorKey } = planMerges(cells, rect, hiddenRows)
 
   const parts: string[] = []
   parts.push('<table style="border-collapse: collapse; border: 1px solid #ccc">')
@@ -404,7 +427,9 @@ export function encodeSelectionAsHtml(input: CopyAsInput): string {
     parts.push('</colgroup>')
   }
 
-  for (let row = rect.startRow; row <= rect.endRow; row += 1) {
+  // Filter-hidden rows emit no `<tr>` at all (§8.2). `planMerges` above was
+  // given the same set so no surviving `rowspan` can reference them.
+  for (const row of copyAsVisibleRows(rect, hiddenRows)) {
     const rowHeight = input.rowHeights?.get(row)
     const trStyle =
       typeof rowHeight === 'number' && isFinite(rowHeight) && rowHeight > 0

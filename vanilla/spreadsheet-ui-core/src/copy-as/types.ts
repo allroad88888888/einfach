@@ -29,6 +29,22 @@ export interface CopyAsInput {
   rect: CopyAsRect
   columnWidths?: ReadonlyMap<number, number>
   rowHeights?: ReadonlyMap<number, number>
+  /**
+   * Sheet-absolute row indices inside `rect` that must not be emitted at
+   * all — no `<tr>`, no GFM row, no TSV line.
+   *
+   * Populate with FILTER-hidden rows only (`viewportFilterHiddenAtom`),
+   * never the manual ∪ filter union. Excel skips filtered-out rows when you
+   * copy a filtered region but copies manually hidden rows normally; passing
+   * the union here would drop manually hidden rows out of the clipboard and
+   * diverge from Excel. See `copy-as/visible-rows.ts` and §8.2 of
+   * `solid/excel/docs/online-excel-parity/design-filter-hidden-rows.md`.
+   *
+   * Omitted / empty means "emit every row in the rect", which is both the
+   * pre-hardening behaviour and the only behaviour reachable until the S5
+   * adapter flip stops compacting filtered rows out of the display range.
+   */
+  hiddenRows?: ReadonlySet<number> | readonly number[]
 }
 
 /**

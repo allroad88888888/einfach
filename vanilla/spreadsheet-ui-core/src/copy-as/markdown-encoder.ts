@@ -1,5 +1,6 @@
 import type { DisplayCell } from '../backend/types'
 import type { CopyAsInput, CopyAsRect } from './types'
+import { copyAsVisibleRows } from './visible-rows'
 
 function makeKey(row: number, col: number): string {
   return `${row},${col}`
@@ -130,14 +131,29 @@ export function encodeSelectionAsMarkdown(input: CopyAsInput): string {
     return `| ${parts.join(' | ')} |`
   }
 
+  // Filter-hidden rows are dropped from the table entirely (§8.2). The GFM
+  // header is therefore the first VISIBLE row of the rect, not necessarily
+  // `rect.startRow` — hiding the top row of a filtered region must promote
+  // the next visible row rather than emit a blank header.
+  const visibleRows = copyAsVisibleRows(rect, input.hiddenRows)
+  if (visibleRows.length === 0) {
+    // An inverted rect (`endRow < startRow`) has always emitted a degenerate
+    // header for `startRow` plus a separator; keep that shape byte-for-byte.
+    // A non-inverted rect with nothing visible means every row was
+    // filter-hidden, and an all-hidden selection copies nothing at all.
+    if (rect.endRow >= rect.startRow) return ''
+    const sepOnly = '|' + Array.from({ length: colCount }, () => ' --- ').join('|') + '|'
+    return [renderRow(rect.startRow), sepOnly].join('\n')
+  }
+
   const lines: string[] = []
-  lines.push(renderRow(rect.startRow))
+  lines.push(renderRow(visibleRows[0]))
   // GFM separator — three dashes per column is the minimum that satisfies
   // every renderer; we use exactly three regardless of header width.
   const sep = '|' + Array.from({ length: colCount }, () => ' --- ').join('|') + '|'
   lines.push(sep)
-  for (let row = rect.startRow + 1; row <= rect.endRow; row += 1) {
-    lines.push(renderRow(row))
+  for (let offset = 1; offset < visibleRows.length; offset += 1) {
+    lines.push(renderRow(visibleRows[offset]))
   }
 
   return lines.join('\n')

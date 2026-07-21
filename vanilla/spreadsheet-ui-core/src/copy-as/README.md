@@ -40,16 +40,60 @@ export function encodeSelectionAsHtml(input: CopyAsInput): string
 export function encodeSelectionAsMarkdown(input: CopyAsInput): string
 export function encodeSelectionAsPlainText(input: CopyAsInput): string
 export function encodeSelectionForClipboard(input: CopyAsInput): CopyAsResult
+export function copyAsVisibleRows(
+  rect: CopyAsRect,
+  hiddenRows: ReadonlySet<number> | readonly number[] | undefined,
+): number[]
+export function normalizeCopyAsHiddenRows(
+  hiddenRows: ReadonlySet<number> | readonly number[] | undefined,
+): ReadonlySet<number>
 ```
 
 `CopyAsInput.cells` is sparse — only occupied cells from the projection.
 The encoders iterate `rect`, not `cells`, so empty cells in the rectangle
 render as empty `<td>` / blank GFM cell / empty plain-text column.
 
+### `hiddenRows` — copy skips filtered-out rows
+
+`CopyAsInput.hiddenRows` lists sheet-absolute rows inside `rect` that emit
+nothing at all: no `<tr>`, no GFM row, no TSV line. Omitting it (or passing
+an empty set) emits every row, which is the pre-hardening behaviour.
+
+**Populate with filter-hidden rows only** — `viewportFilterHiddenAtom`,
+never the `effectiveHiddenAtom` union. Excel's copy is asymmetric:
+
+| row is…          | copied? | how to skip it                            |
+| ---------------- | ------- | ----------------------------------------- |
+| filter-hidden    | no      | automatic, no user action                 |
+| manually hidden  | yes     | `Go To Special → Visible cells only` only |
+
+Passing the union would drop manually hidden rows out of the clipboard and
+manufacture a divergence from Excel. This is the same rule the S3 guards
+follow: anything that MOVES DATA reads the filter subset, only navigation
+and rendering read the union.
+
+Knock-on effects the encoders handle:
+
+- **Markdown header** is the first VISIBLE row of `rect`, not necessarily
+  `rect.startRow`. A rect with no visible rows encodes to `''`.
+- **HTML `rowspan`** is re-clipped to the number of visible rows in the
+  merge's intersection with `rect`, and the emitted anchor moves to the
+  first visible row of that intersection. A merge whose in-rect slice is
+  entirely hidden is dropped. Without this the table would claim more rows
+  than it emits.
+- Rows listed outside `rect` are inert.
+
+Under today's display-compaction filter a filtered-out row has no display
+slot, so it never lands inside `rect` and this parameter is always empty —
+the encoders are accidentally correct. The guard exists for the S5 adapter
+flip, after which a filter-hidden row keeps its index inside `rect` while
+contributing no cells. See
+`solid/excel/docs/online-excel-parity/design-filter-hidden-rows.md` §8.2.
+
 ## HTML encoder semantics
 
 - Root element: `<table style="border-collapse: collapse; border: 1px solid #ccc">`.
-- One `<tr>` per row in `rect`; one `<td>` per column. Empty cells emit a
+- One `<tr>` per non-`hiddenRows` row in `rect`; one `<td>` per column. Empty cells emit a
   `<td></td>` with the per-cell border + padding style but no content.
 - Cell text is HTML-escaped (`&`, `<`, `>`, `"`, `'`); embedded line breaks
   become `<br>` after escaping.
@@ -83,7 +127,7 @@ render as empty `<td>` / blank GFM cell / empty plain-text column.
 
 ## Markdown encoder semantics
 
-- First row of `rect` is the header row.
+- First non-`hiddenRows` row of `rect` is the header row.
 - Columns separated by ` | `, rows separated by `\n`.
 - Separator after the header is a single ` --- ` per column.
 - Cell text escaping: backslash doubled, `|` escaped as `\|`, newlines
