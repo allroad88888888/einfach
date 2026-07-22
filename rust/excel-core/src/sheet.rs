@@ -577,6 +577,18 @@ pub(crate) struct SheetInterior {
     /// appears as a key in `formula_source`. Hydration removes from both
     /// in lockstep.
     pub(crate) needs_parse: RefCell<HashSet<CellAddress>>,
+    /// Sparse column widths in physical pixels, keyed by 0-based column
+    /// (absent → UI default). Lives in the shared interior — rather than
+    /// beside `row_heights` on [`Sheet`] — because a formula-inner read_fn
+    /// ([`AtomFormulaProvider`], reachable only through the `FacadeCtx`'s
+    /// `Rc<SheetInterior>`) needs it to answer `CELL("width")`. `row_heights`
+    /// stays on `Sheet`: no formula reads a row height (Excel has no
+    /// `CELL("height")` info_type). Read UNTRACKED (no dependency edge): a bare
+    /// column resize does not itself re-derive an existing `CELL("width")`
+    /// formula — consistent with `set_col_width` driving no recompute anywhere
+    /// today. Same D7 borrow rule as the other interior fields (borrow → copy
+    /// out → release; never hold across a `store.*` call).
+    pub(crate) col_widths: RefCell<BTreeMap<u32, u32>>,
 }
 
 /// A spreadsheet sheet backed by an atom store.
@@ -656,8 +668,10 @@ pub struct Sheet {
     conditional_rules: Vec<ConditionalRule>,
     /// Sparse row heights in physical pixels. Absent means the UI default.
     row_heights: BTreeMap<u32, u32>,
-    /// Sparse column widths in physical pixels. Absent means the UI default.
-    col_widths: BTreeMap<u32, u32>,
+    // Column widths moved to `SheetInterior::col_widths` (shared `Rc`) so the
+    // formula-inner provider can reach them for `CELL("width")`. The public
+    // `set_col_width` / `col_width` / ... accessors below are unchanged and now
+    // delegate into the interior.
     /// MANUALLY hidden rows, 0-based (E2 of `design-engine-hidden-rows.md`).
     /// The engine's OWNED copy of the fact — as opposed to
     /// `WorkbookAtomContext::eval_hidden_rows`, which is now a read-only
@@ -2225,6 +2239,15 @@ impl<'a, 'r> EvalProvider for AtomFormulaProvider<'a, 'r> {
         self.current_cell.set(addr);
     }
 
+    fn col_width(&self, col: u32) -> Option<u32> {
+        // UNTRACKED read of the shared interior's sparse width map for
+        // `CELL("width")` (D7: borrow → copy → release; no store call between,
+        // no dependency edge armed). This is the formula's OWN sheet — a
+        // cross-sheet `CELL("width", Other!A1)` collapses to this sheet's
+        // widths, the same limitation the content-touching info_types carry.
+        self.ctx.interior.col_widths.borrow().get(&col).copied()
+    }
+
     fn cell_has_formula(&self, addr: CellAddress) -> bool {
         self.ctx.interior.formula_cells.borrow().contains_key(&addr)
             || self.ctx.interior.needs_parse.borrow().contains(&addr)
@@ -2324,6 +2347,7 @@ impl Sheet {
                 formula_texts: RefCell::new(HashMap::new()),
                 formula_source: RefCell::new(RowMajorMap::new()),
                 needs_parse: RefCell::new(HashSet::new()),
+                col_widths: RefCell::new(BTreeMap::new()),
             }),
             slot_epoch_family: Rc::new(RefCell::new(AtomFamily::new())),
             cell_facade_family: Rc::new(RefCell::new(AtomFamily::new())),
@@ -2340,7 +2364,6 @@ impl Sheet {
             range_formats: Vec::new(),
             conditional_rules: Vec::new(),
             row_heights: BTreeMap::new(),
-            col_widths: BTreeMap::new(),
             hidden_rows: BTreeSet::new(),
             filter: None,
             filter_scan_count: Cell::new(0),
@@ -2417,29 +2440,37 @@ impl Sheet {
         if width_px == 0 {
             return self.clear_col_width(col_index);
         }
-        self.col_widths.insert(col_index, width_px) != Some(width_px)
+        self.interior
+            .col_widths
+            .borrow_mut()
+            .insert(col_index, width_px)
+            != Some(width_px)
     }
 
     pub fn clear_col_width(&mut self, col_index: u32) -> bool {
-        self.col_widths.remove(&col_index).is_some()
+        self.interior.col_widths.borrow_mut().remove(&col_index).is_some()
     }
 
     pub fn col_width(&self, col_index: u32) -> Option<u32> {
-        self.col_widths.get(&col_index).copied()
+        self.interior.col_widths.borrow().get(&col_index).copied()
     }
 
     pub fn col_widths_in_range(&self, start_col: u32, end_col: u32) -> Vec<(u32, u32)> {
         if end_col < start_col {
             return Vec::new();
         }
-        self.col_widths
+        self.interior
+            .col_widths
+            .borrow()
             .range(start_col..=end_col)
             .map(|(col_index, width_px)| (*col_index, *width_px))
             .collect()
     }
 
     pub fn all_col_widths(&self) -> Vec<(u32, u32)> {
-        self.col_widths
+        self.interior
+            .col_widths
+            .borrow()
             .iter()
             .map(|(col_index, width_px)| (*col_index, *width_px))
             .collect()
@@ -5993,10 +6024,18 @@ impl Sheet {
                     sheet.shift_filter_hidden_rows(at, count, false);
                 }
                 crate::shift::ShiftEdit::ColInsert { at, count } => {
-                    Self::shift_dimension_insert(&mut sheet.col_widths, at, count);
+                    Self::shift_dimension_insert(
+                        &mut sheet.interior.col_widths.borrow_mut(),
+                        at,
+                        count,
+                    );
                 }
                 crate::shift::ShiftEdit::ColDelete { at, count } => {
-                    Self::shift_dimension_delete(&mut sheet.col_widths, at, count);
+                    Self::shift_dimension_delete(
+                        &mut sheet.interior.col_widths.borrow_mut(),
+                        at,
+                        count,
+                    );
                 }
             }
             sheet
@@ -7363,6 +7402,10 @@ impl<'a> EvalProvider for SheetEvalProvider<'a> {
 
     fn set_current_cell(&self, addr: Option<CellAddress>) {
         self.current_cell.set(addr);
+    }
+
+    fn col_width(&self, col: u32) -> Option<u32> {
+        self.sheet.col_width(col)
     }
 
     fn cell_has_formula(&self, addr: CellAddress) -> bool {

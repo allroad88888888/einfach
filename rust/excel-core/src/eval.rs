@@ -836,6 +836,20 @@ pub trait EvalProvider {
     /// providers without a current-cell concept ignore the call.
     fn set_current_cell(&self, _addr: Option<CellAddress>) {}
 
+    /// Explicit width in physical pixels of column `col` (0-based), or `None`
+    /// when the column has no explicit width (the UI default). Consulted by
+    /// `CELL("width")`, which converts pixels to Excel character units.
+    ///
+    /// Default `None`: providers without sheet-dimension access (the legacy
+    /// single-sheet shim, the wasm-side and test shims) report "no explicit
+    /// width", so `CELL("width")` falls back to Excel's default column width
+    /// (8 characters). Sheet-backed providers (`SheetEvalProvider`,
+    /// `AtomFormulaProvider`, `WorkbookEvalProvider`) override to read the
+    /// per-column width map.
+    fn col_width(&self, _col: u32) -> Option<u32> {
+        None
+    }
+
     /// Workbook-scope defined-name lookup. Returns a clone of the value
     /// registered under `name` (case-insensitive), or `None` if the
     /// workbook has no entry for that name.
@@ -6237,7 +6251,7 @@ fn eval_func(name: &str, args: &[Expr], provider: &dyn EvalProvider) -> Value {
         //   "contents" → the cell's value via provider.cell(addr)
         //   "type"     → "b" blank, "l" text, "v" otherwise
         //   "prefix"   → "'" for text, "" otherwise
-        //   "width"    → 8.0 (approximation; we don't plumb per-column widths)
+        //   "width"    → column width in Excel character units (px→chars)
         //   "protect"  → 1.0 (approximation; per-cell unlock state isn't
         //                tracked at the eval layer)
         // Any other info_type returns #VALUE! (InvalidValue), matching Excel.
@@ -6308,10 +6322,35 @@ fn eval_func(name: &str, args: &[Expr], provider: &dyn EvalProvider) -> Value {
                     Value::Text(_) => Value::Text("'".into()),
                     _ => Value::Text(String::new()),
                 },
-                // note: we don't plumb per-column widths through the eval
-                // layer yet, so this is a constant approximation of Excel's
-                // default column width (8.43 in the UI, rounded to 8).
-                "width" => Value::Number(8.0),
+                // Excel's CELL("width") reports the column width in CHARACTER
+                // units (how many default-font digits fit), "rounded off to an
+                // integer" per the Microsoft docs. We store widths in physical
+                // pixels, so we invert the standard Excel px↔char metric:
+                //
+                //     chars = round((pixels − 5) / MDW)
+                //
+                // where MDW = 7 is Calibri-11's Maximum Digit Width and 5 px is
+                // the cell's left+right padding baked into the stored box width.
+                // Calibration: Excel's default 64 px → (64−5)/7 = 8.43 → 8;
+                // e.g. 100 px → (100−5)/7 = 13.57 → 14. `round` (half away from
+                // zero) matches the docs' "rounded off", not truncation; the
+                // result is clamped at 0 so a sub-padding width can't go
+                // negative. Columns with no explicit width report `None` here
+                // and fall back to Excel's default of 8 characters.
+                //
+                // Modern Excel returns a 2-element spill array {width, is_default};
+                // we return the scalar integer (legacy shape) to match this
+                // engine's existing CELL return contract and stay backward
+                // compatible. Cross-sheet refs collapse to the current sheet's
+                // widths — same limitation the content-touching info_types
+                // ("contents"/"type"/"prefix") already carry.
+                "width" => {
+                    let chars = match provider.col_width(addr.col) {
+                        Some(px) => (((px as f64) - 5.0) / 7.0).round().max(0.0),
+                        None => 8.0,
+                    };
+                    Value::Number(chars)
+                }
                 // note: per-cell locked/unlocked state lives outside the
                 // formula engine — we report "locked" (1) for every cell.
                 "protect" => Value::Number(1.0),
@@ -25809,7 +25848,11 @@ mod tests {
     #[test]
     fn eval_cell_width() {
         let (cm, vs) = make_test_env();
-        // Approximation: Excel default column width.
+        // The test env's provider has no per-column width map (`col_width`
+        // returns the trait default `None`), so `CELL("width")` falls back to
+        // Excel's default column width of 8 characters. Explicit-width
+        // conversion (px → chars) is covered end-to-end in
+        // `tests/cell_function.rs`, which drives a real sheet-backed provider.
         assert_eq!(
             eval_str("=CELL(\"width\",A1)", &cm, &vs),
             Value::Number(8.0)

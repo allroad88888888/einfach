@@ -3975,6 +3975,14 @@ impl<'a> EvalProvider for WorkbookEvalProvider<'a> {
         self.current_cell.set(addr);
     }
 
+    fn col_width(&self, col: u32) -> Option<u32> {
+        // The currently-evaluating sheet's explicit width for `col`, if any —
+        // consumed by `CELL("width")` on the eager workbook eval path
+        // (`get_cell`, `define_name`). Cross-sheet `CELL("width", Other!A1)`
+        // collapses to this sheet, matching the content-touching info_types.
+        self.wb.sheets[self.current.get()].col_width(col)
+    }
+
     fn lookup_named(&self, name: &str) -> Option<Value> {
         // Delegate to the workbook's case-insensitive registry. Returns
         // a clone of the stored value (cheap for `Value::Lambda`, which
