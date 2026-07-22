@@ -1256,6 +1256,15 @@ function shiftHiddenIndexSet(
  * engine keeps them apart the same way (`eval_hidden_rows` vs
  * `eval_filter_hidden_rows`). Both halves are covered by the `filterHidden`
  * phase of vnext-table-totals-static-wasm-parity.
+ *
+ * E6 note (design-engine-hidden-rows §7.1 / §10.1): the manual dual lane does
+ * NOT collapse here. Lane 2 (`evalHiddenRowsBySheetId`, fed by
+ * `setEvalHiddenRows`) is still driven by the host's `eval-hidden-rows-bridge`
+ * and is exercised alone by the `evalLaneOnly` parity phase — removing it now
+ * reds that phase (static reads 400 where WASM reads 320). It retires in E7,
+ * with the bridge, once UI-core writes the manual set on ACK instead of pushing
+ * it. E6's job was to golden-lock the FILTER half to the real engine, which
+ * vnext-filter-static-wasm-parity does; the manual half stays as-is.
  */
 function evalHiddenRowsForSheet(
   state: StaticBackendState,
