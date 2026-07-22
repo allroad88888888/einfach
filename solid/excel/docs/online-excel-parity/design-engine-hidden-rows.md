@@ -33,6 +33,16 @@
 >
 > **修正 8（§5.1/§7.1 static 双 lane 的退休方式）**：E6 报告说 static 的 `evalHiddenRowsForSheet` 双 lane（`hiddenRowsBySheetId` ∪ `evalHiddenRowsBySheetId`）"随 bridge 在 E7 退休"。**实际退休方式**：把 `setEvalHiddenRows` 改成整集替换 `hiddenRowsBySheetId`（与 WASM 引擎 `set_eval_hidden_rows` 写唯一 `Sheet::hidden_rows` 同构），删掉独立的 `evalHiddenRowsBySheetId` 与并集。**端口本身保留**（与 WASM 的 INV-4 永久包袱对齐；parity 断言 `port.setEvalHiddenRows==true`）。唯一退休的是那个 static-only、与 WASM 分歧的"并集"语义 —— 连带删掉 `vnext-static-tables` 里断言该并集的一条用例。
 
+> ### as-built 修正（2026-07-22，E8 实施后核实写入）
+>
+> **修正 9（§6.3 "引擎快照覆盖"不完整 —— UI-core 渲染缓存需要一条新的 re-hydration 路径）**：§6.3 说筛选侧 local-replay "可全删，引擎快照覆盖"。**核实所得：引擎快照（`restoreFilters`）只恢复 _引擎_ 拥有态与 adapter 的 withholding 镜像，恢复不了 UI-core 的渲染缓存 `viewportFilterHiddenAtom`。** 该缓存是 Grid 画哪几行的真值来源（`SpreadsheetGrid.tsx:688/771/1193` 经 `effectiveHiddenAtom` 读它），删掉 local-replay 后无人恢复它 → 撤销后画错行、#27 变红。**E8 的实际形状**：删掉筛选侧 local-replay 后，**新增**一条 re-hydration —— 撤销/重做结束时 provider 从引擎回读 `readSheetHiddenState.filterRows` 写回该缓存（`provider/history-dispatch.ts` `reconcileFilterHiddenFromEngine`，接进 `dispatchUndo`/`dispatchRedo`/`retryHistoryRefresh` 的 refresh）。与 local-replay 的记录像逐字相同（两者都源自同一引擎快照的 before/after）。
+>
+> **修正 10（§6.3 "结构位移全删"会引入重绘闪烁 —— 前向位移保留）**：修正 7 与 §7.1 要求筛选侧 local-replay **与结构位移**一并删。**核实所得：删前向位移（`applyViewportFilterHiddenStructuralShiftAtom`）会让插入行后、异步 re-hydration 回来前有一帧筛选缓存陈旧（画错行）。** 手动侧同样保留其前向位移（乐观、同 tick），二者对称。**E8 只删 local-replay（撤销恢复），保留前向位移**（乐观、同 tick 的渲染投影，非 local-replay）。切片表 E8 行的"结构位移全删"应改为"只删 local-replay 恢复路径，前向位移保留"。
+>
+> **修正 11（手动侧 §6.2 的 `snapshot_hidden` 在 E7 后已冗余 —— E8 不动手动侧 adapter）**：§6.2 与切片表 E8 行要求"宿主事务日志改记 `snapshot_hidden`（手动隐藏侧）"。**核实所得：E7 后手动侧撤销已经把引擎恢复对了** —— 手动 local-replay applier（保留）经 `feedAndReconcileHiddenRows` 用 `setEvalHiddenRows`（整集）把恢复后的手动集重新喂进引擎并对账，删除吞掉成员的无逆情况也由记录像的 before 覆盖。**再加 `snapshot_hidden`/`restore_hidden` 到手动事务会形成对同一引擎集合的第二条恢复路径（§10.2-7 警告的双恢复）**，故 E8 **不动手动侧 adapter**。手动侧仅需 §6.3 已裁定的"local-replay 不删"。**筛选侧则相反下沉**：改用 `snapshotFilters`/`restoreFilters`（替换 E7 的 `filterHiddenOverlay` adapter-memory 前后像 + `setEvalFilterHiddenRows` 回推），因为筛选缓存是纯投影、无自己的写路径。
+>
+> **修正 12（static 缺 `readSheetHiddenState` —— E8 补上）**：§4.2 假设 `readSheetHiddenState` 两后端都有。**核实所得：static 从未实现它**（只有 worker 实现，`engineHiddenState` 门禁）。E8 的筛选缓存 re-hydration 依赖它，故给 static 补了一个（读自 `hiddenRowsBySheetId` / `filterHiddenRowsBySheetId` / `filterSortBySheetId`）；static 引擎态本就由 `restoreFullSheet`（含 `filterHiddenRows`）在事务里恢复，无需改。**副作用**：static 现在也有 `readSheetHiddenState`，手动侧 `feedAndReconcileHiddenRows` 在 static 上也会走对账回读（此前 static 只走乐观写）；结果值不变（对账回读同值），行为中性。
+
 | #   | 问题                | 裁决                                                                                                                 |
 | --- | ------------------- | -------------------------------------------------------------------------------------------------------------------- |
 | 1   | 状态挂哪            | **`Sheet` 拥有**（紧邻 `row_heights`），`WorkbookAtomContext` 的两张 index-keyed 表降级为**引擎内部只读镜像**，由一个私有 `republish_hidden` 单点同步。筛选规则与其派生集合合成一个 `Sheet.filter: Option<SheetAutoFilter>` |

@@ -1,6 +1,5 @@
 import { atom, type Atom } from '@einfach/core'
 import type { BackendStructuralShift } from '../backend/types'
-import { registerHistoryLocalReplayApplier } from '../history'
 import { viewportHiddenAtom } from './hidden'
 import { remapIndexSetAfterStructuralShift } from './structural-remap'
 import type { ViewportFilterHiddenState, ViewportHiddenState } from './types'
@@ -103,14 +102,6 @@ export const clearViewportFilterHiddenRowsAtom = atom(
 )
 clearViewportFilterHiddenRowsAtom.debugLabel = 'spreadsheet.viewport.clearFilterHiddenRows'
 
-/** History local-replay applier key for the filter-hidden row set. */
-export const VIEWPORT_FILTER_HIDDEN_REPLAY_KEY = 'viewport.filterHidden'
-
-/** Snapshot shape carried by filter-hidden structural side payloads. */
-export interface ViewportFilterHiddenReplaySnapshot {
-  readonly rows: readonly number[]
-}
-
 export interface ApplyViewportFilterHiddenStructuralShiftInput {
   readonly sheetId: string
   readonly shift: BackendStructuralShift
@@ -135,8 +126,13 @@ export interface ApplyViewportFilterHiddenStructuralShiftInput {
  * and is inert here. (The manual twin holds both axes and therefore branches.)
  *
  * Part of the enclosing structural operation — records no history entry of its
- * own; the caller carries the pre/post snapshots as a side payload. Returns
- * true when the stored set actually changed.
+ * own. It is the OPTIMISTIC forward projection only: it keeps the render cache
+ * in step the same tick the engine self-shifts its owned filter, with no
+ * round-trip. Undo/redo does NOT invert it (a delete that consumed filter-hidden
+ * rows has no inverse); since E8 the engine's `restoreFilters` snapshot restores
+ * the authoritative filter and UI core re-hydrates this cache from it
+ * (`readSheetHiddenState.filterRows`), so no history side payload is recorded.
+ * Returns true when the stored set actually changed.
  */
 export const applyViewportFilterHiddenStructuralShiftAtom = atom(
   null,
@@ -164,28 +160,6 @@ export const applyViewportFilterHiddenStructuralShiftAtom = atom(
 )
 applyViewportFilterHiddenStructuralShiftAtom.debugLabel =
   'spreadsheet.viewport.applyFilterHiddenShift'
-
-/**
- * Local replay for the structural side payload above. Undoing a delete cannot
- * re-derive which rows the filter had hidden inside the deleted band (the
- * rules are not re-run — the set is a snapshot), so undo/redo restores the
- * exact recorded set instead, the same way the manual twin does.
- */
-registerHistoryLocalReplayApplier(
-  VIEWPORT_FILTER_HIDDEN_REPLAY_KEY,
-  (_get, set, payload, direction) => {
-    const sheetId = typeof payload.sheetId === 'string' ? payload.sheetId : ''
-    if (!sheetId) return false
-    const target = direction === 'undo' ? payload.before : payload.after
-    if (typeof target !== 'object' || target === null) return false
-    const { rows } = target as { rows?: unknown }
-    if (!Array.isArray(rows) || rows.some((row) => !Number.isSafeInteger(row) || row < 0)) {
-      return false
-    }
-    set(setViewportFilterHiddenRowsAtom, { sheetId, rows: rows as number[] })
-    return true
-  },
-)
 
 export function getFilterHiddenRowsForSheet(
   state: ViewportFilterHiddenState,

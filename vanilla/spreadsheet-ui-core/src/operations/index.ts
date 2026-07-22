@@ -36,7 +36,6 @@ import {
 import {
   applyViewportFilterHiddenStructuralShiftAtom,
   getFilterHiddenRowsForSheet,
-  VIEWPORT_FILTER_HIDDEN_REPLAY_KEY,
   viewportFilterHiddenAtom,
 } from '../viewport/effective-hidden'
 
@@ -980,7 +979,6 @@ async function runStructureOperation(
   const hiddenStateBefore = get(viewportHiddenAtom)
   const hiddenRowsBefore = getHiddenRowsForSheet(hiddenStateBefore, sheetId)
   const hiddenColsBefore = getHiddenColumnsForSheet(hiddenStateBefore, sheetId)
-  const filterHiddenRowsBefore = getFilterHiddenRowsForSheet(get(viewportFilterHiddenAtom), sheetId)
   const outlineStateBefore = get(outlineAtom)
   const outlineRowsBefore = getOutlineGroupsForSheet(outlineStateBefore, sheetId, 'row')
   const outlineColsBefore = getOutlineGroupsForSheet(outlineStateBefore, sheetId, 'column')
@@ -1031,15 +1029,12 @@ async function runStructureOperation(
       after: { rows: [...hiddenRowsAfter], cols: [...hiddenColsAfter] },
     })
   }
-  const filterHiddenRowsAfter = getFilterHiddenRowsForSheet(get(viewportFilterHiddenAtom), sheetId)
-  if (!sameIndexArrays(filterHiddenRowsBefore, filterHiddenRowsAfter)) {
-    localSidePayloads.push({
-      applyKey: VIEWPORT_FILTER_HIDDEN_REPLAY_KEY,
-      sheetId,
-      before: { rows: [...filterHiddenRowsBefore] },
-      after: { rows: [...filterHiddenRowsAfter] },
-    })
-  }
+  // FILTER-hidden rows carry NO history side payload since E8. The engine owns
+  // the filter (rules + derived hidden set) and its own `restoreFilters`
+  // snapshot restores it on undo/redo; UI core re-hydrates the render cache
+  // (`viewportFilterHiddenAtom`) from the engine afterwards
+  // (`readSheetHiddenState.filterRows`) — see the provider's undo/redo refresh.
+  // The forward shift above is the optimistic same-tick projection only.
   const outlineStateAfter = get(outlineAtom)
   const outlineRowsAfter = getOutlineGroupsForSheet(outlineStateAfter, sheetId, 'row')
   const outlineColsAfter = getOutlineGroupsForSheet(outlineStateAfter, sheetId, 'column')

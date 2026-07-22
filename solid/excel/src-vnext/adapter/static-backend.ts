@@ -61,7 +61,10 @@ import type {
   SetNamedRangeRequest,
   SetRowHeightRequest,
   SetValidationRuleRequest,
+  SheetHiddenStateRequest,
+  SheetHiddenStateResult,
   SheetMutationResult,
+  ColumnFilterRule,
   SortRangeKey,
   SortRangeRejectionCode,
   SortRangeRequest,
@@ -4532,6 +4535,37 @@ export function createStaticSpreadsheetBackend(
         return
       }
       state.hiddenRowsBySheetId.set(request.sheetId, new Set(rows))
+    },
+    /**
+     * Whole-sheet hidden-state hydration read (design-engine-hidden-rows §4.2),
+     * the twin of the worker's `readSheetHiddenStateThroughWorker`. UI core
+     * re-hydrates its render caches from this after an undo/redo: this backend's
+     * own `restoreFullSheet` already put the manual-hidden and FILTER-hidden
+     * sets (and the filter rules) back on the structural transaction, so this
+     * read reports the restored authoritative sets. Manual COLUMNS are omitted —
+     * this backend, like the WASM engine, has nothing authoritative to say about
+     * hidden columns (§8), which stay UI-core canonical.
+     */
+    async readSheetHiddenState(
+      request: SheetHiddenStateRequest,
+    ): Promise<SheetHiddenStateResult> {
+      const manualRows = [...(state.hiddenRowsBySheetId.get(request.sheetId) ?? [])].sort(
+        (left, right) => left - right,
+      )
+      const filterRows = [...(state.filterHiddenRowsBySheetId.get(request.sheetId) ?? [])].sort(
+        (left, right) => left - right,
+      )
+      const filterRules = (state.filterSortBySheetId.get(request.sheetId)?.rules ??
+        []) as readonly ColumnFilterRule[]
+      return {
+        kind: 'sheet-hidden-state',
+        sheetId: request.sheetId,
+        requestId: request.requestId,
+        revision: request.revision ?? state.revision,
+        manualRows,
+        filterRows,
+        filterRules,
+      }
     },
     async setFormatRange(request: SetFormatRangeRequest) {
       beginUndoableMutation(state)

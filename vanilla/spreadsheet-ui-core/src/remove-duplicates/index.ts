@@ -25,7 +25,6 @@ import {
 import {
   applyViewportFilterHiddenStructuralShiftAtom,
   getFilterHiddenRowsForSheet,
-  VIEWPORT_FILTER_HIDDEN_REPLAY_KEY,
   viewportFilterHiddenAtom,
 } from '../viewport/effective-hidden'
 import {
@@ -1243,10 +1242,6 @@ export const runRemoveDuplicatesConfirmAtom = atom(
     const hiddenStateBefore = get(viewportHiddenAtom)
     const hiddenRowsBefore = getHiddenRowsForSheet(hiddenStateBefore, mutatedSheetId)
     const hiddenColsBefore = getHiddenColumnsForSheet(hiddenStateBefore, mutatedSheetId)
-    const filterHiddenRowsBefore = getFilterHiddenRowsForSheet(
-      get(viewportFilterHiddenAtom),
-      mutatedSheetId,
-    )
     for (const shift of descendingRowDeleteShifts(ticket.target.removedRowIndices)) {
       set(applyViewportFreezeStructuralShiftAtom, { sheetId: mutatedSheetId, shift })
       set(applyViewportHiddenStructuralShiftAtom, { sheetId: mutatedSheetId, shift })
@@ -1281,19 +1276,11 @@ export const runRemoveDuplicatesConfirmAtom = atom(
         after: { rows: [...hiddenRowsAfter], cols: [...hiddenColsAfter] },
       })
     }
-    const filterHiddenRowsAfter = getFilterHiddenRowsForSheet(
-      get(viewportFilterHiddenAtom),
-      mutatedSheetId,
-    )
-    if (!sameNumberList(filterHiddenRowsBefore, filterHiddenRowsAfter)) {
-      localSidePayloads.push({
-        applyKey: VIEWPORT_FILTER_HIDDEN_REPLAY_KEY,
-        sheetId: mutatedSheetId,
-        before: { rows: [...filterHiddenRowsBefore] },
-        after: { rows: [...filterHiddenRowsAfter] },
-      })
-    }
-
+    // FILTER-hidden rows carry NO history side payload since E8 — the engine's
+    // `restoreFilters` snapshot restores its owned filter on undo/redo and UI
+    // core re-hydrates the render cache from the engine afterwards
+    // (`readSheetHiddenState.filterRows`). The forward shift above is the
+    // optimistic same-tick projection only.
     set(pushHistoryAtom, {
       transactionId: `remove-duplicates-${ticket.sessionId}-${ticket.target.requestId}`,
       kind: 'row.delete',

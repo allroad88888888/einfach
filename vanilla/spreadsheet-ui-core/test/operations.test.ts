@@ -665,7 +665,7 @@ describe('structural shift → local view facts + history side payloads', () => 
     expect(staleFilterRows).toContain(1)
   })
 
-  test('insert above an active filter shifts the set and records a payload', async () => {
+  test('insert above an active filter shifts the set but records NO filter payload (E8)', async () => {
     const store = createStore()
     store.setter(hideRowsAtom, { sheetId: 'sheet-1', indices: [2] })
     store.setter(setViewportFilterHiddenRowsAtom, { sheetId: 'sheet-1', rows: [1] })
@@ -676,21 +676,19 @@ describe('structural shift → local view facts + history side payloads', () => 
       { axis: 'row', kind: 'insert', index: 0, count: 1 },
     )
 
+    // The optimistic forward shift still keeps the render cache in step the same
+    // tick the engine self-shifts its owned filter.
     expect(filterRowsOf(store)).toEqual([2])
     expect(store.getter(viewportHiddenAtom).rowsBySheet['sheet-1']).toEqual([3])
 
+    // Since E8 the FILTER-hidden set carries no history side payload: the engine
+    // owns the filter and its `restoreFilters` snapshot restores it on undo,
+    // after which the provider re-hydrates this cache from the engine. Only the
+    // manual `viewport.hidden` payload rides the entry now.
     const entries = store.getter(historyStackAtom).entries
     const payloads = entries[entries.length - 1]!.localSidePayloads!
-    expect(payloads.map((payload) => payload.applyKey)).toEqual([
-      'viewport.hidden',
-      'viewport.filterHidden',
-    ])
-    expect(payloads[1]).toMatchObject({
-      applyKey: 'viewport.filterHidden',
-      sheetId: 'sheet-1',
-      before: { rows: [1] },
-      after: { rows: [2] },
-    })
+    expect(payloads.map((payload) => payload.applyKey)).toEqual(['viewport.hidden'])
+    expect(payloads.some((payload) => payload.applyKey === 'viewport.filterHidden')).toBe(false)
   })
 
   test('a delete band consuming filter-hidden rows drops them from the set', async () => {
@@ -751,52 +749,16 @@ describe('structural shift → local view facts + history side payloads', () => 
     expect(filterRowsOf(store, 'sheet-2')).toEqual([2, 5])
   })
 
-  test('undo/redo of the structural entry round-trips the filter set exactly', async () => {
-    const store = createStore()
-    store.setter(setViewportFilterHiddenRowsAtom, { sheetId: 'sheet-1', rows: [2, 3, 7] })
-
-    await runShiftedOperation(
-      store,
-      createDeleteRowsOperation({ sheetId: 'sheet-1', rowIndex: 2, count: 2 }),
-      { axis: 'row', kind: 'delete', index: 2, count: 2 },
-    )
-    expect(filterRowsOf(store)).toEqual([5])
-
-    const historySource: HistoryControllerPort = {
-      async undoTransaction(request) {
-        return {
-          transactionId: request.transactionId,
-          requestId: request.requestId,
-          revision: 200,
-        }
-      },
-      async redoTransaction(request) {
-        return {
-          transactionId: request.transactionId,
-          requestId: request.requestId,
-          revision: 201,
-        }
-      },
-    }
-
-    await expect(
-      store.setter(runUndoHistoryAtom, {
-        source: historySource,
-        refreshProjection: async () => undefined,
-      }),
-    ).resolves.toBe('completed')
-    // Membership inside a deleted band has no inverse — only the recorded
-    // snapshot can bring 2 and 3 back.
-    expect(filterRowsOf(store)).toEqual([2, 3, 7])
-
-    await expect(
-      store.setter(runRedoHistoryAtom, {
-        source: historySource,
-        refreshProjection: async () => undefined,
-      }),
-    ).resolves.toBe('completed')
-    expect(filterRowsOf(store)).toEqual([5])
-  })
+  // REMOVED at E8: "undo/redo of the structural entry round-trips the filter
+  // set exactly" asserted the FILTER-hidden set was restored by a UI-core
+  // history LOCAL-REPLAY side payload — the mechanism E8 deleted. The engine
+  // now owns the filter and restores it from its own `restoreFilters` snapshot
+  // (worker) / full-sheet capture (static) on the backend transaction, after
+  // which the provider re-hydrates `viewportFilterHiddenAtom` from the engine
+  // (`readSheetHiddenState.filterRows`). That backend-owned round-trip — the
+  // delete-band-has-no-inverse case included — is covered by the adapter suites
+  // (vnext-structural-remap-static, vnext-worker-undo-wasm) and the #27
+  // real-backend e2e, not by a bare UI-core harness that has no engine to read.
 })
 
 // ---------------------------------------------------------------------------

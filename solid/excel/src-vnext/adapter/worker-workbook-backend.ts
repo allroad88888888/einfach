@@ -128,6 +128,7 @@ import {
   type CellFormatSnapshot,
   type CellSnapshotWire,
   type CellWire,
+  type FilterSnapshotWire,
   type FormatRangeSnapshot,
   type ImportCellWire,
   type SortRangeBoundsWire,
@@ -359,16 +360,25 @@ interface WorkerMergeOverlayImage {
 }
 
 /**
- * Pre/post images of one sheet's FILTER-hidden snapshot (S5a), carried by
- * structural records for the same reason the merge overlay is: the shift
- * remaps the set in adapter memory (and in the engine), and inverting a
- * delete cannot re-derive which rows the filter had hidden inside the
- * deleted band — the rules are not re-run, the set IS the snapshot.
+ * Pre/post whole-workbook FILTER snapshots (rules + derived hidden rows),
+ * carried by a structural record that mutated a sheet with an active filter
+ * (E8 undo reroute). The engine self-shifts its OWNED filter on the structural
+ * op; the cell-level undo replay does NOT structurally re-shift it, so undo
+ * REPLACES the engine filter back to the recorded before-image through
+ * `restoreFilters` — the engine's own snapshot primitive, the same
+ * REPLACE-semantics twin of `restoreTables`. This SUPERSEDES the E7 pair of an
+ * adapter-memory before/after array plus a `setEvalFilterHiddenRows` re-push:
+ * `restoreFilters` restores rules AND hidden rows atomically, and inverting a
+ * delete that consumed filter-hidden rows has no inverse — which is exactly
+ * why a full before-image, not a remap, is what undo needs.
  */
-interface WorkerFilterHiddenOverlayImage {
+interface WorkerFilterSnapshotImage {
+  /** Adapter sheetId whose withholding mirror the restore re-syncs. */
   sheetId: string
-  before: number[]
-  after: number[]
+  /** Engine sheet index the mirror re-sync reads out of the snapshot. */
+  sheetIdx: number
+  before: FilterSnapshotWire
+  after: FilterSnapshotWire
 }
 
 interface WorkerTransactionRecord {
@@ -410,11 +420,12 @@ interface WorkerTransactionRecord {
    */
   mergeOverlay?: WorkerMergeOverlayImage
   /**
-   * Present when the mutation displaced a sheet's FILTER-hidden snapshot
-   * (S5a). Rides next to the sparse engine images exactly like
-   * `mergeOverlay`, and is replayed after them.
+   * Present when a structural mutation displaced a sheet that had an active
+   * FILTER (E8). Rides next to the sparse engine images exactly like
+   * `mergeOverlay`, and is replayed after them through the engine's
+   * `restoreFilters` snapshot primitive.
    */
-  filterHiddenOverlay?: WorkerFilterHiddenOverlayImage
+  filtersSnapshot?: WorkerFilterSnapshotImage
   /**
    * Present when the mutation changed the Excel Table REGISTRY (#25).
    * Always carried NEXT TO the sparse cell images, never alone: replaying
@@ -1555,22 +1566,35 @@ export function createWorkerWorkbookSpreadsheetBackend(
     // the after-image post-execute. Pure adapter memory — no RPC, never
     // a reason to degrade the record.
     const mergeBefore = (mergeRangesBySheetId.get(spec.sheetId) ?? []).map(cloneRange)
-    // Filter-hidden side payload (design §4.3), captured on the same
-    // before/after bracket from the mirror: `execute` self-displaces the
-    // engine's owned set AND (via `shiftFilterHiddenOverlay`) this mirror, so
-    // the after-image is the displaced set. A cell-level undo replay does NOT
-    // structurally re-shift, so undo restores the before-image into the engine.
-    const filterHiddenBefore = filterHiddenRowsSnapshot(spec.sheetId)
+    // E8 filter undo: when the mutated sheet has an active filter, bracket the
+    // engine's whole-workbook filter snapshot around the shift. `execute`
+    // self-displaces the engine's OWNED filter (rules + derived hidden set); a
+    // cell-level undo replay does NOT re-shift it, so undo REPLACES it back
+    // through `restoreFilters`. This supersedes the E7 adapter-memory before/
+    // after array + `setEvalFilterHiddenRows` re-push.
+    const sheetHasFilter = filterSortStateBySheetId.has(spec.sheetId)
+    const filtersBefore =
+      sheetHasFilter && typeof client.snapshotFilters === 'function'
+        ? await client.snapshotFilters()
+        : null
     const result = await spec.execute()
     const mergeAfter = (mergeRangesBySheetId.get(spec.sheetId) ?? []).map(cloneRange)
-    const filterHiddenAfter = filterHiddenRowsSnapshot(spec.sheetId)
+    const filtersAfter =
+      filtersBefore !== null && typeof client.snapshotFilters === 'function'
+        ? await client.snapshotFilters()
+        : null
     const mergeOverlay =
       mergeBefore.length > 0 || mergeAfter.length > 0
         ? { sheetId: spec.sheetId, before: mergeBefore, after: mergeAfter }
         : undefined
-    const filterHiddenOverlay =
-      filterHiddenBefore.length > 0 || filterHiddenAfter.length > 0
-        ? { sheetId: spec.sheetId, before: filterHiddenBefore, after: filterHiddenAfter }
+    const filtersSnapshot =
+      filtersBefore !== null && filtersAfter !== null
+        ? {
+            sheetId: spec.sheetId,
+            sheetIdx: spec.sheet.idx,
+            before: filtersBefore,
+            after: filtersAfter,
+          }
         : undefined
     if (before === null) {
       pushTransactionRecord(notUndoableRecord(spec.kind, spec.sheet.idx, null, diagnostic))
@@ -1601,7 +1625,7 @@ export function createWorkerWorkbookSpreadsheetBackend(
             before: { cells: before, format: null },
             after: { cells: after, format: null },
             ...(mergeOverlay ? { mergeOverlay } : {}),
-            ...(filterHiddenOverlay ? { filterHiddenOverlay } : {}),
+            ...(filtersSnapshot ? { filtersSnapshot } : {}),
           }
         : notUndoableRecord(spec.kind, spec.sheet.idx, null, diagnostic),
     )
@@ -1910,21 +1934,27 @@ export function createWorkerWorkbookSpreadsheetBackend(
       const ranges = action === 'undo' ? record.mergeOverlay.before : record.mergeOverlay.after
       mergeRangesBySheetId.set(record.mergeOverlay.sheetId, ranges.map(cloneRange))
     }
-    if (record.filterHiddenOverlay) {
-      // Whole-set restore of the FILTER-hidden mirror, then the same whole-set
-      // replace into the engine (design §4.3). The engine self-shifted its set
-      // forward on the structural op, but the cell-level undo replay above does
-      // NOT structurally re-shift, so the set is stale until we restore it here.
-      // Inverting the shift arithmetic would not do — a delete that consumed
-      // filter-hidden rows has no inverse, which is why the images are recorded.
-      // `setEvalFilterHiddenRows` updates the existing filter's hidden set in
-      // place (rules untouched), so SUBTOTAL reads the right band; the rules are
-      // UI-core canonical and restored by UI-core's own undo.
-      const overlay = record.filterHiddenOverlay
-      const rows = action === 'undo' ? overlay.before : overlay.after
-      if (rows.length === 0) filterHiddenRowsBySheetId.delete(overlay.sheetId)
-      else filterHiddenRowsBySheetId.set(overlay.sheetId, new Set(rows))
-      await client.setEvalFilterHiddenRows?.(record.sheetIdx, rows)
+    if (record.filtersSnapshot) {
+      // E8: REPLACE the engine's owned filter (rules + derived hidden set) back
+      // to the recorded whole-workbook before/after image through the engine's
+      // own `restoreFilters` snapshot primitive — the REPLACE-semantics twin of
+      // `restoreTables`. The engine self-shifted its filter forward on the
+      // structural op, but the cell-level undo replay above does NOT re-shift
+      // it, so it is stale until we restore it here; a delete that consumed
+      // filter-hidden rows has no inverse, so a full before-image is what undo
+      // needs. This runs AFTER the engine cell-image replay so a failed replay
+      // never half-applies the filter side.
+      const snapshot =
+        action === 'undo' ? record.filtersSnapshot.before : record.filtersSnapshot.after
+      await requireFilterClient('restoreFilters')(snapshot)
+      // Re-sync the projection-withholding mirror from the restored engine
+      // snapshot (no extra RPC — the hidden rows ride in the same envelope).
+      const restored = snapshot.filters.find(
+        (entry) => entry.sheet === record.filtersSnapshot!.sheetIdx,
+      )
+      const rows = restored?.hiddenRows ?? []
+      if (rows.length === 0) filterHiddenRowsBySheetId.delete(record.filtersSnapshot.sheetId)
+      else filterHiddenRowsBySheetId.set(record.filtersSnapshot.sheetId, new Set(rows))
     }
     record.boundTransactionId = request.transactionId
     source.pop()
@@ -2009,11 +2039,6 @@ export function createWorkerWorkbookSpreadsheetBackend(
     const ranges = mergeRangesBySheetId.get(sheetId)
     if (!ranges || ranges.length === 0) return
     shiftMergeRangeList(ranges, axis, index, count, direction)
-  }
-
-  /** One sheet's FILTER-hidden mirror as an ascending array. */
-  function filterHiddenRowsSnapshot(sheetId: string): number[] {
-    return [...(filterHiddenRowsBySheetId.get(sheetId) ?? [])].sort((left, right) => left - right)
   }
 
   /**
@@ -3219,6 +3244,23 @@ export function createWorkerWorkbookSpreadsheetBackend(
     | 'restoreTables'
 
   function requireTableClient<K extends TableClientMethod>(
+    method: K,
+  ): NonNullable<WorkerWorkbookClient[K]> {
+    const fn = client[method]
+    if (typeof fn !== 'function') {
+      throw createBackendError('UNSUPPORTED', `worker runtime does not implement ${method}`)
+    }
+    return fn.bind(client) as NonNullable<WorkerWorkbookClient[K]>
+  }
+
+  /**
+   * Bind a filter snapshot/restore client method or throw UNSUPPORTED. A
+   * `filtersSnapshot` record is only ever created when `snapshotFilters` was
+   * available on the same client (engineHiddenState), so on replay
+   * `restoreFilters` is available too; the guard keeps the type honest and
+   * fails closed rather than silently dropping the filter restore.
+   */
+  function requireFilterClient<K extends 'snapshotFilters' | 'restoreFilters'>(
     method: K,
   ): NonNullable<WorkerWorkbookClient[K]> {
     const fn = client[method]

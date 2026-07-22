@@ -432,6 +432,19 @@ describe('worker adapter: an active filter reaches the engine (#27 S4)', () => {
     }
     const filterRows = () =>
       getFilterHiddenRowsForSheet(store.getter(viewportFilterHiddenAtom), SHEET)
+    // Since E8 the FILTER-hidden render cache is re-hydrated FROM THE ENGINE
+    // after an undo/redo (no UI-core local-replay side payload any more). This
+    // reproduces what the provider's `refreshAfterHistory` does — the engine's
+    // `restoreFilters` snapshot already restored the owned filter on the
+    // transaction, so `readSheetHiddenState.filterRows` is the authoritative
+    // answer the cache adopts.
+    const rehydrateFilterFromEngine = async () => {
+      const hidden = await backend.readSheetHiddenState!({
+        kind: 'sheet-hidden-state',
+        sheetId: SHEET,
+      })
+      store.setter(setViewportFilterHiddenRowsAtom, { sheetId: SHEET, rows: [...hidden.filterRows] })
+    }
     /** Source rows the projection actually emits in column E. */
     const projectedColumnE = async (rowEnd: number) => {
       const window = await backend.readRangeProjection({
@@ -497,8 +510,10 @@ describe('worker adapter: an active filter reaches the engine (#27 S4)', () => {
       [5, '40'],
     ])
 
-    // Undo restores every copy from the recorded images — a shift inverse
-    // would not be enough, which is why they are recorded at all.
+    // Undo (E8): the backend transaction restores the ENGINE'S owned filter and
+    // manual sets from the engine's own snapshots — the worker adapter replays
+    // `restoreFilters` (a shift inverse would not be enough for the delete-band
+    // case, which is why a full before-image snapshot is what undo replays).
     await expect(
       store.setter(runUndoHistoryAtom, {
         source: backend,
@@ -506,7 +521,14 @@ describe('worker adapter: an active filter reaches the engine (#27 S4)', () => {
       }),
     ).resolves.toBe('completed')
     await pushManualToEngine()
+    // The manual render cache round-trips through its own local-replay re-feed;
+    // the FILTER render cache re-hydrates from the engine (no local-replay).
+    await rehydrateFilterFromEngine()
 
+    // COUNTER-EXAMPLE that the new path is real: the filter local-replay side
+    // payload is DELETED, so without the engine re-hydration above this would
+    // still read [2]. It reads [1] because `restoreFilters` put the engine's
+    // filter back and the cache adopted the engine's answer.
     expect(filterRows()).toEqual([1])
     expect(getHiddenRowsForSheet(store.getter(viewportHiddenAtom), SHEET)).toEqual([2])
     expect(await probes(0)).toEqual({ s9: '90', s109: '70', sum: '100' })

@@ -1224,15 +1224,15 @@ describe('remove-duplicates structural remap of local view facts', () => {
       getFilterHiddenRowsForSheet(store.getter(viewportFilterHiddenAtom), 'other-sheet'),
     ).toEqual([1, 3, 6])
 
+    // Since E8 the FILTER-hidden set carries NO history side payload — the
+    // engine owns the filter and restores it from its own snapshot on undo,
+    // after which the provider re-hydrates this cache from the engine. The
+    // forward shift above still keeps the render cache live this same tick.
     const entry = store.getter(historyStackAtom).entries.at(-1)!
     const filterPayload = entry.localSidePayloads?.find(
       (payload) => payload.applyKey === 'viewport.filterHidden',
     )
-    expect(filterPayload).toMatchObject({
-      sheetId: SHEET_ID,
-      before: { rows: [1, 3, 6] },
-      after: { rows: [1, 3, 5] },
-    })
+    expect(filterPayload).toBeUndefined()
   })
 
   test('a removal that displaces no local view facts records no side payloads', async () => {
