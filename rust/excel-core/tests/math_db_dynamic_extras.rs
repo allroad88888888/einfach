@@ -40,20 +40,105 @@ fn aggregate_round_trip_with_ignore_errors() {
     // Embed a #DIV/0! in A3.
     wb.set_formula(0, "A3", "=1/0");
 
-    // Without ignore_errors (options=0): #DIV/0! propagates.
+    // Without the ignore-errors bit (options=0): #DIV/0! propagates.
     wb.set_formula(0, "B1", "=AGGREGATE(9, 0, A1:A3)");
     assert_eq!(
         wb.get_cell("Sheet1", "B1"),
         Value::Error(ValueError::DivisionByZero)
     );
 
-    // With options=4 (ignore errors): A3 is skipped, sum = 30.
-    wb.set_formula(0, "B2", "=AGGREGATE(9, 4, A1:A3)");
+    // options=6 has the ignore-errors bit (bit 1) set: A3 is skipped, sum = 30.
+    wb.set_formula(0, "B2", "=AGGREGATE(9, 6, A1:A3)");
     assert_eq!(wb.get_cell("Sheet1", "B2"), Value::Number(30.0));
 
-    // LARGE (14) with k=1 on a range: max value.
-    wb.set_formula(0, "B3", "=AGGREGATE(14, 4, A1:A3, 1)");
-    assert_eq!(wb.get_cell("Sheet1", "B3"), Value::Number(20.0));
+    // options=4 = "ignore nothing" (Microsoft table): the #DIV/0! MUST
+    // propagate — it does NOT ignore errors. This corrects the previous
+    // assertion (=30) that was fossilised by the `options & 4` ignore-errors
+    // mis-map; with the correct `options & 2` map, option 4 propagates.
+    wb.set_formula(0, "B3", "=AGGREGATE(9, 4, A1:A3)");
+    assert_eq!(
+        wb.get_cell("Sheet1", "B3"),
+        Value::Error(ValueError::DivisionByZero)
+    );
+
+    // LARGE (14) with k=1 under option 4 (ignore nothing): error propagates
+    // (previously fossilised as =20 by the same bug).
+    wb.set_formula(0, "B4", "=AGGREGATE(14, 4, A1:A3, 1)");
+    assert_eq!(
+        wb.get_cell("Sheet1", "B4"),
+        Value::Error(ValueError::DivisionByZero)
+    );
+
+    // LARGE (14) with k=1 under option 6 (ignore errors): max of {10,20} = 20.
+    wb.set_formula(0, "B5", "=AGGREGATE(14, 6, A1:A3, 1)");
+    assert_eq!(wb.get_cell("Sheet1", "B5"), Value::Number(20.0));
+}
+
+/// Full sweep of the AGGREGATE `options` ignore-errors bit across every value
+/// 0..=7. Microsoft's official options table (verified 2026-07-22) maps
+/// "ignore error values" to bit 1 (`options & 2`) — set on {2,3,6,7}, clear on
+/// {0,1,4,5}. This is a regression guard against the historical `options & 4`
+/// mis-map, which set ignore-errors on {4,5,6,7}: it silently FAILED to ignore
+/// on options 2/3 (returned an error where 30 was expected) and WRONGLY ignored
+/// on options 4/5 (returned 30 where an error was expected). Options 6/7 agreed
+/// with both maps by coincidence, so they cannot discriminate the bug — 2/3 and
+/// 4/5 are the load-bearing cases.
+#[test]
+fn aggregate_ignore_errors_uses_options_bit_1_not_bit_2() {
+    let mut wb = Workbook::new();
+    wb.set_cell(0, "A1", Value::Number(10.0));
+    wb.set_cell(0, "A2", Value::Number(20.0));
+    // #DIV/0! in A3 — the value whose treatment the ignore-errors bit controls.
+    wb.set_formula(0, "A3", "=1/0");
+
+    // SUM (function 9): ignore -> 30, propagate -> #DIV/0!.
+    // Bit 1 SET => ignore errors.
+    for opt in [2, 3, 6, 7] {
+        wb.set_formula(0, "Z1", &format!("=AGGREGATE(9, {opt}, A1:A3)"));
+        assert_eq!(
+            wb.get_cell("Sheet1", "Z1"),
+            Value::Number(30.0),
+            "AGGREGATE(9, {opt}, A1:A3): options & 2 set -> ignore A3 #DIV/0! -> 30"
+        );
+    }
+    // Bit 1 CLEAR => errors propagate. Option 4 ("ignore nothing") and option 5
+    // ("ignore hidden rows" only) are exactly the cases the old `& 4` map broke.
+    for opt in [0, 1, 4, 5] {
+        wb.set_formula(0, "Z2", &format!("=AGGREGATE(9, {opt}, A1:A3)"));
+        assert_eq!(
+            wb.get_cell("Sheet1", "Z2"),
+            Value::Error(ValueError::DivisionByZero),
+            "AGGREGATE(9, {opt}, A1:A3): options & 2 clear -> #DIV/0! propagates"
+        );
+    }
+
+    // LARGE (function 14, k=1) walks the same ignore_errors seam but through the
+    // k-arg branch: ignore -> max{10,20} = 20, propagate -> #DIV/0!.
+    for opt in [2, 3, 6, 7] {
+        wb.set_formula(0, "Z3", &format!("=AGGREGATE(14, {opt}, A1:A3, 1)"));
+        assert_eq!(
+            wb.get_cell("Sheet1", "Z3"),
+            Value::Number(20.0),
+            "AGGREGATE(14, {opt}, A1:A3, 1): options & 2 set -> ignore error -> LARGE=20"
+        );
+    }
+    for opt in [0, 1, 4, 5] {
+        wb.set_formula(0, "Z4", &format!("=AGGREGATE(14, {opt}, A1:A3, 1)"));
+        assert_eq!(
+            wb.get_cell("Sheet1", "Z4"),
+            Value::Error(ValueError::DivisionByZero),
+            "AGGREGATE(14, {opt}, A1:A3, 1): options & 2 clear -> #DIV/0! propagates"
+        );
+    }
+
+    // SMALL (function 15, k=1) shares the seam too: ignore -> min{10,20} = 10.
+    wb.set_formula(0, "Z5", "=AGGREGATE(15, 2, A1:A3, 1)");
+    assert_eq!(wb.get_cell("Sheet1", "Z5"), Value::Number(10.0));
+    wb.set_formula(0, "Z6", "=AGGREGATE(15, 4, A1:A3, 1)");
+    assert_eq!(
+        wb.get_cell("Sheet1", "Z6"),
+        Value::Error(ValueError::DivisionByZero)
+    );
 }
 
 // ---- ODD / EVEN ----

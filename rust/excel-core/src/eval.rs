@@ -20059,7 +20059,13 @@ fn fn_aggregate(args: &[Expr], provider: &dyn EvalProvider) -> Value {
     if !(0..=7).contains(&options) {
         return Value::Error(ValueError::InvalidValue);
     }
-    let ignore_errors = (options & 4) != 0;
+    // Microsoft's AGGREGATE `options` bit map (official docs, verified
+    // 2026-07-22): bit 0 (`& 1`) = ignore hidden rows {1,3,5,7}; bit 1
+    // (`& 2`) = ignore error values {2,3,6,7}; bit 2 (`& 4`) governs nested
+    // SUBTOTAL/AGGREGATE inclusion, NOT errors. Ignore-errors is therefore
+    // `& 2` — `& 4` would have been the nested-function bit and mis-mapped
+    // options 2/3 (silently NOT ignoring) and 4/5 (wrongly ignoring).
+    let ignore_errors = (options & 2) != 0;
 
     let (data_args, k_arg): (&[Expr], Option<&Expr>) = if (14..=19).contains(&fn_int) {
         if args.len() < 4 {
