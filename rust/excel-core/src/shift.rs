@@ -1,5 +1,5 @@
 use crate::cell::CellAddress;
-use crate::formula::{BinOperator, Expr, RangeBounds, TableArea};
+use crate::formula::{BinOperator, Expr, RangeAbs, RangeBounds, RefAbs, TableArea};
 
 /// What to do with a CellRef whose target was deleted by a structural edit.
 ///
@@ -32,11 +32,12 @@ fn range_has_invalid_ref(start: CellAddress, end: CellAddress, unbounded: RangeB
 /// formula was reading.
 pub fn contains_invalid_ref(expr: &Expr) -> bool {
     match expr {
-        Expr::CellRef(addr) => is_invalid(*addr),
+        Expr::CellRef(addr, _) => is_invalid(*addr),
         Expr::Range {
             start,
             end,
             unbounded,
+            ..
         } => range_has_invalid_ref(*start, *end, *unbounded),
         Expr::SheetRef { addr, .. } => is_invalid(*addr),
         Expr::SheetRange {
@@ -219,10 +220,12 @@ pub enum SourceRewrite {
 ///     shifts, the unbounded axis is pinned — and a corner mapped into
 ///     the deleted band (e.g. `delete_col(0)` under `=SUM(1:3)`) kills
 ///     the formula, matching the hydrated `contains_invalid_ref` path.
-///   - Absolute refs (`$A$1`) and quoted sheet names (`'My Sheet'!A1`)
-///     do not exist in this grammar (`CellAddress::parse` /
-///     `parse_identifier` reject them), so the scanner doesn't model
-///     them.
+///   - Absolute refs (`$A$1`, `$A1`, `A$1`, and the range / whole-col /
+///     whole-row forms) are shifted exactly like their relative twins —
+///     the address moves, the `$` markers are preserved — mirroring the
+///     hydrated `map_addrs` path (absoluteness never changes how an edit
+///     moves an address). Quoted sheet names (`'My Sheet'!A1`) still do
+///     not exist in this grammar, so the scanner doesn't model them.
 ///
 /// Sources that don't parse (possible via `bulk_install_storage`,
 /// which parks without validating) still surface `#VALUE!` at
@@ -259,36 +262,84 @@ pub fn rewrite_parked_source(src: &str, edit: ShiftEdit) -> SourceRewrite {
             prev = b'"';
             continue;
         }
-        if c.is_ascii_alphabetic() {
-            let start = i;
-            i = scan_ident_end(b, i);
-            let token = &src[start..i];
+        if c == b'$' || c.is_ascii_alphabetic() {
+            // A token that immediately follows a sheet `!` is a cross-sheet
+            // address (SheetRef / SheetRange corner). Within-sheet edits
+            // never shift those (mirrors `map_addrs`), so skip the whole
+            // `[$]col[$]row` corner plus an optional `:corner` SheetRange
+            // tail. A non-address after `!` (a DynamicRange end) falls
+            // through so its inner refs still shift.
             if prev == b'!' {
-                // Cross-sheet address after `Sheet!`. Skip it, plus an
-                // optional `: <addr>` SheetRange tail (the parser
-                // allows whitespace around the `:`; if the tail isn't
-                // an address it re-parses as a DynamicRange end, whose
-                // inner refs DO shift — leave those to the main loop).
-                let mut j = skip_ascii_ws(b, i);
-                if j < n && b[j] == b':' {
-                    j = skip_ascii_ws(b, j + 1);
-                    let k = scan_alnum_end(b, j);
-                    if k > j && parse_addr_token(&src[j..k]).is_some() {
-                        i = k;
+                if let Some((_, _, _, end)) = scan_abs_addr_token(b, i) {
+                    let mut k = end;
+                    let j = skip_ascii_ws(b, k);
+                    if j < n && b[j] == b':' {
+                        let jj = skip_ascii_ws(b, j + 1);
+                        if let Some((_, _, _, end2)) = scan_abs_addr_token(b, jj) {
+                            k = end2;
+                        }
                     }
-                }
-                prev = b[i - 1];
-                continue;
-            }
-            match next_non_ws(b, i) {
-                Some(b'(') | Some(b'!') => {
-                    // Function name or sheet name — never a same-sheet ref.
+                    i = k;
                     prev = b[i - 1];
                     continue;
                 }
-                _ => {}
             }
-            if let Some(addr) = parse_addr_token(token) {
+
+            if c.is_ascii_alphabetic() {
+                let start = i;
+                i = scan_ident_end(b, i);
+                match next_non_ws(b, i) {
+                    Some(b'(') | Some(b'!') => {
+                        // Function name or sheet name — never a same-sheet ref.
+                        prev = b[i - 1];
+                        continue;
+                    }
+                    _ => {}
+                }
+                // Same-sheet cell ref (`A5`, `A$5`), `$`-aware on the row.
+                if let Some((addr, col_abs, row_abs, end)) = scan_abs_addr_token(b, start) {
+                    let mapped = edit.apply(addr);
+                    if mapped.row == REF_INVALID_ROW || mapped.col == REF_INVALID_COL {
+                        return SourceRewrite::DeadRef;
+                    }
+                    if mapped != addr {
+                        let buf = out.get_or_insert_with(|| String::with_capacity(src.len() + 8));
+                        buf.push_str(&src[emitted..start]);
+                        push_abs_addr(buf, mapped, col_abs, row_abs);
+                        emitted = end;
+                    }
+                    i = end;
+                    prev = b[i - 1];
+                    continue;
+                }
+                // Whole-column range `A:C` / `A:$C` (start column has no `$`
+                // on this path — a leading `$` routes through the `$` arm).
+                if let Some(res) = try_shift_whole_col(b, start, edit) {
+                    match res {
+                        Err(()) => return SourceRewrite::DeadRef,
+                        Ok((new_i, rewrite)) => {
+                            if let Some(text) = rewrite {
+                                let buf =
+                                    out.get_or_insert_with(|| String::with_capacity(src.len() + 8));
+                                buf.push_str(&src[emitted..start]);
+                                buf.push_str(&text);
+                                emitted = new_i;
+                            }
+                            i = new_i;
+                            prev = b[i - 1];
+                            continue;
+                        }
+                    }
+                }
+                // Plain Name / TRUE / FALSE / error-literal letters — copy.
+                prev = b[i - 1];
+                continue;
+            }
+
+            // c == b'$': a leading `$` always introduces a reference
+            // (never a function / sheet / Name).
+            let start = i;
+            if let Some((addr, col_abs, row_abs, end)) = scan_abs_addr_token(b, start) {
                 let mapped = edit.apply(addr);
                 if mapped.row == REF_INVALID_ROW || mapped.col == REF_INVALID_COL {
                     return SourceRewrite::DeadRef;
@@ -296,111 +347,76 @@ pub fn rewrite_parked_source(src: &str, edit: ShiftEdit) -> SourceRewrite {
                 if mapped != addr {
                     let buf = out.get_or_insert_with(|| String::with_capacity(src.len() + 8));
                     buf.push_str(&src[emitted..start]);
-                    buf.push_str(&mapped.to_string_repr());
-                    emitted = i;
+                    push_abs_addr(buf, mapped, col_abs, row_abs);
+                    emitted = end;
                 }
+                i = end;
                 prev = b[i - 1];
                 continue;
             }
-            // Whole-column range `A:C` — all-alphabetic token, `:` next
-            // (whitespace allowed), all-alphabetic end token NOT
-            // followed by a digit (otherwise it's the `A1:B2` family or
-            // garbage — mirror of the parser's rollback).
-            if token.bytes().all(|x| x.is_ascii_alphabetic()) {
-                let mut j = skip_ascii_ws(b, i);
-                if j < n && b[j] == b':' {
-                    j = skip_ascii_ws(b, j + 1);
-                    let k = scan_alpha_end(b, j);
-                    let followed_by_digit = k < n && b[k].is_ascii_digit();
-                    if k > j && !followed_by_digit {
-                        let start_col = parse_col_letters(token);
-                        let end_col = parse_col_letters(&src[j..k]);
-                        if let (Some(sc), Some(ec)) = (start_col, end_col) {
-                            // Synthetic corners (row 0 = pinned
-                            // unbounded axis), mirroring
-                            // `shift_range_corners`: a row edit leaves
-                            // the corners alone UNLESS the mapping
-                            // kills them (delete at the pinned
-                            // coordinate maps row 0 into the band).
-                            let m1 = edit.apply(CellAddress::new(0, sc));
-                            let m2 = edit.apply(CellAddress::new(0, ec));
-                            if m1.col == REF_INVALID_COL
-                                || m2.col == REF_INVALID_COL
-                                || (!edit.is_row_edit()
-                                    && (m1.row == REF_INVALID_ROW || m2.row == REF_INVALID_ROW))
-                            {
-                                return SourceRewrite::DeadRef;
-                            }
-                            if !edit.is_row_edit() && (m1.col != sc || m2.col != ec) {
-                                let buf =
-                                    out.get_or_insert_with(|| String::with_capacity(src.len() + 8));
-                                buf.push_str(&src[emitted..start]);
-                                buf.push_str(&col_only(m1.col));
-                                buf.push(':');
-                                buf.push_str(&col_only(m2.col));
-                                emitted = k;
-                            }
-                            i = k;
-                            prev = b[i - 1];
-                            continue;
+            if let Some(res) = try_shift_whole_col(b, start, edit) {
+                match res {
+                    Err(()) => return SourceRewrite::DeadRef,
+                    Ok((new_i, rewrite)) => {
+                        if let Some(text) = rewrite {
+                            let buf =
+                                out.get_or_insert_with(|| String::with_capacity(src.len() + 8));
+                            buf.push_str(&src[emitted..start]);
+                            buf.push_str(&text);
+                            emitted = new_i;
                         }
+                        i = new_i;
+                        prev = b[i - 1];
+                        continue;
                     }
                 }
             }
-            // Plain Name / TRUE / FALSE / error-literal letters — copy.
-            prev = b[i - 1];
+            if let Some(res) = try_shift_whole_row(b, start, edit) {
+                match res {
+                    Err(()) => return SourceRewrite::DeadRef,
+                    Ok((new_i, rewrite)) => {
+                        if let Some(text) = rewrite {
+                            let buf =
+                                out.get_or_insert_with(|| String::with_capacity(src.len() + 8));
+                            buf.push_str(&src[emitted..start]);
+                            buf.push_str(&text);
+                            emitted = new_i;
+                        }
+                        i = new_i;
+                        prev = b[i - 1];
+                        continue;
+                    }
+                }
+            }
+            // Lone `$` (not part of a reference) — copy through.
+            prev = b'$';
+            i += 1;
             continue;
         }
         if c.is_ascii_digit() && prev != b'.' {
-            // Candidate whole-row range `1:3`: digit run, IMMEDIATE
-            // `:`, immediate digit run, not followed by a letter —
-            // exactly `try_parse_whole_row_range`'s acceptance rule.
+            // Candidate whole-row range `1:3` / `1:$3`. A leading `$` on the
+            // first corner routes through the `$` arm above.
             let start = i;
-            while i < n && b[i].is_ascii_digit() {
-                i += 1;
-            }
-            if i < n && b[i] == b':' {
-                let d2 = i + 1;
-                let mut j = d2;
-                while j < n && b[j].is_ascii_digit() {
-                    j += 1;
-                }
-                let followed_by_alpha = j < n && b[j].is_ascii_alphabetic();
-                if j > d2 && !followed_by_alpha {
-                    let r1: Option<u32> = src[start..i].parse().ok();
-                    let r2: Option<u32> = src[d2..j].parse().ok();
-                    match (r1, r2) {
-                        (Some(r1), Some(r2)) if r1 > 0 && r2 > 0 => {
-                            // Synthetic corners (col 0 pinned), mirror
-                            // of `shift_range_corners` for
-                            // `RangeBounds::Cols`.
-                            let m1 = edit.apply(CellAddress::new(r1 - 1, 0));
-                            let m2 = edit.apply(CellAddress::new(r2 - 1, 0));
-                            if m1.row == REF_INVALID_ROW
-                                || m2.row == REF_INVALID_ROW
-                                || (edit.is_row_edit()
-                                    && (m1.col == REF_INVALID_COL || m2.col == REF_INVALID_COL))
-                            {
-                                return SourceRewrite::DeadRef;
-                            }
-                            if edit.is_row_edit() && (m1.row != r1 - 1 || m2.row != r2 - 1) {
-                                let buf =
-                                    out.get_or_insert_with(|| String::with_capacity(src.len() + 8));
-                                buf.push_str(&src[emitted..start]);
-                                buf.push_str(&format!("{}:{}", m1.row + 1, m2.row + 1));
-                                emitted = j;
-                            }
-                            i = j;
-                            prev = b[i - 1];
-                            continue;
+            if let Some(res) = try_shift_whole_row(b, start, edit) {
+                match res {
+                    Err(()) => return SourceRewrite::DeadRef,
+                    Ok((new_i, rewrite)) => {
+                        if let Some(text) = rewrite {
+                            let buf =
+                                out.get_or_insert_with(|| String::with_capacity(src.len() + 8));
+                            buf.push_str(&src[emitted..start]);
+                            buf.push_str(&text);
+                            emitted = new_i;
                         }
-                        _ => {
-                            // Unparseable / zero row numbers: the real
-                            // parser rolls back into a parse error —
-                            // leave the text alone.
-                        }
+                        i = new_i;
+                        prev = b[i - 1];
+                        continue;
                     }
                 }
+            }
+            // Not a whole-row range — copy the leading digit run through.
+            while i < n && b[i].is_ascii_digit() {
+                i += 1;
             }
             prev = b[i - 1];
             continue;
@@ -439,20 +455,6 @@ fn scan_ident_end(b: &[u8], mut i: usize) -> usize {
     i
 }
 
-fn scan_alnum_end(b: &[u8], mut i: usize) -> usize {
-    while i < b.len() && b[i].is_ascii_alphanumeric() {
-        i += 1;
-    }
-    i
-}
-
-fn scan_alpha_end(b: &[u8], mut i: usize) -> usize {
-    while i < b.len() && b[i].is_ascii_alphabetic() {
-        i += 1;
-    }
-    i
-}
-
 fn skip_ascii_ws(b: &[u8], mut i: usize) -> usize {
     while i < b.len() && (b[i] == b' ' || b[i] == b'\t' || b[i] == b'\r' || b[i] == b'\n') {
         i += 1;
@@ -485,22 +487,217 @@ fn parse_col_letters(s: &str) -> Option<u32> {
     result.checked_sub(1)
 }
 
-/// Overflow-safe equivalent of `CellAddress::parse` for a bare token
-/// (letters then 1-based row digits, nothing else).
-fn parse_addr_token(s: &str) -> Option<CellAddress> {
-    let split = s.bytes().position(|c| !c.is_ascii_alphabetic())?;
-    if split == 0 {
+/// Parse a `[$]col[$]row` cell-address token at byte index `i` (which must
+/// point at `$` or an ascii letter). Returns `(addr, col_abs, row_abs, end)`
+/// only when the token is a self-delimited cell address — mirroring
+/// `Parser::scan_abs_cell_addr`, boundary check included, so `A1B` / `A1.5`
+/// are NOT treated as addresses. Overflow-safe (runs over hostile parked
+/// text). Returns `None` otherwise.
+fn scan_abs_addr_token(b: &[u8], i: usize) -> Option<(CellAddress, bool, bool, usize)> {
+    let n = b.len();
+    let mut j = i;
+    let col_abs = if j < n && b[j] == b'$' {
+        j += 1;
+        true
+    } else {
+        false
+    };
+    let letters_start = j;
+    while j < n && b[j].is_ascii_alphabetic() {
+        j += 1;
+    }
+    if j == letters_start {
         return None;
     }
-    let (letters, digits) = s.split_at(split);
-    if digits.is_empty() || !digits.bytes().all(|c| c.is_ascii_digit()) {
+    let col = parse_col_letters(std::str::from_utf8(&b[letters_start..j]).ok()?)?;
+    let row_abs = if j < n && b[j] == b'$' {
+        j += 1;
+        true
+    } else {
+        false
+    };
+    let digits_start = j;
+    while j < n && b[j].is_ascii_digit() {
+        j += 1;
+    }
+    if j == digits_start {
         return None;
     }
-    let row: u32 = digits.parse().ok()?;
+    // Boundary: the token must not run into a longer identifier.
+    if j < n {
+        let d = b[j];
+        if d.is_ascii_alphanumeric() || d == b'_' {
+            return None;
+        }
+        if d == b'.' && j + 1 < n && (b[j + 1].is_ascii_alphanumeric() || b[j + 1] == b'_') {
+            return None;
+        }
+    }
+    let row: u32 = std::str::from_utf8(&b[digits_start..j]).ok()?.parse().ok()?;
     if row == 0 {
         return None;
     }
-    Some(CellAddress::new(row - 1, parse_col_letters(letters)?))
+    Some((CellAddress::new(row - 1, col), col_abs, row_abs, j))
+}
+
+/// Emit a `[$]col[$]row` address token into `out`, preserving the `$`
+/// markers.
+fn push_abs_addr(out: &mut String, addr: CellAddress, col_abs: bool, row_abs: bool) {
+    if col_abs {
+        out.push('$');
+    }
+    out.push_str(&col_only(addr.col));
+    if row_abs {
+        out.push('$');
+    }
+    out.push_str(&(addr.row + 1).to_string());
+}
+
+/// Scan a `[$]letters` whole-column corner at `i`. Returns `(col, col_abs,
+/// end)`. Overflow-safe. `None` when no letters are present.
+fn scan_abs_col_token(b: &[u8], i: usize) -> Option<(u32, bool, usize)> {
+    let n = b.len();
+    let mut j = i;
+    let col_abs = if j < n && b[j] == b'$' {
+        j += 1;
+        true
+    } else {
+        false
+    };
+    let s = j;
+    while j < n && b[j].is_ascii_alphabetic() {
+        j += 1;
+    }
+    if j == s {
+        return None;
+    }
+    let col = parse_col_letters(std::str::from_utf8(&b[s..j]).ok()?)?;
+    Some((col, col_abs, j))
+}
+
+/// Try to consume a `$`-aware whole-column range `[$]A:[$]C` starting at
+/// `start`. `None` when the shape is not a whole-column range. `Some(Err)`
+/// when a corner was deleted (DeadRef). `Some(Ok((new_i, rewrite)))`
+/// otherwise, where `rewrite` is `Some(text)` when the columns moved (`$`
+/// markers preserved). Mirrors the hydrated `shift_range_corners` +
+/// `contains_invalid_ref` outcome for `RangeBounds::Rows`.
+fn try_shift_whole_col(
+    b: &[u8],
+    start: usize,
+    edit: ShiftEdit,
+) -> Option<Result<(usize, Option<String>), ()>> {
+    let n = b.len();
+    let (start_col, start_abs, after_start) = scan_abs_col_token(b, start)?;
+    let j = skip_ascii_ws(b, after_start);
+    if j >= n || b[j] != b':' {
+        return None;
+    }
+    let j = skip_ascii_ws(b, j + 1);
+    let (end_col, end_abs, after_end) = scan_abs_col_token(b, j)?;
+    // `A:B3` — a trailing digit means the right corner was a cell address.
+    if after_end < n && b[after_end].is_ascii_digit() {
+        return None;
+    }
+    let m1 = edit.apply(CellAddress::new(0, start_col));
+    let m2 = edit.apply(CellAddress::new(0, end_col));
+    if m1.col == REF_INVALID_COL
+        || m2.col == REF_INVALID_COL
+        || (!edit.is_row_edit() && (m1.row == REF_INVALID_ROW || m2.row == REF_INVALID_ROW))
+    {
+        return Some(Err(()));
+    }
+    let rewrite = if !edit.is_row_edit() && (m1.col != start_col || m2.col != end_col) {
+        let mut s = String::new();
+        if start_abs {
+            s.push('$');
+        }
+        s.push_str(&col_only(m1.col));
+        s.push(':');
+        if end_abs {
+            s.push('$');
+        }
+        s.push_str(&col_only(m2.col));
+        Some(s)
+    } else {
+        None
+    };
+    Some(Ok((after_end, rewrite)))
+}
+
+/// Try to consume a `$`-aware whole-row range `[$]1:[$]3` starting at
+/// `start`. Same result contract as [`try_shift_whole_col`], for
+/// `RangeBounds::Cols`. Mirrors `try_parse_whole_row_range`'s acceptance
+/// rule (immediate `:`, digits both sides, end not followed by a letter).
+fn try_shift_whole_row(
+    b: &[u8],
+    start: usize,
+    edit: ShiftEdit,
+) -> Option<Result<(usize, Option<String>), ()>> {
+    let n = b.len();
+    let mut j = start;
+    let start_abs = if j < n && b[j] == b'$' {
+        j += 1;
+        true
+    } else {
+        false
+    };
+    let s1 = j;
+    while j < n && b[j].is_ascii_digit() {
+        j += 1;
+    }
+    if j == s1 {
+        return None;
+    }
+    let r1: u32 = std::str::from_utf8(&b[s1..j]).ok()?.parse().ok()?;
+    // `:` must be immediate (no whitespace).
+    if j >= n || b[j] != b':' {
+        return None;
+    }
+    j += 1;
+    let end_abs = if j < n && b[j] == b'$' {
+        j += 1;
+        true
+    } else {
+        false
+    };
+    let s2 = j;
+    while j < n && b[j].is_ascii_digit() {
+        j += 1;
+    }
+    if j == s2 {
+        return None;
+    }
+    if j < n && b[j].is_ascii_alphabetic() {
+        return None;
+    }
+    let r2: u32 = std::str::from_utf8(&b[s2..j]).ok()?.parse().ok()?;
+    if r1 == 0 || r2 == 0 {
+        return None;
+    }
+    let m1 = edit.apply(CellAddress::new(r1 - 1, 0));
+    let m2 = edit.apply(CellAddress::new(r2 - 1, 0));
+    if m1.row == REF_INVALID_ROW
+        || m2.row == REF_INVALID_ROW
+        || (edit.is_row_edit() && (m1.col == REF_INVALID_COL || m2.col == REF_INVALID_COL))
+    {
+        return Some(Err(()));
+    }
+    let rewrite = if edit.is_row_edit() && (m1.row != r1 - 1 || m2.row != r2 - 1) {
+        let mut s = String::new();
+        if start_abs {
+            s.push('$');
+        }
+        s.push_str(&(m1.row + 1).to_string());
+        s.push(':');
+        if end_abs {
+            s.push('$');
+        }
+        s.push_str(&(m2.row + 1).to_string());
+        Some(s)
+    } else {
+        None
+    };
+    Some(Ok((j, rewrite)))
 }
 
 /// Walk an AST applying `f` to every CellRef / Range corner address.
@@ -515,17 +712,19 @@ fn parse_addr_token(s: &str) -> Option<CellAddress> {
 pub fn map_addrs(expr: &Expr, f: &dyn Fn(CellAddress) -> CellAddress) -> Expr {
     match expr {
         Expr::Number(_) | Expr::Text(_) | Expr::Bool(_) | Expr::Error(_) => expr.clone(),
-        Expr::CellRef(addr) => Expr::CellRef(f(*addr)),
+        Expr::CellRef(addr, abs) => Expr::CellRef(f(*addr), *abs),
         Expr::Range {
             start,
             end,
             unbounded,
+            abs,
         } => {
             let (new_start, new_end) = shift_range_corners(*start, *end, *unbounded, &|a| f(a));
             Expr::Range {
                 start: new_start,
                 end: new_end,
                 unbounded: *unbounded,
+                abs: *abs,
             }
         }
         // Cross-sheet refs aren't shifted by within-sheet structural edits.
@@ -639,17 +838,19 @@ fn shift_range_corners(
 pub fn shift_refs(expr: &Expr, drow: i32, dcol: i32) -> Result<Expr, ()> {
     Ok(match expr {
         Expr::Number(_) | Expr::Text(_) | Expr::Bool(_) | Expr::Error(_) => expr.clone(),
-        Expr::CellRef(addr) => Expr::CellRef(shift_addr(*addr, drow, dcol)?),
+        Expr::CellRef(addr, abs) => Expr::CellRef(shift_addr(*addr, drow, dcol)?, *abs),
         Expr::Range {
             start,
             end,
             unbounded,
+            abs,
         } => {
             let (s, e) = shift_range_corners_delta(*start, *end, *unbounded, drow, dcol)?;
             Expr::Range {
                 start: s,
                 end: e,
                 unbounded: *unbounded,
+                abs: *abs,
             }
         }
         // Cross-sheet refs aren't shifted on copy/paste — they point to a
@@ -788,32 +989,56 @@ fn col_only(mut col: u32) -> String {
     result.chars().rev().collect()
 }
 
+/// Render one cell address with its `$` absolute markers (`$A$1`, `$A1`,
+/// `A$1`, `A1`). Absoluteness is a written-form annotation only; the address
+/// coordinates are unchanged from `to_string_repr`.
+fn render_abs_addr(addr: CellAddress, abs: RefAbs, out: &mut String) {
+    if abs.col {
+        out.push('$');
+    }
+    out.push_str(&col_only(addr.col));
+    if abs.row {
+        out.push('$');
+    }
+    out.push_str(&format!("{}", addr.row + 1));
+}
+
 fn render_range_body(
     start: CellAddress,
     end: CellAddress,
     unbounded: RangeBounds,
+    abs: RangeAbs,
     out: &mut String,
 ) {
     match unbounded {
-        RangeBounds::None => {
-            out.push_str(&start.to_string_repr());
+        RangeBounds::None | RangeBounds::Both => {
+            render_abs_addr(start, abs.start, out);
             out.push(':');
-            out.push_str(&end.to_string_repr());
+            render_abs_addr(end, abs.end, out);
         }
         RangeBounds::Rows => {
+            // Whole-column range — only the column carries a `$`.
+            if abs.start.col {
+                out.push('$');
+            }
             out.push_str(&col_only(start.col));
             out.push(':');
+            if abs.end.col {
+                out.push('$');
+            }
             out.push_str(&col_only(end.col));
         }
         RangeBounds::Cols => {
+            // Whole-row range — only the row carries a `$`.
+            if abs.start.row {
+                out.push('$');
+            }
             out.push_str(&format!("{}", start.row + 1));
             out.push(':');
+            if abs.end.row {
+                out.push('$');
+            }
             out.push_str(&format!("{}", end.row + 1));
-        }
-        RangeBounds::Both => {
-            out.push_str(&start.to_string_repr());
-            out.push(':');
-            out.push_str(&end.to_string_repr());
         }
     }
 }
@@ -834,17 +1059,18 @@ fn render_into(expr: &Expr, out: &mut String) {
         }
         Expr::Bool(b) => out.push_str(if *b { "TRUE" } else { "FALSE" }),
         Expr::Error(e) => out.push_str(&e.to_string()),
-        Expr::CellRef(addr) => {
+        Expr::CellRef(addr, abs) => {
             if is_invalid(*addr) {
                 out.push_str("#REF!");
             } else {
-                out.push_str(&addr.to_string_repr());
+                render_abs_addr(*addr, *abs, out);
             }
         }
         Expr::Range {
             start,
             end,
             unbounded,
+            abs,
         } => {
             // For whole-col / whole-row ranges, only the bounded axis can
             // carry a #REF! sentinel. is_invalid() checks BOTH axes, so
@@ -853,16 +1079,16 @@ fn render_into(expr: &Expr, out: &mut String) {
             if range_has_invalid_ref(*start, *end, *unbounded) {
                 out.push_str("#REF!");
             } else {
-                render_range_body(*start, *end, *unbounded, out);
+                render_range_body(*start, *end, *unbounded, *abs, out);
             }
         }
-        Expr::SheetRef { sheet, addr } => {
+        Expr::SheetRef { sheet, addr, abs } => {
             if is_invalid(*addr) {
                 out.push_str("#REF!");
             } else {
                 out.push_str(sheet);
                 out.push('!');
-                out.push_str(&addr.to_string_repr());
+                render_abs_addr(*addr, *abs, out);
             }
         }
         Expr::SheetRange {
@@ -870,13 +1096,14 @@ fn render_into(expr: &Expr, out: &mut String) {
             start,
             end,
             unbounded,
+            abs,
         } => {
             if range_has_invalid_ref(*start, *end, *unbounded) {
                 out.push_str("#REF!");
             } else {
                 out.push_str(sheet);
                 out.push('!');
-                render_range_body(*start, *end, *unbounded, out);
+                render_range_body(*start, *end, *unbounded, *abs, out);
             }
         }
         Expr::SpillRef(anchor) => {
@@ -1386,6 +1613,18 @@ mod tests {
             "=#REF!+A2",
             "=\"literal A1:B2 stays\"&A3",
             "=a5+b7", // lowercase refs are valid and shift
+            // Absolute / mixed references: the parked scanner must match the
+            // hydrated `map_addrs` retarget exactly, `$` markers included.
+            "=$A$5",
+            "=A$5+$B7*2",
+            "=SUM($A$1:$B$5)",
+            "=$A$1:B$2 + SUM( $C3 : D$4 )",
+            "=SUM($A:$C)",
+            "=SUM($1:$3)",
+            "=Data!$A$1+$B2",
+            "=$B1#",
+            "=$A$1:INDEX($B:$B,5)",
+            "=IF($A2>0,\"$A$2\",\"B9\")&$C3",
         ];
         for edit in edits {
             for src in corpus {
@@ -1518,6 +1757,125 @@ mod tests {
         assert_eq!(
             rewrite_parked_source("=B1#", ShiftEdit::RowInsert { at: 0, count: 1 }),
             SourceRewrite::Rewritten("=B2#".into())
+        );
+    }
+
+    // ================= Absolute references (`$A$1`) round-trip =================
+
+    #[test]
+    fn render_absolute_refs_byte_exact() {
+        // Requirement #2: a stored `$` form reads back with its `$` intact.
+        // These simple refs carry no binop parens, so render is byte-exact
+        // with the source (the hydrated retarget path re-renders via exactly
+        // this function into `formula_texts` / `get_formula`).
+        for s in [
+            "=$A$1",
+            "=$A1",
+            "=A$1",
+            "=A1",
+            "=$A$2:$B$4",
+            "=$A2:B$4",
+            "=A1:$B$2",
+            "=Sheet1!$A$1",
+            "=Sheet1!$A$2:$B$4",
+            "=$A:$C",
+            "=A:$C",
+            "=$1:$3",
+            "=$A$1#",
+        ] {
+            let parsed = parse_formula(s).unwrap();
+            assert_eq!(render_formula(&parsed), s, "byte round-trip for {s}");
+        }
+    }
+
+    #[test]
+    fn render_absolute_refs_ast_roundtrip() {
+        // Property: parse -> render -> parse == parse, across `$` combos
+        // embedded in binops / function calls.
+        for s in [
+            "=$A$1+$B2*C$3",
+            "=SUM($A$2:$B$4)",
+            "=SUM($A2:B$4)",
+            "=SUM(Sheet1!$A$1:$C$9)",
+            "=SUM($A:$C)+SUM($1:$3)",
+            "=IF($A$1>0,$B$1,C1)",
+        ] {
+            let parsed = parse_formula(s).unwrap();
+            let rendered = render_formula(&parsed);
+            let reparsed = parse_formula(&rendered).unwrap();
+            assert_eq!(parsed, reparsed, "AST round-trip {s} -> {rendered}");
+        }
+    }
+
+    #[test]
+    fn structural_shift_preserves_absolute_markers() {
+        // Requirement #3 (hydrated path): Excel shifts `$A$5` to `$A$6` on a
+        // row insert — the ADDRESS moves, the `$` markers STAY.
+        let shift = |src: &str, edit: ShiftEdit| {
+            let expr = parse_formula(src).unwrap();
+            render_formula(&map_addrs(&expr, &|a| edit.apply(a)))
+        };
+        assert_eq!(
+            shift("=$A$5", ShiftEdit::RowInsert { at: 0, count: 1 }),
+            "=$A$6"
+        );
+        assert_eq!(
+            shift("=SUM($A$2:$B$4)", ShiftEdit::RowInsert { at: 0, count: 2 }),
+            "=SUM($A$4:$B$6)"
+        );
+        assert_eq!(
+            shift("=$A2:B$4", ShiftEdit::ColInsert { at: 0, count: 1 }),
+            "=$B2:C$4"
+        );
+        // Absolute whole-column keeps `$` while the column shifts.
+        assert_eq!(
+            shift("=SUM($B:$C)", ShiftEdit::ColInsert { at: 0, count: 1 }),
+            "=SUM($C:$D)"
+        );
+        // Deleting the referenced row still collapses to #REF!, `$` or not.
+        assert_eq!(
+            shift("=$A$5", ShiftEdit::RowDelete { at: 4, count: 1 }),
+            "=#REF!"
+        );
+    }
+
+    #[test]
+    fn parked_rewrite_absolute_refs_preserve_markers() {
+        // Requirement #3 (lazy/parked path): the token scanner shifts the
+        // address and re-emits the `$`.
+        assert_eq!(
+            rewrite_parked_source("=$A$5", ShiftEdit::RowInsert { at: 0, count: 1 }),
+            SourceRewrite::Rewritten("=$A$6".into())
+        );
+        assert_eq!(
+            rewrite_parked_source("=A$5*$B2", ShiftEdit::RowInsert { at: 0, count: 1 }),
+            SourceRewrite::Rewritten("=A$6*$B3".into())
+        );
+        assert_eq!(
+            rewrite_parked_source("=SUM($A$2:$B$4)", ShiftEdit::ColInsert { at: 0, count: 1 }),
+            SourceRewrite::Rewritten("=SUM($B$2:$C$4)".into())
+        );
+        // Cross-sheet absolute refs are NOT shifted by a within-sheet edit.
+        assert_eq!(
+            rewrite_parked_source(
+                "=Data!$A$1+$B$2",
+                ShiftEdit::RowInsert { at: 0, count: 1 }
+            ),
+            SourceRewrite::Rewritten("=Data!$A$1+$B$3".into())
+        );
+        // Absolute whole-column / whole-row keep `$` on the bounded axis.
+        assert_eq!(
+            rewrite_parked_source("=SUM($B:$C)", ShiftEdit::ColInsert { at: 0, count: 1 }),
+            SourceRewrite::Rewritten("=SUM($C:$D)".into())
+        );
+        assert_eq!(
+            rewrite_parked_source("=SUM($2:$3)", ShiftEdit::RowInsert { at: 0, count: 1 }),
+            SourceRewrite::Rewritten("=SUM($3:$4)".into())
+        );
+        // Deleting the referenced row kills the formula, absolute or not.
+        assert_eq!(
+            rewrite_parked_source("=$B$5", ShiftEdit::RowDelete { at: 4, count: 1 }),
+            SourceRewrite::DeadRef
         );
     }
 }

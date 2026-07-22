@@ -1036,7 +1036,7 @@ pub fn eval_expr_with_provider(expr: &Expr, provider: &dyn EvalProvider) -> Valu
         Expr::Bool(b) => Value::Boolean(*b),
         Expr::Error(e) => Value::Error(e.clone()),
 
-        Expr::CellRef(addr) => {
+        Expr::CellRef(addr, _) => {
             if addr.row == REF_INVALID_ROW || addr.col == REF_INVALID_COL {
                 return Value::Error(ValueError::InvalidRef);
             }
@@ -1088,7 +1088,7 @@ pub fn eval_expr_with_provider(expr: &Expr, provider: &dyn EvalProvider) -> Valu
             }
         }
 
-        Expr::SheetRef { sheet, addr } => {
+        Expr::SheetRef { sheet, addr, .. } => {
             if addr.row == REF_INVALID_ROW || addr.col == REF_INVALID_COL {
                 return Value::Error(ValueError::InvalidRef);
             }
@@ -1629,7 +1629,7 @@ fn runtime_ref_from_expr(
     provider: &dyn EvalProvider,
 ) -> Result<RuntimeRef, ValueError> {
     match arg {
-        Expr::CellRef(addr) => Ok(RuntimeRef {
+        Expr::CellRef(addr, _) => Ok(RuntimeRef {
             sheet: None,
             range: CellRange::single(*addr),
             materialized: None,
@@ -1639,7 +1639,7 @@ fn runtime_ref_from_expr(
             range: CellRange::new(*start, *end),
             materialized: None,
         }),
-        Expr::SheetRef { sheet, addr } => Ok(RuntimeRef {
+        Expr::SheetRef { sheet, addr, .. } => Ok(RuntimeRef {
             sheet: Some(sheet.clone()),
             range: CellRange::single(*addr),
             materialized: None,
@@ -1816,8 +1816,8 @@ fn runtime_ref_from_spill(
     provider: &dyn EvalProvider,
 ) -> Result<RuntimeRef, ValueError> {
     let (sheet, addr) = match anchor {
-        Expr::CellRef(addr) => (None, *addr),
-        Expr::SheetRef { sheet, addr } => (Some(sheet.clone()), *addr),
+        Expr::CellRef(addr, _) => (None, *addr),
+        Expr::SheetRef { sheet, addr, .. } => (Some(sheet.clone()), *addr),
         _ => return Err(ValueError::InvalidRef),
     };
     let raw = match &sheet {
@@ -2054,7 +2054,7 @@ fn eval_offset_as_range(args: &[Expr], provider: &dyn EvalProvider) -> Option<Ce
     }
     // First arg must be a cell reference (the anchor).
     let anchor = match &args[0] {
-        Expr::CellRef(addr) => *addr,
+        Expr::CellRef(addr, _) => *addr,
         _ => return None,
     };
     let row_off = coerce_to_number(&eval_expr_with_provider(&args[1], provider))? as i64;
@@ -5027,7 +5027,7 @@ fn eval_func(name: &str, args: &[Expr], provider: &dyn EvalProvider) -> Value {
                     .unwrap_or(Value::Error(ValueError::InvalidRef));
             }
             match &args[0] {
-                Expr::CellRef(addr) | Expr::SheetRef { addr, .. } => {
+                Expr::CellRef(addr, _) | Expr::SheetRef { addr, .. } => {
                     Value::Number((addr.row + 1) as f64)
                 }
                 Expr::Range { start, .. } | Expr::SheetRange { start, .. } => {
@@ -5049,7 +5049,7 @@ fn eval_func(name: &str, args: &[Expr], provider: &dyn EvalProvider) -> Value {
                     .unwrap_or(Value::Error(ValueError::InvalidRef));
             }
             match &args[0] {
-                Expr::CellRef(addr) | Expr::SheetRef { addr, .. } => {
+                Expr::CellRef(addr, _) | Expr::SheetRef { addr, .. } => {
                     Value::Number((addr.col + 1) as f64)
                 }
                 Expr::Range { start, .. } | Expr::SheetRange { start, .. } => {
@@ -6269,7 +6269,7 @@ fn eval_func(name: &str, args: &[Expr], provider: &dyn EvalProvider) -> Value {
             // collapse to their top-left cell per Excel parity.
             let addr: CellAddress = if args.len() == 2 {
                 match &args[1] {
-                    Expr::CellRef(a) | Expr::SheetRef { addr: a, .. } => *a,
+                    Expr::CellRef(a, _) | Expr::SheetRef { addr: a, .. } => *a,
                     Expr::Range { start, .. } | Expr::SheetRange { start, .. } => *start,
                     _ => return Value::Error(ValueError::WrongType),
                 }
@@ -8912,7 +8912,7 @@ fn eval_func(name: &str, args: &[Expr], provider: &dyn EvalProvider) -> Value {
             }
             match &args[0] {
                 Expr::MultiArea(parts) => Value::Number(parts.len() as f64),
-                Expr::CellRef(_)
+                Expr::CellRef(..)
                 | Expr::Range { .. }
                 | Expr::SheetRef { .. }
                 | Expr::SheetRange { .. } => Value::Number(1.0),
@@ -9394,7 +9394,7 @@ fn eval_func(name: &str, args: &[Expr], provider: &dyn EvalProvider) -> Value {
             }
             let is_ref = matches!(
                 &args[0],
-                Expr::CellRef(_)
+                Expr::CellRef(..)
                     | Expr::Range { .. }
                     | Expr::SheetRef { .. }
                     | Expr::SheetRange { .. }
@@ -15566,7 +15566,7 @@ fn fn_isformula(args: &[Expr], provider: &dyn EvalProvider) -> Value {
         return Value::Error(ValueError::WrongArgCount);
     }
     match &args[0] {
-        Expr::CellRef(addr) => {
+        Expr::CellRef(addr, _) => {
             if addr.row == REF_INVALID_ROW || addr.col == REF_INVALID_COL {
                 return Value::Error(ValueError::InvalidRef);
             }
@@ -15576,7 +15576,7 @@ fn fn_isformula(args: &[Expr], provider: &dyn EvalProvider) -> Value {
             let r = CellRange::new(*start, *end).normalize();
             Value::Boolean(provider.cell_has_formula(r.start))
         }
-        Expr::SheetRef { sheet, addr } => {
+        Expr::SheetRef { sheet, addr, .. } => {
             if addr.row == REF_INVALID_ROW || addr.col == REF_INVALID_COL {
                 return Value::Error(ValueError::InvalidRef);
             }
@@ -15610,7 +15610,7 @@ fn fn_sheet(args: &[Expr], provider: &dyn EvalProvider) -> Value {
     } else {
         match &args[0] {
             // Same-sheet ref → current sheet (Excel parity).
-            Expr::CellRef(_) | Expr::Range { .. } => match provider.current_sheet_index() {
+            Expr::CellRef(..) | Expr::Range { .. } => match provider.current_sheet_index() {
                 Some(idx) => Value::Number((idx + 1) as f64),
                 None => Value::Error(ValueError::InvalidRef),
             },
@@ -15633,7 +15633,7 @@ fn fn_sheets(args: &[Expr], provider: &dyn EvalProvider) -> Value {
         Value::Number(provider.sheet_count() as f64)
     } else {
         match &args[0] {
-            Expr::CellRef(_)
+            Expr::CellRef(..)
             | Expr::Range { .. }
             | Expr::SheetRef { .. }
             | Expr::SheetRange { .. } => Value::Number(1.0),
@@ -22149,7 +22149,7 @@ fn fn_formulatext(args: &[Expr], provider: &dyn EvalProvider) -> Value {
         return Value::Error(ValueError::WrongArgCount);
     }
     match &args[0] {
-        Expr::CellRef(addr) => {
+        Expr::CellRef(addr, _) => {
             if addr.row == REF_INVALID_ROW || addr.col == REF_INVALID_COL {
                 return Value::Error(ValueError::InvalidRef);
             }
@@ -22165,7 +22165,7 @@ fn fn_formulatext(args: &[Expr], provider: &dyn EvalProvider) -> Value {
                 None => Value::Error(ValueError::NotAvailable),
             }
         }
-        Expr::SheetRef { sheet, addr } => {
+        Expr::SheetRef { sheet, addr, .. } => {
             if addr.row == REF_INVALID_ROW || addr.col == REF_INVALID_COL {
                 return Value::Error(ValueError::InvalidRef);
             }
@@ -22270,6 +22270,31 @@ mod tests {
     fn eval_cell_ref() {
         let (cm, vs) = make_test_env();
         assert_eq!(eval_str("=A1", &cm, &vs), Value::Number(10.0));
+    }
+
+    #[test]
+    fn eval_absolute_refs_are_identical_to_relative() {
+        // Requirement #1 / static-parity: absoluteness NEVER changes a value.
+        // The static TS backend strips `$` before evaluating; this engine
+        // keeps `$` but must produce the SAME value — proven here by equality
+        // against the relative twin (`static(strip $)` == `engine(relative)`).
+        let (cm, vs) = make_test_env();
+        for (abs, rel) in [
+            ("=$A$1", "=A1"),
+            ("=$A1", "=A1"),
+            ("=A$1", "=A1"),
+            ("=$A$1+$B$1", "=A1+B1"),
+            ("=SUM($A$1:$B$1)", "=SUM(A1:B1)"),
+            ("=SUM($A$1:$B1)", "=SUM(A1:B1)"),
+        ] {
+            assert_eq!(
+                eval_str(abs, &cm, &vs),
+                eval_str(rel, &cm, &vs),
+                "{abs} must evaluate identically to {rel}"
+            );
+        }
+        // Concrete value anchor so the equality above can't pass vacuously.
+        assert_eq!(eval_str("=$A$1+$B$1", &cm, &vs), Value::Number(30.0));
     }
 
     #[test]

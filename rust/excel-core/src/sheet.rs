@@ -4678,7 +4678,7 @@ impl Sheet {
         detect_unbounded_target: bool,
     ) -> bool {
         match expr {
-            Expr::CellRef(addr) => {
+            Expr::CellRef(addr, _) => {
                 if *addr == target {
                     return true;
                 }
@@ -4821,7 +4821,7 @@ impl Sheet {
                         .iter()
                         .any(|arg| Self::has_direct_unbounded_target_ref(arg, target))
             }
-            Expr::CellRef(_)
+            Expr::CellRef(..)
             | Expr::SheetRef { .. }
             | Expr::SheetRange { .. }
             | Expr::Number(_)
@@ -7090,7 +7090,7 @@ fn collect_range_refs_into(expr: &Expr, out: &mut HashSet<CellRange>) {
         // cross-sheet and tracked at the workbook layer; literals have
         // no deps. LET-bound names resolve at eval time against the
         // local scope, not against the cell graph.
-        Expr::CellRef(_)
+        Expr::CellRef(..)
         | Expr::SheetRef { .. }
         | Expr::SheetRange { .. }
         | Expr::Number(_)
@@ -7141,11 +7141,12 @@ fn collect_range_refs_into(expr: &Expr, out: &mut HashSet<CellRange>) {
 /// Store geometry roots.
 fn collect_refs(expr: &Expr, out: &mut Vec<CellAddress>) {
     match expr {
-        Expr::CellRef(addr) => out.push(*addr),
+        Expr::CellRef(addr, _) => out.push(*addr),
         Expr::Range {
             start,
             end,
             unbounded,
+            ..
         } => {
             // Skip expansion for unbounded ranges — the row/col bound would
             // be u32::MAX. `collect_range_refs` retains the typed range.
@@ -7725,6 +7726,35 @@ mod tests {
         // that can rescue it.
         sheet.set_formula("B1", "=(");
         assert_eq!(sheet.get_formula("B1"), None);
+    }
+
+    #[test]
+    fn absolute_refs_install_read_back_and_evaluate() {
+        // The reported bug: `set_formula` returned FALSE for any `$` formula
+        // and the cell became Error(InvalidValue). It must now install, read
+        // back verbatim, and evaluate identically to the relative twin.
+        let mut sheet = Sheet::new();
+        sheet.set_cell("A1", Value::Number(2.0));
+        sheet.set_cell("A2", Value::Number(3.0));
+
+        assert!(sheet.set_formula("B1", "=$A$1+1"), "=$A$1+1 must install");
+        assert_eq!(sheet.get_formula("B1").as_deref(), Some("=$A$1+1"));
+        assert_eq!(sheet.get_cell("B1"), Value::Number(3.0));
+
+        // Mixed ref and an absolute range evaluate like their relative twins.
+        assert!(sheet.set_formula("B2", "=SUM($A$1:$A2)"));
+        assert_eq!(sheet.get_formula("B2").as_deref(), Some("=SUM($A$1:$A2)"));
+        assert_eq!(sheet.get_cell("B2"), Value::Number(5.0));
+
+        // A pure absolute ref (no binop, so no render parens) read back
+        // verbatim, then structurally retargeted through the REAL Sheet path.
+        assert!(sheet.set_formula("C1", "=$A$1"));
+        assert_eq!(sheet.get_formula("C1").as_deref(), Some("=$A$1"));
+
+        // Inserting a row at the top shifts `$A$1`→`$A$2` while keeping the
+        // `$` markers — the re-rendered `get_formula` text proves it.
+        sheet.insert_row(0, 1);
+        assert_eq!(sheet.get_formula("C2").as_deref(), Some("=$A$2"));
     }
 
     #[test]

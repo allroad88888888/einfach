@@ -1617,7 +1617,7 @@ impl Workbook {
         detect_unbounded_target: bool,
     ) -> bool {
         match expr {
-            Expr::CellRef(addr) => {
+            Expr::CellRef(addr, _) => {
                 if (current_idx, *addr) == target {
                     return true;
                 }
@@ -1627,6 +1627,7 @@ impl Workbook {
                 start,
                 end,
                 unbounded,
+                ..
             } => {
                 if self.collect_cycle_range_refs(
                     current_idx,
@@ -1639,7 +1640,7 @@ impl Workbook {
                     return true;
                 }
             }
-            Expr::SheetRef { sheet, addr } => {
+            Expr::SheetRef { sheet, addr, .. } => {
                 if let Some(&sheet_idx) = self.by_name.get(sheet) {
                     if (sheet_idx, *addr) == target {
                         return true;
@@ -1652,6 +1653,7 @@ impl Workbook {
                 start,
                 end,
                 unbounded,
+                ..
             } => {
                 if let Some(&sheet_idx) = self.by_name.get(sheet) {
                     if self.collect_cycle_range_refs(

@@ -163,7 +163,7 @@ fn rejects_unclosed_segment() {
 
 #[test]
 fn ordinary_formulas_unaffected() {
-    assert!(matches!(parse_formula("=A1"), Some(Expr::CellRef(_))));
+    assert!(matches!(parse_formula("=A1"), Some(Expr::CellRef(..))));
     assert!(matches!(parse_formula("=SUM(A1:B2)"), Some(Expr::FuncCall { .. })));
     assert!(matches!(parse_formula("=Sheet1!A1"), Some(Expr::SheetRef { .. })));
     assert!(matches!(parse_formula("=A1#"), Some(Expr::SpillRef(_))));

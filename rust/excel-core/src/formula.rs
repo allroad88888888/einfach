@@ -66,6 +66,63 @@ pub enum TableArea {
     ThisRow,
 }
 
+/// Absolute-reference markers for one address as it is WRITTEN in a formula
+/// (`$A$1`). Each axis pins independently: `$A1` pins the column, `A$1` pins
+/// the row, `$A$1` pins both, `A1` pins neither (`RefAbs::REL`, the
+/// `Default`).
+///
+/// Absoluteness is purely a written form. It NEVER changes how a reference
+/// evaluates — `$A$1` and `A1` read the same cell — and it NEVER changes how
+/// structural row/column inserts/deletes move the address: Excel shifts
+/// `$A$5` to `$A$6` on a row insert, exactly like `A5`. The flags ride along
+/// with the address through `shift`/`map_addrs` so the `$` survives shifts
+/// and text round-trips. Drag-fill's pin-on-fill semantics are a host
+/// concern (TS clipboard layer) and deliberately NOT modeled here.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Default)]
+pub struct RefAbs {
+    /// Column pinned with a leading `$` (`$A1`).
+    pub col: bool,
+    /// Row pinned with a `$` before the row number (`A$1`).
+    pub row: bool,
+}
+
+impl RefAbs {
+    /// Fully relative (`A1`) — the overwhelmingly common case and the
+    /// `Default`.
+    pub const REL: RefAbs = RefAbs {
+        col: false,
+        row: false,
+    };
+    /// Fully absolute (`$A$1`).
+    pub const ABS: RefAbs = RefAbs {
+        col: true,
+        row: true,
+    };
+    pub fn new(col: bool, row: bool) -> Self {
+        RefAbs { col, row }
+    }
+}
+
+/// Absolute-reference markers for the two corners of a range (`$A$1:$B$2`).
+/// The corners are independent, so mixed forms like `$A1:B$2` are
+/// representable. `Default` / `RangeAbs::REL` is both corners relative.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Default)]
+pub struct RangeAbs {
+    pub start: RefAbs,
+    pub end: RefAbs,
+}
+
+impl RangeAbs {
+    /// Both corners relative (`A1:B2`).
+    pub const REL: RangeAbs = RangeAbs {
+        start: RefAbs::REL,
+        end: RefAbs::REL,
+    };
+    pub fn new(start: RefAbs, end: RefAbs) -> Self {
+        RangeAbs { start, end }
+    }
+}
+
 /// AST node for a formula expression.
 #[derive(Clone, Debug, PartialEq)]
 pub enum Expr {
@@ -77,8 +134,9 @@ pub enum Expr {
     Bool(bool),
     /// Literal Excel error token, e.g. `#N/A`, `#VALUE!`, `#CALC!`.
     Error(ValueError),
-    /// A cell reference, e.g. A1
-    CellRef(CellAddress),
+    /// A cell reference, e.g. `A1`, `$A$1`, `$A1`, `A$1`. The `RefAbs`
+    /// records which axes were written with a `$`; it does not affect eval.
+    CellRef(CellAddress, RefAbs),
     /// Binary operation: left op right
     BinOp {
         op: BinOperator,
@@ -97,10 +155,17 @@ pub enum Expr {
         start: CellAddress,
         end: CellAddress,
         unbounded: RangeBounds,
+        /// Per-corner `$` markers (`$A$1:$B$2`, `$A1:B$2`, ...). Purely a
+        /// written form; does not affect eval or how corners shift.
+        abs: RangeAbs,
     },
     /// Cross-sheet reference: `Sheet1!A1`. Resolution requires a Workbook
     /// scope at eval time; standalone Sheet eval treats it as #REF!.
-    SheetRef { sheet: String, addr: CellAddress },
+    SheetRef {
+        sheet: String,
+        addr: CellAddress,
+        abs: RefAbs,
+    },
     /// Cross-sheet range: `Sheet1!A1:B3`. Kept distinct from `Range` so
     /// sheet-local dependency walkers never register the source addresses on
     /// the formula's own sheet.
@@ -109,6 +174,7 @@ pub enum Expr {
         start: CellAddress,
         end: CellAddress,
         unbounded: RangeBounds,
+        abs: RangeAbs,
     },
     /// Dynamic-array spill reference: `A1#` / `Sheet1!A1#`. The anchor is
     /// restricted to a single-cell reference at parse time.
@@ -228,7 +294,7 @@ fn is_valid_array_lit_element(expr: &Expr) -> bool {
 fn is_ref_expr(expr: &Expr) -> bool {
     matches!(
         expr,
-        Expr::CellRef(_)
+        Expr::CellRef(..)
             | Expr::Range { .. }
             | Expr::SheetRef { .. }
             | Expr::SheetRange { .. }
@@ -476,7 +542,7 @@ impl Parser {
             if self.peek() != Some('#') {
                 return Some(expr);
             }
-            if !matches!(expr, Expr::CellRef(_) | Expr::SheetRef { .. }) {
+            if !matches!(expr, Expr::CellRef(..) | Expr::SheetRef { .. }) {
                 return None;
             }
             self.advance();
@@ -590,8 +656,185 @@ impl Parser {
                 self.parse_number()
             }
             c if c.is_ascii_alphabetic() => self.parse_identifier(),
+            // A leading `$` unambiguously introduces a reference — no other
+            // formula token starts with `$` (sheet names, function names, and
+            // bare Names never carry one). Cover column-absolute cell refs
+            // (`$A$1`, `$A1`), absolute whole-column ranges (`$A:$C`), and
+            // absolute whole-row ranges (`$1:$3`).
+            '$' => self.parse_dollar_primary(),
             _ => None,
         }
+    }
+
+    fn consume_dollar(&mut self) -> bool {
+        if self.peek() == Some('$') {
+            self.advance();
+            true
+        } else {
+            false
+        }
+    }
+
+    /// True if the current position continues an identifier token — an
+    /// alphanumeric / `_`, or a `.` that is itself followed by an identifier
+    /// char (the dotted-function-name rule). Used as the trailing boundary
+    /// for a cell-address token so `A1B` / `A1.5` stay bare Names rather than
+    /// being split into `A1` + trailing garbage.
+    fn at_ident_continuation(&self) -> bool {
+        match self.peek() {
+            Some(c) if c.is_ascii_alphanumeric() || c == '_' => true,
+            Some('.') => matches!(self.peek_at(1), Some(n) if n.is_ascii_alphanumeric() || n == '_'),
+            _ => false,
+        }
+    }
+
+    /// Scan a `[$]col[$]row` cell address at the current position, recording
+    /// which axes carried a `$`. Contiguous (no interior whitespace). On any
+    /// failure — including a token that runs into a longer identifier
+    /// (`A1B`) — the position is restored and `None` is returned, so the
+    /// caller can fall through to whole-column / Name handling. Equivalent to
+    /// "the whole leading token is a valid cell address" for the relative
+    /// case, so it is a drop-in replacement for the old
+    /// `CellAddress::parse(&ident)` path plus `$` support.
+    fn scan_abs_cell_addr(&mut self) -> Option<(CellAddress, RefAbs)> {
+        let save = self.pos;
+        let col_abs = self.consume_dollar();
+        let letters_start = self.pos;
+        while matches!(self.peek(), Some(c) if c.is_ascii_alphabetic()) {
+            self.advance();
+        }
+        if self.pos == letters_start {
+            self.pos = save;
+            return None;
+        }
+        let letters: String = self.chars[letters_start..self.pos].iter().collect();
+        let row_abs = self.consume_dollar();
+        let digits_start = self.pos;
+        while matches!(self.peek(), Some(c) if c.is_ascii_digit()) {
+            self.advance();
+        }
+        if self.pos == digits_start {
+            self.pos = save;
+            return None;
+        }
+        if self.at_ident_continuation() {
+            // e.g. `A1B` / `A1.5` — not a self-delimited address.
+            self.pos = save;
+            return None;
+        }
+        let digits: String = self.chars[digits_start..self.pos].iter().collect();
+        match CellAddress::parse(&format!("{}{}", letters, digits)) {
+            Some(addr) => Some((addr, RefAbs::new(col_abs, row_abs))),
+            None => {
+                self.pos = save;
+                None
+            }
+        }
+    }
+
+    /// Scan a `[$]col` whole-column corner (letters with an optional leading
+    /// `$`, NO row digits). Returns the 0-based column index and its `$`
+    /// marker. Restores the position and returns `None` on failure.
+    fn scan_abs_col(&mut self) -> Option<(u32, bool)> {
+        let save = self.pos;
+        let col_abs = self.consume_dollar();
+        let letters_start = self.pos;
+        while matches!(self.peek(), Some(c) if c.is_ascii_alphabetic()) {
+            self.advance();
+        }
+        if self.pos == letters_start {
+            self.pos = save;
+            return None;
+        }
+        let letters: String = self.chars[letters_start..self.pos].iter().collect();
+        // Reuse the column parser via a synthetic `<letters>1` address.
+        match CellAddress::parse(&format!("{}1", letters)) {
+            Some(a) => Some((a.col, col_abs)),
+            None => {
+                self.pos = save;
+                None
+            }
+        }
+    }
+
+    /// A leading `$` always introduces a reference. Distinguish the three
+    /// shapes by what follows: `$A...` is a column-absolute cell ref or an
+    /// absolute whole-column range; `$1:...` is an absolute whole-row range.
+    fn parse_dollar_primary(&mut self) -> Option<Expr> {
+        if let Some((addr, abs)) = self.scan_abs_cell_addr() {
+            return self.finish_same_sheet_ref(addr, abs);
+        }
+        if let Some(expr) = self.try_scan_whole_col_range() {
+            return Some(expr);
+        }
+        self.try_parse_whole_row_range()
+    }
+
+    /// Given an already-parsed start corner, consume an optional `:` range
+    /// tail. Yields a bounded `Range` (both corners are addresses), a
+    /// `DynamicRange` (the end is a computed reference such as
+    /// `A1:INDEX(...)`), or a bare `CellRef` when no `:` follows.
+    fn finish_same_sheet_ref(&mut self, start: CellAddress, start_abs: RefAbs) -> Option<Expr> {
+        self.skip_whitespace();
+        if self.peek() == Some(':') {
+            self.advance();
+            self.skip_whitespace();
+            let after_colon = self.pos;
+            if let Some((end, end_abs)) = self.scan_abs_cell_addr() {
+                return Some(Expr::Range {
+                    start,
+                    end,
+                    unbounded: RangeBounds::None,
+                    abs: RangeAbs::new(start_abs, end_abs),
+                });
+            }
+            self.pos = after_colon;
+            let end = self.parse_unary()?;
+            return Some(Expr::DynamicRange {
+                start: Box::new(Expr::CellRef(start, start_abs)),
+                end: Box::new(end),
+            });
+        }
+        Some(Expr::CellRef(start, start_abs))
+    }
+
+    /// Whole-column range `[$]A:[$]C`. Both corners are column letters with
+    /// an optional `$`; the range spans every row. Returns `None` (restoring
+    /// position) when the shape is not a whole-column range — in particular
+    /// when the end column is immediately followed by a digit (that is the
+    /// `A1:B2` bounded-range family, handled elsewhere).
+    fn try_scan_whole_col_range(&mut self) -> Option<Expr> {
+        let save = self.pos;
+        let Some((start_col, start_col_abs)) = self.scan_abs_col() else {
+            self.pos = save;
+            return None;
+        };
+        self.skip_whitespace();
+        if self.peek() != Some(':') {
+            self.pos = save;
+            return None;
+        }
+        self.advance(); // ':'
+        self.skip_whitespace();
+        let Some((end_col, end_col_abs)) = self.scan_abs_col() else {
+            self.pos = save;
+            return None;
+        };
+        // `A:B3` — a trailing digit means the right corner was a cell
+        // address, so this is not a whole-column range.
+        if self.peek().map(|c| c.is_ascii_digit()).unwrap_or(false) {
+            self.pos = save;
+            return None;
+        }
+        Some(Expr::Range {
+            start: CellAddress::new(0, start_col),
+            end: CellAddress::new(u32::MAX, end_col),
+            unbounded: RangeBounds::Rows,
+            abs: RangeAbs::new(
+                RefAbs::new(start_col_abs, false),
+                RefAbs::new(end_col_abs, false),
+            ),
+        })
     }
 
     fn matches_literal(&self, token: &str) -> bool {
@@ -633,13 +876,15 @@ impl Parser {
         None
     }
 
-    /// Speculative parse for `<digits>:<digits>` whole-row syntax. On
-    /// success consumes both digit runs and returns the range. On
-    /// failure rolls back to the original position so `parse_number`
-    /// can take over.
+    /// Speculative parse for `[$]<digits>:[$]<digits>` whole-row syntax
+    /// (`1:1`, `1:3`, and the absolute forms `$1:$3`, `1:$3`, ...). On
+    /// success consumes both corners and returns the range. On failure rolls
+    /// back to the original position so `parse_number` (relative entry) or
+    /// the caller (`$` entry) can take over.
     fn try_parse_whole_row_range(&mut self) -> Option<Expr> {
         let save = self.pos;
-        // Scan first digit run.
+        // Optional `$` then first digit run.
+        let start_row_abs = self.consume_dollar();
         let s1 = self.pos;
         while let Some(c) = self.peek() {
             if c.is_ascii_digit() {
@@ -649,6 +894,7 @@ impl Parser {
             }
         }
         if self.pos == s1 {
+            self.pos = save;
             return None;
         }
         let first: String = self.chars[s1..self.pos].iter().collect();
@@ -660,9 +906,9 @@ impl Parser {
             self.pos = save;
             return None;
         }
-        let colon_at = self.pos;
         self.advance();
-        // Scan second digit run.
+        // Optional `$` then second digit run.
+        let end_row_abs = self.consume_dollar();
         let s2 = self.pos;
         while let Some(c) = self.peek() {
             if c.is_ascii_digit() {
@@ -699,11 +945,14 @@ impl Parser {
             self.pos = save;
             return None;
         }
-        let _ = colon_at;
         Some(Expr::Range {
             start: CellAddress::new(start_row - 1, 0),
             end: CellAddress::new(end_row - 1, u32::MAX),
             unbounded: RangeBounds::Cols,
+            abs: RangeAbs::new(
+                RefAbs::new(false, start_row_abs),
+                RefAbs::new(false, end_row_abs),
+            ),
         })
     }
 
@@ -899,117 +1148,54 @@ impl Parser {
         // the same chars would also parse as a cell address.
         if self.peek() == Some('!') {
             self.advance(); // skip '!'
-            let addr_start = self.pos;
-            while let Some(c) = self.peek() {
-                if c.is_ascii_alphanumeric() {
-                    self.advance();
-                } else {
-                    break;
-                }
-            }
-            let addr_str: String = self.chars[addr_start..self.pos].iter().collect();
-            let addr = CellAddress::parse(&addr_str)?;
+            let (start_addr, start_abs) = self.scan_abs_cell_addr()?;
             self.skip_whitespace();
             if self.peek() == Some(':') {
                 self.advance();
                 self.skip_whitespace();
                 let after_colon = self.pos;
-                let end_start = self.pos;
-                while let Some(c) = self.peek() {
-                    if c.is_ascii_alphanumeric() {
-                        self.advance();
-                    } else {
-                        break;
-                    }
-                }
-                let end_str: String = self.chars[end_start..self.pos].iter().collect();
-                if let Some(end) = CellAddress::parse(&end_str) {
+                if let Some((end_addr, end_abs)) = self.scan_abs_cell_addr() {
                     return Some(Expr::SheetRange {
                         sheet: ident,
-                        start: addr,
-                        end,
-                        unbounded: RangeBounds::None,
-                    });
-                }
-                self.pos = after_colon;
-                let end = self.parse_unary()?;
-                return Some(Expr::DynamicRange {
-                    start: Box::new(Expr::SheetRef { sheet: ident, addr }),
-                    end: Box::new(end),
-                });
-            }
-            return Some(Expr::SheetRef { sheet: ident, addr });
-        }
-
-        // Check if it's a cell reference (with possible range)
-        if let Some(addr) = CellAddress::parse(&ident) {
-            self.skip_whitespace();
-            // Check for range operator ':'
-            if self.peek() == Some(':') {
-                self.advance();
-                self.skip_whitespace();
-                let after_colon = self.pos;
-                let range_start = self.pos;
-                while let Some(c) = self.peek() {
-                    if c.is_ascii_alphanumeric() {
-                        self.advance();
-                    } else {
-                        break;
-                    }
-                }
-                let end_ident: String = self.chars[range_start..self.pos].iter().collect();
-                if let Some(end_addr) = CellAddress::parse(&end_ident) {
-                    return Some(Expr::Range {
-                        start: addr,
+                        start: start_addr,
                         end: end_addr,
                         unbounded: RangeBounds::None,
+                        abs: RangeAbs::new(start_abs, end_abs),
                     });
                 }
                 self.pos = after_colon;
                 let end = self.parse_unary()?;
                 return Some(Expr::DynamicRange {
-                    start: Box::new(Expr::CellRef(addr)),
+                    start: Box::new(Expr::SheetRef {
+                        sheet: ident,
+                        addr: start_addr,
+                        abs: start_abs,
+                    }),
                     end: Box::new(end),
                 });
             }
-            return Some(Expr::CellRef(addr));
+            return Some(Expr::SheetRef {
+                sheet: ident,
+                addr: start_addr,
+                abs: start_abs,
+            });
         }
 
-        // Whole-column range: `A:A` / `A:C`. The identifier is all letters
-        // and is followed by ':' + another all-letters identifier. The
-        // column part of `CellAddress::parse("A1")` is what we want, so
-        // we synthesize a `<col>1` string to reuse the parser.
-        if ident.chars().all(|c| c.is_ascii_alphabetic()) && self.peek() == Some(':') {
-            let save = self.pos;
-            self.advance(); // consume ':'
-            self.skip_whitespace();
-            let end_start = self.pos;
-            while let Some(c) = self.peek() {
-                if c.is_ascii_alphabetic() {
-                    self.advance();
-                } else {
-                    break;
-                }
-            }
-            let end_letters: String = self.chars[end_start..self.pos].iter().collect();
-            // The right side must be ALL letters AND not be followed by a
-            // digit (which would make it a cell address like `B3`). If
-            // either condition fails, roll back so the identifier-as-
-            // cell-address path can try again — though `CellAddress::
-            // parse(letters_only)` already returned None above, so the
-            // identifier branch will fall through to `None` like before.
-            if !end_letters.is_empty() && self.peek().map(|c| !c.is_ascii_digit()).unwrap_or(true) {
-                let start_col = CellAddress::parse(&format!("{}1", ident))?.col;
-                let end_col = CellAddress::parse(&format!("{}1", end_letters))?.col;
-                return Some(Expr::Range {
-                    start: CellAddress::new(0, start_col),
-                    end: CellAddress::new(u32::MAX, end_col),
-                    unbounded: RangeBounds::Rows,
-                });
-            }
-            // Roll back — letters:digits isn't valid here (that's the
-            // already-handled `A1:B2` path).
-            self.pos = save;
+        // Same-sheet reference (cell ref, bounded / dynamic range, or
+        // whole-column range), `$`-aware. Rewind to the identifier start:
+        // the identifier read above only served to rule out the function-
+        // call / sheet-ref / table-ref / TRUE-FALSE forms (none matched), so
+        // re-scanning the raw source as a reference here is unambiguous. A
+        // successful `scan_abs_cell_addr` on the whole leading token is
+        // exactly equivalent to the old `CellAddress::parse(&ident)` test for
+        // the relative case, plus it now understands `A$1`.
+        let name_fallback_pos = self.pos;
+        self.pos = start;
+        if let Some((addr, abs)) = self.scan_abs_cell_addr() {
+            return self.finish_same_sheet_ref(addr, abs);
+        }
+        if let Some(expr) = self.try_scan_whole_col_range() {
+            return Some(expr);
         }
 
         // A bare identifier that didn't match anything above (function
@@ -1017,6 +1203,9 @@ impl Parser {
         // range) is a `Name`. The evaluator resolves it against the LET
         // scope at eval time, or yields `#NAME?` if unbound. Numbers
         // never reach here because they route through `parse_number`.
+        // Restore the post-identifier position first (the reference scanners
+        // above rewound to the identifier start).
+        self.pos = name_fallback_pos;
         Some(Expr::Name(ident))
     }
 
@@ -1193,7 +1382,7 @@ mod tests {
     fn parse_cell_ref() {
         assert_eq!(
             parse_formula("=A1"),
-            Some(Expr::CellRef(CellAddress::new(0, 0)))
+            Some(Expr::CellRef(CellAddress::new(0, 0), RefAbs::REL))
         );
     }
 
@@ -1203,8 +1392,8 @@ mod tests {
             parse_formula("=A1+B1"),
             Some(Expr::BinOp {
                 op: BinOperator::Add,
-                left: Box::new(Expr::CellRef(CellAddress::new(0, 0))),
-                right: Box::new(Expr::CellRef(CellAddress::new(0, 1))),
+                left: Box::new(Expr::CellRef(CellAddress::new(0, 0), RefAbs::REL)),
+                right: Box::new(Expr::CellRef(CellAddress::new(0, 1), RefAbs::REL)),
             })
         );
     }
@@ -1217,10 +1406,10 @@ mod tests {
             result,
             Expr::BinOp {
                 op: BinOperator::Add,
-                left: Box::new(Expr::CellRef(CellAddress::new(0, 0))),
+                left: Box::new(Expr::CellRef(CellAddress::new(0, 0), RefAbs::REL)),
                 right: Box::new(Expr::BinOp {
                     op: BinOperator::Mul,
-                    left: Box::new(Expr::CellRef(CellAddress::new(0, 1))),
+                    left: Box::new(Expr::CellRef(CellAddress::new(0, 1), RefAbs::REL)),
                     right: Box::new(Expr::Number(2.0)),
                 }),
             }
@@ -1237,8 +1426,8 @@ mod tests {
                 op: BinOperator::Mul,
                 left: Box::new(Expr::BinOp {
                     op: BinOperator::Add,
-                    left: Box::new(Expr::CellRef(CellAddress::new(0, 0))),
-                    right: Box::new(Expr::CellRef(CellAddress::new(0, 1))),
+                    left: Box::new(Expr::CellRef(CellAddress::new(0, 0), RefAbs::REL)),
+                    right: Box::new(Expr::CellRef(CellAddress::new(0, 1), RefAbs::REL)),
                 }),
                 right: Box::new(Expr::Number(2.0)),
             }
@@ -1251,7 +1440,7 @@ mod tests {
             parse_formula("=-A1"),
             Some(Expr::Negate(Box::new(Expr::CellRef(CellAddress::new(
                 0, 0
-            )))))
+            ), RefAbs::REL))))
         );
     }
 
@@ -1261,8 +1450,8 @@ mod tests {
             parse_formula("=A1/B1"),
             Some(Expr::BinOp {
                 op: BinOperator::Div,
-                left: Box::new(Expr::CellRef(CellAddress::new(0, 0))),
-                right: Box::new(Expr::CellRef(CellAddress::new(0, 1))),
+                left: Box::new(Expr::CellRef(CellAddress::new(0, 0), RefAbs::REL)),
+                right: Box::new(Expr::CellRef(CellAddress::new(0, 1), RefAbs::REL)),
             })
         );
     }
@@ -1273,8 +1462,8 @@ mod tests {
             parse_formula("= A1 + B1 "),
             Some(Expr::BinOp {
                 op: BinOperator::Add,
-                left: Box::new(Expr::CellRef(CellAddress::new(0, 0))),
-                right: Box::new(Expr::CellRef(CellAddress::new(0, 1))),
+                left: Box::new(Expr::CellRef(CellAddress::new(0, 0), RefAbs::REL)),
+                right: Box::new(Expr::CellRef(CellAddress::new(0, 1), RefAbs::REL)),
             })
         );
     }
@@ -1287,8 +1476,8 @@ mod tests {
             Expr::FuncCall {
                 name: "SUM".into(),
                 args: vec![
-                    Expr::CellRef(CellAddress::new(0, 0)),
-                    Expr::CellRef(CellAddress::new(0, 1)),
+                    Expr::CellRef(CellAddress::new(0, 0), RefAbs::REL),
+                    Expr::CellRef(CellAddress::new(0, 1), RefAbs::REL),
                 ],
             }
         );
@@ -1301,7 +1490,7 @@ mod tests {
             result,
             Expr::FuncCall {
                 name: "SUM".into(),
-                args: vec![Expr::CellRef(CellAddress::new(0, 0))],
+                args: vec![Expr::CellRef(CellAddress::new(0, 0), RefAbs::REL)],
             }
         );
     }
@@ -1317,6 +1506,7 @@ mod tests {
                     start: CellAddress::new(0, 0),
                     end: CellAddress::new(2, 1),
                     unbounded: RangeBounds::None,
+                abs: RangeAbs::REL,
                 }],
             }
         );
@@ -1335,6 +1525,7 @@ mod tests {
                     start: CellAddress::new(0, 0),
                     end: CellAddress::new(u32::MAX, 0),
                     unbounded: RangeBounds::Rows,
+                abs: RangeAbs::REL,
                 }],
             }
         );
@@ -1352,6 +1543,7 @@ mod tests {
                     start: CellAddress::new(0, 0),
                     end: CellAddress::new(u32::MAX, 2),
                     unbounded: RangeBounds::Rows,
+                abs: RangeAbs::REL,
                 }],
             }
         );
@@ -1369,6 +1561,7 @@ mod tests {
                     start: CellAddress::new(0, 0),
                     end: CellAddress::new(0, u32::MAX),
                     unbounded: RangeBounds::Cols,
+                abs: RangeAbs::REL,
                 }],
             }
         );
@@ -1386,6 +1579,7 @@ mod tests {
                     start: CellAddress::new(0, 0),
                     end: CellAddress::new(2, u32::MAX),
                     unbounded: RangeBounds::Cols,
+                abs: RangeAbs::REL,
                 }],
             }
         );
@@ -1416,8 +1610,8 @@ mod tests {
                 op: BinOperator::Div,
                 left: Box::new(Expr::BinOp {
                     op: BinOperator::Add,
-                    left: Box::new(Expr::CellRef(CellAddress::new(0, 0))),
-                    right: Box::new(Expr::CellRef(CellAddress::new(0, 1))),
+                    left: Box::new(Expr::CellRef(CellAddress::new(0, 0), RefAbs::REL)),
+                    right: Box::new(Expr::CellRef(CellAddress::new(0, 1), RefAbs::REL)),
                 }),
                 right: Box::new(Expr::Number(2.0)),
             }
@@ -1474,6 +1668,7 @@ mod tests {
             Expr::SheetRef {
                 sheet: "Sheet2".into(),
                 addr: CellAddress::new(0, 0),
+            abs: RefAbs::REL,
             }
         );
     }
@@ -1490,6 +1685,7 @@ mod tests {
                     start: CellAddress::new(0, 0),
                     end: CellAddress::new(99, 0),
                     unbounded: RangeBounds::None,
+                abs: RangeAbs::REL,
                 }],
             }
         );
@@ -1506,7 +1702,7 @@ mod tests {
             parse_formula("=A1#"),
             Some(Expr::SpillRef(Box::new(Expr::CellRef(CellAddress::new(
                 0, 0
-            )))))
+            ), RefAbs::REL))))
         );
     }
 
@@ -1522,6 +1718,7 @@ mod tests {
             Some(Expr::SpillRef(Box::new(Expr::SheetRef {
                 sheet: "Sheet2".into(),
                 addr: CellAddress::new(0, 0),
+            abs: RefAbs::REL,
             })))
         );
     }
@@ -1531,7 +1728,7 @@ mod tests {
         let result = parse_formula("=A1:INDEX(A:A,3)").unwrap();
         match result {
             Expr::DynamicRange { start, end } => {
-                assert_eq!(*start, Expr::CellRef(CellAddress::new(0, 0)));
+                assert_eq!(*start, Expr::CellRef(CellAddress::new(0, 0), RefAbs::REL));
                 assert!(matches!(*end, Expr::FuncCall { .. }));
             }
             other => panic!("expected DynamicRange, got {:?}", other),
@@ -1570,6 +1767,7 @@ mod tests {
                 left: Box::new(Expr::SheetRef {
                     sheet: "Sheet2".into(),
                     addr: CellAddress::new(0, 0),
+                abs: RefAbs::REL,
                 }),
                 right: Box::new(Expr::Number(5.0)),
             }
@@ -1580,7 +1778,7 @@ mod tests {
     fn cell_address_takes_precedence_over_sheet_ref() {
         // `A1` alone is a cell ref, not a sheet name. The bang disambiguates.
         let result = parse_formula("=A1").unwrap();
-        assert!(matches!(result, Expr::CellRef(_)));
+        assert!(matches!(result, Expr::CellRef(..)));
     }
 
     #[test]
@@ -1599,6 +1797,7 @@ mod tests {
                         start: CellAddress::new(0, 0),
                         end: CellAddress::new(2, 0),
                         unbounded: RangeBounds::None,
+                    abs: RangeAbs::REL,
                     },
                 ],
             }
@@ -1618,6 +1817,7 @@ mod tests {
                         start: CellAddress::new(0, 0),
                         end: CellAddress::new(2, 0),
                         unbounded: RangeBounds::None,
+                    abs: RangeAbs::REL,
                     },
                     Expr::Number(0.5),
                 ],
@@ -1703,12 +1903,12 @@ mod tests {
             Expr::FuncCall {
                 name: "SUM".into(),
                 args: vec![
-                    Expr::CellRef(CellAddress::new(0, 0)),
+                    Expr::CellRef(CellAddress::new(0, 0), RefAbs::REL),
                     Expr::FuncCall {
                         name: "SUM".into(),
                         args: vec![
-                            Expr::CellRef(CellAddress::new(0, 1)),
-                            Expr::CellRef(CellAddress::new(0, 2)),
+                            Expr::CellRef(CellAddress::new(0, 1), RefAbs::REL),
+                            Expr::CellRef(CellAddress::new(0, 2), RefAbs::REL),
                         ],
                     },
                 ],
@@ -1957,8 +2157,9 @@ mod tests {
                     start: CellAddress::new(0, 0),
                     end: CellAddress::new(1, 1),
                     unbounded: RangeBounds::None,
+                abs: RangeAbs::REL,
                 },
-                Expr::CellRef(CellAddress::new(4, 3)),
+                Expr::CellRef(CellAddress::new(4, 3), RefAbs::REL),
             ])
         );
     }
@@ -1973,7 +2174,7 @@ mod tests {
         assert_eq!(parts.len(), 3);
         assert!(matches!(parts[0], Expr::Range { .. }));
         assert!(matches!(parts[1], Expr::Range { .. }));
-        assert_eq!(parts[2], Expr::CellRef(CellAddress::new(0, 5)));
+        assert_eq!(parts[2], Expr::CellRef(CellAddress::new(0, 5), RefAbs::REL));
     }
 
     #[test]
@@ -1982,7 +2183,7 @@ mod tests {
         // single-element MultiArea.
         assert_eq!(
             parse_formula("=(A1)"),
-            Some(Expr::CellRef(CellAddress::new(0, 0)))
+            Some(Expr::CellRef(CellAddress::new(0, 0), RefAbs::REL))
         );
     }
 
@@ -2006,8 +2207,8 @@ mod tests {
             result,
             Expr::BinOp {
                 op: BinOperator::Add,
-                left: Box::new(Expr::CellRef(CellAddress::new(0, 0))),
-                right: Box::new(Expr::CellRef(CellAddress::new(0, 1))),
+                left: Box::new(Expr::CellRef(CellAddress::new(0, 0), RefAbs::REL)),
+                right: Box::new(Expr::CellRef(CellAddress::new(0, 1), RefAbs::REL)),
             }
         );
     }
@@ -2058,6 +2259,174 @@ mod tests {
         };
         assert_eq!(parts.len(), 2);
         assert!(matches!(parts[0], Expr::SheetRef { .. }));
-        assert_eq!(parts[1], Expr::CellRef(CellAddress::new(1, 1)));
+        assert_eq!(parts[1], Expr::CellRef(CellAddress::new(1, 1), RefAbs::REL));
+    }
+
+    // ================= Absolute references (`$A$1`) parsing =================
+    //
+    // Counter-example baseline (verified against the pre-change parser): the
+    // dispatch `match` sent `$` to `_ => None`, so EVERY one of the formulas
+    // below returned `parse_formula(..) == None` — a hard parse failure that
+    // surfaced as `Error(InvalidValue)` in the cell, not a wrong value. These
+    // assertions are the green side; they fail to even compile against the old
+    // single-field `CellRef`.
+
+    #[test]
+    fn parse_absolute_cell_ref_all_four_forms() {
+        assert_eq!(
+            parse_formula("=$A$1"),
+            Some(Expr::CellRef(CellAddress::new(0, 0), RefAbs::new(true, true)))
+        );
+        assert_eq!(
+            parse_formula("=$A1"),
+            Some(Expr::CellRef(
+                CellAddress::new(0, 0),
+                RefAbs::new(true, false)
+            ))
+        );
+        assert_eq!(
+            parse_formula("=A$1"),
+            Some(Expr::CellRef(
+                CellAddress::new(0, 0),
+                RefAbs::new(false, true)
+            ))
+        );
+        assert_eq!(
+            parse_formula("=A1"),
+            Some(Expr::CellRef(CellAddress::new(0, 0), RefAbs::REL))
+        );
+    }
+
+    #[test]
+    fn parse_single_absolute_ref_in_expression() {
+        // The canonical reported crash: `=$A$2+1` used to fail the WHOLE
+        // parse. It must now be a normal BinOp with an absolute left operand.
+        assert_eq!(
+            parse_formula("=$A$2+1").unwrap(),
+            Expr::BinOp {
+                op: BinOperator::Add,
+                left: Box::new(Expr::CellRef(CellAddress::new(1, 0), RefAbs::ABS)),
+                right: Box::new(Expr::Number(1.0)),
+            }
+        );
+    }
+
+    #[test]
+    fn parse_absolute_range_corner_combinations() {
+        // Both corners absolute.
+        assert_eq!(
+            parse_formula("=SUM($A$2:$B$4)"),
+            Some(Expr::FuncCall {
+                name: "SUM".into(),
+                args: vec![Expr::Range {
+                    start: CellAddress::new(1, 0),
+                    end: CellAddress::new(3, 1),
+                    unbounded: RangeBounds::None,
+                    abs: RangeAbs::new(RefAbs::ABS, RefAbs::ABS),
+                }],
+            })
+        );
+        // Mixed: `$A2:B$4` — col-abs start, row-abs end.
+        assert_eq!(
+            parse_formula("=SUM($A2:B$4)"),
+            Some(Expr::FuncCall {
+                name: "SUM".into(),
+                args: vec![Expr::Range {
+                    start: CellAddress::new(1, 0),
+                    end: CellAddress::new(3, 1),
+                    unbounded: RangeBounds::None,
+                    abs: RangeAbs::new(RefAbs::new(true, false), RefAbs::new(false, true)),
+                }],
+            })
+        );
+    }
+
+    #[test]
+    fn parse_absolute_cross_sheet_ref_and_range() {
+        assert_eq!(
+            parse_formula("=Sheet1!$A$1"),
+            Some(Expr::SheetRef {
+                sheet: "Sheet1".into(),
+                addr: CellAddress::new(0, 0),
+                abs: RefAbs::ABS,
+            })
+        );
+        assert_eq!(
+            parse_formula("=SUM(Sheet1!$A$2:$B$4)"),
+            Some(Expr::FuncCall {
+                name: "SUM".into(),
+                args: vec![Expr::SheetRange {
+                    sheet: "Sheet1".into(),
+                    start: CellAddress::new(1, 0),
+                    end: CellAddress::new(3, 1),
+                    unbounded: RangeBounds::None,
+                    abs: RangeAbs::new(RefAbs::ABS, RefAbs::ABS),
+                }],
+            })
+        );
+    }
+
+    #[test]
+    fn parse_absolute_whole_col_and_whole_row() {
+        assert_eq!(
+            parse_formula("=SUM($A:$C)"),
+            Some(Expr::FuncCall {
+                name: "SUM".into(),
+                args: vec![Expr::Range {
+                    start: CellAddress::new(0, 0),
+                    end: CellAddress::new(u32::MAX, 2),
+                    unbounded: RangeBounds::Rows,
+                    abs: RangeAbs::new(RefAbs::new(true, false), RefAbs::new(true, false)),
+                }],
+            })
+        );
+        assert_eq!(
+            parse_formula("=SUM($1:$3)"),
+            Some(Expr::FuncCall {
+                name: "SUM".into(),
+                args: vec![Expr::Range {
+                    start: CellAddress::new(0, 0),
+                    end: CellAddress::new(2, u32::MAX),
+                    unbounded: RangeBounds::Cols,
+                    abs: RangeAbs::new(RefAbs::new(false, true), RefAbs::new(false, true)),
+                }],
+            })
+        );
+        // Mixed whole-column: relative start, absolute end.
+        assert_eq!(
+            parse_formula("=SUM(A:$C)"),
+            Some(Expr::FuncCall {
+                name: "SUM".into(),
+                args: vec![Expr::Range {
+                    start: CellAddress::new(0, 0),
+                    end: CellAddress::new(u32::MAX, 2),
+                    unbounded: RangeBounds::Rows,
+                    abs: RangeAbs::new(RefAbs::REL, RefAbs::new(true, false)),
+                }],
+            })
+        );
+    }
+
+    #[test]
+    fn parse_absolute_spill_anchor() {
+        assert_eq!(
+            parse_formula("=$A$1#"),
+            Some(Expr::SpillRef(Box::new(Expr::CellRef(
+                CellAddress::new(0, 0),
+                RefAbs::ABS
+            ))))
+        );
+    }
+
+    #[test]
+    fn dollar_does_not_disturb_names_numbers_or_relative_refs() {
+        // Regression guard: relative forms and non-reference tokens are
+        // unchanged, and a stray `$` fails cleanly instead of mis-parsing.
+        assert_eq!(parse_formula("=x"), Some(Expr::Name("x".into())));
+        assert_eq!(parse_formula("=A1B"), Some(Expr::Name("A1B".into())));
+        assert_eq!(parse_formula("=1.5"), Some(Expr::Number(1.5)));
+        assert!(parse_formula("=$").is_none());
+        assert!(parse_formula("=$5").is_none());
+        assert!(parse_formula("=$Z").is_none());
     }
 }
