@@ -18,18 +18,15 @@
  * itself a second engine (it has its own `evaluateFormula`), so it legitimately
  * carries a TS predicate; this module is that engine's internal implementation.
  *
- * SCOPE NOTE (temporary, E5 removes it)
+ * SCOPE (as-built after E5)
  *
- * The design's slice table names this file `static-filter-predicate.ts` and
- * calls it "static-only". That is the END state, not the state at E4: the
- * worker adapter still calls `buildFilterSortDisplayRows` today
- * (`worker-workbook-backend.ts`), and its removal is slice E5, which has not
- * landed. So this module is imported by BOTH adapters for now — the same
- * shape as its sibling `filter-hidden-rows.ts`, which both adapters already
- * share for this exact feature. It is deliberately named neutrally rather
- * than `static-*` so the filename does not lie about who uses it. Once E5
- * deletes the worker's `computeFilterSortDisplayRows` layer, this becomes
- * static-only and SHOULD be renamed to `static-filter-predicate.ts`.
+ * Now static-only: E5 deleted the worker adapter's
+ * `computeFilterSortDisplayRows` layer (`worker-workbook-backend.ts` no longer
+ * imports this module — the worker feeds the engine's `applyFilter` instead),
+ * so `static-backend.ts` is the sole importer. The design's slice table calls
+ * for renaming this to `static-filter-predicate.ts`; that rename is deferred
+ * (it would touch the one importer plus tests for zero behavioural gain) and
+ * tracked as available cleanup, not done here.
  *
  * This file is a VERBATIM move out of
  * `vanilla/spreadsheet-ui-core/src/backend/projection-helpers.ts` — matching
