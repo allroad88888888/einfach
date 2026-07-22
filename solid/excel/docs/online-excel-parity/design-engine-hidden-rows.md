@@ -25,6 +25,14 @@
 >
 > **修正 5（§4.3 乐观写）**：见 §4.3 内的主控裁定块 —— 乐观写 + 无条件对账已定为**默认**而非备选。
 
+> ### as-built 修正（2026-07-22，E7 实施后核实写入）—— **E8 动工前必读**
+>
+> **修正 6（§4.2 的核心前提过期 —— 引擎的手动集合 feed 端口）**：§4.2 / §7.1 / §10.1-E7 假设**手动隐藏经 `hideRows` / `unhideRows` 端口下沉引擎**，E7 把 UI-core 从"本地写"翻成"经这两个端口 ACK 写"。**核实所得：worker adapter 从未暴露 `hideRows` / `unhideRows` 端口。** E5 只暴露了 `setFilterSort` + `readSheetHiddenState`（`worker-workbook-backend.ts:4077/4088`，均 `engineHiddenState` 门禁），手动集合的引擎 feed **一直是 `setEvalHiddenRows`（整集替换，`:4147`，`evalHiddenRows` 门禁）**，由被删的 `eval-hidden-rows-bridge` 驱动。静态后端虽有 `hideRows` 端口，但也暴露 `setEvalHiddenRows`。**后果**：删 bridge 后若照 §4.2 只调 `hideRows`，worker 的引擎永不收到手动隐藏 → SUBTOTAL 101-111 不排除（UI smoke 实测：隐藏后 G2=SUBTOTAL(109) 停在 100 不变 80）。**E7 的实际形状**：手动 feed 走 `setEvalHiddenRows`（整集，两后端都支持），从 bridge 搬进 atom 的乐观+对账路径（`viewport/hidden.ts` `feedAndReconcileHiddenRows`）；`readSheetHiddenState` 做无条件对账；`hideRows`/`unhideRows` 降级为"仅有它们时"的 fire-and-forget 镜像后备。**"宿主推"没有消失，因为 adapter 没建 §4.2 假设的端口**；要真正做到"引擎 ACK 写、零推送"必须先给 worker 暴露 `hideRows`/`unhideRows` 端口（adapter 活，E7 范围外）。
+>
+> **修正 7（§10.1-E7 的筛选侧删除与 §10.2-7 冲突）**：E7 行要求"筛选侧 local-replay + 结构位移全删"。**核实所得：这与 §10.2-7（E8 晚于 E7）及 #27 回归 e2e 硬冲突。** `vnext-filter-structural-shift-real-backend.spec.ts:164-170` 断言撤销结构操作时**靠 local-replay 记录像恢复筛选缓存**；`undoTransaction`（`HistoryTransactionResult`）不回传隐藏态，所以引擎事务撤销不会重建 UI-core 筛选缓存；引擎快照撤销是 E8。**E7 若删掉筛选侧 local-replay，撤销即无法恢复筛选缓存，#27 e2e 变红。** 故 E7 **保留**筛选侧结构位移 + local-replay（引擎自平移与 UI-core 乐观平移同语义、同结果），把它们的删除**推迟到 E8（undo 改道引擎快照同切片）**。切片表应把"筛选侧 local-replay 删除"从 E7 移到 E8。
+>
+> **修正 8（§5.1/§7.1 static 双 lane 的退休方式）**：E6 报告说 static 的 `evalHiddenRowsForSheet` 双 lane（`hiddenRowsBySheetId` ∪ `evalHiddenRowsBySheetId`）"随 bridge 在 E7 退休"。**实际退休方式**：把 `setEvalHiddenRows` 改成整集替换 `hiddenRowsBySheetId`（与 WASM 引擎 `set_eval_hidden_rows` 写唯一 `Sheet::hidden_rows` 同构），删掉独立的 `evalHiddenRowsBySheetId` 与并集。**端口本身保留**（与 WASM 的 INV-4 永久包袱对齐；parity 断言 `port.setEvalHiddenRows==true`）。唯一退休的是那个 static-only、与 WASM 分歧的"并集"语义 —— 连带删掉 `vnext-static-tables` 里断言该并集的一条用例。
+
 | #   | 问题                | 裁决                                                                                                                 |
 | --- | ------------------- | -------------------------------------------------------------------------------------------------------------------- |
 | 1   | 状态挂哪            | **`Sheet` 拥有**（紧邻 `row_heights`），`WorkbookAtomContext` 的两张 index-keyed 表降级为**引擎内部只读镜像**，由一个私有 `republish_hidden` 单点同步。筛选规则与其派生集合合成一个 `Sheet.filter: Option<SheetAutoFilter>` |

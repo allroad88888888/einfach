@@ -422,7 +422,7 @@ describe('worker adapter: an active filter reaches the engine (#27 S4)', () => {
       return { s9: at(6), s109: at(7), sum: at(8) }
     }
 
-    /** Stand-in for the provider's `eval-hidden-rows-bridge`: mirror manual → engine. */
+    /** Stand-in for the hidden-row engine feed (`setEvalHiddenRows`, whole-set): mirror manual → engine. */
     const pushManualToEngine = async () => {
       await backend.setEvalHiddenRows!({
         kind: 'set-eval-hidden-rows',

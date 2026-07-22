@@ -467,8 +467,9 @@ async function runScript(backend: TableBackend): Promise<Observation[]> {
 // hidden state and never infers a row's source — `setEvalHiddenRows` is a
 // whole-set REPLACE evaluation input the HOST pushes. The manual hide lane
 // (`hideRows`, a VIEW fact) and the eval lane are therefore both driven here,
-// exactly as the app drives them (UI-core hide command → `hideRows`;
-// `eval-hidden-rows-bridge` → `setEvalHiddenRows`).
+// exactly as the app drives them (UI-core hide command → `hideRows` on static;
+// the hidden-row engine feed → `setEvalHiddenRows`, the port the worker exposes
+// and the one UI core's hide command now pushes since the sink-down, E7).
 //
 // Filter visibility is deliberately included: per design §6.1 the MVP push
 // source is `viewportHiddenAtom` (MANUAL rows only) and filter-hidden rows
@@ -577,10 +578,11 @@ async function runHiddenScript(backend: TableBackend): Promise<Observation[]> {
   await declareHiddenRows(backend, [])
   await probeAll('afterUnhide')
 
-  // The eval lane ALONE — no `hideRows` call at all. This is exactly what the
-  // host's `eval-hidden-rows-bridge` drives, and the only lane the WASM
-  // backend has. A backend that infers exclusion solely from its own hide-port
-  // state reads the unhidden baseline here instead of excluding, which is the
+  // The eval lane ALONE — no `hideRows` call at all. This is exactly the
+  // hidden-row engine feed (`setEvalHiddenRows`) UI core's hide command pushes,
+  // and the only lane the WASM backend has. A backend that infers exclusion
+  // solely from its own hide-port state reads the unhidden baseline here
+  // instead of excluding, which is the
   // divergence this phase exists to catch.
   await backend.setEvalHiddenRows?.({
     kind: 'set-eval-hidden-rows',

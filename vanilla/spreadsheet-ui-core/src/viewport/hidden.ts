@@ -4,6 +4,9 @@ import type {
   BackendStructuralShift,
   HideColumnsRequest,
   HideRowsRequest,
+  SetEvalHiddenRowsRequest,
+  SheetHiddenStateRequest,
+  SheetHiddenStateResult,
   UnhideColumnsRequest,
   UnhideRowsRequest,
   ViewportSizeProjectionRequest,
@@ -18,14 +21,25 @@ import { selectionRegionsAtom, selectionSnapshotAtom } from '../selection'
 import { remapIndexSetAfterStructuralShift } from './structural-remap'
 import type { ViewportHiddenState } from './types'
 
-// Hidden rows and columns are UI-core canonical (CANONICAL_OWNERSHIP flip
-// step 2). The per-sheet full index sets below are the source of truth;
-// the backend `hideRows` / `unhideRows` / `hideColumns` / `unhideColumns`
-// ports degrade to a fire-and-forget persistence mirror, and the hidden
-// slices of `readViewportSizeProjection` degrade to a one-shot hydration
-// seed. No ACK lifecycle, no authority ticket, no windowed reconcile: a
-// hide/unhide command commits synchronously and works with backends that
-// expose no hidden port at all.
+// Hidden ROWS are an ENGINE-owned fact since the hidden-row sink-down
+// (design-engine-hidden-rows §4.2/§8): they change what SUBTOTAL 101-111
+// evaluate, so the engine is their authoritative STORE. `sheetHiddenRowsAtom`
+// below is UI core's render-time PROJECTION of that store — written
+// optimistically for an instant visual, then UNCONDITIONALLY reconciled from
+// the backend ACK (`readSheetHiddenState`) so a bounded optimistic window never
+// decays into a silent permanent divergence (§4.3 disciplines).
+//
+// Hidden COLUMNS stay UI-core canonical (§8 — the engine models no hidden
+// columns; SUBTOTAL filters on `addr.row` only). `viewportHiddenColsAtom` is
+// the source of truth for them; the column commits stay synchronous and mirror
+// into the optional `hideColumns` / `unhideColumns` ports fire-and-forget.
+//
+// The two axes are separate atoms precisely because their ownership differs:
+// merging them would let a future refactor push hidden columns at the engine,
+// which has nowhere to put them. `viewportHiddenAtom` is a COMPAT derived that
+// synthesises the historic `{ rowsBySheet, colsBySheet }` shape from the two so
+// the 15 unmigrated consumers keep reading it verbatim; new code must not
+// write it.
 
 export const DEFAULT_VIEWPORT_HIDDEN_STATE: ViewportHiddenState = {
   rowsBySheet: {},
@@ -79,19 +93,75 @@ export function getHiddenColumnsForSheet(state: ViewportHiddenState, sheetId: st
   return state.colsBySheet[sheetId] ?? []
 }
 
-const viewportHiddenBackingAtom = atom<ViewportHiddenState>(DEFAULT_VIEWPORT_HIDDEN_STATE)
-viewportHiddenBackingAtom.debugLabel = 'spreadsheet.viewport.hiddenBacking'
+// --- Split backing atoms (design-engine-hidden-rows §8) ---------------------
 
-/** Read-only projection of the UI-core canonical hidden state. Mutate via hide/unhide commands. */
-export const viewportHiddenAtom: Atom<ViewportHiddenState> = atom((get) =>
-  get(viewportHiddenBackingAtom),
+/** Engine-projection cache for manually hidden ROWS. Written on ACK, never canonical. */
+const sheetHiddenRowsBackingAtom = atom<Record<string, number[]>>({})
+sheetHiddenRowsBackingAtom.debugLabel = 'spreadsheet.viewport.hiddenRowsBacking'
+
+/** UI-core canonical hidden COLUMNS. */
+const viewportHiddenColsBackingAtom = atom<Record<string, number[]>>({})
+viewportHiddenColsBackingAtom.debugLabel = 'spreadsheet.viewport.hiddenColsBacking'
+
+/**
+ * Per-sheet monotonic generation for the row reconcile. Bumped by every
+ * optimistic write (command, structural shift, replay, hydrate); the async
+ * reconcile records the generation it launched under and discards its
+ * `readSheetHiddenState` answer if a newer write has since advanced it — the
+ * existing `requestId`-style staleness guard (§4.3 discipline 2) so two rapid
+ * hides, or a structural edit between a hide and its ACK, cannot flash the
+ * view back to a stale engine snapshot.
+ */
+const hiddenRowsReconcileGenAtom = atom<Record<string, number>>({})
+hiddenRowsReconcileGenAtom.debugLabel = 'spreadsheet.viewport.hiddenRowsReconcileGen'
+
+function bumpRowReconcileGen(get: Getter, set: Setter, sheetId: string): number {
+  const gens = get(hiddenRowsReconcileGenAtom)
+  const next = (gens[sheetId] ?? 0) + 1
+  set(hiddenRowsReconcileGenAtom, { ...gens, [sheetId]: next })
+  return next
+}
+
+function currentRowReconcileGen(get: Getter, sheetId: string): number {
+  return get(hiddenRowsReconcileGenAtom)[sheetId] ?? 0
+}
+
+/** Read-only projection of the engine-owned hidden ROW sets. Mutate via the row commands. */
+export const sheetHiddenRowsAtom: Atom<Record<string, number[]>> = atom((get) =>
+  get(sheetHiddenRowsBackingAtom),
 )
+sheetHiddenRowsAtom.debugLabel = 'spreadsheet.viewport.hiddenRows'
+
+/** Read-only projection of the UI-core canonical hidden COLUMN sets. Mutate via column commands. */
+export const viewportHiddenColsAtom: Atom<Record<string, number[]>> = atom((get) =>
+  get(viewportHiddenColsBackingAtom),
+)
+viewportHiddenColsAtom.debugLabel = 'spreadsheet.viewport.hiddenCols'
+
+/**
+ * COMPAT derived: synthesises the historic `{ rowsBySheet, colsBySheet }`
+ * shape from the two axis atoms so unmigrated consumers read it unchanged.
+ * Every sheet touched on either axis appears in BOTH maps (an absent axis is
+ * an empty array), which reproduces the pre-split state object byte-for-byte.
+ * Read-only — mutate via the hide/unhide commands. New code must not write it.
+ */
+export const viewportHiddenAtom: Atom<ViewportHiddenState> = atom((get) => {
+  const rows = get(sheetHiddenRowsBackingAtom)
+  const cols = get(viewportHiddenColsBackingAtom)
+  const sheetIds = new Set<string>([...Object.keys(rows), ...Object.keys(cols)])
+  const rowsBySheet: Record<string, number[]> = {}
+  const colsBySheet: Record<string, number[]> = {}
+  for (const sheetId of sheetIds) {
+    rowsBySheet[sheetId] = rows[sheetId] ?? []
+    colsBySheet[sheetId] = cols[sheetId] ?? []
+  }
+  return { rowsBySheet, colsBySheet }
+})
 viewportHiddenAtom.debugLabel = 'spreadsheet.viewport.hidden'
 
 // Sheets that are locally owned: either seeded once from the persistence
-// hook or written by a local command. A late hydration result must never
-// clobber a locally owned sheet. Bounded by the sheet count, same as the
-// hidden maps themselves.
+// hook or written by a local command. A late hydration seed must never
+// clobber a locally owned sheet. Bounded by the sheet count.
 const viewportHiddenSeededSheetsAtom = atom<ReadonlySet<string>>(new Set<string>())
 viewportHiddenSeededSheetsAtom.debugLabel = 'spreadsheet.viewport.hiddenSeededSheets'
 
@@ -110,11 +180,24 @@ export const viewportHiddenDiagnosticAtom: Atom<ViewportHiddenDiagnostic | null>
 )
 viewportHiddenDiagnosticAtom.debugLabel = 'spreadsheet.viewport.hiddenDiagnostic'
 
-/** Optional persistence hook. Absence of any method never degrades the feature. */
+/**
+ * Optional persistence / engine hook. Absence of any method never degrades the
+ * feature.
+ *
+ * The engine feed for manually hidden ROWS is `setEvalHiddenRows` — a WHOLE-SET
+ * replace of the engine's owned set (the port both real backends actually
+ * expose for it: the worker engine owns it there, the static engine folds it
+ * into its own hidden map). `readSheetHiddenState` is the reconcile read-back:
+ * with it the row commands are optimistic-then-reconciled; without it (static)
+ * the feed alone keeps the engine in step. A backend exposing neither — only
+ * `hideRows` / `unhideRows` — degrades to a fire-and-forget delta mirror.
+ */
 export interface ViewportHiddenPersistencePort {
   readViewportSizeProjection?: (
     request: ViewportSizeProjectionRequest,
   ) => Promise<ViewportSizeProjectionResult>
+  readSheetHiddenState?: (request: SheetHiddenStateRequest) => Promise<SheetHiddenStateResult>
+  setEvalHiddenRows?: (request: SetEvalHiddenRowsRequest) => Promise<void> | void
   hideRows?: (request: HideRowsRequest) => Promise<BackendMutationResult>
   unhideRows?: (request: UnhideRowsRequest) => Promise<BackendMutationResult>
   hideColumns?: (request: HideColumnsRequest) => Promise<BackendMutationResult>
@@ -133,9 +216,10 @@ export interface ViewportHiddenAxisCommandInput {
   readonly sheetId: string
   readonly indices: readonly number[]
   /**
-   * Optional persistence hook. When present, the committed delta is
-   * mirrored fire-and-forget; a failure records a diagnostic and never
-   * rolls back the local canonical state.
+   * Optional persistence / engine hook. When it exposes `readSheetHiddenState`
+   * the committed row delta is reconciled against the engine's authoritative
+   * set; otherwise the committed delta is mirrored fire-and-forget. A failure
+   * records a diagnostic and never rolls back the local projection.
    */
   readonly source?: ViewportHiddenPersistencePort
 }
@@ -179,17 +263,47 @@ function hiddenErrorMessage(error: unknown): string {
   return error instanceof Error && error.message ? error.message : 'Unknown transport failure.'
 }
 
-function writeSheetHidden(
+function getSheetRows(get: Getter, sheetId: string): number[] {
+  return get(sheetHiddenRowsBackingAtom)[sheetId] ?? []
+}
+
+function getSheetCols(get: Getter, sheetId: string): number[] {
+  return get(viewportHiddenColsBackingAtom)[sheetId] ?? []
+}
+
+/** Optimistic ROW write: replaces the sheet's row set and bumps the reconcile generation. */
+function writeSheetRowsOptimistic(
+  get: Getter,
   set: Setter,
-  state: ViewportHiddenState,
   sheetId: string,
   rows: readonly number[],
-  cols: readonly number[],
 ) {
-  set(viewportHiddenBackingAtom, {
-    rowsBySheet: { ...state.rowsBySheet, [sheetId]: [...rows] },
-    colsBySheet: { ...state.colsBySheet, [sheetId]: [...cols] },
-  })
+  const state = get(sheetHiddenRowsBackingAtom)
+  set(sheetHiddenRowsBackingAtom, { ...state, [sheetId]: [...rows] })
+  bumpRowReconcileGen(get, set, sheetId)
+}
+
+/**
+ * Reconcile ROW write: replaces the sheet's row set with the engine's
+ * authoritative answer. UNCONDITIONAL (§4.3 discipline 1) — it always writes,
+ * even when the value equals the optimistic one, so the projection can never
+ * silently drift from the store; it deliberately does NOT bump the reconcile
+ * generation (it is the settle, not a new intent).
+ */
+function writeSheetRowsReconcile(
+  get: Getter,
+  set: Setter,
+  sheetId: string,
+  rows: readonly number[],
+) {
+  const state = get(sheetHiddenRowsBackingAtom)
+  set(sheetHiddenRowsBackingAtom, { ...state, [sheetId]: [...rows] })
+}
+
+/** Column write (UI-core canonical). */
+function writeSheetCols(get: Getter, set: Setter, sheetId: string, cols: readonly number[]) {
+  const state = get(viewportHiddenColsBackingAtom)
+  set(viewportHiddenColsBackingAtom, { ...state, [sheetId]: [...cols] })
 }
 
 function persistHiddenMutation(
@@ -240,27 +354,73 @@ function persistHiddenMutation(
   }
 }
 
-/** Mirrors an absolute per-axis transition as hide/unhide deltas into the optional hook. */
-function persistHiddenAxisDelta(
+/**
+ * Feed the engine's owned manual hidden-ROW set and reconcile the projection
+ * (design-engine-hidden-rows §4.2/§4.3).
+ *
+ * The feed is a WHOLE-SET `setEvalHiddenRows` push of the current set — the port
+ * both real backends expose for manual rows (the worker never exposed
+ * `hideRows`; the static engine folds the push into its own hidden map). When
+ * the backend also exposes `readSheetHiddenState` (the worker) the pushed set is
+ * re-read and the projection is overwritten UNCONDITIONALLY with the engine's
+ * answer; a stale answer (a newer write advanced the generation) is dropped
+ * rather than rolled back — the engine self-corrects through the same write path
+ * on the next ACK. Backends that expose neither `setEvalHiddenRows` nor
+ * `readSheetHiddenState` fall back to a fire-and-forget `hideRows` / `unhideRows`
+ * delta mirror.
+ */
+function feedAndReconcileHiddenRows(
+  get: Getter,
   set: Setter,
   source: unknown,
   sheetId: string,
-  axis: 'row' | 'column',
-  before: readonly number[],
-  after: readonly number[],
+  wholeSet: readonly number[],
+  added: readonly number[],
+  removed: readonly number[],
+  gen: number,
 ) {
-  const beforeSet = new Set(before)
-  const afterSet = new Set(after)
-  const added = after.filter((index) => !beforeSet.has(index))
-  const removed = before.filter((index) => !afterSet.has(index))
-  persistHiddenMutation(set, source, sheetId, axis === 'row' ? 'hide-rows' : 'hide-columns', added)
-  persistHiddenMutation(
-    set,
-    source,
-    sheetId,
-    axis === 'row' ? 'unhide-rows' : 'unhide-columns',
-    removed,
-  )
+  if (typeof source !== 'object' || source === null) return
+  const port = source as ViewportHiddenPersistencePort
+  if (typeof port.setEvalHiddenRows !== 'function') {
+    // Persistence-mirror fallback: no engine feed, just mirror the delta.
+    persistHiddenMutation(set, port, sheetId, 'hide-rows', added)
+    persistHiddenMutation(set, port, sheetId, 'unhide-rows', removed)
+    return
+  }
+  const pushEval = port.setEvalHiddenRows
+  const readback = port.readSheetHiddenState
+  const recordFailure = (error: unknown) => {
+    set(viewportHiddenDiagnosticBackingAtom, {
+      kind: 'persist-failed',
+      sheetId,
+      message: hiddenErrorMessage(error),
+    })
+  }
+  void (async () => {
+    try {
+      await pushEval.call(port, { kind: 'set-eval-hidden-rows', sheetId, rows: [...wholeSet] })
+      if (typeof readback !== 'function') return
+      const result = await readback.call(port, {
+        kind: 'sheet-hidden-state',
+        sheetId,
+        requestId: gen,
+      })
+      // Discard a stale ACK: a newer write (another hide, a structural shift, a
+      // replay) has advanced the generation, so its own reconcile owns the set.
+      if (currentRowReconcileGen(get, sheetId) !== gen) return
+      if (
+        typeof result !== 'object' ||
+        result === null ||
+        result.sheetId !== sheetId ||
+        !Array.isArray(result.manualRows)
+      ) {
+        return
+      }
+      writeSheetRowsReconcile(get, set, sheetId, sanitizeIndices(result.manualRows))
+    } catch (error) {
+      recordFailure(error)
+    }
+  })()
 }
 
 function runViewportHiddenAxisCommand(
@@ -282,10 +442,7 @@ function runViewportHiddenAxisCommand(
   }
 
   const indices = sanitizeIndices(rawIndices)
-  const state = get(viewportHiddenBackingAtom)
-  const rows = state.rowsBySheet[sheetId] ?? []
-  const cols = state.colsBySheet[sheetId] ?? []
-  const current = axis === 'row' ? rows : cols
+  const current = axis === 'row' ? getSheetRows(get, sheetId) : getSheetCols(get, sheetId)
   // Any local command claims the sheet — a late hydration seed must not clobber it.
   markViewportHiddenSeeded(get, set, sheetId)
 
@@ -295,9 +452,10 @@ function runViewportHiddenAxisCommand(
       : current.filter((index) => !indices.includes(index))
   if (sameIndices(current, next)) return 'unchanged'
 
-  const nextRows = axis === 'row' ? next : rows
-  const nextCols = axis === 'column' ? next : cols
-  writeSheetHidden(set, state, sheetId, nextRows, nextCols)
+  // Optimistic write — synchronous, so the grid repaints this tick.
+  if (axis === 'row') writeSheetRowsOptimistic(get, set, sheetId, next)
+  else writeSheetCols(get, set, sheetId, next)
+
   const snapshotBefore: ViewportHiddenReplaySnapshot =
     axis === 'row' ? { rows: Object.freeze([...current]) } : { cols: Object.freeze([...current]) }
   const snapshotAfter: ViewportHiddenReplaySnapshot =
@@ -316,23 +474,35 @@ function runViewportHiddenAxisCommand(
   })
   const mutated = operation === 'hide' ? indices.filter((index) => !current.includes(index)) : []
   const cleared = operation === 'unhide' ? current.filter((index) => !next.includes(index)) : []
-  persistHiddenMutation(
-    set,
-    input.source,
-    sheetId,
-    axis === 'row'
-      ? operation === 'hide'
-        ? 'hide-rows'
-        : 'unhide-rows'
-      : operation === 'hide'
-        ? 'hide-columns'
-        : 'unhide-columns',
-    operation === 'hide' ? mutated : cleared,
-  )
+  const delta = operation === 'hide' ? mutated : cleared
+
+  if (axis === 'row') {
+    // Feed the engine the whole optimistic set (§4.2) and reconcile from the
+    // ACK. The generation was bumped by the optimistic write above.
+    feedAndReconcileHiddenRows(
+      get,
+      set,
+      input.source,
+      sheetId,
+      next,
+      mutated,
+      cleared,
+      currentRowReconcileGen(get, sheetId),
+    )
+  } else {
+    // Columns stay UI-core canonical (§8): mirror the delta fire-and-forget.
+    persistHiddenMutation(
+      set,
+      input.source,
+      sheetId,
+      operation === 'hide' ? 'hide-columns' : 'unhide-columns',
+      delta,
+    )
+  }
   return 'committed'
 }
 
-/** Command: hide rows locally (UI-core canonical). Synchronous; records local-replay history. */
+/** Command: hide rows (engine-owned projection). Optimistic commit; reconciles on ACK. */
 export const hideRowsAtom = atom(
   null,
   (get, set, input: ViewportHiddenAxisCommandInput): ViewportHiddenCommandOutcome =>
@@ -340,7 +510,7 @@ export const hideRowsAtom = atom(
 )
 hideRowsAtom.debugLabel = 'spreadsheet.viewport.hideRows'
 
-/** Command: unhide rows locally (UI-core canonical). Synchronous; records local-replay history. */
+/** Command: unhide rows (engine-owned projection). Optimistic commit; reconciles on ACK. */
 export const unhideRowsAtom = atom(
   null,
   (get, set, input: ViewportHiddenAxisCommandInput): ViewportHiddenCommandOutcome =>
@@ -366,9 +536,9 @@ unhideColumnsAtom.debugLabel = 'spreadsheet.viewport.unhideColumns'
 
 /**
  * Pure precheck shared by menu entries: resolves the current single-region
- * selection against the local canonical hidden state and returns the exact
- * hidden indices the selection covers on the requested axis, or null when
- * the selection cannot host the command at all.
+ * selection against the local hidden state and returns the exact hidden
+ * indices the selection covers on the requested axis, or null when the
+ * selection cannot host the command at all.
  */
 export function resolveViewportHiddenSelectionUnhide(
   get: Getter,
@@ -387,10 +557,7 @@ export function resolveViewportHiddenSelectionUnhide(
     return null
   }
 
-  const hidden = get(viewportHiddenBackingAtom)
-  const canonical = selectsRows
-    ? (hidden.rowsBySheet[sheetId] ?? [])
-    : (hidden.colsBySheet[sheetId] ?? [])
+  const canonical = selectsRows ? getSheetRows(get, sheetId) : getSheetCols(get, sheetId)
   return {
     sheetId,
     indices: canonical.filter((index) => index >= start && index <= end),
@@ -487,13 +654,8 @@ export const hydrateViewportHiddenAtom = atom(
     }
 
     markViewportHiddenSeeded(get, set, sheetId)
-    writeSheetHidden(
-      set,
-      get(viewportHiddenBackingAtom),
-      sheetId,
-      sanitizeIndices(payload.hiddenRowIndices),
-      sanitizeIndices(payload.hiddenColIndices),
-    )
+    writeSheetRowsOptimistic(get, set, sheetId, sanitizeIndices(payload.hiddenRowIndices))
+    writeSheetCols(get, set, sheetId, sanitizeIndices(payload.hiddenColIndices))
     return 'hydrated'
   },
 )
@@ -501,10 +663,13 @@ hydrateViewportHiddenAtom.debugLabel = 'spreadsheet.viewport.hydrateHidden'
 
 /**
  * Command: consume a `BackendMutationResult.structuralShift` so the local
- * canonical hidden sets move with inserted/deleted rows/columns. Indices
- * inside a deleted band drop out. Part of the enclosing structural
- * operation — records no history entry of its own. Returns true when a
- * set actually changed.
+ * hidden sets move with inserted/deleted rows/columns. Indices inside a
+ * deleted band drop out. Part of the enclosing structural operation — records
+ * no history entry of its own. Returns true when a set actually changed.
+ *
+ * The engine self-displaces its OWNED row set on the same shift, so this keeps
+ * the render projection in step without a re-read; the bumped reconcile
+ * generation drops any hide-ACK still in flight from before the shift.
  */
 export const applyViewportHiddenStructuralShiftAtom = atom(
   null,
@@ -520,22 +685,14 @@ export const applyViewportHiddenStructuralShiftAtom = atom(
     ) {
       return false
     }
-    const state = get(viewportHiddenBackingAtom)
-    const rows = state.rowsBySheet[sheetId] ?? []
-    const cols = state.colsBySheet[sheetId] ?? []
-    const current = shift.axis === 'row' ? rows : cols
+    const current = shift.axis === 'row' ? getSheetRows(get, sheetId) : getSheetCols(get, sheetId)
     if (current.length === 0) return false
     const remapped = sanitizeIndices([
       ...remapIndexSetAfterStructuralShift(new Set(current), shift),
     ])
     if (sameIndices(current, remapped)) return false
-    writeSheetHidden(
-      set,
-      state,
-      sheetId,
-      shift.axis === 'row' ? remapped : rows,
-      shift.axis === 'column' ? remapped : cols,
-    )
+    if (shift.axis === 'row') writeSheetRowsOptimistic(get, set, sheetId, remapped)
+    else writeSheetCols(get, set, sheetId, remapped)
     return true
   },
 )
@@ -563,13 +720,11 @@ function snapshotHiddenReplayTarget(value: unknown): ViewportHiddenReplaySnapsho
  * Records NO history entry — the CALLER owns the entry that replays this.
  *
  * This is the hidden module's write primitive for features that hide rows
- * or columns as a side effect of their own single-entry gesture, and it is
- * deliberately a plain exported function rather than a registry lookup:
- * `outline` (collapse/expand) needs the seeded + persist invariants above
- * and must not be able to obtain them by chance. When the hidden canonical
- * set sinks into the engine, deleting this function must be a COMPILE
- * error at every call site — a nullable applier lookup would instead have
- * degraded those callers to a silent no-op.
+ * or columns as a side effect of their own single-entry gesture (`outline`
+ * collapse/expand) and for the manual-hide undo replay. When present, the
+ * row axis mirrors its delta through the `hideRows` / `unhideRows` engine
+ * ports (as before); the reconcile generation is bumped so a hide-ACK still
+ * in flight cannot clobber the replayed set.
  */
 export function applyViewportHiddenReplaySnapshot(
   get: Getter,
@@ -583,15 +738,56 @@ export function applyViewportHiddenReplaySnapshot(
   if (target === null) return false
 
   markViewportHiddenSeeded(get, set, sheetId)
-  const state = get(viewportHiddenBackingAtom)
-  const prevRows = state.rowsBySheet[sheetId] ?? []
-  const prevCols = state.colsBySheet[sheetId] ?? []
+  const prevRows = getSheetRows(get, sheetId)
+  const prevCols = getSheetCols(get, sheetId)
   const nextRows = target.rows ?? prevRows
   const nextCols = target.cols ?? prevCols
-  writeSheetHidden(set, state, sheetId, nextRows, nextCols)
-  persistHiddenAxisDelta(set, source, sheetId, 'row', prevRows, nextRows)
-  persistHiddenAxisDelta(set, source, sheetId, 'column', prevCols, nextCols)
+  if (target.rows !== undefined) {
+    writeSheetRowsOptimistic(get, set, sheetId, nextRows)
+    const prevRowSet = new Set(prevRows)
+    const nextRowSet = new Set(nextRows)
+    // Same engine feed + reconcile path the hide/unhide commands take, so an
+    // outline collapse or a manual-hide undo replays into the engine (and its
+    // SUBTOTAL 101-111) identically — not only into the local projection.
+    feedAndReconcileHiddenRows(
+      get,
+      set,
+      source,
+      sheetId,
+      nextRows,
+      nextRows.filter((index) => !prevRowSet.has(index)),
+      prevRows.filter((index) => !nextRowSet.has(index)),
+      currentRowReconcileGen(get, sheetId),
+    )
+  }
+  if (target.cols !== undefined) {
+    writeSheetCols(get, set, sheetId, nextCols)
+    persistHiddenAxisDelta(set, source, sheetId, 'column', prevCols, nextCols)
+  }
   return true
+}
+
+/** Mirrors an absolute per-axis transition as hide/unhide deltas into the optional hook. */
+function persistHiddenAxisDelta(
+  set: Setter,
+  source: unknown,
+  sheetId: string,
+  axis: 'row' | 'column',
+  before: readonly number[],
+  after: readonly number[],
+) {
+  const beforeSet = new Set(before)
+  const afterSet = new Set(after)
+  const added = after.filter((index) => !beforeSet.has(index))
+  const removed = before.filter((index) => !afterSet.has(index))
+  persistHiddenMutation(set, source, sheetId, axis === 'row' ? 'hide-rows' : 'hide-columns', added)
+  persistHiddenMutation(
+    set,
+    source,
+    sheetId,
+    axis === 'row' ? 'unhide-rows' : 'unhide-columns',
+    removed,
+  )
 }
 
 registerHistoryLocalReplayApplier(

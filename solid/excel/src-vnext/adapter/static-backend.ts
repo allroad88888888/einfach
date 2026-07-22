@@ -351,20 +351,12 @@ interface StaticBackendState {
   hiddenRowsBySheetId: Map<string, Set<number>>
   hiddenColsBySheetId: Map<string, Set<number>>
   /**
-   * Host-pushed SUBTOTAL 101-111 evaluation input (`setEvalHiddenRows`,
-   * design-excel-table §6.1) — NOT a view fact and NOT this backend's own
-   * hidden-row state. Stored verbatim, exactly like the engine's
-   * `Sheet::eval_hidden_rows`: whole-set REPLACE, never shifted by row
-   * insert/delete (the host re-pushes), never inferring a row's source.
-   */
-  evalHiddenRowsBySheetId: Map<string, Set<number>>
-  /**
    * FILTER-hidden rows derived by THIS backend when `setFilterSort` applied
    * the rules (`design-filter-hidden-rows` §4.2, slice S4) — the static
    * counterpart of what the worker adapter pushes into the engine through
    * `setEvalFilterHiddenRows`.
    *
-   * Independent of `evalHiddenRowsBySheetId` on purpose, and NEVER merged with
+   * Independent of `hiddenRowsBySheetId` on purpose, and NEVER merged with
    * it: Excel's `SUBTOTAL(1-11)` excludes filter-hidden rows while INCLUDING
    * manually hidden ones, a rule one merged set cannot express (design §3
    * constraint 1). Snapshot semantics — computed when the rules are applied,
@@ -964,7 +956,6 @@ function buildState(
     colWidthsBySheetId: new Map(),
     hiddenRowsBySheetId: new Map(),
     hiddenColsBySheetId: new Map(),
-    evalHiddenRowsBySheetId: new Map(),
     filterHiddenRowsBySheetId: new Map(),
     freezeBySheetId: new Map(sheets.map((sheet) => [sheet.id, { rows: 0, cols: 0 }])),
     sheets,
@@ -1232,53 +1223,32 @@ function shiftHiddenIndexSet(
 }
 
 /**
- * The row set SUBTOTAL 101-111 excludes on `sheetId` — the union of this
- * backend's two host-declared hidden lanes (design-excel-table §6.1):
+ * The row set SUBTOTAL 101-111 excludes on `sheetId` — this backend's manually
+ * hidden rows (design-excel-table §6.1).
  *
- *  1. `hiddenRowsBySheetId` — rows hidden through this backend's own
- *     `hideRows` / `unhideRows` ports;
- *  2. `evalHiddenRowsBySheetId` — the whole-set REPLACE pushed through
- *     `setEvalHiddenRows` by the host's eval-hidden bridge.
+ * SINGLE lane since the hidden-row sink-down (design-engine-hidden-rows §7.1,
+ * E7): the eval-input `setEvalHiddenRows` no longer feeds a SEPARATE
+ * `evalHiddenRowsBySheetId` map that was UNIONED in here. The host's
+ * `eval-hidden-rows-bridge` was retired with E7 (the engine owns the manual
+ * set through the `hideRows` / `unhideRows` ports and UI core reconciles from
+ * the ACK), so the pushed lane had no production driver left; `setEvalHiddenRows`
+ * now whole-set-REPLACES `hiddenRowsBySheetId` directly — the same store its
+ * `hideRows` port mutates — exactly as the WASM engine's `set_eval_hidden_rows`
+ * writes the one owned `Sheet::hidden_rows`. The static-only union that could
+ * hold `hideRows` and a divergent push at once is gone with it.
  *
- * A union rather than a precedence rule, because the two lanes carry the SAME
- * canonical fact from different directions: the real host drives both for one
- * hide (UI-core hide command → `hideRows`; `eval-hidden-rows-bridge` →
- * `setEvalHiddenRows`), while the WASM backend exposes only lane 2 and older
- * static callers only lane 1. Unioning lets either lane alone be sufficient,
- * so both hosts observe the same exclusion.
- *
- * Filter-hidden rows are deliberately NOT merged in, and this is now a load
- * bearing separation rather than a deferral. Excel's rule
+ * Filter-hidden rows are deliberately NOT merged in. Excel's rule
  * (`design-filter-hidden-rows` §2/§3) is that `SUBTOTAL(1-11)` excludes
  * FILTER-hidden rows but INCLUDES manually hidden ones, while 101-111 excludes
- * both — merging the two sets destroys the source information that rule is
- * stated in. The filter side lives in `filterHiddenRowsForSheet` below and the
- * engine keeps them apart the same way (`eval_hidden_rows` vs
- * `eval_filter_hidden_rows`). Both halves are covered by the `filterHidden`
- * phase of vnext-table-totals-static-wasm-parity.
- *
- * E6 note (design-engine-hidden-rows §7.1 / §10.1): the manual dual lane does
- * NOT collapse here. Lane 2 (`evalHiddenRowsBySheetId`, fed by
- * `setEvalHiddenRows`) is still driven by the host's `eval-hidden-rows-bridge`
- * and is exercised alone by the `evalLaneOnly` parity phase — removing it now
- * reds that phase (static reads 400 where WASM reads 320). It retires in E7,
- * with the bridge, once UI-core writes the manual set on ACK instead of pushing
- * it. E6's job was to golden-lock the FILTER half to the real engine, which
- * vnext-filter-static-wasm-parity does; the manual half stays as-is.
+ * both — merging the two destroys the source information that rule is stated
+ * in. The filter side lives in `filterHiddenRowsForSheet` below and the engine
+ * keeps them apart the same way (`eval_hidden_rows` vs `eval_filter_hidden_rows`).
  */
 function evalHiddenRowsForSheet(
   state: StaticBackendState,
   sheetId: string,
 ): ReadonlySet<number> | undefined {
-  const manual = state.hiddenRowsBySheetId.get(sheetId)
-  const pushed = state.evalHiddenRowsBySheetId.get(sheetId)
-  // The common cases stay allocation-free: at most one lane is ever populated
-  // unless a host drives both, and then the sets are usually identical.
-  if (!pushed?.size) return manual
-  if (!manual?.size) return pushed
-  const union = new Set<number>(manual)
-  for (const row of pushed) union.add(row)
-  return union
+  return state.hiddenRowsBySheetId.get(sheetId)
 }
 
 /**
@@ -4544,29 +4514,24 @@ export function createStaticSpreadsheetBackend(
     },
     /**
      * SUBTOTAL 101-111 hidden-row evaluation input (parity #23,
-     * design-excel-table §6.1). The port used to be omitted on the grounds
-     * that this evaluator had no 101-111 family — that stopped being true when
-     * the totals row landed, and omitting it left the static host deaf to the
-     * ONLY lane the WASM backend offers (it exposes no `hideRows`), so a host
-     * driving the documented eval lane got no exclusion here while WASM
-     * excluded correctly.
+     * design-excel-table §6.1). Retained as a port for surface parity with the
+     * WASM engine (which cannot drop the export — INV-4 fingerprints it as
+     * permanent baggage), but since the hidden-row sink-down (E7) it writes the
+     * ONE `hiddenRowsBySheetId` store, exactly as the WASM engine's
+     * `set_eval_hidden_rows` writes the one owned `Sheet::hidden_rows`. There is
+     * no longer a separate eval lane to union in.
      *
-     * Semantics copied from `Workbook::set_eval_hidden_rows`: whole-set
-     * REPLACE, stored verbatim as pure evaluation input. An empty set drops
-     * the sheet from the ledger. Out-of-range and duplicate rows are harmless
-     * — the evaluator only ever tests membership. Not undoable and does not
-     * bump the revision: this is a view-derived eval input, not workbook data,
-     * and the host re-pushes it whenever its canonical hidden set changes
-     * (including after row insert/delete, which is why the set is never
-     * shifted here — the engine does not shift its copy either).
+     * Whole-set REPLACE: an empty set clears the sheet. Out-of-range and
+     * duplicate rows are harmless — the evaluator only tests membership. Not
+     * undoable and does not bump the revision.
      */
     setEvalHiddenRows(request: SetEvalHiddenRowsRequest): void {
       const rows = request.rows.filter((row) => Number.isSafeInteger(row) && row >= 0)
       if (rows.length === 0) {
-        state.evalHiddenRowsBySheetId.delete(request.sheetId)
+        state.hiddenRowsBySheetId.delete(request.sheetId)
         return
       }
-      state.evalHiddenRowsBySheetId.set(request.sheetId, new Set(rows))
+      state.hiddenRowsBySheetId.set(request.sheetId, new Set(rows))
     },
     async setFormatRange(request: SetFormatRangeRequest) {
       beginUndoableMutation(state)
@@ -5223,7 +5188,6 @@ export function createStaticSpreadsheetBackend(
       state.colWidthsBySheetId.delete(request.sheetId)
       state.hiddenRowsBySheetId.delete(request.sheetId)
       state.hiddenColsBySheetId.delete(request.sheetId)
-      state.evalHiddenRowsBySheetId.delete(request.sheetId)
       state.freezeBySheetId.delete(request.sheetId)
       // Drop every Table anchored to the deleted sheet (design §4.4). Not
       // captured by the undo delta — the registry is outside the timeline.

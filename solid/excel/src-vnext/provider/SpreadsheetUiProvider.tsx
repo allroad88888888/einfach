@@ -10,7 +10,7 @@ import {
 import { onCleanup } from 'solid-js'
 import { SpreadsheetUiContext } from './context'
 import { spreadsheetBackendAtom } from './atoms'
-import { attachEvalHiddenRowsBridge } from './eval-hidden-rows-bridge'
+import { attachHiddenRowsRefreshBridge } from './hidden-rows-refresh-bridge'
 import { attachNamedRangeFeaturePort } from './named-range-feature-port'
 import { attachStatusBarProjectionBridge } from './status-bar-projection-bridge'
 import type { SpreadsheetUiProviderProps } from './types'
@@ -87,7 +87,7 @@ export function SpreadsheetUiProvider(props: SpreadsheetUiProviderProps) {
     props.namedRangeCapabilityPort,
   )
   const detachStatusBarProjectionBridge = attachStatusBarProjectionBridge(core.store)
-  const detachEvalHiddenRowsBridge = attachEvalHiddenRowsBridge(core.store, props.backend)
+  const detachHiddenRowsRefreshBridge = attachHiddenRowsRefreshBridge(core.store, props.backend)
 
   // Wave 8 — custom-formula registry bridge. The backend may omit the
   // port entirely (static backend, legacy hosts); in that case the
@@ -192,7 +192,7 @@ export function SpreadsheetUiProvider(props: SpreadsheetUiProviderProps) {
   onCleanup(() => {
     detachNamedRangeFeaturePort()
     detachStatusBarProjectionBridge()
-    detachEvalHiddenRowsBridge()
+    detachHiddenRowsRefreshBridge()
     unmounted = true
     unsubscribe()
     // Empty desired keeps the same serial pump alive. A pending register

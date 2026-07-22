@@ -723,14 +723,13 @@ describe('static backend — SUBTOTAL semantics', () => {
     expect(await evalAt(backend, '=SUBTOTAL(102,A1:A6)')).toBe('2')
   })
 
-  it('unions the pushed eval set with the manually hidden rows', async () => {
-    const backend = subtotalBackend()
-    await backend.hideRows!({ kind: 'hide-rows', sheetId: SHEET, rowIndices: [1] }) // A2 = 20
-    // A6 = 40
-    backend.setEvalHiddenRows!({ kind: 'set-eval-hidden-rows', sheetId: SHEET, rows: [5] })
-    // Neither lane alone would drop both rows.
-    expect(await evalAt(backend, '=SUBTOTAL(109,A1:A6)')).toBe('40') // 10 + 30
-  })
+  // Retired with the dual lane (design-engine-hidden-rows §7.1, E7): there was
+  // a static-only test here asserting `setEvalHiddenRows` UNIONED with a
+  // separate `hideRows` set. That union never existed on the WASM engine (both
+  // write the one owned `Sheet::hidden_rows`, so a push REPLACES the hide), and
+  // the eval lane lost its production driver when the `eval-hidden-rows-bridge`
+  // was deleted. `setEvalHiddenRows` now whole-set-replaces the same store
+  // `hideRows` mutates, matching WASM; there is no union to assert.
 
   it('setEvalHiddenRows is a whole-set REPLACE and an empty push clears it', async () => {
     const backend = subtotalBackend()
