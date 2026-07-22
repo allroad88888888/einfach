@@ -174,6 +174,28 @@ export function SpreadsheetFilterDropdown(props: SpreadsheetFilterDropdownProps)
     })
   }
 
+  // "OK" (and Enter inside a condition field) applies the draft AND closes the
+  // dropdown, matching Excel: confirming a filter dismisses the AutoFilter menu.
+  // The close is conditional on a CLEAN apply — the mutation settles back to
+  // 'editing' only when the rules committed and the projection refreshed. A
+  // validation failure settles to 'blocked' (error still shown, `activeMutation`
+  // never reserved) and a transport failure leaves the request busy, so both
+  // deliberately keep the dropdown open. The session guard prevents closing a
+  // dropdown a newer editing session has since opened over this one.
+  async function applyDraftAndClose() {
+    const sessionId = draft().sessionId
+    await store.setter(runFilterSortMutationAtom, {
+      source: backend,
+      sessionId,
+      intent: { kind: 'apply-draft' },
+      refreshProjection: (targetSheetId) => refreshVisibleProjection(store, backend, targetSheetId),
+    })
+    const settled = store.getter(filterSortLifecycleAtom)
+    if (settled.status === 'editing' && settled.sessionId === sessionId) {
+      close()
+    }
+  }
+
   // Sort dispatches the SAME physical-sort command as the toolbar / menu
   // (design-engine-sort S6 / #29). The dropdown closes (Excel closes its
   // AutoFilter menu on sort) and the engine reorders data by THIS dropdown's
@@ -384,7 +406,7 @@ export function SpreadsheetFilterDropdown(props: SpreadsheetFilterDropdownProps)
               onKeyDown={(event) => {
                 if (event.key === 'Enter' && !mutationDisabled()) {
                   event.preventDefault()
-                  run({ kind: 'apply-draft' })
+                  void applyDraftAndClose()
                 }
               }}
             />
@@ -401,7 +423,7 @@ export function SpreadsheetFilterDropdown(props: SpreadsheetFilterDropdownProps)
               onKeyDown={(event) => {
                 if (event.key === 'Enter' && !mutationDisabled()) {
                   event.preventDefault()
-                  run({ kind: 'apply-draft' })
+                  void applyDraftAndClose()
                 }
               }}
             />
@@ -484,7 +506,7 @@ export function SpreadsheetFilterDropdown(props: SpreadsheetFilterDropdownProps)
               class="filter-btn filter-btn-primary"
               data-testid="filter-add-equals"
               disabled={mutationDisabled()}
-              onClick={() => run({ kind: 'apply-draft' })}
+              onClick={() => void applyDraftAndClose()}
             >
               {t('filterSort.apply')}
             </button>

@@ -23,6 +23,7 @@ import { createStore } from '@einfach/core'
 import { cleanup, fireEvent, render, waitFor } from '@solidjs/testing-library'
 import type { VisibleProjectionResult } from '@einfach/spreadsheet-ui-core'
 import {
+  filterDropdownAtom,
   filterSortLifecycleAtom,
   filterSortStateAtom,
   openFilterDropdownAtom,
@@ -626,11 +627,12 @@ describe('worker path filter/sort UI integration', () => {
     fireEvent.click(container.querySelector('[data-testid="filter-add-equals"]')!)
 
     // Committed ui-core canonical state and the refreshed worker projection.
+    // OK applies AND closes the dropdown (Excel parity).
     await waitFor(() => {
       expect(store.getter(filterSortStateAtom)['sheet-1']?.rules).toEqual([
         { kind: 'equals', colIndex: 0, value: 'Alpha' },
       ])
-      expect(store.getter(filterSortLifecycleAtom).status).toBe('editing')
+      expect(store.getter(filterDropdownAtom).status).toBe('closed')
     })
     await waitFor(() => {
       // Beta's row is hidden rather than compacted away: row 3 is gone from the
@@ -640,7 +642,12 @@ describe('worker path filter/sort UI integration', () => {
       expect(gridCellText(container, 'B4')).toBe('2')
     })
 
-    // Clearing the filter brings the row back at its own index.
+    // Re-open the column menu (OK closed it) to clear the filter, which brings
+    // the row back at its own index.
+    store.setter(openFilterDropdownAtom, { sheetId: 'sheet-1', colIndex: 0 })
+    await waitFor(() => {
+      expect(store.getter(filterSortLifecycleAtom).status).toBe('editing')
+    })
     fireEvent.click(container.querySelector('[data-testid="filter-clear-filter"]')!)
     await waitFor(() => {
       expect(store.getter(filterSortStateAtom)['sheet-1']?.rules).toEqual([])

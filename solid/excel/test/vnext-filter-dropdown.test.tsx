@@ -13,6 +13,7 @@ import type {
 import {
   FILTER_SORT_ACKNOWLEDGEMENT_ERROR,
   FILTER_SORT_CAPABILITY_ERROR,
+  FILTER_SORT_INVALID_INPUT_ERROR,
   FILTER_SORT_OUTCOME_UNKNOWN_ERROR,
   createVisibleProjectionRequest,
   filterDropdownAtom,
@@ -183,7 +184,8 @@ describe('vNext SpreadsheetFilterDropdown', () => {
     })
     await waitFor(() => {
       expect(store.getter(filterSortStateAtom)['sheet-1']?.rules).toEqual([equalsRule(0, 'alpha')])
-      expect(store.getter(filterSortLifecycleAtom).status).toBe('editing')
+      // OK applies cleanly and closes the dropdown (Excel parity).
+      expect(store.getter(filterDropdownAtom).status).toBe('closed')
     })
   })
 
@@ -209,7 +211,8 @@ describe('vNext SpreadsheetFilterDropdown', () => {
     expect(store.getter(filterSortStateAtom)['sheet-1']).toBeUndefined()
 
     ack.resolve({ sheetId: 'sheet-1', requestId: calls[0]!.requestId, revision: 1 })
-    await waitForEditing(store)
+    // The first mutation settles and its OK closes the dropdown.
+    await waitFor(() => expect(store.getter(filterDropdownAtom).status).toBe('closed'))
   })
 
   it('retains a mismatched acknowledgement without committing or resending', async () => {
@@ -271,14 +274,11 @@ describe('vNext SpreadsheetFilterDropdown', () => {
     })
 
     firstAck.resolve({ sheetId: 'sheet-1', requestId: calls[0]!.requestId, revision: 1 })
-    await waitForEditing(store)
+    // The settled OK applies column 0's draft and then closes the dropdown
+    // (Excel parity); the inert reopen to column 1 never took effect.
+    await waitFor(() => expect(store.getter(filterDropdownAtom).status).toBe('closed'))
 
     expect(store.getter(filterSortStateAtom)['sheet-1']?.rules).toEqual([equalsRule(0, 'alpha')])
-    expect(store.getter(filterDropdownAtom)).toMatchObject({
-      status: 'open',
-      sheetId: 'sheet-1',
-      colIndex: 0,
-    })
   })
 
   it('keeps committed state unchanged on transport rejection and exposes the error', async () => {
@@ -359,36 +359,45 @@ describe('vNext SpreadsheetFilterDropdown', () => {
     openDropdown(store, 1)
     const { container } = renderDropdown(store, createFakeBackend())
     await waitForEditing(store)
-    const condition = container.querySelector(
-      '[data-testid="filter-condition-kind"]',
-    ) as HTMLSelectElement
+    // Each confirmation applies AND closes the dropdown (Excel parity), so the
+    // column menu is re-opened per condition kind — the way a user re-opens it
+    // to replace the rule on the same column.
+    const setCondition = (value: string) =>
+      fireEvent.change(
+        container.querySelector('[data-testid="filter-condition-kind"]') as HTMLSelectElement,
+        { target: { value } },
+      )
 
-    fireEvent.change(condition, { target: { value: 'equals' } })
+    setCondition('equals')
     const equalsInput = container.querySelector(
       '[data-testid="filter-equals-input"]',
     ) as HTMLInputElement
     fireEvent.input(equalsInput, { target: { value: 'alpha' } })
     fireEvent.keyDown(equalsInput, { key: 'Enter' })
-    await waitFor(() =>
+    await waitFor(() => {
       expect(store.getter(filterSortStateAtom)['sheet-1']?.rules).toEqual([
         { kind: 'equals', colIndex: 1, value: 'alpha' },
-      ]),
-    )
-    await waitForEditing(store)
+      ])
+      expect(store.getter(filterDropdownAtom).status).toBe('closed')
+    })
 
-    fireEvent.change(condition, { target: { value: 'contains' } })
+    openDropdown(store, 1)
+    await waitForEditing(store)
+    setCondition('contains')
     fireEvent.input(container.querySelector('[data-testid="filter-contains-input"]')!, {
       target: { value: 'west' },
     })
     fireEvent.click(button(container, 'filter-add-equals'))
-    await waitFor(() =>
+    await waitFor(() => {
       expect(store.getter(filterSortStateAtom)['sheet-1']?.rules).toEqual([
         { kind: 'contains', colIndex: 1, value: 'west' },
-      ]),
-    )
-    await waitForEditing(store)
+      ])
+      expect(store.getter(filterDropdownAtom).status).toBe('closed')
+    })
 
-    fireEvent.change(condition, { target: { value: 'range' } })
+    openDropdown(store, 1)
+    await waitForEditing(store)
+    setCondition('range')
     fireEvent.input(container.querySelector('[data-testid="filter-range-min-input"]')!, {
       target: { value: '10' },
     })
@@ -396,11 +405,12 @@ describe('vNext SpreadsheetFilterDropdown', () => {
       target: { value: '20' },
     })
     fireEvent.click(button(container, 'filter-add-equals'))
-    await waitFor(() =>
+    await waitFor(() => {
       expect(store.getter(filterSortStateAtom)['sheet-1']?.rules).toEqual([
         { kind: 'range', colIndex: 1, min: 10, max: 20 },
-      ]),
-    )
+      ])
+      expect(store.getter(filterDropdownAtom).status).toBe('closed')
+    })
   })
 
   it('clears the column filter, then clears the whole column', async () => {
@@ -477,7 +487,9 @@ describe('vNext SpreadsheetFilterDropdown', () => {
 
     await waitFor(() => {
       expect(store.getter(spreadsheetProjectionSnapshotAtom).result?.revision).toBe(2)
-      expect(store.getter(filterSortLifecycleAtom).status).toBe('editing')
+      // The projection refresh runs before the OK-driven close, so the window
+      // is current and the dropdown has closed.
+      expect(store.getter(filterDropdownAtom).status).toBe('closed')
     })
     expect(reads).toHaveLength(1)
   })
@@ -521,6 +533,55 @@ describe('vNext SpreadsheetFilterDropdown', () => {
     expect(store.getter(filterDropdownAtom).status).toBe('closed')
     expect(store.getter(filterSortLifecycleAtom).status).toBe('closed')
     expect(container.querySelector('[data-testid="filter-dropdown"]')).toBeNull()
+  })
+
+  it('closes the dropdown after a successful Apply (Excel parity)', async () => {
+    const store = createStore()
+    openDropdown(store, 1)
+    const { container } = renderDropdown(store, createFakeBackend())
+    await waitForEditing(store)
+    expect(store.getter(filterDropdownAtom).status).toBe('open')
+
+    applyEqualsDraft(container, 'alpha')
+
+    // Excel applies AND closes the AutoFilter menu when the user confirms with
+    // OK. The rule commits and the dropdown closes, freeing the toolbar lane.
+    await waitFor(() => {
+      expect(store.getter(filterSortStateAtom)['sheet-1']?.rules).toEqual([equalsRule(1, 'alpha')])
+      expect(store.getter(filterDropdownAtom).status).toBe('closed')
+    })
+    expect(store.getter(filterSortLifecycleAtom).status).toBe('closed')
+    expect(container.querySelector('[data-testid="filter-dropdown"]')).toBeNull()
+  })
+
+  it('keeps the dropdown open when Apply fails validation (invalid range)', async () => {
+    const store = createStore()
+    openDropdown(store, 0)
+    const { container } = renderDropdown(store, createFakeBackend())
+    await waitForEditing(store)
+
+    const condition = container.querySelector(
+      '[data-testid="filter-condition-kind"]',
+    ) as HTMLSelectElement
+    fireEvent.change(condition, { target: { value: 'range' } })
+    fireEvent.input(container.querySelector('[data-testid="filter-range-min-input"]')!, {
+      target: { value: '20' },
+    })
+    fireEvent.input(container.querySelector('[data-testid="filter-range-max-input"]')!, {
+      target: { value: '10' },
+    })
+    fireEvent.click(button(container, 'filter-add-equals'))
+
+    // An invalid custom filter is rejected before any transport and leaves the
+    // lifecycle 'blocked' with the error visible — the dropdown stays open so
+    // the user can correct the input (Excel's custom-filter validation).
+    await waitFor(() =>
+      expect(store.getter(filterSortLifecycleAtom).status).toBe('blocked'),
+    )
+    expect(store.getter(filterDropdownAtom).status).toBe('open')
+    expect(container.querySelector('[data-testid="filter-error-text"]')?.textContent).toBe(
+      FILTER_SORT_INVALID_INPUT_ERROR,
+    )
   })
 })
 
