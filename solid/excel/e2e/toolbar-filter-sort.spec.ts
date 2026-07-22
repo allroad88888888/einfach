@@ -115,14 +115,21 @@ test.describe('Wave 5 toolbar — filter and sort', () => {
     await filterEqualsInput(page).fill(equalsValue)
     await filterAddEquals(page).click()
 
-    await expect(filterRules(page)).toContainText(`= ${equalsValue}`)
+    // OK applies AND closes the dropdown (Excel parity). The filter is active —
+    // the column carries its chevron and the grid reflects the rule.
+    await expect(filterDropdown(page)).toBeHidden()
     await expect(filterChevron(page, 1)).toBeVisible()
-    await expect(filterDropdown(page)).toBeVisible()
     await expect(cell(page, 'A2').locator('.cell-display')).toHaveText('North')
     await expect(cell(page, 'B2').locator('.cell-display')).toHaveText('120')
     // #27 S5: non-matching rows are HIDDEN — unmounted, not blanked — so the
     // assertion is absence of the element, not an empty string.
     await expect(cell(page, 'A3')).toHaveCount(0)
+
+    // Reopen via the column chevron to confirm the rule was committed (this is
+    // the equivalent of the old in-dropdown rule assertion, now that OK closes).
+    await filterChevron(page, 1).click()
+    await expect(filterDropdown(page)).toBeVisible()
+    await expect(filterRules(page)).toContainText(`= ${equalsValue}`)
   })
 
   test('filter dropdown applies value-list and condition filters, then clears them', async ({
@@ -137,11 +144,18 @@ test.describe('Wave 5 toolbar — filter and sort', () => {
     await page.getByTestId('filter-value-South').click()
     await page.getByTestId('filter-add-equals').click()
     // South (row 3) is hidden; East does NOT slide up into its place — it keeps
-    // A4, which is the whole difference between hiding and compacting.
+    // A4, which is the whole difference between hiding and compacting. OK applies
+    // AND closes the dropdown (Excel parity).
+    await expect(filterDropdown(page)).toBeHidden()
     await expect(cell(page, 'A2').locator('.cell-display')).toHaveText('North')
     await expect(cell(page, 'A3')).toHaveCount(0)
     await expect(cell(page, 'A4').locator('.cell-display')).toHaveText('East')
 
+    // Reopen via the column chevron (OK closed the dropdown) to clear the rule.
+    // clear-filter keeps the dropdown open, so the next rule is added in the
+    // same session.
+    await filterChevron(page, 0).click()
+    await expect(filterDropdown(page)).toBeVisible()
     await page.getByTestId('filter-clear-filter').click()
     await expect(cell(page, 'A3').locator('.cell-display')).toHaveText('South')
 

@@ -124,7 +124,7 @@ test.describe('vNext filter + structural shift — real worker backend (#27 S5a)
     await expect(page.getByTestId('vnext-worker-filter-dropdown')).toBeVisible()
     await page.getByTestId('filter-value-10').uncheck()
     await page.getByTestId('filter-add-equals').click()
-    await page.getByTestId('filter-close').click()
+    // OK applies AND closes the dropdown (Excel parity), freeing the toolbar lane.
     await expect(page.getByTestId('vnext-worker-filter-dropdown')).toBeHidden()
 
     // Screen rows 1, 4, 5 — the header plus 30 and 40.
@@ -187,7 +187,8 @@ test.describe('vNext filter + structural shift — real worker backend (#27 S5a)
     await expect(page.getByTestId('vnext-worker-filter-dropdown')).toBeVisible()
     await page.getByTestId('filter-value-10').uncheck()
     await page.getByTestId('filter-add-equals').click()
-    await page.getByTestId('filter-close').click()
+    // OK applies AND closes the dropdown (Excel parity).
+    await expect(page.getByTestId('vnext-worker-filter-dropdown')).toBeHidden()
     await expect.poll(() => paintedRows(page, 4)).toEqual([0, 2, 3, 4])
 
     await rowHeader(page, 0).click({ button: 'right' })

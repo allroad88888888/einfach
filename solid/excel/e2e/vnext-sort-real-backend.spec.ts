@@ -206,9 +206,9 @@ test.describe('vNext engine physical sort real-backend evidence', () => {
 
     // Filter column D to 'keep' → the MIDDLE data row (D3='drop') is HIDDEN
     // (#27 S5), so the rows below it keep their own numbers instead of sliding
-    // up. Close the dropdown to free the toolbar sort lane.
+    // up. OK applies AND closes the dropdown (Excel parity), freeing the toolbar
+    // sort lane.
     await applyEqualsFilterOnColumn(page, 3, 'keep')
-    await page.getByTestId('filter-close').click()
     await expect(workerFilterDropdown(page)).toBeHidden()
 
     // Row 3 is unmounted; the survivors stay at rows 2, 4, 5 in source order.

@@ -64,7 +64,7 @@ async function applyEqualsFilterOnColumnA(page: Page, value: string) {
   await page.getByTestId('filter-condition-kind').selectOption('equals')
   await page.getByTestId('filter-equals-input').fill(value)
   await page.getByTestId('filter-add-equals').click()
-  await page.getByTestId('filter-close').click()
+  // OK applies AND closes the dropdown (Excel parity) — no manual close needed.
   await expect(filterDropdown(page)).toBeHidden()
 }
 

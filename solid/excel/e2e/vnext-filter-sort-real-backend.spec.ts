@@ -94,8 +94,11 @@ test.describe('vNext filter real-backend evidence', () => {
     await expect(page.locator('th.spreadsheet-grid-row-header[data-row="1"]')).toHaveCount(0)
     await expect(page.locator('th.spreadsheet-grid-row-header[data-row="3"]')).toHaveCount(1)
 
-    // The filtered column carries its chevron affordance.
+    // The filtered column carries its chevron affordance. OK closed the dropdown
+    // (Excel parity), so reopen it via the column chevron to clear the rule.
     await expect(page.getByTestId('filter-chevron-0')).toBeVisible()
+    await page.getByTestId('filter-chevron-0').click()
+    await expect(filterDropdown(page)).toBeVisible()
 
     // Clearing the rule restores the source layout.
     await page.getByTestId('filter-clear-filter').click()
@@ -112,7 +115,7 @@ test.describe('vNext filter real-backend evidence', () => {
 
     await applyEqualsFilterOnColumnA(page, 'cell4')
     await expect(cellDisplay(page, 'A4')).toHaveText('cell4')
-    await page.getByTestId('filter-close').click()
+    // OK applied AND closed the dropdown (Excel parity) — no manual close needed.
     await expect(filterDropdown(page)).toBeHidden()
 
     // What used to need a gateway remap (edit display row 2 -> write source
@@ -165,7 +168,10 @@ test.describe('vNext filter real-backend evidence', () => {
     await expect(cellDisplay(page, 'A4')).toHaveText('cell4')
 
     // Clearing the filter must NOT unhide the manually hidden row: the two sets
-    // are independent, and a filter change never rewrites the manual one.
+    // are independent, and a filter change never rewrites the manual one. OK
+    // closed the dropdown (Excel parity), so reopen it via the column chevron.
+    await page.getByTestId('filter-chevron-0').click()
+    await expect(filterDropdown(page)).toBeVisible()
     await page.getByTestId('filter-clear-filter').click()
     await page.getByTestId('filter-close').click()
     await expect(cellDisplay(page, 'A2')).toHaveText('cell1')
