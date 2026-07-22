@@ -439,6 +439,16 @@ interface SheetDelta {
   hiddenCols?: Map<number, boolean>
   /** null means the canonical entry was absent; undefined means this delta did not touch freeze. */
   freeze?: ViewportFreezeConfig | null
+  /**
+   * Before-image of the sheet's FILTER (rules + derived hidden rows) for a
+   * filter apply/clear undo (2026-07-22 Excel-parity flip). `rules === null` /
+   * `hiddenRows === null` mean the sheet had no filter entry; `undefined`
+   * (the whole field) means this delta did not touch the filter. Both halves
+   * ride together because they are one committed fact — a rename-free apply
+   * changes rules and the derived set in the same step, and undoing a delete-
+   * band case (no inverse) needs the exact recorded rows, not a remap.
+   */
+  filter?: { rules: FilterSortState | null; hiddenRows: Set<number> | null }
   /** Labeled O(one-sheet) fallback for structural ops. Supersedes the granular fields. */
   fullSheet?: FullSheetCapture
 }
@@ -455,6 +465,18 @@ const STATIC_BACKEND_UNDO_CAP = 200
 
 function cloneRangeFormatLayers(layers: readonly RangeFormatLayer[]): RangeFormatLayer[] {
   return layers.map((layer) => ({ range: { ...layer.range }, format: cloneFormat(layer.format) }))
+}
+
+/** True when two nullable number sets hold exactly the same members. */
+function sameNumberSet(left: Set<number> | null, right: Set<number> | null): boolean {
+  const leftSize = left?.size ?? 0
+  const rightSize = right?.size ?? 0
+  if (leftSize !== rightSize) return false
+  if (leftSize === 0) return true
+  for (const value of left!) {
+    if (!right!.has(value)) return false
+  }
+  return true
 }
 
 function beginUndoableMutation(state: StaticBackendState): void {
@@ -845,6 +867,27 @@ function applyStateDelta(state: StaticBackendState, delta: StateDelta): StateDel
           state.freezeBySheetId.delete(sheetId)
         } else {
           state.freezeBySheetId.set(sheetId, { ...sheet.freeze })
+        }
+      }
+      if (sheet.filter !== undefined) {
+        // Whole-filter swap (rules + derived hidden rows) — REPLACE semantics,
+        // the static twin of the worker's `restoreFilters`. Capture the current
+        // filter as the symmetric inverse, then restore the recorded before.
+        const currentRules = state.filterSortBySheetId.get(sheetId)
+        const currentHidden = state.filterHiddenRowsBySheetId.get(sheetId)
+        inverseSheet.filter = {
+          rules: currentRules ? cloneFilterSortState(currentRules) : null,
+          hiddenRows: currentHidden ? new Set(currentHidden) : null,
+        }
+        if (sheet.filter.rules === null) {
+          state.filterSortBySheetId.delete(sheetId)
+        } else {
+          state.filterSortBySheetId.set(sheetId, cloneFilterSortState(sheet.filter.rules))
+        }
+        if (sheet.filter.hiddenRows === null || sheet.filter.hiddenRows.size === 0) {
+          state.filterHiddenRowsBySheetId.delete(sheetId)
+        } else {
+          state.filterHiddenRowsBySheetId.set(sheetId, new Set(sheet.filter.hiddenRows))
         }
       }
     }
@@ -4884,6 +4927,15 @@ export function createStaticSpreadsheetBackend(
     async setFilterSort(request: SetFilterSortRequest): Promise<SetFilterSortResult> {
       const nextRevision = nextRevisionOrThrow(state.revision)
       const next = cloneFilterSortState({ rules: request.rules })
+      // Excel-parity filter undo (2026-07-22): capture the before-image so a
+      // CHANGED apply/clear can be recorded as an undoable delta. Cheap clones
+      // of one sheet's rules + derived hidden set — the twin of the worker's
+      // `snapshotFilters` bracket.
+      const beforeRules = state.filterSortBySheetId.get(request.sheetId) ?? null
+      const beforeRulesImage = beforeRules ? cloneFilterSortState(beforeRules) : null
+      const beforeHidden = state.filterHiddenRowsBySheetId.get(request.sheetId)
+      const beforeHiddenImage = beforeHidden ? new Set(beforeHidden) : null
+
       let hiddenRowIndices: readonly number[] = []
       if (filterSortHasEffect(next)) {
         state.filterSortBySheetId.set(request.sheetId, next)
@@ -4918,10 +4970,41 @@ export function createStaticSpreadsheetBackend(
         state.filterHiddenRowsBySheetId.delete(request.sheetId)
       }
       state.revision = nextRevision
+
+      // Record iff the caller opted in AND the filter actually changed. A no-op
+      // apply/clear records nothing and leaves the redo stack intact — the same
+      // "identity is not an undo step" discipline the worker applies — so the
+      // host↔backend stacks stay aligned entry-for-entry. Self-contained delta
+      // (not the `pendingDelta` recorder path) because the before-image was
+      // captured above, before the mutation overwrote it.
+      const afterRules = state.filterSortBySheetId.get(request.sheetId) ?? null
+      const afterHidden = state.filterHiddenRowsBySheetId.get(request.sheetId) ?? null
+      const changed =
+        JSON.stringify(beforeRulesImage?.rules ?? null) !==
+          JSON.stringify(afterRules?.rules ?? null) ||
+        !sameNumberSet(beforeHiddenImage, afterHidden)
+      let historyRecorded = false
+      if (request.recordHistory === true && changed) {
+        const delta: StateDelta = {
+          sheetDeltas: new Map([
+            [
+              request.sheetId,
+              { filter: { rules: beforeRulesImage, hiddenRows: beforeHiddenImage } },
+            ],
+          ]),
+        }
+        state.undoStack.push(delta)
+        if (state.undoStack.length > STATIC_BACKEND_UNDO_CAP) state.undoStack.shift()
+        // A new undoable mutation invalidates forward history, mirroring the
+        // worker's `pushTransactionRecord` and UI-core's `pushHistoryAtom`.
+        state.redoStack = []
+        historyRecorded = true
+      }
+
       // The set travels back to UI core on the ACK, where it becomes the
       // canonical answer for rendering, navigation and sort exclusion — one
       // scan, three consumers, no second derivation to drift from this one.
-      return { ...mutationResult(request, state.revision), hiddenRowIndices }
+      return { ...mutationResult(request, state.revision), hiddenRowIndices, historyRecorded }
     },
     async sortRange(request: SortRangeRequest): Promise<SortRangeResult> {
       return applyStaticSortRange(state, request)

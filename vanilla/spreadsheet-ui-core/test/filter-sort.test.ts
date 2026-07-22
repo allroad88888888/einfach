@@ -23,10 +23,12 @@ import {
   filterSortSessionIdAtom,
   filterSortStateAtom,
   filterSortSyncTicketAtom,
+  historyStackAtom,
   issueFilterSortSyncTicketAtom,
   notifyActiveSheetChangedAtom,
   openFilterDropdownAtom,
   openFilterDropdownFromEntrypointAtom,
+  reconcileFilterSortRulesFromEngineAtom,
   retryFilterSortRefreshAtom,
   runFilterSortMutationAtom,
   setFilterSortAtom,
@@ -581,6 +583,67 @@ describe('Core-owned filter/sort mutation lifecycle', () => {
 
     expect(store.getter(filterSortStateAtom)['A']?.rules).toEqual([equalsRule(1, 'x')])
     expect(store.getter(filterSortLifecycleAtom).status).toBe('editing')
+  })
+
+  test('requests recordHistory and pushes ONE paired filter.set entry when the backend recorded', async () => {
+    const store = makeStore()
+    const calls: SetFilterSortRequest[] = []
+    const source: FilterSortControllerPort = {
+      async setFilterSort(request) {
+        calls.push(request)
+        // The adapter is the sole judge of "changed"; it recorded, so UI core
+        // must pair exactly one entry.
+        return { sheetId: request.sheetId, requestId: request.requestId, revision: 7, historyRecorded: true }
+      },
+    }
+    const sessionId = openWithEqualsDraft(store, source, 'x')
+    await store.setter(runFilterSortMutationAtom, {
+      source,
+      sessionId,
+      intent: applyDraft,
+      refreshProjection: async () => undefined,
+    })
+
+    // The apply carried the opt-in so the backend could record undoably.
+    expect(calls[0]!.recordHistory).toBe(true)
+    const entries = store.getter(historyStackAtom).entries
+    expect(entries).toHaveLength(1)
+    expect(entries[0]).toMatchObject({ kind: 'filter.set', sheetId: 'A', projectionRevision: 7 })
+  })
+
+  test('pushes NO history entry when the backend reports historyRecorded falsy (no skew)', async () => {
+    const store = makeStore()
+    const source: FilterSortControllerPort = {
+      // A no-op / legacy backend: the apply committed but nothing was recorded,
+      // so pushing a UI-core entry would offset the two stacks by one.
+      async setFilterSort(request) {
+        return { sheetId: request.sheetId, requestId: request.requestId, revision: 7, historyRecorded: false }
+      },
+    }
+    const sessionId = openWithEqualsDraft(store, source, 'x')
+    await store.setter(runFilterSortMutationAtom, {
+      source,
+      sessionId,
+      intent: applyDraft,
+      refreshProjection: async () => undefined,
+    })
+
+    expect(store.getter(filterSortStateAtom)['A']?.rules).toEqual([equalsRule(1, 'x')])
+    expect(store.getter(historyStackAtom).entries).toHaveLength(0)
+  })
+
+  test('reconcileFilterSortRulesFromEngineAtom set-or-removes the committed rules', () => {
+    const store = makeStore()
+    // Absent → present (undo of a clear / redo of an apply).
+    store.setter(reconcileFilterSortRulesFromEngineAtom, {
+      sheetId: 'A',
+      rules: [equalsRule(1, 'x')],
+    })
+    expect(store.getter(filterSortStateAtom)['A']?.rules).toEqual([equalsRule(1, 'x')])
+    // Present → absent (undo of an apply): empty rules REMOVE the entry, they
+    // do not leave an inert `{rules:[]}` the funnel indicator would misread.
+    store.setter(reconcileFilterSortRulesFromEngineAtom, { sheetId: 'A', rules: [] })
+    expect(store.getter(filterSortStateAtom)).toEqual({})
   })
 
   test.each([

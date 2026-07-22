@@ -1,6 +1,7 @@
 import type { Store } from '@einfach/core'
 import {
   pushHistoryAtom,
+  reconcileFilterSortRulesFromEngineAtom,
   retryHistoryRefreshAtom,
   runRedoHistoryAtom,
   runUndoHistoryAtom,
@@ -21,17 +22,24 @@ function activeProjectionSheetId(store: Store): string | undefined {
 }
 
 /**
- * Re-hydrate the FILTER-hidden render cache from the engine after an undo/redo
- * (design-engine-hidden-rows §6.3, E8). Since E8 the filter-hidden set carries
- * NO UI-core history side payload: a structural undo/redo restores the engine's
- * OWNED filter through its own `restoreFilters` snapshot (worker) or the
- * full-sheet capture (static), and this read pulls the restored set back into
- * `viewportFilterHiddenAtom` so the grid, navigation and copy all see the rows
- * the engine now hides. Manual-hidden rows keep their own local-replay re-feed,
- * so only the filter axis is written here. A backend without
- * `readSheetHiddenState` (the TS worker, which fails filter closed) has no
- * filter to restore, so the read is skipped. Best-effort: the transaction is
- * already committed, so a read failure never rolls it back.
+ * Re-hydrate the FILTER render caches from the engine after an undo/redo
+ * (design-engine-hidden-rows §6.3, E8; extended 2026-07-22 for filter
+ * apply/clear undo). The engine OWNS the filter (rules + derived hidden set)
+ * and a structural / filter undo/redo restores it through the engine's own
+ * `restoreFilters` snapshot (worker) or the delta (static). This read pulls
+ * BOTH restored halves back into UI core's render caches:
+ *   - `viewportFilterHiddenAtom` (the grid's paint / navigation / copy source),
+ *   - `filterSortStateAtom` (the dropdown funnel indicator + Reapply gate),
+ * via `reconcileFilterSortRulesFromEngineAtom` (set-or-remove so an undone
+ * apply leaves no stale rules and an undone clear brings them back).
+ *
+ * Restoring rules matters ONLY for the new apply/clear undo — a STRUCTURAL undo
+ * never displaces rules, so re-hydrating them there writes the same rules back
+ * (a harmless no-op). Manual-hidden rows keep their own local-replay re-feed, so
+ * only the filter axis is written here. A backend without `readSheetHiddenState`
+ * (the TS worker, which fails filter closed) has no filter to restore, so the
+ * read is skipped. Best-effort: the transaction is already committed, so a read
+ * failure never rolls it back.
  */
 async function reconcileFilterHiddenFromEngine(
   store: Store,
@@ -58,6 +66,15 @@ async function reconcileFilterHiddenFromEngine(
     return
   }
   store.setter(setViewportFilterHiddenRowsAtom, { sheetId, rows: [...result.filterRows] })
+  // The rules half re-hydrates only when the backend reports it (E8's static
+  // read and the worker both return `filterRules`); an older backend that omits
+  // it leaves the rules cache untouched rather than clearing a live filter.
+  if (Array.isArray(result.filterRules)) {
+    store.setter(reconcileFilterSortRulesFromEngineAtom, {
+      sheetId,
+      rules: [...result.filterRules],
+    })
+  }
 }
 
 /**

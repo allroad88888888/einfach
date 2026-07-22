@@ -65,7 +65,7 @@ Consequences that fall out of the identity, rather than being implemented:
 | set                        | atom                       | origin                    | history                  |
 | -------------------------- | -------------------------- | ------------------------- | ------------------------ |
 | manually hidden rows/cols  | `viewportHiddenAtom`       | a user command            | own local-replay entries |
-| filter-hidden rows         | `viewportFilterHiddenAtom` | derived from filter rules | none (the rules' undo is its undo) |
+| filter-hidden rows         | `viewportFilterHiddenAtom` | derived from filter rules | via the rules' `filter.set` entry (see "Undoable apply/clear") |
 
 Both live in `../src/viewport/effective-hidden.ts` (**not** in a
 `filter-sort/filter-hidden.ts` — the design doc planned that path and it was not
@@ -171,10 +171,13 @@ stopped being view state with #24, so `FilterSortState` holds `rules` and
 nothing else, and re-running a physical sort would be a data mutation behind a
 visibility command.
 
-**Not in the undo stack.** Applying a filter records no history entry, so a
-Reapply entry would be an undo step with no counterpart. Microsoft documents
-Excel's Reapply/undo interaction *neither way* — this is consistency with Apply,
-**an unverified default rather than verified parity**.
+**Not in the undo stack** — Reapply only. Reapply is an *identity* re-run of the
+committed rules (it changes which rows satisfy them, never what is filtered), so
+it records no history entry and passes `recordHistory: false` to the backend so
+nothing is recorded there either. This is now DISTINCT from Apply/Clear, which
+ARE undoable (see "Undoable apply/clear (Excel parity)" below); Microsoft
+documents Excel's Reapply/undo interaction *neither way*, so keeping Reapply out
+of the stack is the same "identity is not an undo step" rule the sort path uses.
 
 **Disabled, not hidden**, when the host lacks `setFilterSort`, the lane is busy,
 the dropdown is open, there is no active sheet, or — the common case — the sheet
@@ -197,6 +200,31 @@ full-sheet capture on static), and the provider re-hydrates this render cache fr
 `readSheetHiddenState.filterRows` (`reconcileFilterHiddenFromEngine` in
 `solid/excel/src-vnext/provider/history-dispatch.ts`). See
 `solid/excel/docs/online-excel-parity/design-engine-hidden-rows.md` §6.3.
+
+### Undoable apply/clear (Excel parity, 2026-07-22)
+
+Applying or clearing an AutoFilter is **Ctrl+Z-able**, matching Excel (verified).
+This reverses the earlier "filter apply is not an undo step" default and REUSES
+the E8 machinery — only the trigger is new (the filter mutation itself, not a
+structural op that displaced it):
+
+- **One decision-maker, two paired stacks.** `runFilterSortMutationAtom` sends
+  `recordHistory: true`; the backend records an undoable transaction **iff the
+  apply/clear actually changed the committed filter** (before ≠ after) and echoes
+  that verdict in `SetFilterSortResult.historyRecorded`. UI core pushes exactly
+  one paired `filter.set` history entry when — and only when — the verdict is
+  `true`. A no-op apply/clear (and every Reapply, which sends `recordHistory:
+  false`) records on **neither** side, so the two stacks stay aligned
+  entry-for-entry. This is the same positional-alignment contract Table
+  definitions use (`tables/commands.ts` `recordTableHistory`).
+- **The entry carries no local-replay payload.** Undo/redo restores the engine's
+  owned filter (rules + derived hidden set) through the SAME `snapshotFilters` /
+  `restoreFilters` primitive (worker) or reverse delta (static) as a structural
+  undo, then the provider re-hydrates BOTH render caches from the engine:
+  `viewportFilterHiddenAtom` (paint/navigation) and `filterSortStateAtom` (the
+  funnel indicator + Reapply gate, via `reconcileFilterSortRulesFromEngineAtom`,
+  set-or-remove so an undone apply leaves no stale rules).
+- **Reapply and no-ops stay out**, as above.
 
 ---
 
@@ -264,10 +292,15 @@ written optimistically then UNCONDITIONALLY reconciled against `readSheetHiddenS
 — **not** through a `hideRows` port (the worker adapter never exposed one) and **not**
 through the deleted `eval-hidden-rows-bridge.ts`.
 
-**Undo — engine snapshot.** A structural undo/redo of an active filter restores the
-engine's owned filter from its own snapshot primitive (`snapshotFilters` /
-`restoreFilters`, the REPLACE twin of `restoreTables`); the provider then re-hydrates
-`viewportFilterHiddenAtom` from `readSheetHiddenState.filterRows`. The E7-era
+**Undo — engine snapshot.** A structural undo/redo of an active filter — AND a
+`filter.set` undo/redo of an apply/clear itself (2026-07-22 Excel-parity flip) —
+restores the engine's owned filter from its own snapshot primitive
+(`snapshotFilters` / `restoreFilters`, the REPLACE twin of `restoreTables`); the
+provider then re-hydrates `viewportFilterHiddenAtom` (from
+`readSheetHiddenState.filterRows`) and `filterSortStateAtom` (from `filterRules`).
+The apply/clear case brackets the mutation with `snapshotFilters` in
+`setFilterSortThroughWorker` and pushes a filter-only transaction record — the
+same envelope a structural op carries, minus the cell images. The E7-era
 `setEvalFilterHiddenRows` re-push and adapter-memory before/after array are gone;
 `setEvalFilterHiddenRows` is now **unused by the adapter**, but the WASM port stays as
 additive INV-4 baggage (whole-set replace, empty clears, never throws).

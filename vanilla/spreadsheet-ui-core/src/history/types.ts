@@ -30,6 +30,17 @@ export type HistoryEntryKind =
    * with it positionally, so the distinction is cosmetic here.
    */
   | 'table.define'
+  /**
+   * A filter APPLY or CLEAR that actually changed a sheet's committed filter
+   * (Excel parity: applying/clearing an AutoFilter is undoable). One entry per
+   * changed `setFilterSort`, aligned positionally with the adapter's
+   * `filtersSnapshot` transaction record; a no-op apply/clear records neither
+   * side. Undo/redo restores the engine's owned filter from its own
+   * `snapshotFilters`/`restoreFilters` primitive (worker) or delta (static),
+   * after which the provider re-hydrates the rules + hidden render caches from
+   * the engine — no UI-core local-replay payload rides the entry.
+   */
+  | 'filter.set'
 
 export interface HistoryAffectedRange {
   readonly rowStart: number

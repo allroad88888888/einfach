@@ -1891,7 +1891,15 @@ export function createWorkerWorkbookSpreadsheetBackend(
     if (record.boundTransactionId !== null && record.boundTransactionId !== request.transactionId) {
       return historyNotApplied(request, `unknown transactionId: ${request.transactionId}`)
     }
-    if ((record.before === null || record.after === null) && !record.mergeOverlay) {
+    if (
+      (record.before === null || record.after === null) &&
+      !record.mergeOverlay &&
+      !record.filtersSnapshot
+    ) {
+      // A payload-only record is still undoable: merge/unmerge carry only their
+      // overlay, and a filter apply/clear carries only its `filtersSnapshot`
+      // (no cells changed). Only a record with neither cell images nor a
+      // payload is genuinely not-undoable.
       return historyNotApplied(
         request,
         record.diagnostic ?? 'transaction was recorded as not undoable',
@@ -1947,14 +1955,27 @@ export function createWorkerWorkbookSpreadsheetBackend(
       const snapshot =
         action === 'undo' ? record.filtersSnapshot.before : record.filtersSnapshot.after
       await requireFilterClient('restoreFilters')(snapshot)
-      // Re-sync the projection-withholding mirror from the restored engine
-      // snapshot (no extra RPC — the hidden rows ride in the same envelope).
+      // Re-sync BOTH adapter mirrors from the restored engine snapshot (no extra
+      // RPC — rules and hidden rows ride in the same envelope). The hidden-row
+      // mirror gates projection withholding; the RULES mirror gates whether a
+      // later STRUCTURAL op brackets the engine filter with a `filtersSnapshot`
+      // (`recordStructuralMutation`'s `sheetHasFilter`). Undoing a CLEAR brings
+      // the engine filter back, so the rules mirror MUST come back too — leaving
+      // it stale-empty would make the next insert/delete skip the bracket and
+      // leave the engine's self-shifted filter unrestorable on that op's undo.
       const restored = snapshot.filters.find(
         (entry) => entry.sheet === record.filtersSnapshot!.sheetIdx,
       )
       const rows = restored?.hiddenRows ?? []
       if (rows.length === 0) filterHiddenRowsBySheetId.delete(record.filtersSnapshot.sheetId)
       else filterHiddenRowsBySheetId.set(record.filtersSnapshot.sheetId, new Set(rows))
+      if (restored === undefined) filterSortStateBySheetId.delete(record.filtersSnapshot.sheetId)
+      else {
+        filterSortStateBySheetId.set(
+          record.filtersSnapshot.sheetId,
+          cloneFilterSortState({ rules: restored.rules as unknown as ColumnFilterRule[] }),
+        )
+      }
     }
     record.boundTransactionId = request.transactionId
     source.pop()
@@ -2677,56 +2698,121 @@ export function createWorkerWorkbookSpreadsheetBackend(
     const sheet = await resolveSheet(request.sheetId)
     const next = cloneFilterSortState({ rules: request.rules })
 
+    // Excel-parity filter undo (2026-07-22): bracket the apply / clear with the
+    // engine's whole-workbook filter snapshot so a CHANGED filter becomes one
+    // undoable transaction. Reuses the E8 `filtersSnapshot` record + its
+    // `restoreFilters` replay verbatim; only the trigger is new (the filter
+    // mutation ITSELF, not a structural op that displaced it). Captured only
+    // when the caller opted in AND the runtime can snapshot — Reapply passes
+    // `recordHistory: false`, so it never brackets and never records.
+    const wantsHistory =
+      request.recordHistory === true && typeof client.snapshotFilters === 'function'
+    const filtersBefore = wantsHistory ? await client.snapshotFilters!() : null
+
+    let hiddenRowIndices: readonly number[]
     if (!filterSortHasEffect(next)) {
       filterSortStateBySheetId.delete(request.sheetId)
       filterHiddenRowsBySheetId.delete(request.sheetId)
       // Scan-free: drops the engine's rules AND derived rows, so SUBTOTAL stops
       // excluding rows that are visible again.
       await client.clearFilter!(sheet.idx)
-      return {
-        sheetId: request.sheetId,
-        requestId: request.requestId,
-        revision: request.revision ?? bumpRevision(),
-        // Explicitly empty, never absent: "the rules hid nothing" is the answer
-        // here, and UI core must clear its set on the strength of it.
-        hiddenRowIndices: [],
+      // Explicitly empty, never absent: "the rules hid nothing" is the answer
+      // here, and UI core must clear its set on the strength of it.
+      hiddenRowIndices = []
+    } else {
+      // The engine runs the predicate ONCE and commits both the rules and the
+      // rows they hid; the refusal (if any) rides in the resolved value, never
+      // a throw (`sortRange` convention). This REPLACES the host predicate scan
+      // the adapter used to run — the engine reproduced it cell-for-cell
+      // (verified at E3 over 7700 judgments) — and the separate eval-input
+      // push, since `applyFilter` writes the engine's owned set itself.
+      const report = await client.applyFilter!(sheet.idx, request.rules)
+      if (!report.ok) {
+        if (report.code === 'source-too-large') {
+          throw createBackendError(
+            FILTER_SORT_SOURCE_TOO_LARGE,
+            report.message ??
+              'filter/sort predicate source is too large; the filter was not applied',
+          )
+        }
+        // invalid-sheet / mutation-during-custom-call / invalid-payload: none is
+        // reachable from a compliant caller, so surface a structured backend
+        // error rather than a fake ACK.
+        throw createBackendError(
+          'FILTER_REJECTED',
+          report.message ?? `filter refused: ${report.code}`,
+        )
+      }
+      filterSortStateBySheetId.set(request.sheetId, next)
+      // Mirror the engine's answer for projection withholding + the structural
+      // undo before/after images. This is a MIRROR of engine-owned state, not
+      // an independently derived set — nothing here re-runs the predicate.
+      filterHiddenRowsBySheetId.set(request.sheetId, new Set(report.hiddenRows))
+      hiddenRowIndices = report.hiddenRows
+    }
+
+    // Record iff the caller asked AND the sheet's filter actually changed. The
+    // whole-workbook snapshot before/after IS the ground truth for "will an
+    // undo do anything", so a no-op apply / clear records on neither side and
+    // leaves both redo stacks intact (the adapter mirrors UI-core's push-on-
+    // change discipline). The adapter is the single decision-maker; UI core
+    // pushes its paired entry off the `historyRecorded` verdict returned here.
+    let historyRecorded = false
+    if (filtersBefore !== null) {
+      const filtersAfter = await client.snapshotFilters!()
+      if (filterSnapshotSheetChanged(filtersBefore, filtersAfter, sheet.idx)) {
+        pushTransactionRecord({
+          kind: 'filter.set',
+          sheetIdx: sheet.idx,
+          boundTransactionId: null,
+          affectedRange: null,
+          clearRange: null,
+          // A filter mutation rewrites no cells — the record carries ONLY the
+          // filter snapshot, exactly like a merge/unmerge record carries only
+          // its overlay. `runHistoryTransaction` skips the (absent) cell replay
+          // and restores the engine filter through `restoreFilters`.
+          before: null,
+          after: null,
+          filtersSnapshot: {
+            sheetId: request.sheetId,
+            sheetIdx: sheet.idx,
+            before: filtersBefore,
+            after: filtersAfter,
+          },
+        })
+        historyRecorded = true
       }
     }
 
-    // The engine runs the predicate ONCE and commits both the rules and the
-    // rows they hid; the refusal (if any) rides in the resolved value, never a
-    // throw (`sortRange` convention). This REPLACES the host predicate scan the
-    // adapter used to run — the engine reproduced it cell-for-cell (verified at
-    // E3 over 7700 judgments) — and the separate eval-input push, since
-    // `applyFilter` writes the engine's owned set itself.
-    const report = await client.applyFilter!(sheet.idx, request.rules)
-    if (!report.ok) {
-      if (report.code === 'source-too-large') {
-        throw createBackendError(
-          FILTER_SORT_SOURCE_TOO_LARGE,
-          report.message ??
-            'filter/sort predicate source is too large; the filter was not applied',
-        )
-      }
-      // invalid-sheet / mutation-during-custom-call / invalid-payload: none is
-      // reachable from a compliant caller, so surface a structured backend
-      // error rather than a fake ACK.
-      throw createBackendError('FILTER_REJECTED', report.message ?? `filter refused: ${report.code}`)
-    }
-    filterSortStateBySheetId.set(request.sheetId, next)
-    // Mirror the engine's answer for projection withholding + the structural
-    // undo before/after images. This is a MIRROR of engine-owned state, not an
-    // independently derived set — nothing here re-runs the predicate.
-    filterHiddenRowsBySheetId.set(request.sheetId, new Set(report.hiddenRows))
-    // The engine's epoch bump has already fired inside `applyFilter`, so the
-    // revision minted now corresponds to the re-derived aggregates the host
-    // will read off this ACK.
+    // The engine's epoch bump has already fired inside `applyFilter`/`clearFilter`,
+    // so the revision minted now corresponds to the re-derived aggregates the
+    // host will read off this ACK.
     return {
       sheetId: request.sheetId,
       requestId: request.requestId,
       revision: request.revision ?? bumpRevision(),
-      hiddenRowIndices: report.hiddenRows,
+      hiddenRowIndices,
+      historyRecorded,
     }
+  }
+
+  /**
+   * True when one sheet's committed filter differs between two whole-workbook
+   * `snapshotFilters` envelopes. `snapshot_filters` omits sheets with no
+   * filter, so an apply (absent → present) and a clear (present → absent) both
+   * register as a change; a re-apply of identical rules over unchanged data
+   * (rules + derived hidden rows both equal) registers as none. The entries are
+   * plain wire objects, so a structural stringify is an exact, order-stable
+   * comparison (the engine emits rules and hidden rows deterministically).
+   */
+  function filterSnapshotSheetChanged(
+    before: FilterSnapshotWire,
+    after: FilterSnapshotWire,
+    sheetIdx: number,
+  ): boolean {
+    const beforeEntry = before.filters.find((entry) => entry.sheet === sheetIdx) ?? null
+    const afterEntry = after.filters.find((entry) => entry.sheet === sheetIdx) ?? null
+    return JSON.stringify(beforeEntry) !== JSON.stringify(afterEntry)
   }
 
   async function readSheetHiddenStateThroughWorker(

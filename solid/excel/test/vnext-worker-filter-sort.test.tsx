@@ -35,6 +35,7 @@ import type {
   CellWire,
   ColumnFilterRuleWire,
   FilterApplyResultWire,
+  FilterSnapshotWire,
   SparseRangeWire,
   WorkerWorkbookClient,
 } from '../src-vnext/adapter'
@@ -96,6 +97,10 @@ function createFilterFakeClient(
 ): FilterFakeClient {
   const cells = new Map<string, CellSnapshotWire>()
   const dirtyListeners = new Set<(refs: CellRefWire[]) => void>()
+  // Committed filter per sheet, so the engine double can snapshot/restore it
+  // (the worker adapter brackets a recordHistory apply/clear with
+  // `snapshotFilters`; `engineHiddenState` runtimes always expose it).
+  const filtersBySheet = new Map<number, { rules: ColumnFilterRuleWire[]; hiddenRows: number[] }>()
   const calls: FilterFakeClient['calls'] = {
     listNonEmpty: 0,
     readSparseRange: [],
@@ -245,16 +250,36 @@ function createFilterFakeClient(
           { headerRow: 0, startRow: 1, endRow: rowCount },
           valueAt,
         ) ?? []
-      return {
-        ok: true,
-        hiddenRows: filterHiddenRowsFromDisplayRows(displayRows, rowCount),
-        scannedRows: rowCount,
-        predicateCells,
-      }
+      const hiddenRows = filterHiddenRowsFromDisplayRows(displayRows, rowCount)
+      // The engine commits the rules + derived set; the double mirrors it so a
+      // subsequent `snapshotFilters` reports the committed filter.
+      filtersBySheet.set(sheet, { rules: rules.map((rule) => ({ ...rule })), hiddenRows: [...hiddenRows] })
+      return { ok: true, hiddenRows, scannedRows: rowCount, predicateCells }
     },
     async clearFilter(sheet): Promise<FilterApplyResultWire> {
       calls.clearFilter.push({ sheet })
+      filtersBySheet.delete(sheet)
       return { ok: true, hiddenRows: [], scannedRows: 0, predicateCells: 0 }
+    },
+    async snapshotFilters(): Promise<FilterSnapshotWire> {
+      return {
+        version: 1,
+        filters: [...filtersBySheet.entries()].map(([sheet, filter]) => ({
+          sheet,
+          rules: filter.rules.map((rule) => ({ ...rule })),
+          hiddenRows: [...filter.hiddenRows],
+        })),
+      }
+    },
+    async restoreFilters(snapshot: FilterSnapshotWire): Promise<number> {
+      filtersBySheet.clear()
+      for (const entry of snapshot.filters) {
+        filtersBySheet.set(entry.sheet, {
+          rules: entry.rules.map((rule) => ({ ...rule })),
+          hiddenRows: [...entry.hiddenRows],
+        })
+      }
+      return snapshot.filters.length
     },
     // The engine-set restore path used by structural undo/redo of a filtered
     // sheet (`setFilterSort` no longer pushes here — `applyFilter` writes the

@@ -38,6 +38,16 @@ export interface SetFilterSortRequest extends SheetRef {
   rules: readonly ColumnFilterRule[]
   requestId?: ProjectionRequestId
   revision?: ProjectionRevision
+  /**
+   * When `true`, the backend records an UNDOABLE transaction iff this apply /
+   * clear actually changes the sheet's committed filter (Excel parity). The
+   * backend is the sole judge of "changed" and reports its verdict back in
+   * `SetFilterSortResult.historyRecorded`, which UI core mirrors with exactly
+   * one paired history entry so the two undo stacks stay aligned entry-for-
+   * entry. Absent / `false` keeps the legacy non-undoable behaviour (Reapply
+   * passes `false`; a no-op apply records on neither side regardless).
+   */
+  recordHistory?: boolean
 }
 
 export interface FilterSortMutationResult extends SheetRef {

@@ -846,6 +846,16 @@ export interface SetFilterSortResult extends BackendMutationResult {
    * (and normal) statement "the rules hid nothing".
    */
   hiddenRowIndices?: readonly number[]
+  /**
+   * `true` iff the backend pushed an UNDOABLE transaction record for this
+   * apply / clear (it changed the sheet's committed filter and the caller
+   * asked for history via `SetFilterSortRequest.recordHistory`). UI core MUST
+   * push exactly one paired history entry when this is `true` and none when it
+   * is falsy — the adapter is the single decision-maker so the host↔backend
+   * undo stacks can never skew by one. Absent means "not recorded" (legacy
+   * backends and no-op mutations).
+   */
+  historyRecorded?: boolean
 }
 
 export interface SpreadsheetSheetMetadata {

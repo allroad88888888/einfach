@@ -567,3 +567,236 @@ describe('worker adapter: an active filter reaches the engine (#27 S4)', () => {
     backend.dispose()
   })
 })
+
+/**
+ * Excel-parity filter undo (2026-07-22): a filter APPLY / CLEAR that changes
+ * the committed filter is one undoable engine transaction, restored through the
+ * engine's own `snapshotFilters`/`restoreFilters` primitive. These tests drive
+ * the REAL Rust engine through the worker adapter's transaction ports directly,
+ * so the reversibility they assert is the engine's, not a UI-core mirror.
+ */
+describe('worker adapter: filter apply/clear is undoable (Excel parity)', () => {
+  const undo = (backend: WorkerWorkbookSpreadsheetBackend, transactionId: string) =>
+    backend.undoTransaction!({
+      kind: 'undo-transaction',
+      transactionId,
+      requestId: requestId++,
+      revision: 1,
+    })
+  const redo = (backend: WorkerWorkbookSpreadsheetBackend, transactionId: string) =>
+    backend.redoTransaction!({
+      kind: 'redo-transaction',
+      transactionId,
+      requestId: requestId++,
+      revision: 1,
+    })
+  const filterState = async (backend: WorkerWorkbookSpreadsheetBackend) => {
+    const hidden = await backend.readSheetHiddenState!({
+      kind: 'sheet-hidden-state',
+      sheetId: SHEET,
+    })
+    return { rows: [...hidden.filterRows], ruleCount: hidden.filterRules.length }
+  }
+  const readCell = async (
+    backend: WorkerWorkbookSpreadsheetBackend,
+    row: number,
+    col: number,
+  ): Promise<string> => {
+    const result = await backend.readRangeProjection({
+      kind: 'range',
+      sheetId: SHEET,
+      reason: 'test',
+      requestId: requestId++,
+      range: { rowStart: row, rowEnd: row, colStart: col, colEnd: col },
+    })
+    return result.cells.find((cell: DisplayCell) => cell.row === row && cell.col === col)
+      ?.displayValue ?? ''
+  }
+  const applyNorth = (backend: WorkerWorkbookSpreadsheetBackend, recordHistory: boolean) =>
+    backend.setFilterSort!({
+      kind: 'set-filter-sort',
+      sheetId: SHEET,
+      rules: [{ kind: 'equals', colIndex: 0, value: 'North' }],
+      requestId: requestId++,
+      recordHistory,
+    })
+
+  test('apply → undo removes the filter → redo restores it', async () => {
+    const backend = createBackend!()
+    await backend.ready()
+    await seed(backend)
+
+    // COUNTER-EXAMPLE (before the fix this whole flow was impossible — apply
+    // recorded no transaction, so Ctrl+Z could not touch the filter at all).
+    const ack = await applyNorth(backend, true)
+    expect(ack.historyRecorded).toBe(true)
+    expect(await filterState(backend)).toEqual({ rows: [2], ruleCount: 1 })
+    expect((await readRow0(backend)).subtotal9).toBe('40')
+
+    // UNDO restores the engine's OWNED filter to its pre-apply (empty) image.
+    const undone = await undo(backend, 'tx-filter')
+    expect(undone.applied).not.toBe(false)
+    expect(await filterState(backend)).toEqual({ rows: [], ruleCount: 0 })
+    expect((await readRow0(backend)).subtotal9).toBe('60')
+
+    // REDO re-applies it.
+    const redone = await redo(backend, 'tx-filter')
+    expect(redone.applied).not.toBe(false)
+    expect(await filterState(backend)).toEqual({ rows: [2], ruleCount: 1 })
+    expect((await readRow0(backend)).subtotal9).toBe('40')
+
+    backend.dispose()
+  })
+
+  test('clear an active filter is undoable and redoable', async () => {
+    const backend = createBackend!()
+    await backend.ready()
+    await seed(backend)
+
+    await applyNorth(backend, true)
+    // Clear via empty rules; the CLEAR path also records because before≠after.
+    const cleared = await backend.setFilterSort!({
+      kind: 'set-filter-sort',
+      sheetId: SHEET,
+      rules: [],
+      requestId: requestId++,
+      recordHistory: true,
+    })
+    expect(cleared.historyRecorded).toBe(true)
+    expect(await filterState(backend)).toEqual({ rows: [], ruleCount: 0 })
+
+    // UNDO the clear brings the filter back.
+    await undo(backend, 'tx-clear')
+    expect(await filterState(backend)).toEqual({ rows: [2], ruleCount: 1 })
+
+    // REDO the clear removes it again.
+    await redo(backend, 'tx-clear')
+    expect(await filterState(backend)).toEqual({ rows: [], ruleCount: 0 })
+
+    backend.dispose()
+  })
+
+  test('recordHistory:false and no-op applies record NOTHING (Reapply / identity)', async () => {
+    const backend = createBackend!()
+    await backend.ready()
+    await seed(backend)
+
+    // recordHistory:false — the Reapply lane. The adapter reports no record...
+    const ack = await applyNorth(backend, false)
+    expect(ack.historyRecorded).toBeFalsy()
+    // ...and the proof it stayed OUT of the undo stack: an undo now reverts the
+    // last seeded CELL, leaving the filter untouched (before the fix this was
+    // the ONLY behaviour — the filter was never undoable). If the false apply
+    // had wrongly recorded, this undo would clear the filter instead.
+    await undo(backend, 'tx-none')
+    expect((await filterState(backend)).ruleCount).toBe(1)
+
+    // A no-op apply (empty rules with no active filter) is an identity: even
+    // with recordHistory:true, before≡after, so it records nothing.
+    const backend2 = createBackend!()
+    await backend2.ready()
+    await seed(backend2)
+    const noop = await backend2.setFilterSort!({
+      kind: 'set-filter-sort',
+      sheetId: SHEET,
+      rules: [],
+      requestId: requestId++,
+      recordHistory: true,
+    })
+    expect(noop.historyRecorded).toBeFalsy()
+
+    backend.dispose()
+    backend2.dispose()
+  })
+
+  test('undoing a CLEAR re-syncs the rules mirror so a later insert still brackets the filter', async () => {
+    // Regression for the rules-mirror re-sync: undoing a clear brings the engine
+    // filter back, and a subsequent structural op MUST bracket it with a
+    // `filtersSnapshot` so that op's own undo can restore the pre-shift set.
+    // Without the re-sync the adapter's `sheetHasFilter` gate reads stale-empty,
+    // skips the bracket, and the insert's undo leaves the engine filter shifted
+    // onto the wrong row.
+    const backend = createBackend!()
+    await backend.ready()
+    await seed(backend)
+
+    await applyNorth(backend, true)
+    expect(await filterState(backend)).toEqual({ rows: [2], ruleCount: 1 })
+
+    // Clear (records), then UNDO the clear — the filter comes back.
+    await backend.setFilterSort!({
+      kind: 'set-filter-sort',
+      sheetId: SHEET,
+      rules: [],
+      requestId: requestId++,
+      recordHistory: true,
+    })
+    await undo(backend, 'tx-clear')
+    expect(await filterState(backend)).toEqual({ rows: [2], ruleCount: 1 })
+
+    // Insert a row at the top: the engine self-shifts the filter (row 2 → 3).
+    await backend.insertRows!({
+      kind: 'insert-rows',
+      sheetId: SHEET,
+      rowIndex: 0,
+      count: 1,
+      requestId: requestId++,
+    })
+    expect(await filterState(backend)).toEqual({ rows: [3], ruleCount: 1 })
+
+    // Undo the insert restores the pre-shift filter set — only possible because
+    // the insert bracketed the filter (which needs the re-synced rules mirror).
+    await undo(backend, 'tx-insert')
+    expect(await filterState(backend)).toEqual({ rows: [2], ruleCount: 1 })
+  })
+
+  test('the filter record interleaves with cell edits without skewing the undo stack', async () => {
+    const backend = createBackend!()
+    await backend.ready()
+    await seed(backend)
+
+    // Stack (bottom→top): [ filter, edit B2, edit B4 ]. B2 (row 1) and B4
+    // (row 3) are both "North" rows, so they stay VISIBLE under the filter and
+    // read back through the projection; row 2 (South) is filter-hidden.
+    await applyNorth(backend, true)
+    await backend.setCellInput({
+      kind: 'set-cell-input',
+      sheetId: SHEET,
+      row: 1,
+      col: 1,
+      input: '999',
+      requestId: requestId++,
+    })
+    await backend.setCellInput({
+      kind: 'set-cell-input',
+      sheetId: SHEET,
+      row: 3,
+      col: 1,
+      input: '888',
+      requestId: requestId++,
+    })
+
+    // Undo pops LIFO: last cell edit, first cell edit, THEN the filter — each
+    // step reverts exactly the right thing (no off-by-one skew).
+    await undo(backend, 'tx-b4')
+    expect(await readCell(backend, 3, 1)).toBe('30')
+    expect((await filterState(backend)).ruleCount).toBe(1)
+
+    await undo(backend, 'tx-b2')
+    expect(await readCell(backend, 1, 1)).toBe('10')
+    expect((await filterState(backend)).ruleCount).toBe(1)
+
+    await undo(backend, 'tx-filter')
+    expect(await filterState(backend)).toEqual({ rows: [], ruleCount: 0 })
+
+    // Redo rolls forward in the mirror order: filter, first edit, last edit.
+    await redo(backend, 'tx-filter')
+    expect((await filterState(backend)).ruleCount).toBe(1)
+    await redo(backend, 'tx-b2')
+    expect(await readCell(backend, 1, 1)).toBe('999')
+    await redo(backend, 'tx-b4')
+    expect(await readCell(backend, 3, 1)).toBe('888')
+
+    backend.dispose()
+  })
+})

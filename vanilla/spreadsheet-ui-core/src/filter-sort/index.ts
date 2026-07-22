@@ -7,7 +7,7 @@ import type {
   SortRangeResult,
 } from '../backend/types'
 import type { CellRange } from '../shared'
-import { pushHistoryAtom } from '../history'
+import { nextHistoryTransactionId, pushHistoryAtom, type HistoryEntry } from '../history'
 import { getHiddenRowsForSheet, viewportHiddenAtom } from '../viewport/hidden'
 import {
   getFilterHiddenRowsForSheet,
@@ -657,6 +657,33 @@ export const setFilterSortAtom = atom(
 )
 setFilterSortAtom.debugLabel = 'spreadsheet.filterSort.set'
 
+/**
+ * Re-hydrate the committed filter RULES render cache from the engine after an
+ * undo/redo (design-engine-hidden-rows §6.3, extended for filter apply/clear
+ * undo). The rules twin of `setViewportFilterHiddenRowsAtom`: the engine's own
+ * snapshot restores its owned filter on the backend transaction, and the
+ * provider reads `readSheetHiddenState.filterRules` back into this cache so the
+ * dropdown funnel indicator, `sheetHasActiveFilterRules` and Reapply all agree
+ * with what the engine now filters. SET-or-REMOVE — empty rules delete the
+ * sheet entry (matching a fresh clear) instead of leaving an inert `{rules:[]}`
+ * behind. Pure cache reconcile: no dropdown / lifecycle side effects, so it is
+ * safe to run after every history undo/redo regardless of the active sheet's
+ * filter state.
+ */
+export const reconcileFilterSortRulesFromEngineAtom = atom(
+  null,
+  (get, set, { sheetId, rules }: { sheetId: string; rules: readonly ColumnFilterRule[] }) => {
+    const current = get(filterSortStateBackingAtom)
+    set(
+      filterSortStateBackingAtom,
+      rules.length === 0
+        ? stateStoreWithout(current, sheetId)
+        : stateStoreWith(current, sheetId, { rules }),
+    )
+  },
+)
+reconcileFilterSortRulesFromEngineAtom.debugLabel = 'spreadsheet.filterSort.reconcileRulesFromEngine'
+
 export const setFilterSortErrorAtom = atom(null, (_get, set, error: unknown) => {
   set(filterSortErrorBackingAtom, error == null ? '' : errorMessage(error))
 })
@@ -955,6 +982,42 @@ function readAckHiddenRowIndices(acknowledgement: unknown): readonly number[] {
   }
 }
 
+/**
+ * Push the ONE UI-core history entry that pairs with the ONE adapter
+ * transaction record a filter apply / clear produced, gated on the backend's
+ * `historyRecorded` verdict so the two undo stacks align entry-for-entry.
+ *
+ * The backend is the single decision-maker: it pushed a record iff the apply /
+ * clear actually changed the committed filter, and only then does
+ * `historyRecorded` read `true`. Recording here on a no-op (or on a legacy
+ * backend that omits the field) would offset the stacks by one — every later
+ * Ctrl+Z would then revert a step older than the UI believes — so a falsy
+ * verdict pushes nothing. The entry carries no local-replay payload: undo/redo
+ * restores the engine's owned filter through its own snapshot and the provider
+ * re-hydrates the rules + hidden render caches from the engine afterwards.
+ */
+function recordFilterSortHistory(
+  set: (atomToSet: typeof pushHistoryAtom, value: HistoryEntry) => boolean,
+  acknowledgement: unknown,
+  sheetId: string,
+): void {
+  let recorded = false
+  let revision: unknown
+  try {
+    recorded = (acknowledgement as { historyRecorded?: unknown }).historyRecorded === true
+    revision = (acknowledgement as { revision?: unknown }).revision
+  } catch {
+    return
+  }
+  if (!recorded) return
+  set(pushHistoryAtom, {
+    transactionId: nextHistoryTransactionId(),
+    kind: 'filter.set',
+    sheetId,
+    projectionRevision: revision as HistoryEntry['projectionRevision'],
+  })
+}
+
 export const runFilterSortMutationAtom = atom(
   null,
   async (get, set, input: RunFilterSortMutationInput): Promise<void> => {
@@ -1071,6 +1134,11 @@ export const runFilterSortMutationAtom = atom(
         sheetId,
         rules: ticket.next.rules,
         requestId,
+        // Excel parity: an apply / clear that actually changes the committed
+        // filter is undoable. The backend judges "changed" and echoes its
+        // verdict in `historyRecorded`, which we mirror below with one paired
+        // entry (`recordFilterSortHistory`) so the stacks stay aligned.
+        recordHistory: true,
       })
     } catch (error) {
       if (!isCurrent()) return
@@ -1117,6 +1185,9 @@ export const runFilterSortMutationAtom = atom(
       sheetId,
       rows: readAckHiddenRowIndices(acknowledgement),
     })
+    // Excel-parity undo: pair the committed apply / clear with one history
+    // entry iff the backend recorded a matching transaction (`historyRecorded`).
+    recordFilterSortHistory(set, acknowledgement, sheetId)
     set(
       filterSortDraftBackingAtom,
       draftFromState(
@@ -1225,15 +1296,20 @@ reapplyFilterDisabledReasonAtom.debugLabel = 'spreadsheet.filterSort.reapplyDisa
 /**
  * Re-run the active sheet's committed filter rules and re-commit the answer.
  *
- * NOT in the undo stack, and no `pushHistoryAtom`. Applying a filter records no
- * history entry here (the rules' own undo is its undo, `filter-sort.md`), so a
- * Reapply entry would be an undo step whose counterpart the user never got —
- * Ctrl+Z would restore a hidden set that nothing else in the stack accounts
- * for. Microsoft documents neither way for Excel's Reapply (checked
- * 2026-07-21: the official "Reapply a filter and sort, or clear a filter" page
- * is silent on undo, and the only claims either way are third-party), so this
- * is CONSISTENCY WITH APPLY, not verified Excel parity. Treat it as an
- * unverified default that can be revisited if Apply ever becomes undoable.
+ * NOT in the undo stack, and no `pushHistoryAtom`. Reapply is an IDENTITY
+ * re-run of the already-committed rules — it never changes WHAT is filtered,
+ * only which rows currently satisfy it — so it is not an undo step: a Reapply
+ * entry would be a Ctrl+Z whose counterpart the user never issued. It passes
+ * `recordHistory: false` so the backend records nothing either (a `true` there
+ * would let the engine's before≠after verdict push a record UI core never
+ * pairs, skewing the stacks). This is DISTINCT from Apply / Clear, which since
+ * the 2026-07-22 filter-undo flip ARE undoable (`runFilterSortMutationAtom`
+ * pairs a `filter.set` entry on the backend's `historyRecorded` verdict) —
+ * matching Excel, where applying or clearing an AutoFilter is Ctrl+Z-able.
+ * Microsoft documents neither way for Reapply specifically (checked 2026-07-21:
+ * the official "Reapply a filter and sort, or clear a filter" page is silent on
+ * undo), so keeping Reapply out of the stack is a deliberate identity-not-an-
+ * undo-step choice, the same rule the sort path applies to an identity sort.
  *
  * FILTER ONLY, despite the name. Excel's Reapply covers sort too — that IS
  * verified (Microsoft's page is literally titled "Reapply a filter *and sort*",
@@ -1320,6 +1396,10 @@ export const reapplyFilterAtom = atom(
         sheetId: target.sheetId,
         rules: ticket.next.rules,
         requestId,
+        // Reapply is NEVER an undo step (identity re-run of committed rules):
+        // it pushes no history entry here, so it must tell the backend not to
+        // record one either, or the two stacks would skew by one.
+        recordHistory: false,
       })
     } catch (error) {
       if (!ownsTicket()) return
