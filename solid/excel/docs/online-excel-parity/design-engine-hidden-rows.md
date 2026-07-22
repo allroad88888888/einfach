@@ -1,7 +1,9 @@
 # 设计｜隐藏行下沉：从"宿主推送求值输入"到"引擎拥有状态"
 
-- **状态**：**设计稿，未开工。** 本文只裁决形状，不描述现状。找现状请读
-  `vanilla/spreadsheet-ui-core/docs/filter-sort.md`（#27 后的现行契约）。
+- **状态**：**E0–E8 已全量落地（2026-07-22），E9 文档收口完成。** 本文既是裁决记录、
+  也是 as-built 收口 —— 见 §0 的"E9 收敛"块。找现行契约请读
+  `vanilla/spreadsheet-ui-core/docs/filter-sort.md`（引擎拥有筛选、谓词在 Rust 求值）
+  与 `CANONICAL_OWNERSHIP.md` #03 / #29（已翻为引擎 canonical）。
 - **日期**：2026-07-21
 - **基线**：分支 `claude/rust-core-state-plan-Auzcj`，`a3325e7`
 - **前置**：[design-filter-hidden-rows.md](./design-filter-hidden-rows.md)（#27，已全量落地）；
@@ -12,6 +14,64 @@
 ---
 
 ## 0｜裁决摘要
+
+> ### E9 收敛（2026-07-22）：全切片已落地，本文转为设计 + as-built 记录
+>
+> **E0–E8 已全部落地并合入**（提交 `2fd3cc5` `82f4283` `8ffd9ff` `7dc8667`
+> `931612b` `7b51e07` `f75488f` `064ef93` `9d7e18d` `e1a52bd`）。下方修正 1–12 是各切片
+> 实施者核实写入的偏离；本块把它们收敛成一致的最终态，§10.1 切片表与 §4.2 / §6.3 / §7.1
+> 正文均已标注 as-built。读现行契约优先看 `vanilla/spreadsheet-ui-core/docs/filter-sort.md`
+> 与 `CANONICAL_OWNERSHIP.md` #03 / #29（本次已翻为引擎 canonical）。
+>
+> **落地形状与设计稿的实质差异（修正 1–12 收敛结论，均已回代码核实）：**
+>
+> 1. **引擎确实拿到全部拥有态**（Rust，§1–§3 / §5.2 / §6.2 照做）：
+>    `Sheet.hidden_rows`、`SheetAutoFilter`（规则 + 派生隐藏集）、
+>    `apply/reapply/clear_filter`、`hide/unhide_rows`、`snapshot/restore_hidden`、
+>    `republish_hidden`（含分集合幂等去重）；`WorkbookAtomContext` 两张表降级为只读镜像
+>    （`sheet.rs` `eval_hidden_rows` / `eval_filter_hidden_rows`）。persistence v1 新增
+>    `hidden` / `filters` 字段（`rust/wasm/src/lib.rs`），闭合 xlsx parity 缺口。
+> 2. **谓词落点是"每个引擎一份"**（§5.2 采纳）：worker 经引擎 `applyFilter` 在 Rust 内
+>    求值（E5 删掉适配器扫描，`worker-workbook-backend.ts` 零 `buildFilterSortDisplayRows`
+>    命中）；static 是第二引擎，保留 TS 谓词 —— **实名 `filter-predicate.ts`，非设计稿
+>    计划的 `static-filter-predicate.ts`**（E4 落地时 worker 仍用它，故中性命名；E5 后
+>    已 static-only，文件未改名，其头部注释"E5 removes it / both adapters"已过期）。
+>    UI-core 谓词零知识（`grep filterRuleMatchesValue vanilla/spreadsheet-ui-core/src` 零命中）。
+> 3. **手动隐藏的引擎 feed 是 `setEvalHiddenRows`（整集替换），不是 `hideRows` 端口**
+>    （修正 6）：worker 适配器从未把 `hideRows` / `unhideRows` 暴露到 `SpreadsheetBackend`；
+>    feed 从被删的 `eval-hidden-rows-bridge.ts` 搬进原子的乐观 + 对账路径
+>    （`viewport/hidden.ts` `feedAndReconcileHiddenRows`），`readSheetHiddenState` 做无条件
+>    对账回读，`hideRows` / `unhideRows` 仅作"两者皆无时"的 fire-and-forget 后备。
+>    §4.2 假设的"经 `hideRows` 端口 ACK 写"前提**不成立**。乐观写 + 无条件对账（§4.3）已落地，
+>    实测 worker 往返：乐观重绘 ~11ms、SUBTOTAL 落定 ~19ms、撤销 ~20ms。
+> 4. **筛选 undo 走引擎快照 `snapshotFilters` / `restoreFilters`**（E8，修正 11），
+>    取代 §6.2 泛指的 `restore_hidden`；`setEvalFilterHiddenRows` 现被适配器**弃用**
+>    （WASM 端口仍在，INV-4 加法式包袱）。
+> 5. **UI-core 渲染缓存需一条新 re-hydration**（修正 9）：引擎快照恢复不了
+>    `viewportFilterHiddenAtom`，故 provider 撤销/重做后从 `readSheetHiddenState.filterRows`
+>    回读写回（`provider/history-dispatch.ts` `reconcileFilterHiddenFromEngine`）。
+>    §6.3"筛选侧引擎快照覆盖 = 可全删"不完整。
+> 6. **筛选侧前向结构位移保留、只删 local-replay 恢复路径**（修正 10）：
+>    `applyViewportFilterHiddenStructuralShiftAtom`（乐观同 tick 投影）保留；
+>    `VIEWPORT_FILTER_HIDDEN_REPLAY_KEY` 及其 applier、两处 side payload 已删。
+> 7. **手动侧 adapter 不动**（修正 11）：E7 后手动 local-replay applier 经
+>    `feedAndReconcileHiddenRows` 已把引擎恢复对了，再加 `snapshot_hidden` 会双恢复
+>    （§10.2-7 警告），故 E8 不给手动事务加 `snapshot_hidden`。§6.2 / 切片表 E8 行的
+>    "手动侧记 snapshot_hidden" **不采纳**；手动侧仍保留 local-replay。
+> 8. **static 补了 `readSheetHiddenState`**（修正 12，设计假设两后端都有、static 原本没有），
+>    读自 `hiddenRowsBySheetId` / `filterHiddenRowsBySheetId` / `filterSortBySheetId`，
+>    re-hydration 才能在 static 上工作。static 双 lane 并集按修正 8 退休。
+> 9. **`filter-hidden-rows.ts` 未整文件删除**：§7.1 DELETE 清单列它全删，实际它**保留** ——
+>    仍持 `filterHiddenRowsFromDisplayRows`（static 折排列→隐藏集，`static-backend.ts`）与
+>    `filterTsvBandRows`（两后端 TSV 导出）。§7.1 为设计期估算，实际删除集以各切片提交为准。
+> 10. **E0 / E1 前置已完成**（修正 2）：`2fd3cc5` / `82f4283`（D1 重键 + 位移）、
+>     `8ffd9ff`（outline 解耦）。
+>
+> **修正间无冲突**：修正 7（E7 把筛选侧 local-replay 删除推迟到 E8）与修正 9–11
+> （E8 删 local-replay + 新增 re-hydration + 保前向位移 + 手动侧不动）是同一决定的先后两半，
+> 已一致收敛，不是矛盾。
+>
+> ---
 
 > ### as-built 修正（2026-07-21，E2 实施后核实写入）—— **E3 动工前必读**
 >
@@ -319,6 +379,11 @@ pub fn clear_filter(&mut self, sheet_index: usize) -> FilterApplyReport
 
 ### 4.2 裁决：保形状、换写者、加一个整表读
 
+> **as-built（见 §0 收敛块修正 3）**：手动隐藏的引擎 feed 落在 `setEvalHiddenRows`（整集替换），
+> **不是**本节假设的 `hideRows` / `unhideRows` 端口 —— worker 适配器从未把它们暴露到
+> `SpreadsheetBackend`。feed 从被删的 bridge 搬进原子的乐观写 + 无条件对账路径
+> （`viewport/hidden.ts` `feedAndReconcileHiddenRows`，对账回读 `readSheetHiddenState`）。
+
 **两个 atom 的形状与 API 一个字不改**，12 + 3 个消费者零改动迁移。
 变的是写者：从 UI-core 命令（`hidden.ts:336-349` 的 `hideRowsAtom` / `unhideRowsAtom`、
 `effective-hidden.ts:75-95` 的 `setViewportFilterHiddenRowsAtom`）
@@ -517,6 +582,14 @@ filters: Vec<SheetAutoFilterJSON>,
 
 ### 6.3 能删多少 local-replay —— 筛选侧全删，手动侧**不能删**
 
+> **as-built（见 §0 收敛块修正 5–7）**：筛选侧删 local-replay 的**同时**新增一条 provider
+> re-hydration —— 引擎快照（`restoreFilters`）恢复不了 UI-core 渲染缓存
+> `viewportFilterHiddenAtom`，故撤销/重做后从 `readSheetHiddenState.filterRows` 回读写回
+> （`provider/history-dispatch.ts` `reconcileFilterHiddenFromEngine`）。筛选侧**前向结构位移
+> 保留**（`applyViewportFilterHiddenStructuralShiftAtom`，乐观同 tick 投影，删它会闪帧）；只删
+> local-replay 恢复路径。手动侧 adapter **不加 `snapshot_hidden`**（会与 E7 保留的 local-replay
+> 形成双恢复），故 E8 不动手动侧。
+
 - **筛选侧**：`VIEWPORT_FILTER_HIDDEN_REPLAY_KEY` + applier
   （`effective-hidden.ts:107` / `:174-188`）+ 两个调用点的 `localSidePayloads`
   可全删，引擎快照覆盖。
@@ -556,6 +629,11 @@ filters: Vec<SheetAutoFilterJSON>,
 | `vanilla/…/src/viewport/hidden.ts`                          | 189-221, 285-316, 509-575（部分） | backing 写、backend 镜像 fire-and-forget、结构位移、replay（手动侧下沉时） |  约 150 |
 
 **合计可删/可迁 TS ≈ 1000 行**，其中真正净删（非迁移）≈ **850 行**。
+
+> **as-built（见 §0 收敛块修正 9）**：本表为设计期估算，实际删除集与之有出入。最显著的一处：
+> `filter-hidden-rows.ts` **未整文件删除** —— 保留 `filterHiddenRowsFromDisplayRows`
+> （static 折排列→隐藏集）与 `filterTsvBandRows`（两后端 TSV 导出）。谓词模块实名
+> `filter-predicate.ts`（非 `static-filter-predicate.ts`，未改名）。以各切片提交为准。
 
 顺带消失的**机制**（比行数更重要）：
 
@@ -711,6 +789,10 @@ static 侧迁走后可以顺手改成 `computeFilterHiddenRows(...): Set<number>
 ## 10｜切片计划
 
 ### 10.1 切片表
+
+**状态（2026-07-22）：E0–E9 全部已落地。** 下表为设计期定义的范围/门禁；E7 / E8 的 as-built
+偏离（手动 feed 走 `setEvalHiddenRows` 而非 `hideRows` 端口、筛选侧 local-replay 删除移至 E8
+并新增 provider re-hydration、筛选侧前向位移保留、手动侧不加 `snapshot_hidden`）见 §0 收敛块修正 3–9。
 
 | 片      | 范围                                                                                                            | 文件边界                                                                                     | 验收门禁                                                                                                     |
 | ------- | --------------------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------ |

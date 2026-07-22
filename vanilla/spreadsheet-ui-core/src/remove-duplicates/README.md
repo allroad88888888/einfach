@@ -117,9 +117,13 @@ Behaviour:
 
    Structural inserts and deletes shift the set rather than invalidating
    it: this module calls `applyViewportFilterHiddenStructuralShiftAtom`
-   (with a `VIEWPORT_FILTER_HIDDEN_REPLAY_KEY` local side payload for undo)
    next to its manual-set counterpart, because the filter set is a snapshot
-   and nothing else would correct it.
+   and nothing else would correct it. (This is the forward shift only; since
+   the hidden-row sink-down slice E8 the filter set carries no UI-core undo
+   side payload — a structural undo restores the engine's owned filter from
+   its own snapshot and the provider re-hydrates the cache from
+   `readSheetHiddenState`. See
+   `solid/excel/docs/online-excel-parity/design-engine-hidden-rows.md` §6.3.)
 
 Empty range (`startRow > endRow` or `startCol > endCol`) returns zero
 scanned rows and never throws.

@@ -96,7 +96,12 @@ operates on the whole selection *including* manually hidden rows).
 
 ## Who computes visibility
 
-**The host adapter, once, when the rules are applied.** Not during projection.
+**The engine, once, when the rules are applied.** Not during projection. (Since the
+hidden-row **sink-down** the worker adapter forwards `setFilterSort` to the engine's
+`applyFilter`, which runs the predicate inside Rust; `static-backend` runs its own TS
+predicate as a *second engine*. Either way it is one whole-column scan, not a
+per-projection derivation, and the result rides back on the ACK — the UI-core contract
+below is unchanged. See "Engine contract".)
 
 A filter predicate needs the *whole column*; a projection is a bounded window.
 So `setFilterSort` runs one whole-column predicate scan and returns the complete
@@ -184,6 +189,15 @@ adapter's local snapshot, and the engine copy. Missing any one layer leaves the
 set pointing at a *different real row*, which shows up as "the header is
 swallowed and a filtered-out value reappears".
 
+Since sink-down slice E8 this is the **forward** shift only — the same-tick render
+projection. The filter set carries no UI-core undo side payload any more: a structural
+undo/redo restores the engine's *owned* filter (rules + derived hidden set) from the
+engine's own snapshot (`snapshotFilters` / `restoreFilters` on the worker; the
+full-sheet capture on static), and the provider re-hydrates this render cache from
+`readSheetHiddenState.filterRows` (`reconcileFilterHiddenFromEngine` in
+`solid/excel/src-vnext/provider/history-dispatch.ts`). See
+`solid/excel/docs/online-excel-parity/design-engine-hidden-rows.md` §6.3.
+
 ---
 
 ## User-visible behaviour changes from #27
@@ -216,45 +230,64 @@ visible-cells path and is not implemented as a user-facing command.
 
 ## Engine contract
 
-The engine holds **two** per-sheet hidden row sets, pushed over two independent
-ports, so `SUBTOTAL` can express both bands:
+Since the **hidden-row sink-down**
+(`solid/excel/docs/online-excel-parity/design-engine-hidden-rows.md`, slices E2–E8,
+2026-07-22) the engine **owns** the filter — the rules, the derived hidden set, and
+the predicate evaluation itself — and both per-sheet hidden row sets, so `SUBTOTAL`
+can express both bands:
 
 | band                | excludes                              |
 | ------------------- | ------------------------------------- |
 | `SUBTOTAL(1-11)`    | filter-hidden rows                    |
 | `SUBTOTAL(101-111)` | manually hidden ∪ filter-hidden rows   |
 
-- Manual set: `setEvalHiddenRows` (pre-existing, unchanged by #27).
-- Filter set: `setEvalFilterHiddenRows` (added by #27; WASM `js_name`
-  `setEvalFilterHiddenRows`, whole-set replace, empty clears, never throws).
+Rust keeps two invalidation epochs (`manual_hidden_epoch` / `filter_hidden_epoch`)
+so pushing a manual hide does not dirty every `SUBTOTAL(1-11)` in the workbook.
 
-Both are additive: the WASM API signature snapshot gains a line and INV-4's
-delete/modify hard-failure never fires. Rust keeps two invalidation epochs
-(`manual_hidden_epoch` / `filter_hidden_epoch`) so that pushing a manual hide does
-not dirty every `SUBTOTAL(1-11)` in the workbook.
+**Filter — the engine evaluates the predicate.** On the worker, `setFilterSort`
+forwards its rules to the engine's `applyFilter` (WASM `js_name` `applyFilter`), which
+runs the predicate ONCE inside Rust and commits the rules + derived hidden set
+atomically; the hidden rows ride back in the resolved value (`sortRange` convention —
+a structured `source-too-large` refusal is *returned*, never thrown). `reapplyFilter`
+/ `clearFilter` are recompute and teardown. The host-side predicate scan the adapter
+used to run is **gone** (E5). `static-backend` is itself a second engine (its own
+`evaluateFormula`), so it legitimately keeps a TS predicate
+(`src-vnext/adapter/filter-predicate.ts`, a verbatim move out of UI core in E4) pinned
+to the Rust `apply_filter` result by a golden-parity test. UI core has **zero**
+predicate knowledge — it keeps only the `ColumnFilterRule` wire type, still calls the
+same `setFilterSort` port, and still stores the ACK's `hiddenRowIndices` into
+`viewportFilterHiddenAtom`. That contract is unchanged.
 
-The push is **not** routed through `eval-hidden-rows-bridge.ts`. Each adapter
-pushes the filter set from inside its own `setFilterSort`, before the ACK
-(`worker-workbook-backend` over the port; `static-backend` straight into its
-evaluator input). Adding a bridge lane would create a second writer for the same
-fact, one tick later than the adapter's. Do not "fix" this without first adding a
-`SpreadsheetBackend.setEvalFilterHiddenRows` port and removing both internal
-pushes.
+**Manual hidden rows — optimistic feed.** Pushed to the engine over
+`setEvalHiddenRows` (whole-set replace) from UI core's `feedAndReconcileHiddenRows`,
+written optimistically then UNCONDITIONALLY reconciled against `readSheetHiddenState`
+— **not** through a `hideRows` port (the worker adapter never exposed one) and **not**
+through the deleted `eval-hidden-rows-bridge.ts`.
 
-**Three-tier degradation, all silent and none dishonest:**
+**Undo — engine snapshot.** A structural undo/redo of an active filter restores the
+engine's owned filter from its own snapshot primitive (`snapshotFilters` /
+`restoreFilters`, the REPLACE twin of `restoreTables`); the provider then re-hydrates
+`viewportFilterHiddenAtom` from `readSheetHiddenState.filterRows`. The E7-era
+`setEvalFilterHiddenRows` re-push and adapter-memory before/after array are gone;
+`setEvalFilterHiddenRows` is now **unused by the adapter**, but the WASM port stays as
+additive INV-4 baggage (whole-set replace, empty clears, never throws).
 
-1. Both ports present (WASM worker + current wasm-pkg) → full two-band semantics.
-2. `setEvalHiddenRows` only (older wasm-pkg) → the filter set never reaches the
-   engine; both bands fall back to pre-#27 behaviour. The view still hides the
-   rows correctly, so the result is *conservative*, never wrong.
-3. Neither (TS worker) → pre-#27 behaviour, matching the existing
-   `evalHiddenRows: false` degradation shape.
+**Persistence.** Persistence v1 now carries the hidden rows and the autoFilter state
+(`hidden` + `filters` fields, additive / back-compatible), so save/load round-trips
+them — closing the xlsx parity gap.
 
-Note that export filtering (TSV / image) deliberately does **not** use this
-mechanism: the hidden set is applied at the main-thread adapter boundary and never
-crosses `postMessage`, so it works identically on the WASM worker, the TS worker's
-single-shot fallback, and the static backend, with no capability gate and no
-wasm-pkg version skew.
+**Degradation — TS worker (fail-closed).** The TS worker declares
+`engineHiddenState: false` (plus `evalHiddenRows` / `evalFilterHiddenRows` false) and
+answers UNSUPPORTED for the eleven engine-owned commands — no success-shaped fake ACK.
+Filtering is withheld and the manual set never reaches the engine, so both SUBTOTAL
+bands fall back to pre-sink-down behaviour. The view still hides the rows correctly, so
+the result is *conservative*, never wrong.
+
+Note that export filtering (TSV / image) deliberately does **not** cross the engine:
+the hidden set is applied at the main-thread adapter boundary
+(`RangeTsvExportRequest.hiddenRows` / `RangeImageExportRequest.hiddenRows`), so it
+works identically on the WASM worker, the TS worker's single-shot fallback, and the
+static backend, with no capability gate and no wasm-pkg version skew.
 
 ---
 
@@ -326,8 +359,9 @@ these ports are executors.
   stable; UI core cannot enforce it.
 - **List-rule size.** `MAX_FILTER_LIST_VALUES = 10000`; oversized rules are
   truncated before dispatch.
-- **Persistence.** Excel stores autoFilter state in the file format. Whether the
-  filter-hidden set (or the rules) should be persisted is out of scope.
+- **Persistence.** Landed with the sink-down: persistence v1 now carries the hidden
+  rows and the autoFilter rules (`hidden` + `filters` fields, additive), so save/load
+  round-trips them, closing the xlsx parity gap.
 
 ---
 

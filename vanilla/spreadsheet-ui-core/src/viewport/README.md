@@ -13,21 +13,41 @@ roll back local state. Freeze mutations record local-replay history entries (see
 `../history/README.md`) and structural shifts from `BackendMutationResult.structuralShift`
 remap the frozen band in place without history.
 
-## Hidden rows/columns — UI-core canonical (flip step 2)
+## Hidden rows — engine-owned (cached here); hidden columns — UI-core canonical
 
-Hidden rows/columns are per-sheet sorted index sets and are UI-core canonical per
-`solid/excel/docs/online-excel-parity/CANONICAL_OWNERSHIP.md`. The backend `hideRows` /
-`unhideRows` / `hideColumns` / `unhideColumns` ports are an **optional persistence
-mirror** (fire-and-forget deltas), and the `hiddenRowIndices` / `hiddenColIndices`
-slices of `readViewportSizeProjection` degrade to a **one-shot full-sheet hydration
-seed** (`hydrateViewportHiddenAtom`; seeded-sheets ownership guards late clobber). Port
-absence never degrades the feature. Hide/unhide commands commit synchronously
-('committed' | 'unchanged' | 'invalid'), record local-replay history entries, and
-structural shifts remap the local sets in place via `remapIndexSetAfterStructuralShift`
-— a delete drops in-band membership, which is why structural backend history entries
-snapshot hidden/freeze side payloads (see `../history/README.md`). The sizes hydration
-in `window.ts` (`hydrateViewportSizeProjectionAtom`) is sizes-only and ignores hidden
-slices entirely.
+Since the hidden-row **sink-down**
+(`solid/excel/docs/online-excel-parity/design-engine-hidden-rows.md`, slices E2/E7,
+2026-07-22) the two axes have **different owners**, because only rows affect
+calculation. See CANONICAL_OWNERSHIP #03.
+
+- **Hidden ROWS are an engine data fact.** They change what `SUBTOTAL(101-111)`
+  evaluates, so the engine (`Sheet.hidden_rows`) is their authoritative store and
+  `sheetHiddenRowsAtom` is UI core's render-time PROJECTION — written on the backend
+  ACK, never canonical. `hideRowsAtom` / `unhideRowsAtom` are
+  **optimistic-then-reconciled** (`feedAndReconcileHiddenRows`): the command writes the
+  projection synchronously for an instant repaint, feeds the engine a whole-set
+  `setEvalHiddenRows` push, then UNCONDITIONALLY overwrites the cache with the engine's
+  authoritative set read back through `readSheetHiddenState` — even when the values
+  already match, so a bounded optimistic window can never decay into a permanent silent
+  divergence. A per-sheet reconcile generation drops a stale out-of-order ACK. Backends
+  exposing neither `setEvalHiddenRows` nor `readSheetHiddenState` degrade to a
+  fire-and-forget `hideRows` / `unhideRows` delta mirror. Manual-row undo stays a
+  UI-core local-replay entry (`VIEWPORT_HIDDEN_REPLAY_KEY`) whose applier re-feeds the
+  restored set to the engine.
+- **Hidden COLUMNS stay UI-core canonical.** The engine models no hidden columns
+  (`SUBTOTAL` filters on `addr.row` only), so `viewportHiddenColsAtom` is their source
+  of truth; column commits stay synchronous and mirror into the optional `hideColumns`
+  / `unhideColumns` ports fire-and-forget.
+
+The two axes are separate backing atoms precisely because their ownership differs —
+merging them would let a future refactor push hidden columns at the engine, which has
+nowhere to put them. `viewportHiddenAtom` is a **compat derived** that synthesises the
+historic `{ rowsBySheet, colsBySheet }` shape from the two so the read consumers migrate
+unchanged; new code must not write it. Structural shifts remap the sets in place via
+`remapIndexSetAfterStructuralShift` — a delete drops in-band membership, which is why
+structural backend history entries snapshot the manual hidden/freeze side payloads (see
+`../history/README.md`). The sizes hydration in `window.ts`
+(`hydrateViewportSizeProjectionAtom`) is sizes-only and ignores hidden slices entirely.
 
 ## State Decision Template
 
@@ -39,11 +59,13 @@ slices entirely.
   `spreadsheet.viewport.hiddenSeededSheets` / `hiddenDiagnosticBacking` (private),
   `spreadsheet.viewport.filterHiddenBacking` (private; per-sheet sorted FILTER-hidden
   row sets — see "Two hidden-row sets" below).
-- Derived atoms: `visibleWindowAtom`, `viewportFreezeAtom` and `viewportHiddenAtom`
-  (read-only projections — names and shapes unchanged across the canonical flips;
-  `viewportHiddenAtom` now serves the FULL per-sheet truth, not a windowed mirror),
-  `viewportFilterHiddenAtom` (read-only projection of the filter-hidden sets),
-  `effectiveHiddenAtom` (manual ∪ filter, `ViewportHiddenState`-shaped),
+- Derived atoms: `visibleWindowAtom`, `viewportFreezeAtom`; `sheetHiddenRowsAtom`
+  (engine-projection cache for manually hidden ROWS, written on ACK) and
+  `viewportHiddenColsAtom` (UI-core canonical hidden COLUMNS) — the per-axis split of
+  the old single hidden atom (E7); `viewportHiddenAtom` is now a **compat derived**
+  synthesising `{ rowsBySheet, colsBySheet }` from the two so the read consumers migrate
+  unchanged; `viewportFilterHiddenAtom` (read-only projection of the filter-hidden
+  sets), `effectiveHiddenAtom` (manual ∪ filter, `ViewportHiddenState`-shaped),
   `viewportFreezeDiagnosticAtom`, `viewportHiddenDiagnosticAtom`.
 - Commands: `setViewportMetricsAtom`, `scrollToCellAtom`, `setViewportRowHeightAtom`,
   `setViewportColumnWidthAtom`, `setFreezeConfigAtom` (synchronous local commit +
@@ -85,14 +107,21 @@ only`. Anything that must tell the two origins apart (SUBTOTAL pushes, copy, and
 `remove-duplicates` / `text-to-columns` dense scans, which must keep splitting and
 de-duplicating manually hidden rows for Excel parity) reads the two source atoms.
 
-The population path is live as of #27 slice S5: `runFilterSortMutationAtom` writes
-`SetFilterSortResult.hiddenRowIndices` into the filter set on a matched ACK, and is
-its only production writer. The set is a SNAPSHOT — it is not recomputed when cells
-change (Excel's model), and inserts/deletes shift it via
+The population path is live as of #27 slice S5 and was extended by the hidden-row
+sink-down: `runFilterSortMutationAtom` writes `SetFilterSortResult.hiddenRowIndices`
+into the filter set on a matched ACK. The set is a SNAPSHOT — it is not recomputed
+when cells change (Excel's model), and inserts/deletes shift it via
 `applyViewportFilterHiddenStructuralShiftAtom` rather than triggering a rescan.
 That command is **row-axis only**: a filter set is a set of rows, so a column shift
-is a no-op for it, unlike the manual set which carries both axes. Because a delete
-band has no inverse for the members it swallows, callers pair it with a
-`VIEWPORT_FILTER_HIDDEN_REPLAY_KEY` local side payload (same reasoning as the manual
-set). See `solid/excel/docs/online-excel-parity/design-filter-hidden-rows.md` §3,
-§4.3 and §8.1, and `../../docs/filter-sort.md` for the whole-feature contract.
+is a no-op for it, unlike the manual set which carries both axes.
+
+The filter set is a **pure projection with no write path of its own**, so since
+sink-down slice E8 its structural **forward** shift is KEPT but its UI-core
+local-replay side payload (`VIEWPORT_FILTER_HIDDEN_REPLAY_KEY`) is **deleted**:
+structural undo/redo now restores the engine's owned filter (rules + derived hidden
+set) from the engine's own snapshot (`snapshotFilters` / `restoreFilters` on the
+worker; the full-sheet capture on static), and the provider re-hydrates this cache
+from `readSheetHiddenState.filterRows` (`reconcileFilterHiddenFromEngine` in
+`solid/excel/src-vnext/provider/history-dispatch.ts`). See
+`solid/excel/docs/online-excel-parity/design-engine-hidden-rows.md` §6.3 and
+`../../docs/filter-sort.md` for the whole-feature contract.
