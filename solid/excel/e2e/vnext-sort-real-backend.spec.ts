@@ -297,22 +297,18 @@ test.describe('vNext engine physical sort real-backend evidence', () => {
     // reorder data has NO sort at all. The toolbar Sort button is gone...
     await expect(page.getByTestId('toolbar-btn-sort')).toHaveCount(0)
 
-    // ...and so are both Data menu sort entries (filter stays, it is a view
-    // fact the TS worker does support).
+    // ...and so are both Data menu sort entries.
     await page.getByTestId('menu-bar-button-data').click()
-    await expect(page.getByTestId('menu-bar-item-data.filter')).toBeVisible()
     await expect(page.getByTestId('menu-bar-item-data.sortAsc')).toHaveCount(0)
     await expect(page.getByTestId('menu-bar-item-data.sortDesc')).toHaveCount(0)
     await page.keyboard.press('Escape')
 
-    // ...and the filter dropdown offers no sort section either.
-    const filterButton = page.getByTestId('toolbar-btn-filter')
-    await expect(filterButton).toBeEnabled()
-    await filterButton.click()
-    await expect(workerFilterDropdown(page)).toBeVisible()
-    await expect(page.getByTestId('filter-sort-section')).toHaveCount(0)
-    await expect(page.getByTestId('filter-sort-asc')).toHaveCount(0)
-    await page.getByTestId('filter-close').click()
+    // Since E5 the FILTER button is withheld too: the predicate is engine-owned
+    // (design-engine-hidden-rows §5.2) and the TS worker has no engine, so
+    // `engineHiddenState:false` fail-closes filter just like `sortRange:false`
+    // fail-closes sort. Before E5 this test asserted the filter button ENABLED
+    // (filter was a TS-worker view fact); that premise no longer holds.
+    await expect(page.getByTestId('toolbar-btn-filter')).toBeDisabled()
 
     // The seeded data is untouched and no sort history entry exists at all.
     await expect(cellDisplay(page, 'E2')).toHaveText('3')

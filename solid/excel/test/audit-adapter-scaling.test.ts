@@ -408,15 +408,17 @@ describe('audit D-4 · P-D · FIXED — worker backend deleteSheet drops per-she
   })
 })
 
-describe('audit D-7 · P-A · FLIPPED — worker filter visibility is a bounded scan that withholds rows', () => {
-  // Was: the adapter omitted `setFilterSort` and the projection stayed
-  // canonical. Parity slice #29 landed the port; #27 S5 then replaced display
-  // compaction with Excel's hidden-row semantics. The scan stays bounded — one
-  // single-column predicate read per predicate column, once, when the rules are
-  // applied — and the projection read goes back to a plain rectangular range
-  // read, because survivors no longer scatter across a bounding box. Engine data
-  // is never reordered, and sort is not part of this path at all (#24).
-  test('implements the port with bounded predicate scans and identity projections', async () => {
+describe('audit D-7 · P-A · SUPERSEDED by E5 — the filter predicate is engine-owned; the TS runtime fail-closes filter', () => {
+  // Was: parity #29 / #27 S5 landed `setFilterSort` as a BOUNDED ADAPTER SCAN
+  // (one single-column predicate read per predicate column) that withheld rows.
+  // E5 (design-engine-hidden-rows) sinks the predicate itself into the engine:
+  // the adapter no longer scans — it forwards the rules to `applyFilter` and
+  // reflects the returned rows. The TS worker runtime has no such engine, so it
+  // declares `engineHiddenState: false` and the adapter WITHHOLDS the
+  // `setFilterSort` port entirely (fail-closed), rather than faking a scan the
+  // TS core cannot do. The projection therefore stays canonical here — this is
+  // the honest post-E5 state of what used to be a bounded-scan finding.
+  test('withholds setFilterSort on the TS runtime and leaves the projection canonical', async () => {
     const client = createWorkerWorkbook({ workerFactory: () => createInProcessWorker() })
     const readRanges: SparseRangeWire[] = []
     const spyClient: typeof client = {
@@ -433,7 +435,6 @@ describe('audit D-7 · P-A · FLIPPED — worker filter visibility is a bounded 
     })
     await backend.ready()
 
-    // Descending values make the filter's row compression obvious.
     await backend.importCells?.({
       kind: 'import-cells',
       sheetId: 'sheet-1',
@@ -451,51 +452,23 @@ describe('audit D-7 · P-A · FLIPPED — worker filter visibility is a bounded 
     )
     expect(before.cells.find((cell) => cell.row === 1 && cell.col === 0)?.displayValue).toBe('99')
 
-    expect(typeof backend.setFilterSort).toBe('function')
-    const ack = await backend.setFilterSort!({
-      kind: 'set-filter-sort',
-      sheetId: 'sheet-1',
-      // Keep only values <= 90, i.e. source rows 10..30. Rows 1..9 are hidden
-      // and every survivor keeps the row number it already had.
-      rules: [{ kind: 'range', colIndex: 0, max: 90 }],
-      requestId: 2,
-    })
-    expect(ack).toMatchObject({ sheetId: 'sheet-1', requestId: 2 })
+    // Fail-closed: the `engineHiddenState: false` witness withholds the port, so
+    // UI-core hides the filter entry. Never a fake ACK, never an adapter scan.
+    expect(backend.setFilterSort).toBeUndefined()
+    expect(backend.readSheetHiddenState).toBeUndefined()
 
+    // No filter can be applied, so the projection is unchanged: source row 1
+    // still reads 99, and only the single window read was issued (no predicate
+    // scan — the finding this block used to audit no longer exists in the
+    // adapter at all).
     const after = await backend.readVisibleProjection(
       createVisibleProjectionRequest({ sheetId: 'sheet-1', requestId: 3, window }),
     )
-
-    // Three sparse-range reads: the unfiltered window read, ONE single-column
-    // predicate scan (col 0 doubles as the summary probe), and the post-filter
-    // window read — which is a plain rectangle again. The compacted path used a
-    // cell-by-cell `readCells` batch over a bounding box instead.
+    expect(after.cells.find((cell) => cell.row === 1 && cell.col === 0)?.displayValue).toBe('99')
     expect(readRanges).toEqual([
       { sheet: 0, startRow: 0, endRow: 20, startCol: 0, endCol: 5 },
-      { sheet: 0, startRow: 0, endRow: 30, startCol: 0, endCol: 0 },
       { sheet: 0, startRow: 0, endRow: 20, startCol: 0, endCol: 5 },
     ])
-    // Header row 0 passes through; rows 1..9 are withheld outright, so the
-    // first surviving data row is source row 10 AT row 10 — the compacted path
-    // reported it at display row 1. Row ORDER stays source order (#24).
-    expect(after.cells.find((cell) => cell.row === 0 && cell.col === 0)?.displayValue).toBe('100')
-    expect(after.cells.some((cell) => cell.row >= 1 && cell.row <= 9)).toBe(false)
-    expect(after.cells.find((cell) => cell.row === 10 && cell.col === 0)).toMatchObject({
-      displayValue: '90',
-    })
-    // The mutation ACK bumped the revision; the engine rows themselves
-    // did not move (clearing the state restores the canonical order).
-    expect(after.revision).not.toBe(before.revision)
-    await backend.setFilterSort!({
-      kind: 'set-filter-sort',
-      sheetId: 'sheet-1',
-      rules: [],
-      requestId: 4,
-    })
-    const cleared = await backend.readVisibleProjection(
-      createVisibleProjectionRequest({ sheetId: 'sheet-1', requestId: 5, window }),
-    )
-    expect(cleared.cells.find((cell) => cell.row === 1 && cell.col === 0)?.displayValue).toBe('99')
 
     backend.dispose()
   })

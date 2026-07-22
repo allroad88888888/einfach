@@ -34,6 +34,14 @@ async function gotoWorkerDemo(page: Page) {
   await expect(cellDisplay(page, 'C2')).toHaveText('13', { timeout: 30_000 })
 }
 
+function activeProjectIsWasm(): boolean {
+  try {
+    return test.info().project.name !== 'ts'
+  } catch {
+    return true
+  }
+}
+
 function filterDropdown(page: Page) {
   return page.getByTestId('vnext-worker-filter-dropdown')
 }
@@ -70,6 +78,17 @@ async function editCell(page: Page, addr: string, value: string) {
 }
 
 test.describe('vNext Data -> Reapply real-backend evidence', () => {
+  // Reapply re-dispatches `setFilterSort`, which is engine-owned since E5. The
+  // TS worker declares `engineHiddenState:false` and the adapter withholds the
+  // port, so filter and its Reapply entry are both fail-closed there (§10.3).
+  // These tests run on the WASM project only.
+  test.beforeEach(() => {
+    test.skip(
+      !activeProjectIsWasm(),
+      'filter/Reapply are engine-owned since E5 — the TS worker fail-closes them',
+    )
+  })
+
   test.afterEach(async ({ page }) => {
     await expectNoConsoleErrors(page)
   })

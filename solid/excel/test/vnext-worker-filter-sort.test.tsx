@@ -32,6 +32,8 @@ import type {
   CellRefWire,
   CellSnapshotWire,
   CellWire,
+  ColumnFilterRuleWire,
+  FilterApplyResultWire,
   SparseRangeWire,
   WorkerWorkbookClient,
 } from '../src-vnext/adapter'
@@ -40,6 +42,8 @@ import {
   MAX_FILTER_SORT_PREDICATE_CELLS,
   createWorkerWorkbookSpreadsheetBackend,
 } from '../src-vnext/adapter'
+import { buildFilterSortDisplayRows } from '../src-vnext/adapter/filter-predicate'
+import { filterHiddenRowsFromDisplayRows } from '../src-vnext/adapter/filter-hidden-rows'
 import { SpreadsheetFilterDropdown } from '../src-vnext/filter-sort'
 import { SpreadsheetGrid } from '../src-vnext/grid'
 import { SpreadsheetUiProvider } from '../src-vnext/provider'
@@ -73,6 +77,8 @@ type FilterFakeClient = WorkerWorkbookClient & {
     readCells: CellRefWire[][]
     setCell: Array<{ sheet: number; addr: string; value: CellWire }>
     setEvalFilterHiddenRows: Array<{ sheet: number; rows: number[] }>
+    applyFilter: Array<{ sheet: number; rules: ColumnFilterRuleWire[] }>
+    clearFilter: Array<{ sheet: number }>
   }
   seedCell(row: number, col: number, value: string | number): void
   emitDirty(): void
@@ -95,6 +101,8 @@ function createFilterFakeClient(
     readCells: [],
     setCell: [],
     setEvalFilterHiddenRows: [],
+    applyFilter: [],
+    clearFilter: [],
   }
 
   function key(sheet: number, addr: string) {
@@ -202,9 +210,54 @@ function createFilterFakeClient(
     async setFormulaDetailed() {
       return { ok: true as const }
     },
-    // #27 S4: applying (or clearing) the rules also hands the engine the
-    // FILTER-hidden row set. Recorded rather than stubbed so the payload
-    // itself is assertable — the whole point of the slice.
+    // E5: `setFilterSort` now routes through the engine's `applyFilter`, which
+    // runs the predicate ONCE and returns the FILTER-hidden rows (plus commits
+    // them for SUBTOTAL — a real engine does; this double just returns the
+    // answer). The scan is reproduced against the seeded cells with the SAME
+    // shared helpers the engine's Rust port mirrors, so the double agrees with
+    // the engine cell-for-cell, and the over-cap refusal rides in the resolved
+    // value (`{ ok: false, code: 'source-too-large' }`), never a throw.
+    async applyFilter(sheet, rules): Promise<FilterApplyResultWire> {
+      calls.applyFilter.push({ sheet, rules: rules.map((rule) => ({ ...rule })) })
+      let maxRow = -1
+      for (const cell of cells.values()) {
+        if (cell.sheet !== sheet) continue
+        const coord = parseAddr(cell.addr)
+        if (coord.row > maxRow) maxRow = coord.row
+      }
+      const rowCount = maxRow + 1
+      const cols = new Set<number>([0])
+      for (const rule of rules) cols.add(rule.colIndex)
+      const predicateCells = rowCount * cols.size
+      if (predicateCells > MAX_FILTER_SORT_PREDICATE_CELLS) {
+        return {
+          ok: false,
+          code: 'source-too-large',
+          message: `filter predicate scan needs ${predicateCells} cells; the filter was not applied`,
+        }
+      }
+      const valueAt = (row: number, col: number): string =>
+        cells.get(key(sheet, toAddr(row, col)))?.display ?? ''
+      const displayRows =
+        buildFilterSortDisplayRows(
+          { rules },
+          { headerRow: 0, startRow: 1, endRow: rowCount },
+          valueAt,
+        ) ?? []
+      return {
+        ok: true,
+        hiddenRows: filterHiddenRowsFromDisplayRows(displayRows, rowCount),
+        scannedRows: rowCount,
+        predicateCells,
+      }
+    },
+    async clearFilter(sheet): Promise<FilterApplyResultWire> {
+      calls.clearFilter.push({ sheet })
+      return { ok: true, hiddenRows: [], scannedRows: 0, predicateCells: 0 }
+    },
+    // The engine-set restore path used by structural undo/redo of a filtered
+    // sheet (`setFilterSort` no longer pushes here — `applyFilter` writes the
+    // set itself). Recorded so undo tests can assert the restore.
     async setEvalFilterHiddenRows(sheet, rows) {
       calls.setEvalFilterHiddenRows.push({ sheet, rows: [...rows] })
       if (evalFilterHiddenRows === 'unsupported') {
@@ -317,69 +370,42 @@ describe('worker adapter setFilterSort projection', () => {
     expect(result.cells.some((cell) => cell.displayValue === 'Beta')).toBe(false)
   })
 
-  // #27 S4 — the OTHER projection of the same scan. The engine cannot see the
-  // filter, so without this push `SUBTOTAL(1-11)` keeps summing Beta.
-  it('hands the engine the filter-hidden source rows when the rules are applied', async () => {
+  // E5 — the engine's `applyFilter` commits the FILTER-hidden set itself (the
+  // separate host push is retired). Without it `SUBTOTAL(1-11)` keeps summing
+  // Beta; the adapter forwards the rules and reflects the returned rows.
+  it('routes the rules to the engine applyFilter and reflects the returned hidden rows', async () => {
     const { client, backend } = createFilterBackend()
-    seedPeople(client)
-
-    await backend.setFilterSort!({
-      kind: 'set-filter-sort',
-      sheetId: 'sheet-1',
-      rules: [{ kind: 'equals', colIndex: 0, value: 'Alpha' }],
-      requestId: 7,
-    })
-
-    // SOURCE rows, not display slots: Beta sits at source row 2. The header
-    // (row 0) and the matching rows 1 / 3 must never appear.
-    expect(client.calls.setEvalFilterHiddenRows).toEqual([{ sheet: 0, rows: [2] }])
-
-    // The set is derived from the SAME scan that decides the projection, so it
-    // is exactly the complement of what the projection shows.
-    const result = await readWindow(backend)
-    const visibleSourceRows = new Set(result.cells.map((cell) => cell.row))
-    expect(visibleSourceRows.has(2)).toBe(false)
-    expect([...visibleSourceRows].sort()).toEqual([0, 1, 3])
-
-    // Clearing the rules clears the engine set — whole-set replace, empty
-    // clears. A stale set would keep excluding rows that are visible again.
-    await backend.setFilterSort!({ kind: 'set-filter-sort', sheetId: 'sheet-1', rules: [] })
-    expect(client.calls.setEvalFilterHiddenRows).toEqual([
-      { sheet: 0, rows: [2] },
-      { sheet: 0, rows: [] },
-    ])
-  })
-
-  // #27 S4, design §6.5 tier 2: a wasm-pkg predating the export answers a
-  // structured UNSUPPORTED. The user's filter must still apply — the VIEW is
-  // correct and only the engine stays uninformed ("not excluded" is
-  // conservative, never a wrong number). A rethrow here would turn an old
-  // wasm build into a completely broken filter.
-  it('still applies the filter when the engine cannot accept the push', async () => {
-    const { client, backend } = createFilterBackend('unsupported')
     seedPeople(client)
 
     const ack = await backend.setFilterSort!({
       kind: 'set-filter-sort',
       sheetId: 'sheet-1',
       rules: [{ kind: 'equals', colIndex: 0, value: 'Alpha' }],
-      requestId: 11,
+      requestId: 7,
     })
-    expect(ack).toMatchObject({ sheetId: 'sheet-1', requestId: 11 })
 
-    // The view is filtered exactly as on a capable engine.
+    // The rules are forwarded verbatim to the engine — no separate eval-input
+    // push (`applyFilter` writes the engine set), and the ACK carries the
+    // SOURCE rows the engine hid: Beta at source row 2.
+    expect(client.calls.applyFilter).toEqual([
+      { sheet: 0, rules: [{ kind: 'equals', colIndex: 0, value: 'Alpha' }] },
+    ])
+    expect(client.calls.setEvalFilterHiddenRows).toEqual([])
+    expect(ack.hiddenRowIndices).toEqual([2])
+
+    // The mirror is the engine's answer, so the projection withholds exactly the
+    // complement of what it shows.
     const result = await readWindow(backend)
-    expect(result.cells.some((cell) => cell.displayValue === 'Beta')).toBe(false)
+    const visibleSourceRows = new Set(result.cells.map((cell) => cell.row))
+    expect(visibleSourceRows.has(2)).toBe(false)
+    expect([...visibleSourceRows].sort()).toEqual([0, 1, 3])
 
-    // Attempted once, then latched off — a refusal is a property of the build,
-    // not of the payload, so re-asking every time would be pure noise.
-    expect(client.calls.setEvalFilterHiddenRows).toHaveLength(1)
-    await backend.setFilterSort!({
-      kind: 'set-filter-sort',
-      sheetId: 'sheet-1',
-      rules: [{ kind: 'equals', colIndex: 0, value: 'Beta' }],
-    })
-    expect(client.calls.setEvalFilterHiddenRows).toHaveLength(1)
+    // Clearing the rules drops the engine's filter through `clearFilter`
+    // (scan-free), so a stale set cannot keep excluding rows that are visible
+    // again.
+    await backend.setFilterSort!({ kind: 'set-filter-sort', sheetId: 'sheet-1', rules: [] })
+    expect(client.calls.clearFilter).toEqual([{ sheet: 0 }])
+    expect(client.calls.applyFilter).toHaveLength(1)
   })
 
   it('never reorders rows and never touches engine data (sort branch retired)', async () => {
@@ -400,15 +426,16 @@ describe('worker adapter setFilterSort projection', () => {
     // Visibility only: no engine writes of any kind happened.
     expect(client.calls.setCell).toHaveLength(0)
 
-    // Clearing brings the withheld row back.
-    const scans = client.calls.listNonEmpty
+    // Clearing brings the withheld row back through `clearFilter`, which never
+    // runs the predicate scan (`applyFilter`), so it cannot be blocked by the cap.
+    const applies = client.calls.applyFilter.length
     await backend.setFilterSort!({
       kind: 'set-filter-sort',
       sheetId: 'sheet-1',
       rules: [],
     })
-    // Clearing never runs the predicate scan, so it cannot be blocked by the cap.
-    expect(client.calls.listNonEmpty).toBe(scans)
+    expect(client.calls.applyFilter).toHaveLength(applies)
+    expect(client.calls.clearFilter).toEqual([{ sheet: 0 }])
     const cleared = await readWindow(backend)
     expect(cellAt(cleared, 2, 1)).toMatchObject({ displayValue: '3' })
   })
@@ -449,12 +476,13 @@ describe('worker adapter setFilterSort projection', () => {
       sheetId: 'sheet-1',
       rules: [{ kind: 'equals', colIndex: 0, value: 'Alpha' }],
     })
-    expect(client.calls.listNonEmpty).toBe(1)
+    expect(client.calls.applyFilter).toHaveLength(1)
 
-    // Projection reads never scan: the answer was computed once, above.
+    // Projection reads never re-run the predicate: the answer was computed once,
+    // above, inside the engine's single `applyFilter`.
     await readWindow(backend)
     await readWindow(backend)
-    expect(client.calls.listNonEmpty).toBe(1)
+    expect(client.calls.applyFilter).toHaveLength(1)
 
     // Beta now matches the rule, but the snapshot is not consulted again, so
     // row 2 stays withheld until the rules are re-applied.
@@ -466,23 +494,23 @@ describe('worker adapter setFilterSort projection', () => {
       input: 'Alpha',
     })
     const afterEdit = await readWindow(backend)
-    expect(client.calls.listNonEmpty).toBe(1)
+    expect(client.calls.applyFilter).toHaveLength(1)
     expect(afterEdit.cells.some((cell) => cell.row === 2)).toBe(false)
     expect(cellAt(afterEdit, 3, 0)).toMatchObject({ displayValue: 'Alpha' })
 
     // Nor does a worker-initiated cellsDirty push (async formula settle).
     client.emitDirty()
     await readWindow(backend)
-    expect(client.calls.listNonEmpty).toBe(1)
+    expect(client.calls.applyFilter).toHaveLength(1)
 
     // Re-applying the same rules is the explicit recompute path, and it does
-    // rescan — so the row can always be brought back.
+    // re-run `applyFilter` — so the row can always be brought back.
     await backend.setFilterSort!({
       kind: 'set-filter-sort',
       sheetId: 'sheet-1',
       rules: [{ kind: 'equals', colIndex: 0, value: 'Alpha' }],
     })
-    expect(client.calls.listNonEmpty).toBe(2)
+    expect(client.calls.applyFilter).toHaveLength(2)
     const afterReapply = await readWindow(backend)
     expect(cellAt(afterReapply, 2, 0)).toMatchObject({ displayValue: 'Alpha' })
   })

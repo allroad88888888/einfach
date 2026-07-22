@@ -20,6 +20,8 @@ import type {
   CellRefWire,
   CellSnapshotWire,
   CellWire,
+  ColumnFilterRuleWire,
+  FilterApplyResultWire,
   FormatRangeSnapshot,
   BeginImportOptionsWire,
   ImportCellWire,
@@ -30,6 +32,8 @@ import type {
   WorkbookImportStatsWire,
   WorkbookSheetMeta,
 } from '../src-vnext/adapter'
+import { buildFilterSortDisplayRows } from '../src-vnext/adapter/filter-predicate'
+import { filterHiddenRowsFromDisplayRows } from '../src-vnext/adapter/filter-hidden-rows'
 import {
   createWorkerWorkbook,
   createStaticNamedRangeCapabilityPort,
@@ -75,6 +79,8 @@ type FakeWorkerWorkbookClient = WorkerWorkbookClient & {
     renameSheet: Array<{ sheet: number; name: string }>
     removeSheet: number[]
     moveSheet: Array<{ from: number; to: number }>
+    applyFilter: Array<{ sheet: number; rules: ColumnFilterRuleWire[] }>
+    clearFilter: Array<{ sheet: number }>
   }
   putCell(cell: CellSnapshotWire): void
   emitDirty(cells: CellRefWire[]): void
@@ -170,6 +176,8 @@ function createFakeWorkerWorkbookClient(): FakeWorkerWorkbookClient {
     renameSheet: [],
     removeSheet: [],
     moveSheet: [],
+    applyFilter: [],
+    clearFilter: [],
   }
   let metas: WorkbookSheetMeta[] = []
   let nextImportId = 1
@@ -700,6 +708,37 @@ function createFakeWorkerWorkbookClient(): FakeWorkerWorkbookClient {
     async readSparseRange(range) {
       calls.readSparseRange.push({ ...range })
       return [...cells.values()].filter((cell) => insideRange(cell, range))
+    },
+    // E5: `setFilterSort` routes here. The engine runs the predicate ONCE and
+    // returns the FILTER-hidden rows; this double reproduces that scan against
+    // its own cell store with the shared helper the Rust port mirrors.
+    async applyFilter(sheet, rules): Promise<FilterApplyResultWire> {
+      calls.applyFilter.push({ sheet, rules: rules.map((rule) => ({ ...rule })) })
+      let maxRow = -1
+      for (const cell of cells.values()) {
+        if (cell.sheet !== sheet) continue
+        const coord = parseCellAddress(cell.addr)
+        if (coord.row > maxRow) maxRow = coord.row
+      }
+      const rowCount = maxRow + 1
+      const valueAt = (row: number, col: number): string =>
+        cells.get(key(sheet, toCellAddress(row, col)))?.display ?? ''
+      const displayRows =
+        buildFilterSortDisplayRows(
+          { rules },
+          { headerRow: 0, startRow: 1, endRow: rowCount },
+          valueAt,
+        ) ?? []
+      return {
+        ok: true,
+        hiddenRows: filterHiddenRowsFromDisplayRows(displayRows, rowCount),
+        scannedRows: rowCount,
+        predicateCells: rowCount,
+      }
+    },
+    async clearFilter(sheet): Promise<FilterApplyResultWire> {
+      calls.clearFilter.push({ sheet })
+      return { ok: true, hiddenRows: [], scannedRows: 0, predicateCells: 0 }
     },
     async debugFormulaCacheState() {
       throw new Error('not used')
@@ -1278,12 +1317,13 @@ describe('vnext adapter', () => {
       // Source rows 2 and 3 (South, East) fail the rule.
       hiddenRowIndices: [2, 3],
     })
-    // The predicate scan is column-bounded: one single-column read per
-    // predicate column (col 0 summary probe + the filter-rule column).
-    expect(client.calls.readSparseRange).toEqual([
-      { sheet: 0, startRow: 0, endRow: 3, startCol: 0, endCol: 0 },
-      { sheet: 0, startRow: 0, endRow: 3, startCol: 1, endCol: 1 },
+    // The predicate scan lives in the engine now (E5): the adapter forwards the
+    // rules to `applyFilter` and reflects the returned rows — it runs no
+    // column reads of its own for the filter.
+    expect(client.calls.applyFilter).toEqual([
+      { sheet: 0, rules: [{ kind: 'equals', colIndex: 1, value: '120' }] },
     ])
+    expect(client.calls.readSparseRange).toEqual([])
 
     const projected = await backend.readVisibleProjection(
       createVisibleProjectionRequest({

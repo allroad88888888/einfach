@@ -1,5 +1,5 @@
 import type { CellCoord, CellRange, SheetRef, SpreadsheetError } from '../shared'
-import type { SetFilterSortRequest, SortDirection } from '../filter-sort/types'
+import type { ColumnFilterRule, SetFilterSortRequest, SortDirection } from '../filter-sort/types'
 import type { ReadPrintConfigRequest, ReadPrintConfigResult, SetPrintConfigRequest } from '../print/types'
 import type { PresenceUpdate } from '../presence/types'
 import type { DisplayCellRichValue } from '../rich-types/types'
@@ -649,6 +649,39 @@ export interface ViewportSizeProjectionResult extends SheetRef {
   hiddenColIndices?: number[]
 }
 
+/**
+ * Read-back of a sheet's ENGINE-OWNED hidden state
+ * (`design-engine-hidden-rows` §4.2). Since the sink-down the engine — not the
+ * host — is the authoritative STORE of manually hidden rows and the filter
+ * (rules + derived hidden set), so the host needs a way to hydrate its render
+ * caches from it: on sheet activation, on an ACK-less fallback, and after a
+ * workbook restore. Deliberately NOT the window-bounded
+ * `readViewportSizeProjection` — a host must know about hidden rows OUTSIDE the
+ * visible window to expand that window correctly.
+ */
+export interface SheetHiddenStateRequest extends SheetRef {
+  kind: 'sheet-hidden-state'
+  requestId?: ProjectionRequestId
+  revision?: ProjectionRevision
+}
+
+export interface SheetHiddenStateResult extends SheetRef {
+  kind: 'sheet-hidden-state'
+  requestId?: ProjectionRequestId
+  revision?: ProjectionRevision
+  /** 0-based manually hidden rows (engine `listHiddenRows`). */
+  manualRows: readonly number[]
+  /** 0-based rows the active filter hid (engine `getFilter().hiddenRows`). */
+  filterRows: readonly number[]
+  /** The committed filter rules (engine `getFilter().rules`); `[]` when no filter. */
+  filterRules: readonly ColumnFilterRule[]
+  // NOTE: no `manualCols`. The engine models NO hidden columns (§8 — SUBTOTAL
+  // filters on `addr.row` only), so it has nothing authoritative to report;
+  // hidden columns stay UI-core canonical and hydrate from UI-core's own
+  // persistence. An always-empty field here would let a hydration consumer
+  // wrongly CLEAR real hidden columns.
+}
+
 export interface HideRowsRequest extends SheetRef {
   kind: 'hide-rows'
   rowIndices: number[]
@@ -1030,6 +1063,12 @@ export interface SpreadsheetBackend {
   setFreezeConfig?(request: SetFreezeConfigRequest): Promise<BackendMutationResult>
   hideRows?(request: HideRowsRequest): Promise<BackendMutationResult>
   unhideRows?(request: UnhideRowsRequest): Promise<BackendMutationResult>
+  // Read-back of the engine-owned hidden state (rows + filter), for hydrating
+  // UI-core render caches on sheet activation / restore. Optional: a backend
+  // whose engine does not OWN this state (the TS worker) omits the port and
+  // UI-core keeps its own canonical view fact instead of hydrating from a
+  // source that cannot answer authoritatively.
+  readSheetHiddenState?(request: SheetHiddenStateRequest): Promise<SheetHiddenStateResult>
   hideColumns?(request: HideColumnsRequest): Promise<BackendMutationResult>
   unhideColumns?(request: UnhideColumnsRequest): Promise<BackendMutationResult>
   // engine hidden-row eval input (parity #23). Optional, fire-and-forget

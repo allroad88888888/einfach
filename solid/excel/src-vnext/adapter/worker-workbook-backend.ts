@@ -48,6 +48,9 @@ import type {
   SetEvalHiddenRowsRequest,
   SetFilterSortRequest,
   SetFilterSortResult,
+  SheetHiddenStateRequest,
+  SheetHiddenStateResult,
+  ColumnFilterRule,
   SetFormatRangeRequest,
   SetNamedRangeRequest,
   SetRowHeightRequest,
@@ -146,8 +149,7 @@ import {
   pasteRangeGeometry,
   pasteSourceCoord,
 } from './paste-range-plan'
-import { filterHiddenRowsFromDisplayRows, filterTsvBandRows } from './filter-hidden-rows'
-import { buildFilterSortDisplayRows } from './filter-predicate'
+import { filterTsvBandRows } from './filter-hidden-rows'
 
 export interface WorkerWorkbookBackendSheetInput {
   id?: string
@@ -195,33 +197,16 @@ const MIN_IMPORT_CELLS_PER_CHUNK = 1
 const MAX_IMPORT_CELLS_PER_CHUNK = 10_000
 
 /**
- * Bounded predicate scan for filter/sort visibility (parity item #29).
- *
- * The shared pure helper `buildFilterSortDisplayRows` needs the display
- * value of every data row in each predicate column (column 0 for the
- * summary-row probe, plus every filter-rule column). On the worker
- * path those values live behind RPC, so the scan must be explicitly
- * bounded: `dataRowCount x predicateColumnCount` may not exceed this cap
- * (same 50k-cell budget as `DEFAULT_MAX_PROJECTION_CELLS` and
- * `STATUS_BAR_AGGREGATE_MEMBERSHIP_CHECKS_MAX` in ui-core). Crossing it
- * is a structured rejection (`FILTER_SORT_SOURCE_TOO_LARGE`) — the
- * filter does NOT activate and nothing is silently truncated.
+ * Fail-closed source-size cap for the filter predicate (parity item #29). Since
+ * E5 the SCAN itself lives in the engine (`MAX_FILTER_PREDICATE_CELLS`, the same
+ * 50k value); this constant is the host mirror of that number, and
+ * `FILTER_SORT_SOURCE_TOO_LARGE` is the host error code the adapter maps the
+ * engine's structured `source-too-large` refusal onto, so ui-core's over-cap
+ * handling is unchanged. Crossing the cap does NOT activate the filter and
+ * truncates nothing.
  */
 export const MAX_FILTER_SORT_PREDICATE_CELLS = 50_000
 export const FILTER_SORT_SOURCE_TOO_LARGE = 'FILTER_SORT_SOURCE_TOO_LARGE'
-
-/**
- * The two projections of ONE predicate scan. `displayRows` is the sparse
- * `display -> source` permutation the projection reads through (compression
- * semantics, retired in S5); `hiddenRows` is its complement over the scanned
- * extent — the FILTER-hidden set the engine consumes for SUBTOTAL
- * (`design-filter-hidden-rows` §4.2). Kept together so they can never be
- * derived from different scans.
- */
-interface FilterSortScan {
-  readonly displayRows: number[]
-  readonly hiddenRows: number[]
-}
 
 /**
  * Fail-closed source-size cap for engine physical sort (design-engine-sort
@@ -1274,18 +1259,17 @@ export function createWorkerWorkbookSpreadsheetBackend(
    */
   const filterSortStateBySheetId = new Map<string, FilterSortState>()
   /**
-   * FILTER-hidden source rows per sheet — the rows an active filter withholds
-   * from the projection (one entry per filtered sheet, size bounded by the
-   * scanned extent, itself bounded by MAX_FILTER_SORT_PREDICATE_CELLS /
-   * predicate columns).
+   * FILTER-hidden source rows per sheet — a MIRROR of the engine's owned filter
+   * set, so the projection can withhold those rows without a per-frame round
+   * trip and so the same projection contract holds across the WASM and static
+   * backends (static withholds identically until its E6 flip).
    *
-   * A SNAPSHOT taken in `setFilterSort`, and deliberately NOT invalidated by
-   * `bumpRevision()` the way the display-row permutation it replaces was.
-   * Recomputing on every mutation is what made our filter live while Excel's is
-   * not: editing a cell must not make its row vanish, that is what
-   * `Data → Reapply` is for. UI core holds the same set as canonical view truth
-   * (`viewportFilterHiddenAtom`); this copy exists so the projection can
-   * withhold the rows without a round trip.
+   * Since E5 the ENGINE owns and evaluates this set (design §4.2/§5): the mirror
+   * is populated from `applyFilter`'s returned `hiddenRows`, NOT from a host
+   * predicate scan. A structural row edit self-displaces the engine's set, and
+   * this mirror follows with the same arithmetic (`shiftFilterHiddenOverlay`) so
+   * the two never disagree about where a hidden row landed. It retires fully
+   * when UI-core becomes the sole render authority (E7).
    */
   const filterHiddenRowsBySheetId = new Map<string, Set<number>>()
   /**
@@ -1571,8 +1555,11 @@ export function createWorkerWorkbookSpreadsheetBackend(
     // the after-image post-execute. Pure adapter memory — no RPC, never
     // a reason to degrade the record.
     const mergeBefore = (mergeRangesBySheetId.get(spec.sheetId) ?? []).map(cloneRange)
-    // S5a side payload, captured on the same before/after bracket: `execute`
-    // remaps the FILTER-hidden snapshot right after the engine shift ACKs.
+    // Filter-hidden side payload (design §4.3), captured on the same
+    // before/after bracket from the mirror: `execute` self-displaces the
+    // engine's owned set AND (via `shiftFilterHiddenOverlay`) this mirror, so
+    // the after-image is the displaced set. A cell-level undo replay does NOT
+    // structurally re-shift, so undo restores the before-image into the engine.
     const filterHiddenBefore = filterHiddenRowsSnapshot(spec.sheetId)
     const result = await spec.execute()
     const mergeAfter = (mergeRangesBySheetId.get(spec.sheetId) ?? []).map(cloneRange)
@@ -1924,15 +1911,20 @@ export function createWorkerWorkbookSpreadsheetBackend(
       mergeRangesBySheetId.set(record.mergeOverlay.sheetId, ranges.map(cloneRange))
     }
     if (record.filterHiddenOverlay) {
-      // S5a: whole-set restore of the FILTER-hidden snapshot, then the same
-      // whole-set replace into the engine. Inverting the shift arithmetic
-      // would not do — a delete that consumed filter-hidden rows has no
-      // inverse, which is exactly why the images are recorded.
+      // Whole-set restore of the FILTER-hidden mirror, then the same whole-set
+      // replace into the engine (design §4.3). The engine self-shifted its set
+      // forward on the structural op, but the cell-level undo replay above does
+      // NOT structurally re-shift, so the set is stale until we restore it here.
+      // Inverting the shift arithmetic would not do — a delete that consumed
+      // filter-hidden rows has no inverse, which is why the images are recorded.
+      // `setEvalFilterHiddenRows` updates the existing filter's hidden set in
+      // place (rules untouched), so SUBTOTAL reads the right band; the rules are
+      // UI-core canonical and restored by UI-core's own undo.
       const overlay = record.filterHiddenOverlay
       const rows = action === 'undo' ? overlay.before : overlay.after
       if (rows.length === 0) filterHiddenRowsBySheetId.delete(overlay.sheetId)
       else filterHiddenRowsBySheetId.set(overlay.sheetId, new Set(rows))
-      await pushEvalFilterHiddenRows(record.sheetIdx, rows)
+      await client.setEvalFilterHiddenRows?.(record.sheetIdx, rows)
     }
     record.boundTransactionId = request.transactionId
     source.pop()
@@ -2019,31 +2011,20 @@ export function createWorkerWorkbookSpreadsheetBackend(
     shiftMergeRangeList(ranges, axis, index, count, direction)
   }
 
-  /** One sheet's FILTER-hidden snapshot as an ascending array (S5a). */
+  /** One sheet's FILTER-hidden mirror as an ascending array. */
   function filterHiddenRowsSnapshot(sheetId: string): number[] {
     return [...(filterHiddenRowsBySheetId.get(sheetId) ?? [])].sort((left, right) => left - right)
   }
 
   /**
-   * W3 remap of the FILTER-hidden snapshot after an ACKed ROW shift (S5a).
-   *
-   * The twin of `shiftMergeOverlay` above, and it exists for the same reason
-   * the manual hidden set has one in UI core: since the S5 flip this set is a
-   * SNAPSHOT (design §4.3), not a per-revision rederivation, so an unshifted
-   * index withholds a row the filter never judged and reveals one it did.
-   *
-   * `index` / `count` are PRE-mutation coordinates — the same frame
-   * `BackendStructuralShift` is stated in, and the same arithmetic
-   * `remapIndexSetAfterStructuralShift` applies UI-core side: on delete, rows
-   * inside the band are dropped and rows past it move back; on insert, rows at
-   * or after the point move forward.
-   *
-   * ROWS ONLY: a column insert/delete displaces nothing in a row set, so there
-   * is no `axis` parameter to get wrong.
-   *
-   * Returns true when the sheet had a set to displace — the caller then
-   * re-pushes it so the engine's copy follows the same displacement and
-   * SUBTOTAL does not aggregate over a stale band.
+   * Displace the FILTER-hidden MIRROR after an ACKed ROW shift, with the same
+   * arithmetic the engine applies to its owned set (`Sheet::shift_filter_hidden_rows`)
+   * and UI-core applies to `viewportFilterHiddenAtom`: on delete, rows inside
+   * the band drop and rows past it move back; on insert, rows at or after the
+   * point move forward. ROWS ONLY — a column edit displaces nothing in a row
+   * set. Returns true when the sheet had a set to displace. There is NO re-push:
+   * the engine self-displaced its own copy, so this only keeps the mirror (used
+   * for withholding + the undo before/after images) in step.
    */
   function shiftFilterHiddenOverlay(
     sheetId: string,
@@ -2190,119 +2171,6 @@ export function createWorkerWorkbookSpreadsheetBackend(
     return sheet
   }
 
-  /** Column 0 (summary-row probe) plus every filter-rule column. */
-  function filterSortPredicateColumns(state: FilterSortState): number[] {
-    const cols = new Set<number>([0])
-    for (const rule of state.rules) cols.add(rule.colIndex)
-    return [...cols]
-  }
-
-  /**
-   * Bounded predicate scan + shared pure permutation. Mirrors the static
-   * backend exactly (headerRow 0, data rows 1..maxRow, summary-row
-   * pass-through) but reads engine display values over existing RPCs:
-   * `listNonEmpty` as the exact per-sheet extent probe, then ONE
-   * `readSparseRange` per predicate column, all inside the declared
-   * MAX_FILTER_SORT_PREDICATE_CELLS budget. Over-budget sources reject
-   * with a structured error instead of truncating.
-   */
-  async function computeFilterSortDisplayRows(
-    sheet: WorkerWorkbookBackendSheet,
-    state: FilterSortState,
-  ): Promise<FilterSortScan> {
-    const cols = filterSortPredicateColumns(state)
-    const refs = await client.listNonEmpty()
-    let maxRow = -1
-    for (const ref of refs) {
-      if (ref.sheet !== sheet.idx) continue
-      const coord = parseA1(ref.addr)
-      if (coord && coord.row > maxRow) maxRow = coord.row
-    }
-    const rowCount = maxRow + 1
-    const predicateCells = rowCount * cols.length
-    if (predicateCells > MAX_FILTER_SORT_PREDICATE_CELLS) {
-      throw createBackendError(
-        FILTER_SORT_SOURCE_TOO_LARGE,
-        `filter/sort predicate scan needs ${predicateCells} cells (${rowCount} rows x ` +
-          `${cols.length} columns) but the adapter cap is ${MAX_FILTER_SORT_PREDICATE_CELLS}; ` +
-          'filter and sort were not applied',
-      )
-    }
-
-    const values = new Map<string, string>()
-    if (rowCount > 0) {
-      await Promise.all(
-        cols.map(async (col) => {
-          const snapshots = await client.readSparseRange({
-            sheet: sheet.idx,
-            startRow: 0,
-            endRow: maxRow,
-            startCol: col,
-            endCol: col,
-          })
-          for (const snapshot of snapshots) {
-            const coord = parseA1(snapshot.addr)
-            if (coord) values.set(keyFor(coord.row, coord.col), snapshot.display)
-          }
-        }),
-      )
-    }
-
-    const displayRows =
-      buildFilterSortDisplayRows(
-        state,
-        { headerRow: 0, startRow: 1, endRow: rowCount },
-        (row, col) => values.get(keyFor(row, col)) ?? '',
-      ) ?? []
-    // Same scan, second projection: the rows the predicate judged and did not
-    // display are exactly the FILTER-hidden set the engine needs
-    // (`design-filter-hidden-rows` §4.2). No extra reads, no second predicate
-    // pass, and it cannot disagree with what the projection shows.
-    return { displayRows, hiddenRows: filterHiddenRowsFromDisplayRows(displayRows, rowCount) }
-  }
-
-  /**
-   * Push the FILTER-hidden row set to the engine (`design-filter-hidden-rows`
-   * §4.2/§6.5). Whole-set REPLACE, per sheet, empty clears — the same contract
-   * as the manual twin, and like it NOT a mutation: no exact ACK, no undo
-   * record, no revision bump of its own. The engine's `filter_hidden_epoch`
-   * bump dirties the SUBTOTAL formulas that read the set and the recompute
-   * arrives on the normal `cellsDirty` path.
-   *
-   * Awaited before `setFilterSort` acknowledges, so the projection refresh the
-   * host runs off that ACK already observes the re-derived aggregates.
-   *
-   * Degradation is silent but never a lie (design §6.5 tiers 2 and 3): a
-   * runtime that declares `evalFilterHiddenRows: false` (the TS worker) is
-   * never asked, and a WASM runtime whose wasm-pkg predates the export answers
-   * a structured `UNSUPPORTED`, which is latched so the RPC is attempted once
-   * and never again. Either way the filter still applies to the VIEW and the
-   * engine simply keeps today's SUBTOTAL behaviour — "not excluded" is
-   * conservative, never a wrong number.
-   */
-  let evalFilterHiddenRowsUnavailable = false
-  async function pushEvalFilterHiddenRows(
-    sheetIdx: number,
-    rows: readonly number[],
-  ): Promise<void> {
-    if (evalFilterHiddenRowsUnavailable) return
-    if (!runtimeSupports('evalFilterHiddenRows')) return
-    const push = client.setEvalFilterHiddenRows
-    if (!push) {
-      evalFilterHiddenRowsUnavailable = true
-      return
-    }
-    try {
-      await push.call(client, sheetIdx, rows)
-    } catch (error) {
-      const code = (error as Error & { code?: string }).code
-      if (code === 'UNSUPPORTED' || code === 'UNKNOWN_COMMAND') {
-        evalFilterHiddenRowsUnavailable = true
-        return
-      }
-      throw error
-    }
-  }
 
   async function readRange(
     sheetId: string,
@@ -2352,7 +2220,10 @@ export function createWorkerWorkbookSpreadsheetBackend(
     // full rectangle, so a filter cannot change what the surviving rows look
     // like — only which of them are reported. Rows are dropped rather than
     // emitted-and-ignored so that "inside the range yet contributing no cell"
-    // means "filtered away", the property visible-cell consumers depend on.
+    // means "filtered away", the property visible-cell consumers depend on and
+    // the property that keeps this projection identical to the static backend's.
+    // The mirror it reads is the engine's own filter set (populated from
+    // `applyFilter`, displaced with the engine on structural edits).
     const filterHidden = filterHiddenRowsBySheetId.get(sheetId)
     const visibleCells = filterHidden?.size
       ? mergedCells.filter((cell) => !filterHidden.has(cell.row))
@@ -2627,7 +2498,6 @@ export function createWorkerWorkbookSpreadsheetBackend(
 
     const successfullyRemoved: number[] = []
     let failureCause: unknown = null
-    let filterHiddenDisplaced = false
     for (const band of bands) {
       try {
         const accepted = await client.deleteRows(sheet.idx, band.startRow, band.count)
@@ -2647,26 +2517,15 @@ export function createWorkerWorkbookSpreadsheetBackend(
         // coordinates until their own turn. On partial failure the
         // overlay matches the bands the engine really deleted.
         shiftMergeOverlay(request.sheetId, 'row', band.startRow, band.count, -1)
-        // Same bottom-up composition argument for the S5a filter-hidden
-        // snapshot; the engine push is deferred to one whole-set replace
-        // after the loop so a multi-band removal costs one RPC, not N.
-        filterHiddenDisplaced =
-          shiftFilterHiddenOverlay(request.sheetId, band.startRow, band.count, -1) ||
-          filterHiddenDisplaced
+        // The engine self-displaces its OWNED filter set on each `deleteRows`
+        // (`Sheet::shift_filter_hidden_rows`), so SUBTOTAL already reads the
+        // displaced band and there is no re-push; this only keeps the projection
+        // mirror in step. Undo images are captured from the mirror around the
+        // whole `execute` in `recordStructuralMutation`.
+        shiftFilterHiddenOverlay(request.sheetId, band.startRow, band.count, -1)
       } catch (error) {
         failureCause = error
         break
-      }
-    }
-    if (filterHiddenDisplaced) {
-      try {
-        await pushEvalFilterHiddenRows(sheet.idx, filterHiddenRowsSnapshot(request.sheetId))
-      } catch (pushError) {
-        // A failed eval-input push must never MASK a band failure: the delete
-        // error is the one the user has to reconcile, and it is reported with
-        // the partial extent attached below. With no band failure the push
-        // error still propagates.
-        if (failureCause === null) throw pushError
       }
     }
 
@@ -2787,6 +2646,84 @@ export function createWorkerWorkbookSpreadsheetBackend(
     }
   }
 
+  async function setFilterSortThroughWorker(
+    request: SetFilterSortRequest,
+  ): Promise<SetFilterSortResult> {
+    const sheet = await resolveSheet(request.sheetId)
+    const next = cloneFilterSortState({ rules: request.rules })
+
+    if (!filterSortHasEffect(next)) {
+      filterSortStateBySheetId.delete(request.sheetId)
+      filterHiddenRowsBySheetId.delete(request.sheetId)
+      // Scan-free: drops the engine's rules AND derived rows, so SUBTOTAL stops
+      // excluding rows that are visible again.
+      await client.clearFilter!(sheet.idx)
+      return {
+        sheetId: request.sheetId,
+        requestId: request.requestId,
+        revision: request.revision ?? bumpRevision(),
+        // Explicitly empty, never absent: "the rules hid nothing" is the answer
+        // here, and UI core must clear its set on the strength of it.
+        hiddenRowIndices: [],
+      }
+    }
+
+    // The engine runs the predicate ONCE and commits both the rules and the
+    // rows they hid; the refusal (if any) rides in the resolved value, never a
+    // throw (`sortRange` convention). This REPLACES the host predicate scan the
+    // adapter used to run — the engine reproduced it cell-for-cell (verified at
+    // E3 over 7700 judgments) — and the separate eval-input push, since
+    // `applyFilter` writes the engine's owned set itself.
+    const report = await client.applyFilter!(sheet.idx, request.rules)
+    if (!report.ok) {
+      if (report.code === 'source-too-large') {
+        throw createBackendError(
+          FILTER_SORT_SOURCE_TOO_LARGE,
+          report.message ??
+            'filter/sort predicate source is too large; the filter was not applied',
+        )
+      }
+      // invalid-sheet / mutation-during-custom-call / invalid-payload: none is
+      // reachable from a compliant caller, so surface a structured backend
+      // error rather than a fake ACK.
+      throw createBackendError('FILTER_REJECTED', report.message ?? `filter refused: ${report.code}`)
+    }
+    filterSortStateBySheetId.set(request.sheetId, next)
+    // Mirror the engine's answer for projection withholding + the structural
+    // undo before/after images. This is a MIRROR of engine-owned state, not an
+    // independently derived set — nothing here re-runs the predicate.
+    filterHiddenRowsBySheetId.set(request.sheetId, new Set(report.hiddenRows))
+    // The engine's epoch bump has already fired inside `applyFilter`, so the
+    // revision minted now corresponds to the re-derived aggregates the host
+    // will read off this ACK.
+    return {
+      sheetId: request.sheetId,
+      requestId: request.requestId,
+      revision: request.revision ?? bumpRevision(),
+      hiddenRowIndices: report.hiddenRows,
+    }
+  }
+
+  async function readSheetHiddenStateThroughWorker(
+    request: SheetHiddenStateRequest,
+  ): Promise<SheetHiddenStateResult> {
+    const sheet = await resolveSheet(request.sheetId)
+    const [manualRows, filter] = await Promise.all([
+      client.listHiddenRows!(sheet.idx),
+      client.getFilter!(sheet.idx),
+    ])
+    return {
+      kind: 'sheet-hidden-state',
+      sheetId: request.sheetId,
+      requestId: request.requestId,
+      revision: request.revision ?? revision,
+      manualRows,
+      filterRows: filter.hiddenRows,
+      // Wire shape is byte-identical to `ColumnFilterRule`; no mapping layer.
+      filterRules: filter.rules as ColumnFilterRule[],
+    }
+  }
+
   // Capability-gated port implementations. Exposed through getters below
   // so a runtime that declares `structuralEdits: false` / `formats: false`
   // in the `describeCapabilities` handshake makes the optional port read
@@ -2803,9 +2740,11 @@ export function createWorkerWorkbookSpreadsheetBackend(
       execute: async () => {
         await client.insertRows(sheet.idx, request.rowIndex, request.count)
         shiftMergeOverlay(request.sheetId, 'row', request.rowIndex, request.count, 1)
-        if (shiftFilterHiddenOverlay(request.sheetId, request.rowIndex, request.count, 1)) {
-          await pushEvalFilterHiddenRows(sheet.idx, filterHiddenRowsSnapshot(request.sheetId))
-        }
+        // The engine self-displaces its OWNED filter set on `insertRows`; this
+        // only keeps the projection mirror in step (no re-push). The undo
+        // before/after images are captured from the mirror in
+        // `recordStructuralMutation` around this `execute`.
+        shiftFilterHiddenOverlay(request.sheetId, request.rowIndex, request.count, 1)
         return structuralMutationResult(request, bumpRevision())
       },
     })
@@ -2822,9 +2761,8 @@ export function createWorkerWorkbookSpreadsheetBackend(
       execute: async () => {
         await client.deleteRows(sheet.idx, request.rowIndex, request.count)
         shiftMergeOverlay(request.sheetId, 'row', request.rowIndex, request.count, -1)
-        if (shiftFilterHiddenOverlay(request.sheetId, request.rowIndex, request.count, -1)) {
-          await pushEvalFilterHiddenRows(sheet.idx, filterHiddenRowsSnapshot(request.sheetId))
-        }
+        // Engine self-displaces its OWNED set on `deleteRows`; mirror follows.
+        shiftFilterHiddenOverlay(request.sheetId, request.rowIndex, request.count, -1)
         return structuralMutationResult(request, bumpRevision())
       },
     })
@@ -4116,67 +4054,39 @@ export function createWorkerWorkbookSpreadsheetBackend(
     },
 
     /**
-     * Parity item #29 — filter VISIBILITY on the worker path. The rules
-     * stay ui-core canonical (this ACK is what lets ui-core commit
-     * them); the adapter mirrors the payload and computes the visibility
-     * permutation with the shared pure helper at projection time, so the
-     * engine data is never reordered. Sorting is NOT part of this path
-     * at all: the display-permutation sort was retired with #24, and a
-     * physical sort goes through `sortRange` (which the TS runtime
-     * withholds — that host simply has no sort). The permutation is
-     * computed BEFORE acknowledging: an over-cap source rejects with
-     * FILTER_SORT_SOURCE_TOO_LARGE and the filter never activates —
-     * fail-closed, no silent truncation. Clearing (a no-effect payload)
-     * never scans and therefore always succeeds, so an over-cap state
-     * can always be exited.
+     * Parity item #29 — filter VISIBILITY on the worker path, routed through
+     * the engine since E5. The rules stay ui-core canonical (this ACK is what
+     * lets ui-core commit them); the adapter forwards them to `applyFilter`,
+     * which runs the predicate ONCE inside the engine and commits both the rules
+     * and the rows they hid. The returned `hiddenRows` IS the answer — the same
+     * host scan that used to compute it here is gone (the engine reproduced it
+     * cell-for-cell, verified at E3 over 7700 predicate judgments), and so is
+     * the separate eval-input push (the engine owns the set now, its
+     * `filter_hidden_epoch` bump re-derives SUBTOTAL on the normal `cellsDirty`
+     * path). An over-cap source rejects with `source-too-large`, mapped to the
+     * legacy `FILTER_SORT_SOURCE_TOO_LARGE` host error so ui-core's over-cap
+     * handling is unchanged — the filter never activates, fail-closed, no silent
+     * truncation. Clearing (a no-effect payload) calls `clearFilter` (scan-free,
+     * always succeeds), so an over-cap state can always be exited.
      *
-     * The same scan also feeds the engine (`design-filter-hidden-rows` §4.2,
-     * slice S4): its complement is the FILTER-hidden row set, pushed through
-     * `pushEvalFilterHiddenRows` before this ACK resolves so SUBTOTAL 1-11 and
-     * 101-111 both stop counting filtered-out rows. That push is the ONLY new
-     * side effect here — the visibility permutation and the compression path
-     * are untouched (they retire in S5).
+     * The port is capability-gated by `engineHiddenState`: the TS runtime
+     * declares it `false` (no engine predicate), so this getter reads
+     * `undefined` and ui-core hides the filter entry — fail-closed, never a fake
+     * scan the TS core cannot do.
      */
-    async setFilterSort(request: SetFilterSortRequest): Promise<SetFilterSortResult> {
-      const sheet = await resolveSheet(request.sheetId)
-      const next = cloneFilterSortState({ rules: request.rules })
+    get setFilterSort() {
+      return runtimeSupports('engineHiddenState') ? setFilterSortThroughWorker : undefined
+    },
 
-      if (!filterSortHasEffect(next)) {
-        filterSortStateBySheetId.delete(request.sheetId)
-        filterHiddenRowsBySheetId.delete(request.sheetId)
-        const nextRevision = bumpRevision()
-        // Clearing the filter must clear the engine's set too, or SUBTOTAL
-        // would keep excluding rows that are visible again.
-        await pushEvalFilterHiddenRows(sheet.idx, [])
-        return {
-          sheetId: request.sheetId,
-          requestId: request.requestId,
-          revision: request.revision ?? nextRevision,
-          // Explicitly empty, never absent: "the rules hid nothing" is the
-          // answer here, and UI core must clear its set on the strength of it.
-          hiddenRowIndices: [],
-        }
-      }
-
-      const { hiddenRows } = await computeFilterSortDisplayRows(sheet, next)
-      filterSortStateBySheetId.set(request.sheetId, next)
-      const nextRevision = bumpRevision()
-      // One scan, three destinations: the engine (so SUBTOTAL excludes the
-      // rows), this adapter's projection (so it withholds them) and — via the
-      // ACK below — UI core, which owns rendering and sort exclusion. They
-      // cannot disagree because none of them re-derives it.
-      filterHiddenRowsBySheetId.set(request.sheetId, new Set(hiddenRows))
-      // Unconditional whole-set replace rather than a diff against a local
-      // ledger: the push is idempotent, a filter application is a user-paced
-      // action (never a hot path), and a ledger would go stale against engine
-      // state the adapter does not own (snapshot restore, workbook reload).
-      await pushEvalFilterHiddenRows(sheet.idx, hiddenRows)
-      return {
-        sheetId: request.sheetId,
-        requestId: request.requestId,
-        revision: request.revision ?? nextRevision,
-        hiddenRowIndices: hiddenRows,
-      }
+    /**
+     * Read-back of the engine-owned hidden state (design §4.2), so ui-core can
+     * hydrate its render caches on sheet activation / restore. Combines
+     * `listHiddenRows` (manual) and `getFilter` (rules + derived filter rows) in
+     * one whole-sheet answer. Capability-gated by `engineHiddenState` — the TS
+     * runtime omits it and ui-core keeps its own canonical view fact.
+     */
+    get readSheetHiddenState() {
+      return runtimeSupports('engineHiddenState') ? readSheetHiddenStateThroughWorker : undefined
     },
 
     /**

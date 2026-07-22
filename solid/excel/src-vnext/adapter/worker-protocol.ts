@@ -319,6 +319,98 @@ export interface TableRegistrySnapshotWire {
   tables: TableJSONWire[]
 }
 
+// === Engine-owned hidden rows + filter wire (E5, design-engine-hidden-rows) ===
+//
+// The engine now OWNS the manually-hidden row set (E2) and the filter rules +
+// derived hidden set (E3). These wire shapes forward the E2/E3 wasm exports
+// (`hideRows` / `unhideRows` / `listHiddenRows` / `snapshotHidden` /
+// `restoreHidden` / `applyFilter` / `reapplyFilter` / `clearFilter` /
+// `getFilter` / `snapshotFilters` / `restoreFilters`) so the host adapter can
+// CALL the engine instead of pushing a set it computed itself.
+
+/**
+ * One column filter rule — the cross-language wire shape. Byte-for-byte the
+ * `ColumnFilterRule` union in `@einfach/spreadsheet-ui-core` and the
+ * `ColumnFilterRuleJSON` serde mirror in `rust/wasm`, so a host forwards its
+ * existing rule objects with no mapping layer. `list` compares RAW strings
+ * while `equals`/`contains` case-fold by default — a deliberate existing
+ * inconsistency the engine reproduces (design §5.2), not a wire bug.
+ */
+export type ColumnFilterRuleWire =
+  | { kind: 'equals'; colIndex: number; value: string; caseSensitive?: boolean }
+  | { kind: 'contains'; colIndex: number; value: string; caseSensitive?: boolean }
+  | { kind: 'range'; colIndex: number; min?: number; max?: number }
+  | { kind: 'list'; colIndex: number; values: readonly string[] }
+
+/**
+ * Success shape of `applyFilter` / `reapplyFilter` / `clearFilter`, mirroring
+ * the `sortRange` `{ ok: true, … }` convention so a caller discriminates on
+ * `ok` alone. `hiddenRows` is the 0-based SOURCE rows the rules hid for the
+ * WHOLE scanned extent — the answer the host returns verbatim on the
+ * `setFilterSort` ACK.
+ */
+export interface FilterApplyReportWire {
+  ok: true
+  hiddenRows: number[]
+  scannedRows: number
+  predicateCells: number
+}
+
+/**
+ * Structured refusal of a filter command — arrives INSIDE the resolved value
+ * (never a thrown exception), exactly like the wasm binding returns it.
+ * `source-too-large` is the engine-side twin of the adapter's legacy
+ * `FILTER_SORT_SOURCE_TOO_LARGE`; the filter does NOT activate and nothing is
+ * truncated.
+ */
+export type FilterApplyRejectCode =
+  | 'invalid-sheet'
+  | 'mutation-during-custom-call'
+  | 'source-too-large'
+  | 'invalid-payload'
+
+export interface FilterApplyRejectWire {
+  ok: false
+  code: FilterApplyRejectCode
+  message?: string
+}
+
+export type FilterApplyResultWire = FilterApplyReportWire | FilterApplyRejectWire
+
+/**
+ * One sheet's committed filter as `getFilter` returns it and as the
+ * `snapshotFilters` / `restoreFilters` envelope carries it. Sheet-INDEX keyed.
+ * A WHOLE-SHEET read on purpose: a host must know about hidden rows OUTSIDE the
+ * visible window to expand that window correctly.
+ */
+export interface SheetFilterStateWire {
+  sheet: number
+  rules: ColumnFilterRuleWire[]
+  hiddenRows: number[]
+}
+
+/** One sheet's manually-hidden rows — element of the `snapshotHidden` envelope. */
+export interface SheetHiddenRowsWire {
+  sheet: number
+  rows: number[]
+}
+
+/**
+ * `snapshotHidden` / `restoreHidden` envelope (whole-workbook undo
+ * before-image). Restoring an empty `hidden` array CLEARS every sheet's manual
+ * set — that is the point of REPLACE, not a no-op.
+ */
+export interface HiddenRowsSnapshotWire {
+  version: number
+  hidden: SheetHiddenRowsWire[]
+}
+
+/** `snapshotFilters` / `restoreFilters` envelope, versioned like its hidden twin. */
+export interface FilterSnapshotWire {
+  version: number
+  filters: SheetFilterStateWire[]
+}
+
 export interface WorkbookPersistenceSheetWire {
   idx: number
   name: string
@@ -397,6 +489,18 @@ export interface WorkerRuntimeCapabilitiesWire {
    * family trusted.
    */
   structuredTables: boolean
+  /**
+   * The engine OWNS hidden rows + filter (design-engine-hidden-rows E2/E3) and
+   * exposes the caller surface: `applyFilter` / `reapplyFilter` / `clearFilter`
+   * / `getFilter` / `hideRows` / `unhideRows` / `listHiddenRows` plus the
+   * snapshot/restore undo primitives. The host adapter routes `setFilterSort`
+   * and `readSheetHiddenState` through these ports. The TS runtime has no such
+   * engine and declares this `false`, so the adapter withholds `setFilterSort`
+   * and `readSheetHiddenState` (fail-closed — filter hides its UI entry rather
+   * than the host faking a scan the engine cannot do). The WASM runtime's null
+   * witness keeps the family trusted.
+   */
+  engineHiddenState: boolean
 }
 
 export interface WorkerWorkbookSheetDebugCountersWire {
@@ -538,6 +642,34 @@ export interface WorkerWorkbookClient {
    */
   snapshotTables?(): Promise<TableRegistrySnapshotWire>
   restoreTables?(snapshot: TableRegistrySnapshotWire): Promise<number>
+  /**
+   * Engine-owned hidden rows + filter (design-engine-hidden-rows E2/E3, wired
+   * on the host in E5). All optional so hand-rolled client doubles keep
+   * compiling and the TS runtime answers `UNSUPPORTED`; the host adapter guards
+   * presence + the `engineHiddenState` capability before use.
+   *
+   * `applyFilter` runs the predicate ONCE inside the engine and commits both
+   * the rules and the rows they hid, resolving `{ ok: true, hiddenRows, … }` or
+   * a structured `{ ok: false, code }` (never a thrown exception — a refusal
+   * rides in the resolved value, `sortRange` convention). `reapplyFilter`
+   * re-runs the ALREADY COMMITTED rules; `clearFilter` drops rules + rows.
+   * `getFilter` is a WHOLE-SHEET read (rules + derived hidden rows outside the
+   * viewport too). `hideRows`/`unhideRows` add/remove manual rows and resolve
+   * whether anything changed; `listHiddenRows` reads the manual set.
+   * `snapshot*`/`restore*` are the whole-workbook undo primitives (REPLACE
+   * semantics: an empty payload CLEARS).
+   */
+  applyFilter?(sheet: number, rules: readonly ColumnFilterRuleWire[]): Promise<FilterApplyResultWire>
+  reapplyFilter?(sheet: number): Promise<FilterApplyResultWire>
+  clearFilter?(sheet: number): Promise<FilterApplyResultWire>
+  getFilter?(sheet: number): Promise<SheetFilterStateWire>
+  hideRows?(sheet: number, rows: readonly number[]): Promise<boolean>
+  unhideRows?(sheet: number, rows: readonly number[]): Promise<boolean>
+  listHiddenRows?(sheet: number): Promise<number[]>
+  snapshotHidden?(): Promise<HiddenRowsSnapshotWire>
+  restoreHidden?(snapshot: HiddenRowsSnapshotWire): Promise<number>
+  snapshotFilters?(): Promise<FilterSnapshotWire>
+  restoreFilters?(snapshot: FilterSnapshotWire): Promise<number>
   beginImport(
     sessionIdOrOptions?: number | BeginImportOptionsWire,
     options?: BeginImportOptionsWire,
@@ -876,6 +1008,39 @@ export function createWorkerWorkbook(opts: WorkerWorkbookOptions): WorkerWorkboo
     },
     restoreTables(snapshot) {
       return request<number>('restoreTables', { snapshot })
+    },
+    applyFilter(sheet, rules) {
+      return request<FilterApplyResultWire>('applyFilter', { sheet, rules: [...rules] })
+    },
+    reapplyFilter(sheet) {
+      return request<FilterApplyResultWire>('reapplyFilter', { sheet })
+    },
+    clearFilter(sheet) {
+      return request<FilterApplyResultWire>('clearFilter', { sheet })
+    },
+    getFilter(sheet) {
+      return request<SheetFilterStateWire>('getFilter', { sheet })
+    },
+    hideRows(sheet, rows) {
+      return request<boolean>('hideRows', { sheet, rows: [...rows] })
+    },
+    unhideRows(sheet, rows) {
+      return request<boolean>('unhideRows', { sheet, rows: [...rows] })
+    },
+    listHiddenRows(sheet) {
+      return request<number[]>('listHiddenRows', { sheet })
+    },
+    snapshotHidden() {
+      return request<HiddenRowsSnapshotWire>('snapshotHidden')
+    },
+    restoreHidden(snapshot) {
+      return request<number>('restoreHidden', { snapshot })
+    },
+    snapshotFilters() {
+      return request<FilterSnapshotWire>('snapshotFilters')
+    },
+    restoreFilters(snapshot) {
+      return request<number>('restoreFilters', { snapshot })
     },
     beginImport(sessionIdOrOptions, options) {
       const sessionId =

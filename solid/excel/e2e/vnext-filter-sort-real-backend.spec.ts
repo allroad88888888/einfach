@@ -30,6 +30,14 @@ async function gotoWorkerDemo(page: Page) {
   await expect(cellDisplay(page, 'C2')).toHaveText('13', { timeout: 30_000 })
 }
 
+function activeProjectIsWasm(): boolean {
+  try {
+    return test.info().project.name !== 'ts'
+  } catch {
+    return true
+  }
+}
+
 function filterDropdown(page: Page) {
   return page.getByTestId('vnext-worker-filter-dropdown')
 }
@@ -47,6 +55,18 @@ async function applyEqualsFilterOnColumnA(page: Page, value: string) {
 }
 
 test.describe('vNext filter real-backend evidence', () => {
+  // Since E5 the filter predicate is engine-owned (design-engine-hidden-rows):
+  // the WASM worker runs it, but the TS worker declares `engineHiddenState:false`
+  // and the adapter WITHHOLDS `setFilterSort` (fail-closed, §10.3). So these
+  // apply-a-filter tests only run on the WASM project; the `ts` project asserts
+  // the withheld entry below instead.
+  test.beforeEach(() => {
+    test.skip(
+      !activeProjectIsWasm(),
+      'filter predicate is engine-owned since E5 — the TS worker fail-closes filter',
+    )
+  })
+
   test.afterEach(async ({ page }) => {
     await expectNoConsoleErrors(page)
   })
@@ -151,5 +171,28 @@ test.describe('vNext filter real-backend evidence', () => {
     await expect(cellDisplay(page, 'A2')).toHaveText('cell1')
     await expect(page.locator('th.spreadsheet-grid-row-header[data-row="2"]')).toHaveCount(0)
     await expect(cellDisplay(page, 'A4')).toHaveText('cell4')
+  })
+})
+
+test.describe('vNext filter fail-closed on the TS worker (E5)', () => {
+  test.beforeEach(() => {
+    test.skip(activeProjectIsWasm(), 'this contract is specific to the TS worker backend')
+  })
+
+  test('the filter entry is withheld because the predicate is engine-owned', async ({ page }) => {
+    guardConsoleErrors(page)
+    await gotoRoot(page)
+    await page.getByRole('button', { name: 'vNext Worker', exact: true }).click()
+    await expect(page.getByTestId('vnext-worker-grid')).toBeVisible({ timeout: 30_000 })
+    await page.locator('th.spreadsheet-grid-col-header[data-col="0"]').click()
+
+    // The TS core has no engine predicate (design §5.2), so the adapter withholds
+    // `setFilterSort` and the toolbar filter button is disabled — never a fake
+    // scan the TS worker cannot run. (The button's tooltip is the standard
+    // "Filter and sort are unavailable because this workbook does not provide
+    // setFilterSort." degradation message.)
+    await expect(page.getByTestId('toolbar-btn-filter')).toBeDisabled()
+
+    await expectNoConsoleErrors(page)
   })
 })

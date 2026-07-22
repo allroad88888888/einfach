@@ -149,9 +149,34 @@ describe('TS worker runtime — structured UNSUPPORTED instead of success-shaped
       evalHiddenRows: false,
       evalFilterHiddenRows: false,
       structuredTables: false,
+      engineHiddenState: false,
     }
     expect(expectOk(await raw({ cmd: 'describeCapabilities' }))).toEqual(witness)
     expect({ ...TS_WORKER_RUNTIME_CAPABILITIES }).toEqual(witness)
+  })
+
+  test('engine-owned hidden/filter commands refuse with UNSUPPORTED (no fake predicate ACKs)', async () => {
+    const { raw } = makeRpc()
+    await raw({ cmd: 'initWorkbook', sheets: ['Sheet1'] })
+
+    // The engine that OWNS hidden rows + filter lives in rust/excel-core only.
+    // A fake `applyFilter` would leave the host believing rows are filtered away
+    // when the TS core cannot evaluate the predicate; an empty `getFilter` /
+    // `listHiddenRows` would read as "nothing hidden" — both lies. Refuse every
+    // command honestly (`engineHiddenState: false`).
+    expectUnsupported(
+      await raw({ cmd: 'applyFilter', sheet: 0, rules: [{ kind: 'range', colIndex: 0, min: 1 }] }),
+    )
+    expectUnsupported(await raw({ cmd: 'reapplyFilter', sheet: 0 }))
+    expectUnsupported(await raw({ cmd: 'clearFilter', sheet: 0 }))
+    expectUnsupported(await raw({ cmd: 'getFilter', sheet: 0 }))
+    expectUnsupported(await raw({ cmd: 'hideRows', sheet: 0, rows: [1, 3] }))
+    expectUnsupported(await raw({ cmd: 'unhideRows', sheet: 0, rows: [1, 3] }))
+    expectUnsupported(await raw({ cmd: 'listHiddenRows', sheet: 0 }))
+    expectUnsupported(await raw({ cmd: 'snapshotHidden' }))
+    expectUnsupported(await raw({ cmd: 'restoreHidden', snapshot: { version: 1, hidden: [] } }))
+    expectUnsupported(await raw({ cmd: 'snapshotFilters' }))
+    expectUnsupported(await raw({ cmd: 'restoreFilters', snapshot: { version: 1, filters: [] } }))
   })
 
   test('table CRUD commands refuse with UNSUPPORTED (no fake registry ACKs)', async () => {
@@ -402,6 +427,13 @@ describe('TS worker backend — the capability handshake withholds unimplemented
     expect(backend.deleteTable).toBeUndefined()
     expect(backend.listTables).toBeUndefined()
     expect(backend.getTable).toBeUndefined()
+    // Engine-owned hidden state: the TS runtime declares `engineHiddenState:
+    // false`, so filter (`setFilterSort`) and the hidden-state read-back
+    // (`readSheetHiddenState`) are withheld — UI-core hides the filter entry and
+    // keeps its own canonical view fact instead of hydrating from a source that
+    // cannot answer.
+    expect(backend.setFilterSort).toBeUndefined()
+    expect(backend.readSheetHiddenState).toBeUndefined()
 
     backend.dispose()
   })
@@ -514,6 +546,10 @@ describe('legacy runtimes without the handshake keep the full-trust contract (WA
     expect(typeof backend.deleteTable).toBe('function')
     expect(typeof backend.listTables).toBe('function')
     expect(typeof backend.getTable).toBe('function')
+    // Full-trust null witness keeps the engine-owned filter + hidden-state
+    // read-back ports exposed too.
+    expect(typeof backend.setFilterSort).toBe('function')
+    expect(typeof backend.readSheetHiddenState).toBe('function')
 
     backend.dispose()
   })

@@ -287,37 +287,28 @@ describe('worker adapter merge overlay — real in-process TS runtime', () => {
     backend.dispose()
   })
 
-  test('filter active keeps merge metadata; the row it hides just stops rendering', async () => {
+  test('filter is fail-closed on the TS runtime; merge metadata is untouched', async () => {
     const backend = await createTsBackend()
-    // Header + data column the filter predicates on.
     await setInput(backend, 0, 0, 'H')
     await setInput(backend, 1, 0, 'keep')
     await setInput(backend, 2, 0, 'drop')
     await setInput(backend, 3, 0, 'keep')
     await backend.mergeRange!({ kind: 'merge-range', sheetId: SHEET, range: B2_C3 })
 
-    await backend.setFilterSort!({
-      kind: 'set-filter-sort',
-      sheetId: SHEET,
-      rules: [{ kind: 'equals', colIndex: 0, value: 'keep' }],
-    })
-    const filtered = await readCells(backend, WINDOW)
-    // Source row 3 stays at row 3 (it does NOT slide up into row 2), and row 2
-    // is withheld entirely. Merge coordinates are source facts, and source
-    // coordinates are now the only coordinates, so the span survives: the
-    // wholesale suppression existed only to avoid drawing a span across a
-    // permuted row space, and there is no permutation left to lie about.
-    expect(cellAt(filtered, 3, 0)?.displayValue).toBe('keep')
-    expect(filtered.some((cell) => cell.row === 2)).toBe(false)
-    expect(cellAt(filtered, 1, 1)?.mergedSpan).toEqual({ rows: 2, cols: 2 })
+    // Since E5 the filter predicate is engine-owned; the TS runtime has no
+    // engine, so it declares `engineHiddenState: false` and the adapter
+    // WITHHOLDS `setFilterSort` (fail-closed). The merge+withhold interaction —
+    // readRange applies the merge overlay BEFORE withholding filter-hidden rows,
+    // so a span survives even when a spanned row is hidden — is unchanged adapter
+    // logic exercised on the engine path (`vnext-worker-filter-subtotal-wasm`,
+    // `vnext-worker-filter-sort`); it simply cannot arise on this runtime.
+    expect(backend.setFilterSort).toBeUndefined()
 
-    await backend.setFilterSort!({
-      kind: 'set-filter-sort',
-      sheetId: SHEET,
-      rules: [],
-    })
-    const restored = await readCells(backend, WINDOW)
-    expect(cellAt(restored, 1, 1)?.mergedSpan).toEqual({ rows: 2, cols: 2 })
+    // With no filter possible, the merge span is exactly as merged and every
+    // row is present.
+    const cells = await readCells(backend, WINDOW)
+    expect(cellAt(cells, 2, 0)?.displayValue).toBe('drop')
+    expect(cellAt(cells, 1, 1)?.mergedSpan).toEqual({ rows: 2, cols: 2 })
     backend.dispose()
   })
 

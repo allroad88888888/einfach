@@ -21,6 +21,11 @@ import type {
   SortRangeRejectWire,
   SortRangeReportWire,
   SparseCellWire,
+  ColumnFilterRuleWire,
+  FilterApplyResultWire,
+  SheetFilterStateWire,
+  HiddenRowsSnapshotWire,
+  FilterSnapshotWire,
   TableJSONWire,
   TableRegistrySnapshotWire,
   TableRejectCode,
@@ -204,6 +209,26 @@ type WasmWorkbookRuntime = {
    */
   snapshotTables?: () => TableRegistrySnapshotWire
   restoreTables?: (snapshot: TableRegistrySnapshotWire) => number
+  /**
+   * Engine-owned hidden rows + filter (design-engine-hidden-rows E2/E3). The
+   * three filter commands return the `{ ok, … }` union in their resolved value
+   * (a structured refusal is NEVER a throw — `sortRange` convention); only a
+   * serialization failure throws. `getFilter` is a whole-sheet read;
+   * `snapshot*`/`restore*` are the whole-workbook undo primitives. Optional so
+   * a wasm-pkg predating the exports and test mocks keep compiling —
+   * `assertMethod` guards the call at dispatch time.
+   */
+  applyFilter?: (sheetIdx: number, payload: { rules: ColumnFilterRuleWire[] }) => FilterApplyResultWire
+  reapplyFilter?: (sheetIdx: number) => FilterApplyResultWire
+  clearFilter?: (sheetIdx: number) => FilterApplyResultWire
+  getFilter?: (sheetIdx: number) => SheetFilterStateWire
+  hideRows?: (sheetIdx: number, rows: Uint32Array | number[]) => boolean
+  unhideRows?: (sheetIdx: number, rows: Uint32Array | number[]) => boolean
+  listHiddenRows?: (sheetIdx: number) => number[]
+  snapshotHidden?: () => HiddenRowsSnapshotWire
+  restoreHidden?: (snapshot: HiddenRowsSnapshotWire) => number
+  snapshotFilters?: () => FilterSnapshotWire
+  restoreFilters?: (snapshot: FilterSnapshotWire) => number
   snapshot_persistence_v1?: () => WorkbookPersistenceSnapshotWire
   restore_persistence_v1?: (
     snapshot: WorkbookPersistenceSnapshotWire,
@@ -1055,6 +1080,21 @@ function normalizeStructuralIndex(value: unknown, name: string): number {
   return index
 }
 
+/**
+ * Sanitize a whole-set row list (`hideRows` / `unhideRows`), dropping
+ * non-integers and negatives — the same defensive coercion the eval-input
+ * pushes apply.
+ */
+function sanitizeRowList(value: unknown): number[] {
+  const raw = Array.isArray(value) ? (value as unknown[]) : []
+  const rows: number[] = []
+  for (const entry of raw) {
+    const index = Number(entry)
+    if (Number.isInteger(index) && index >= 0) rows.push(index)
+  }
+  return rows
+}
+
 function normalizeStructuralCount(value: unknown): number {
   const count = Number(value)
   if (!Number.isInteger(count) || count < 1) {
@@ -1686,6 +1726,89 @@ export function installWorkerRuntime() {
             const restoreTables = assertMethod(wb, 'restoreTables')
             const snapshot = msg.snapshot as TableRegistrySnapshotWire
             dispatchTable(msg.id, () => restoreTables.call(wb, snapshot))
+          }
+          break
+        // --- Engine-owned hidden rows + filter (E5) --------------------------
+        //
+        // The three filter commands forward the engine's `{ ok, … }` union
+        // VERBATIM: a structured refusal (`source-too-large`, `invalid-sheet`)
+        // rides in the resolved value, exactly as the wasm binding returns it,
+        // so the host adapter discriminates on `ok` and never sees a throw for
+        // a refusal. Only a serialization failure throws → outer toRpcError.
+        case 'applyFilter':
+          {
+            const sheet = Number(msg.sheet)
+            const applyFilter = assertMethod(wb, 'applyFilter')
+            const rules = (Array.isArray(msg.rules) ? msg.rules : []) as ColumnFilterRuleWire[]
+            postResponse(msg.id, applyFilter.call(wb, sheet, { rules }) as FilterApplyResultWire)
+          }
+          break
+        case 'reapplyFilter':
+          {
+            const sheet = Number(msg.sheet)
+            const reapplyFilter = assertMethod(wb, 'reapplyFilter')
+            postResponse(msg.id, reapplyFilter.call(wb, sheet) as FilterApplyResultWire)
+          }
+          break
+        case 'clearFilter':
+          {
+            const sheet = Number(msg.sheet)
+            const clearFilter = assertMethod(wb, 'clearFilter')
+            postResponse(msg.id, clearFilter.call(wb, sheet) as FilterApplyResultWire)
+          }
+          break
+        case 'getFilter':
+          {
+            const sheet = Number(msg.sheet)
+            const getFilter = assertMethod(wb, 'getFilter')
+            postResponse(msg.id, getFilter.call(wb, sheet) as SheetFilterStateWire)
+          }
+          break
+        case 'hideRows':
+          {
+            const sheet = normalizeStructuralIndex(msg.sheet, 'sheet index')
+            const rows = sanitizeRowList(msg.rows)
+            postResponse(msg.id, assertMethod(wb, 'hideRows').call(wb, sheet, rows) as boolean)
+          }
+          break
+        case 'unhideRows':
+          {
+            const sheet = normalizeStructuralIndex(msg.sheet, 'sheet index')
+            const rows = sanitizeRowList(msg.rows)
+            postResponse(msg.id, assertMethod(wb, 'unhideRows').call(wb, sheet, rows) as boolean)
+          }
+          break
+        case 'listHiddenRows':
+          {
+            const sheet = Number(msg.sheet)
+            const listHiddenRows = assertMethod(wb, 'listHiddenRows')
+            postResponse(msg.id, listHiddenRows.call(wb, sheet) as number[])
+          }
+          break
+        case 'snapshotHidden':
+          {
+            const snapshotHidden = assertMethod(wb, 'snapshotHidden')
+            postResponse(msg.id, snapshotHidden.call(wb) as HiddenRowsSnapshotWire)
+          }
+          break
+        case 'restoreHidden':
+          {
+            const restoreHidden = assertMethod(wb, 'restoreHidden')
+            const snapshot = msg.snapshot as HiddenRowsSnapshotWire
+            postResponse(msg.id, restoreHidden.call(wb, snapshot) as number)
+          }
+          break
+        case 'snapshotFilters':
+          {
+            const snapshotFilters = assertMethod(wb, 'snapshotFilters')
+            postResponse(msg.id, snapshotFilters.call(wb) as FilterSnapshotWire)
+          }
+          break
+        case 'restoreFilters':
+          {
+            const restoreFilters = assertMethod(wb, 'restoreFilters')
+            const snapshot = msg.snapshot as FilterSnapshotWire
+            postResponse(msg.id, restoreFilters.call(wb, snapshot) as number)
           }
           break
         case 'setFormatRange':

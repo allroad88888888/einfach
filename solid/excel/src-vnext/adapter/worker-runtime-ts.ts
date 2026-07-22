@@ -134,6 +134,13 @@ export const TS_WORKER_RUNTIME_CAPABILITIES: WorkerRuntimeCapabilitiesWire = Obj
   // withholds the six table CRUD ports (fail-closed); WASM is the only
   // real Table path (design-excel-table.md §1/§10).
   structuredTables: false,
+  // The TS core does not OWN hidden rows or filter (design-engine-hidden-rows
+  // E2/E3 landed in rust/excel-core only). Declaring `false` withholds the host
+  // `setFilterSort` and `readSheetHiddenState` ports, so on this runtime filter
+  // hides its UI entry (fail-closed) rather than the adapter faking a predicate
+  // scan the engine cannot run. Every apply/reapply/clear/hide/unhide/list/
+  // getFilter/snapshot/restore command answers a structured `UNSUPPORTED`.
+  engineHiddenState: false,
 })
 
 const CUSTOM_FORMULA_ERROR_CODES: readonly ErrorCode[] = [
@@ -1543,6 +1550,26 @@ export function createWorkerRuntimeTs(events?: WorkerRuntimeTsEvents): ExcelCore
         // `snapshotTables` envelope replayed through `restoreTables` would
         // CLEAR a registry rather than restore one).
         return unsupported(`${String(msg.cmd)} (structured tables)`)
+      case 'applyFilter':
+      case 'reapplyFilter':
+      case 'clearFilter':
+      case 'getFilter':
+      case 'hideRows':
+      case 'unhideRows':
+      case 'listHiddenRows':
+      case 'snapshotHidden':
+      case 'restoreHidden':
+      case 'snapshotFilters':
+      case 'restoreFilters':
+        // Fail-closed: the engine that OWNS hidden rows + filter
+        // (design-engine-hidden-rows E2/E3) lives in rust/excel-core only. The
+        // `engineHiddenState: false` witness withholds the host `setFilterSort`
+        // and `readSheetHiddenState` ports, so a compliant adapter never sends
+        // these; if one does, refuse honestly rather than fake an ACK. An empty
+        // `getFilter`/`listHiddenRows` would read as "nothing hidden" — a lie —
+        // and a fake `applyFilter` would leave the host believing rows are
+        // filtered away when the TS core cannot evaluate the predicate.
+        return unsupported(`${String(msg.cmd)} (engine hidden-row state)`)
       case 'setFormatRange':
         // Fail-closed: was "succeed with 0 cells affected".
         return unsupported('setFormatRange (formats)')
