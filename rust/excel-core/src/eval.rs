@@ -19685,10 +19685,13 @@ fn stat_phi(args: &[Expr], provider: &dyn EvalProvider) -> Value {
 /// - `SUBTOTAL(1-11)` excludes FILTER-hidden rows but INCLUDES manually
 ///   hidden ones → [`ExcludeFilter`](Self::ExcludeFilter).
 /// - `SUBTOTAL(101-111)` excludes both → [`ExcludeFilterAndManual`].
-/// - `AGGREGATE` currently honours neither (its ignore-hidden option bits are
-///   parsed but not applied — TODO #32 §6.3) → [`IncludeAll`](Self::IncludeAll),
-///   which touches no provider hook and therefore registers no epoch edge,
-///   preserving that function's existing behaviour byte-for-byte.
+/// - `AGGREGATE` maps its ignore-hidden option bit (`& 1`, options 1/3/5/7)
+///   onto a two-way pick (#32 §6.3, verified on real Excel): bit SET →
+///   [`ExcludeFilterAndManual`] (drops BOTH sets), bit CLEAR →
+///   [`IncludeAll`](Self::IncludeAll), which touches no provider hook and
+///   therefore registers no epoch edge. AGGREGATE never uses the
+///   [`ExcludeFilter`](Self::ExcludeFilter) filter-only tier — that is the
+///   `SUBTOTAL(1-11)`-only middle case.
 ///
 /// [`ExcludeFilterAndManual`]: Self::ExcludeFilterAndManual
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -20066,6 +20069,20 @@ fn fn_aggregate(args: &[Expr], provider: &dyn EvalProvider) -> Value {
     // `& 2` — `& 4` would have been the nested-function bit and mis-mapped
     // options 2/3 (silently NOT ignoring) and 4/5 (wrongly ignoring).
     let ignore_errors = (options & 2) != 0;
+    // AGGREGATE's ignore-hidden bit (`& 1`, options 1/3/5/7) is a UNIFIED
+    // switch over BOTH the manually-hidden AND the filter-hidden set —
+    // verified against real Excel (#32 §6.3): with the bit SET a manual hide
+    // and a filter hide are BOTH dropped; with it CLEAR BOTH are kept (even
+    // filter-hidden rows still count). Unlike SUBTOTAL there is no "filter
+    // only" tier here, so this is a straight two-way pick.
+    // `subtotal_hidden_for_arg` touches the provider hidden hooks ONLY under
+    // `ExcludeFilterAndManual`, so the two hidden epoch edges register exactly
+    // when the bit is set and never when it is clear.
+    let hidden_policy = if (options & 1) != 0 {
+        SubtotalHiddenPolicy::ExcludeFilterAndManual
+    } else {
+        SubtotalHiddenPolicy::IncludeAll
+    };
 
     let (data_args, k_arg): (&[Expr], Option<&Expr>) = if (14..=19).contains(&fn_int) {
         if args.len() < 4 {
@@ -20077,6 +20094,11 @@ fn fn_aggregate(args: &[Expr], provider: &dyn EvalProvider) -> Value {
         (&args[2..], None)
     };
 
+    // Numeric collection shared by the ignore-errors 1-11 arms and every
+    // k-arg / MEDIAN / MODE arm below. Hidden-row exclusion rides the same
+    // per-argument `subtotal_hidden_for_arg` seam SUBTOTAL uses, so the
+    // `options & 1` bit is honoured here identically to the `run_subtotal`
+    // path (empty sets under `IncludeAll` => no filtering, no epoch edge).
     let collect_nums_skip_errors = |args_inner: &[Expr]| -> Result<Vec<f64>, ValueError> {
         let mut out = Vec::new();
         let mut err: Option<ValueError> = None;
@@ -20084,7 +20106,8 @@ fn fn_aggregate(args: &[Expr], provider: &dyn EvalProvider) -> Value {
             if err.is_some() {
                 break;
             }
-            for_each_arg_value(arg, provider, &mut |_addr, v| {
+            let hidden = subtotal_hidden_for_arg(arg, provider, hidden_policy);
+            for_each_subtotal_value(arg, provider, &hidden, &mut |v| {
                 if err.is_some() {
                     return;
                 }
@@ -20106,21 +20129,12 @@ fn fn_aggregate(args: &[Expr], provider: &dyn EvalProvider) -> Value {
     match fn_int {
         1..=11 => {
             if !ignore_errors {
-                // AGGREGATE's ignore-hidden lives in its `options` bit
-                // (1/3/5/7), NOT the 100+ SUBTOTAL convention — so hidden
-                // exclusion stays off here (`IncludeAll`), and neither hidden
-                // epoch edge is registered.
-                // TODO(#32 §6.3): options 1/3/5/7 can reuse the SUBTOTAL
-                // `subtotal_hidden_for_arg` seam, which now carries BOTH
-                // sources (`design-filter-hidden-rows` §9.3); explicitly out
-                // of the T4 acceptance scope (design §3.2) and out of the
-                // filter-hidden S1 scope (`design-filter-hidden-rows` §12-3).
-                return run_subtotal(
-                    fn_int as u32,
-                    data_args,
-                    provider,
-                    SubtotalHiddenPolicy::IncludeAll,
-                );
+                // Errors propagate (bit `& 2` clear) => reuse the streaming
+                // SUBTOTAL body, now with the ignore-hidden bit mapped onto its
+                // policy. `IncludeAll` keeps every row and registers no epoch
+                // edge; `ExcludeFilterAndManual` drops both hidden sets and
+                // registers both edges (#32 §6.3).
+                return run_subtotal(fn_int as u32, data_args, provider, hidden_policy);
             }
             let nums = match collect_nums_skip_errors(data_args) {
                 Ok(v) => v,
@@ -20135,9 +20149,13 @@ fn fn_aggregate(args: &[Expr], provider: &dyn EvalProvider) -> Value {
                 }
                 2 => Value::Number(nums.len() as f64),
                 3 => {
+                    // COUNTA under the ignore-errors path: same per-argument
+                    // hidden filter as the numeric collector so `options & 1`
+                    // drops hidden rows from the non-null count too.
                     let mut count = 0u64;
                     for arg in data_args {
-                        for_each_arg_value(arg, provider, &mut |_addr, v| match v {
+                        let hidden = subtotal_hidden_for_arg(arg, provider, hidden_policy);
+                        for_each_subtotal_value(arg, provider, &hidden, &mut |v| match v {
                             Value::Error(_) => {}
                             Value::Null => {}
                             _ => count += 1,
