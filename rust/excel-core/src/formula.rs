@@ -863,6 +863,7 @@ impl Parser {
             ("#TYPE!", ValueError::WrongType),
             ("#ARGS!", ValueError::WrongArgCount),
             ("#BUSY!", ValueError::Busy),
+            ("#REMOTE!", ValueError::Remote),
             ("#REF!", ValueError::InvalidRef),
             ("#NUM!", ValueError::Overflow),
             ("#N/A", ValueError::NotAvailable),

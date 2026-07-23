@@ -47,6 +47,9 @@ pub enum ValueError {
     /// per-call result atom is written and dependents recompute. Propagates
     /// through the normal error short-circuit so dependents show pending too.
     Busy, // #BUSY!
+    /// Remote formula call failed (network error, timeout, or bad gateway).
+    /// Surfaced as #REMOTE!.
+    Remote, // #REMOTE!
 }
 
 impl std::fmt::Display for ValueError {
@@ -65,6 +68,7 @@ impl std::fmt::Display for ValueError {
             ValueError::Spill => write!(f, "#SPILL!"),
             ValueError::Calc => write!(f, "#CALC!"),
             ValueError::Busy => write!(f, "#BUSY!"),
+            ValueError::Remote => write!(f, "#REMOTE!"),
         }
     }
 }

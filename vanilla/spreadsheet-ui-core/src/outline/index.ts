@@ -657,3 +657,7 @@ registerHistoryLocalReplayApplier(
     return true
   },
 )
+
+// Re-exported for the persistence module (src/outline/persistence.ts) which needs
+// write access to the backing atom to seed hydration from a backend port.
+export { outlineBackingAtom }

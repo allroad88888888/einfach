@@ -6736,3 +6736,52 @@ mod tests {
     // linear-memory ceiling is the only remaining bound and it manifests
     // as a runtime allocation failure, not a structured `Result::Err`.
 }
+
+#[wasm_bindgen]
+impl WasmWorkbook {
+    /// Drain pending remote calls. Returns Array of {callId, url, args}.
+    pub fn drain_remote_pending(&mut self) -> JsValue {
+        let arr = js_sys::Array::new();
+        for call in self.workbook.take_pending_remote_calls() {
+            let obj = js_sys::Object::new();
+            let _ = js_sys::Reflect::set(&obj, &JsValue::from_str("callId"), &JsValue::from_f64(call.call_id as f64));
+            let _ = js_sys::Reflect::set(&obj, &JsValue::from_str("url"), &JsValue::from_str(&call.url));
+            let js_args = js_sys::Array::new();
+            for (i, arg) in call.args.iter().enumerate() {
+                js_args.set(i as u32, value_to_js(arg));
+            }
+            let _ = js_sys::Reflect::set(&obj, &JsValue::from_str("args"), &js_args);
+            arr.push(&obj);
+        }
+        arr.into()
+    }
+
+    /// Feed a successful remote result back to the engine.
+    pub fn fulfill_remote(&mut self, call_id: f64, result: JsValue) -> bool {
+        let value = js_to_value(&result);
+        self.workbook.resolve_remote_call(call_id as u64, value).unwrap_or(false)
+    }
+
+    /// Reject a remote call.
+    pub fn reject_remote(&mut self, call_id: f64, error_kind: &str) -> bool {
+        use einfach_excel_core::workbook::RemoteErrorKind;
+        let kind = match error_kind {
+            "network" => RemoteErrorKind::Network,
+            "timeout" => RemoteErrorKind::Timeout,
+            "invalidUrl" => RemoteErrorKind::InvalidUrl,
+            "badResponse" => RemoteErrorKind::BadResponse,
+            _ => RemoteErrorKind::Network,
+        };
+        self.workbook.reject_remote_call(call_id as u64, kind).unwrap_or(false)
+    }
+
+    /// Force-recompute all REMOTE() cells.
+    pub fn invalidate_remote_cache(&mut self) {
+        self.workbook.invalidate_remote_cache();
+    }
+
+    /// Diagnostics probe.
+    pub fn remote_entry_count(&self) -> u32 {
+        self.workbook.remote_entry_count() as u32
+    }
+}

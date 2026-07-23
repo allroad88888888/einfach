@@ -1253,3 +1253,45 @@ export interface PublishLocalPresenceRequest extends SheetRef {
 }
 
 export type SubscribePresenceUnsubscribe = () => void
+
+// ── outline persistence (UI-core canonical grouping/collapse metadata) ──────
+
+/**
+ * Portable wire shape for one outline group. Self-contained so backends
+ * never import outline internals. `start`/`end` are 0-based inclusive
+ * indices; `collapsed` is false when the constituent rows/columns are visible.
+ */
+export interface OutlinePersistenceGroup {
+  readonly start: number
+  readonly end: number
+  readonly collapsed: boolean
+}
+
+/** Read-back request for the outline metadata of one sheet. */
+export interface ReadOutlineProjectionRequest extends SheetRef {
+  kind: 'read-outline'
+  requestId?: ProjectionRequestId
+  revision?: ProjectionRevision
+}
+
+/** Result of a read-outline persistence call. */
+export interface OutlineProjectionResult extends SheetRef {
+  kind: 'outline-projection'
+  rowGroups?: readonly OutlinePersistenceGroup[]
+  colGroups?: readonly OutlinePersistenceGroup[]
+  requestId?: ProjectionRequestId
+  revision?: ProjectionRevision
+}
+
+/** Write the full outline group list for ONE axis. Whole-set replace. */
+export interface SetOutlineGroupsRequest extends SheetRef {
+  kind: 'set-outline-groups'
+  axis: 'row' | 'column'
+  groups: readonly OutlinePersistenceGroup[]
+  requestId?: ProjectionRequestId
+  revision?: ProjectionRevision
+}
+
+// Optional outline persistence ports on SpreadsheetBackend:
+//   readOutlineProjection?(request: ReadOutlineProjectionRequest): Promise<OutlineProjectionResult>
+//   setOutlineGroups?(request: SetOutlineGroupsRequest): Promise<BackendMutationResult>

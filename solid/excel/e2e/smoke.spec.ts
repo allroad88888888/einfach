@@ -71,16 +71,6 @@ test.describe('Solid Excel smoke', () => {
     await expect(cellDisplay(page, 'B1')).toHaveText('101')
   })
 
-  /**
-   * Press undo/redo on the focused table wrapper.
-   *
-   * NOTE: KNOWN APP BUG (TODO 1.2.1) — `Cell.commitEdit` runs twice on Enter
-   * (once from onKeyDown, once from the input's onBlur as <Show> unmounts it).
-   * Each user-visible edit therefore pushes TWO undo entries; the second has
-   * before == after, so the first Ctrl/Cmd+Z is a no-op visually. To make
-   * undo/redo tests deterministic, we press the shortcut twice when expecting
-   * a real revert. Once the bug is fixed, drop the extra press.
-   */
   async function pressShortcut(
     page: Page,
     opts: { shift?: boolean; key?: 'z' | 'y' } = {},
@@ -98,8 +88,6 @@ test.describe('Solid Excel smoke', () => {
     await typeIntoCell(page, 'A1', '7')
     await expect(cellDisplay(page, 'A1')).toHaveText('7')
 
-    // Two presses to step past the empty no-op undo entry — see TODO 1.2.1.
-    await pressShortcut(page)
     await pressShortcut(page)
     await expect(cellDisplay(page, 'A1')).toHaveText('')
   })
@@ -108,14 +96,9 @@ test.describe('Solid Excel smoke', () => {
     await gotoBlank(page)
     await typeIntoCell(page, 'A1', '7')
 
-    // Two undos for the same reason as above.
-    await pressShortcut(page)
     await pressShortcut(page)
     await expect(cellDisplay(page, 'A1')).toHaveText('')
 
-    // Two redos (symmetric — the same no-op entry sits between us and the
-    // real change on the redo stack).
-    await pressShortcut(page, { shift: true })
     await pressShortcut(page, { shift: true })
     await expect(cellDisplay(page, 'A1')).toHaveText('7')
   })

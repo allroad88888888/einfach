@@ -1158,6 +1158,7 @@ pub(crate) struct WorkbookAtomContext {
     custom_call_depth: Rc<Cell<usize>>,
     in_flight: Rc<RefCell<HashSet<(usize, CellAddress)>>>,
     async_custom: RefCell<AsyncCustomState>,
+    remote: RefCell<RemoteState>,
 }
 
 impl WorkbookAtomContext {
@@ -1188,6 +1189,13 @@ impl WorkbookAtomContext {
             custom_call_depth,
             in_flight: Rc::new(RefCell::new(HashSet::new())),
             async_custom: RefCell::new(AsyncCustomState {
+                entries: HashMap::new(),
+                by_call_id: HashMap::new(),
+                pending: Vec::new(),
+                next_call_id: 1,
+                generation: 0,
+            }),
+            remote: RefCell::new(RemoteState {
                 entries: HashMap::new(),
                 by_call_id: HashMap::new(),
                 pending: Vec::new(),
@@ -10354,5 +10362,116 @@ mod tests {
             sheet.store.get(facade_a1),
             Value::Error(ValueError::CyclicRef)
         );
+    }
+}
+
+
+// ── Remote formula state (§ REMOTE_FORMULAS_DESIGN.md) ────────────────────
+
+#[derive(Debug, Clone)]
+pub struct PendingRemoteCall {
+    pub call_id: u64,
+    pub url: String,
+    pub args: Vec<Value>,
+}
+
+struct RemoteEntry {
+    atom: AtomId,
+    call_id: u64,
+    generation: u64,
+}
+
+struct RemoteState {
+    entries: HashMap<String, RemoteEntry>,
+    by_call_id: HashMap<u64, String>,
+    pending: Vec<PendingRemoteCall>,
+    next_call_id: u64,
+    generation: u64,
+}
+
+const REMOTE_RESULT_CACHE_CAP: usize = 512;
+
+fn canonical_remote_call_key(url: &str, args: &[Value]) -> String {
+    use std::fmt::Write;
+    let mut key = String::with_capacity(url.len() + args.len() * 16);
+    key.push_str(url);
+    key.push('\0');
+    for arg in args {
+        write!(key, "{:?}", arg).ok();
+        key.push('\0');
+    }
+    key
+}
+
+impl WorkbookAtomContext {
+    pub(crate) fn remote_result(
+        &self, url: &str, args: &[Value], deps: &ReadArgs,
+    ) -> Value {
+        let mut state = self.remote.borrow_mut();
+        let key = canonical_remote_call_key(url, args);
+        if let Some(entry) = state.entries.get(&key).map(|e| e.atom) {
+            deps.depend(entry);
+            return self.store.get(entry);
+        }
+        let call_id = state.next_call_id;
+        state.next_call_id += 1;
+        let gen = state.generation;
+        let atom_id = self.store.create_atom(Value::Error(ValueError::Busy));
+        state.entries.insert(key.clone(), RemoteEntry {
+            atom: atom_id, call_id, generation: gen,
+        });
+        state.by_call_id.insert(call_id, key);
+        state.pending.push(PendingRemoteCall {
+            call_id, url: url.to_string(), args: args.to_vec(),
+        });
+        deps.depend(atom_id);
+        Value::Error(ValueError::Busy)
+    }
+
+    pub(crate) fn take_pending_remote_calls(&self) -> Vec<PendingRemoteCall> {
+        let mut state = self.remote.borrow_mut();
+        sweep_remote_unobserved(&mut state, &self.store);
+        std::mem::take(&mut state.pending)
+    }
+
+    pub(crate) fn resolve_remote_call(&self, call_id: u64, value: Value) -> bool {
+        let atom_id = {
+            let state = self.remote.borrow();
+            let key = match state.by_call_id.get(&call_id) { Some(k) => k, None => return false };
+            let entry = match state.entries.get(key) { Some(e) if e.call_id == call_id => e, _ => return false };
+            entry.atom
+        };
+        self.store.set(atom_id, value);
+        true
+    }
+
+    pub(crate) fn invalidate_remote_cache(&self) {
+        let mut state = self.remote.borrow_mut();
+        state.generation += 1;
+        state.pending.clear();
+        state.by_call_id.clear();
+        for entry in state.entries.values() {
+            self.store.set(entry.atom, Value::Error(ValueError::Busy));
+        }
+    }
+
+    pub(crate) fn remote_entry_count(&self) -> usize {
+        self.remote.borrow().entries.len()
+    }
+}
+
+fn sweep_remote_unobserved(state: &mut RemoteState, store: &Store) {
+    if state.entries.len() <= REMOTE_RESULT_CACHE_CAP { return; }
+    let to_remove: Vec<String> = state.entries.iter()
+        .filter(|(_, entry)| {
+            !store.has_dependents(entry.atom) && !store.has_subscribers(entry.atom)
+        })
+        .map(|(k, _)| k.clone())
+        .take(state.entries.len() - REMOTE_RESULT_CACHE_CAP)
+        .collect();
+    for key in &to_remove {
+        if let Some(entry) = state.entries.remove(key) {
+            state.by_call_id.remove(&entry.call_id);
+        }
     }
 }

@@ -5479,3 +5479,46 @@ mod tests {
         );
     }
 }
+
+
+// ── Remote formula public API (Wave 8.1) ──────────────────────────────────
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RemoteErrorKind {
+    Network,
+    Timeout,
+    InvalidUrl,
+    BadResponse,
+}
+
+impl Workbook {
+    pub fn take_pending_remote_calls(&self) -> Vec<crate::sheet::PendingRemoteCall> {
+        if self.custom_call_depth.get() > 0 { return Vec::new(); }
+        self.atom_context.take_pending_remote_calls()
+    }
+
+    pub fn resolve_remote_call(&self, call_id: u64, value: Value) -> Result<bool, WorkbookError> {
+        if self.custom_call_depth.get() > 0 {
+            return Err(WorkbookError::MutationDuringCustomCall);
+        }
+        Ok(self.atom_context.resolve_remote_call(call_id, value))
+    }
+
+    pub fn reject_remote_call(&self, call_id: u64, kind: RemoteErrorKind) -> Result<bool, WorkbookError> {
+        let value = match kind {
+            RemoteErrorKind::Network | RemoteErrorKind::Timeout =>
+                Value::Error(ValueError::Remote),
+            RemoteErrorKind::InvalidUrl | RemoteErrorKind::BadResponse =>
+                Value::Error(ValueError::WrongType),
+        };
+        self.resolve_remote_call(call_id, value)
+    }
+
+    pub fn invalidate_remote_cache(&self) {
+        self.atom_context.invalidate_remote_cache();
+    }
+
+    pub fn remote_entry_count(&self) -> usize {
+        self.atom_context.remote_entry_count()
+    }
+}

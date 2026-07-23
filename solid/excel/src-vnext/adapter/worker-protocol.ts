@@ -1220,3 +1220,34 @@ export function createWorkerWorkbook(opts: WorkerWorkbookOptions): WorkerWorkboo
     },
   }
 }
+
+// ============================================================================
+// Wave 8.1 Remote formulas (=REMOTE(url, args)) — protocol additions
+// ============================================================================
+// Merge into worker-protocol.ts. See REMOTE_FORMULA_PROTOCOL.ts for full context.
+
+/** One =REMOTE(url, args) call the worker drains for host-side fetch. */
+export interface PendingRemoteCallWire {
+  callId: number
+  url: string
+  args: CellWire[]
+}
+
+export type RemoteErrorKindWire =
+  | 'network' | 'timeout' | 'invalid-url' | 'server-error' | 'parse-error'
+
+export interface RemoteFormulaGateway {
+  drainRemoteCalls(calls: PendingRemoteCallWire[]): void | Promise<void>
+}
+
+// Add to WorkerRuntimeCapabilitiesWire:
+//   /** Worker runtime can drain/resolve/reject REMOTE(url, args) calls. */
+//   remoteFormulas: boolean
+
+// Add to RpcEventWire:
+//   | { event: 'remoteCallDrain'; calls: PendingRemoteCallWire[] }
+
+// Add to WorkerWorkbookClient (after unregisterCustomFormula):
+//   registerRemoteGateway?(gateway: RemoteFormulaGateway | null): void
+//   resolveRemoteCall?(callId: number, value: CellWire): Promise<void>
+//   rejectRemoteCall?(callId: number, kind: RemoteErrorKindWire, message: string): Promise<void>

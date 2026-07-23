@@ -425,6 +425,7 @@ pub fn is_builtin_function_name(name: &str) -> bool {
             | "RANK.EQ"
             | "RATE"
             | "REDUCE"
+            | "REMOTE"
             | "REPLACE"
             | "REPLACEB"
             | "REPT"
@@ -948,6 +949,15 @@ pub trait EvalProvider {
     /// this file) keep their current behaviour without code changes.
     fn call_custom(&self, _name: &str, _args: &[Value]) -> Option<Value> {
         None
+    }
+
+    /// =REMOTE(url, args) — remote formula async fetch entry point.
+    /// Called by the REMOTE eval arm. Default returns #NAME? so providers
+    /// that predate Wave 8.1 treat =REMOTE() as an unrecognized name.
+    /// The WASM-backed WorkbookAtomContext overrides this to call into the
+    /// RemoteState memo/drain/resolve machinery (sheet.rs).
+    fn remote_result(&self, _url: &str, _args: &[Value]) -> Value {
+        Value::Error(ValueError::InvalidName)
     }
 
     /// Resolve a structured-reference Table (design doc #32 §5.3). `name`
@@ -7633,6 +7643,33 @@ fn eval_func(name: &str, args: &[Expr], provider: &dyn EvalProvider) -> Value {
             }
             acc
         }
+        // REMOTE(url, args…) — async fetch =REMOTE (Wave 8.1)
+        //
+        // Eagerly evaluates all args (errors short-circuit), validates the
+        // URL, then delegates to the provider's remote_result method which
+        // handles the per-call memo atom + drain queue. While the request is
+        // in flight the cell shows #BUSY! (same sentinel as async customs).
+        // url must start with https:// in v1.
+        "REMOTE" => {
+            if args.is_empty() {
+                return Value::Error(ValueError::WrongArgCount);
+            }
+            // Eagerly evaluate all args. Errors short-circuit.
+            let url = match eval_expr_with_provider(&args[0], provider) {
+                Value::Text(s) if !s.is_empty() && s.starts_with("https://") => s,
+                _ => return Value::Error(ValueError::WrongType),
+            };
+            let mut rest = Vec::with_capacity(args.len() - 1);
+            for a in &args[1..] {
+                let v = eval_expr_with_provider(a, provider);
+                if let Value::Error(_) = &v {
+                    return v;
+                }
+                rest.push(v);
+            }
+            provider.remote_result(&url, &rest)
+        }
+
 
         // SCAN(initial, array, lambda)
         //
