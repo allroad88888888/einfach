@@ -1,0 +1,42 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://einfach.dev/agent-orchestration/task-schema.json",
+  "title": "AgentTask",
+  "description": "多 Agent 编排系统的任务描述标准格式",
+  "type": "object",
+  "properties": {
+    "taskId": {
+      "type": "string",
+      "description": "全局唯一的任务 ID"
+    },
+    "title": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 200,
+      "description": "简短任务标题"
+    },
+    "description": {
+      "type": "string",
+      "description": "详细任务描述（上下文、设计约束、参考文档链接）"
+    },
+    "acceptanceCriteria": {
+      "type": "array",
+      "minItems": 1,
+      "items": { "type": "string" },
+      "description": "可验证的验收条件列表"
+    },
+    "dependencies": {
+      "type": "array",
+      "items": { "type": "string" },
+      "description": "依赖的其他 taskId 列表"
+    },
+    "timeoutMs": {
+      "type": "integer",
+      "minimum": 60000,
+      "maximum": 3600000,
+      "default": 1800000,
+      "description": "超时时间（毫秒），默认 30 分钟"
+    }
+  },
+  "required": ["taskId", "title", "description", "acceptanceCriteria"]
+}
