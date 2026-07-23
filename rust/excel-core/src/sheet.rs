@@ -2331,6 +2331,12 @@ impl<'a, 'r> EvalProvider for AtomFormulaProvider<'a, 'r> {
         self.workbook_context()?
             .call_custom(name, values, self.args)
     }
+
+    fn remote_result(&self, url: &str, args: &[Value]) -> Value {
+        self.workbook_context()
+            .map(|ctx| ctx.remote_result(url, args, self.args))
+            .unwrap_or(Value::Error(ValueError::InvalidName))
+    }
 }
 
 impl Sheet {
@@ -10375,12 +10381,14 @@ pub struct PendingRemoteCall {
     pub args: Vec<Value>,
 }
 
+#[derive(Debug)]
 struct RemoteEntry {
     atom: AtomId,
     call_id: u64,
     generation: u64,
 }
 
+#[derive(Debug)]
 struct RemoteState {
     entries: HashMap<String, RemoteEntry>,
     by_call_id: HashMap<u64, String>,
@@ -10409,9 +10417,18 @@ impl WorkbookAtomContext {
     ) -> Value {
         let mut state = self.remote.borrow_mut();
         let key = canonical_remote_call_key(url, args);
-        if let Some(entry) = state.entries.get(&key).map(|e| e.atom) {
-            deps.depend(entry);
-            return self.store.get(entry);
+        let gen = state.generation;
+        // Check hit with generation guard: entries from a previous generation
+        // (after invalidate_remote_cache) are treated as stale — the atom is
+        // still at #BUSY!; create a fresh call_id.
+        if let Some(entry) = state.entries.get(&key) {
+            if entry.generation == gen {
+                let atom = entry.atom;
+                drop(state);
+                deps.depend(atom);
+                return self.store.get(atom);
+            }
+            // Stale generation — atom already reset to #BUSY! by invalidate.
         }
         let call_id = state.next_call_id;
         state.next_call_id += 1;
