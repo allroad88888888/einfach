@@ -325,6 +325,44 @@ export const WORKER_TABLE_FORMULA_SNAPSHOT_MAX = 3000
  * constraint — it only binds on a table wider than 2500 columns.
  */
 export const WORKER_TABLE_TOTALS_SNAPSHOT_MAX = 5000
+/**
+ * Cap for the E8 whole-workbook FILTER undo image (`filtersSnapshot`), counted
+ * as the SUM of `hiddenRows.length` across every sheet entry in ONE image
+ * (before OR after), matching how the structural cap checks its before and its
+ * after image each against the same threshold.
+ *
+ * This is the ONLY gate the filter snapshot ever sees. A `filter.set` record
+ * nulls both cell images, so no cell cap can look at it; on a structural record
+ * the filter payload rides BESIDE a cell image the cell caps size independently,
+ * so those caps never account for it either. The hidden-row arrays — tens of
+ * thousands of ints on a heavily filtered big table, ×before/after×100 resident
+ * records — are unbounded without this cap.
+ *
+ * CAP DERIVATION — identical envelope to the cell-image caps: 128 MiB worst-case
+ * resident, `WORKER_UNDO_STACK_CAP` (100) records × 2 images (before + after)
+ * held simultaneously, so per-image budget = 128 MiB / 200 = 671 088 B. The
+ * image here is a plain array of row-index integers, so per-element cost is the
+ * V8 numeric backing-store slot: MEASURED 8.00 B/int (`--expose-gc`, heapUsed
+ * delta over 200k–1M-element arrays, both SMI-built and JSON.parse-origin — a
+ * row index is always an Smi). Rounded UP to 16 B/int to absorb the amortized
+ * per-`SheetFilterStateWire` wrapper (`sheet` + `rules[]` + object header) this
+ * count-based cap does not separately measure — the same "round the per-unit
+ * cost up, then the unit count down" discipline the cell caps use (120→128,
+ * 192→200).
+ *
+ *   671 088 B / 16 B ≈ 41 943 ints → 40 000
+ *
+ * Same degradation contract as the cell-image caps: above the threshold the
+ * mutation still executes, but its undo record degrades to NOT-UNDOABLE — the
+ * snapshot is never truncated (a truncated filter image would REPLACE the engine
+ * filter with a WRONG hidden set on undo, worse than no undo). NARROWING the
+ * image to just the mutated sheet was rejected: `restore_filters`
+ * (rust/excel-core/src/workbook.rs) is a whole-workbook REPLACE — every sheet
+ * absent from the payload has its filter CLEARED — so a single-sheet image would
+ * wipe every OTHER sheet's filter on replay. Degradation keeps the sibling
+ * contract and touches no Rust.
+ */
+export const WORKER_FILTER_SNAPSHOT_MAX = 40000
 /** u32 max — full-sheet sparse bound accepted by both worker runtimes. */
 const FULL_SHEET_INDEX_BOUND = 0xffffffff
 
@@ -1600,6 +1638,27 @@ export function createWorkerWorkbookSpreadsheetBackend(
       pushTransactionRecord(notUndoableRecord(spec.kind, spec.sheet.idx, null, diagnostic))
       return result
     }
+    // The filter side payload has its OWN budget (`WORKER_FILTER_SNAPSHOT_MAX`)
+    // that no cell cap covers — here it rides beside a cell image sized
+    // independently. If the whole-workbook hidden-row image blows it, the WHOLE
+    // record must degrade, not just its filter leg: the engine self-shifted its
+    // filter forward on `execute`, and replaying the cells without restoring the
+    // filter would strand it (the exact half-state E8 exists to prevent).
+    if (filtersBefore !== null && filtersAfter !== null) {
+      const filtersExcess = filterSnapshotOverCap(filtersBefore, filtersAfter)
+      if (filtersExcess !== null) {
+        pushTransactionRecord(
+          notUndoableRecord(
+            spec.kind,
+            spec.sheet.idx,
+            null,
+            `filter undo snapshot needs ${filtersExcess} hidden-row indices but the cap is ` +
+              `${WORKER_FILTER_SNAPSHOT_MAX} per image; the operation is not undoable`,
+          ),
+        )
+        return result
+      }
+    }
     let after: SparseCellWire[] | null = null
     try {
       after = await client.snapshotRangeSparse(fullRange)
@@ -2760,7 +2819,18 @@ export function createWorkerWorkbookSpreadsheetBackend(
     let historyRecorded = false
     if (filtersBefore !== null) {
       const filtersAfter = await client.snapshotFilters!()
-      if (filterSnapshotSheetChanged(filtersBefore, filtersAfter, sheet.idx)) {
+      // A filter that hides tens of thousands of rows blows the whole-workbook
+      // hidden-row budget (`WORKER_FILTER_SNAPSHOT_MAX`); this record's cell
+      // images are null, so this is the ONLY place that cap can act. Over it the
+      // filter still applies but is not recorded — observably identical to the
+      // no-change branch below (historyRecorded stays false, no push, redo
+      // stacks untouched, adapter and UI-core stay aligned because UI core only
+      // pushes its paired entry when this verdict is true). Truncating instead
+      // would restore a wrong hidden set on undo, so the record is dropped whole.
+      if (
+        filterSnapshotSheetChanged(filtersBefore, filtersAfter, sheet.idx) &&
+        filterSnapshotOverCap(filtersBefore, filtersAfter) === null
+      ) {
         pushTransactionRecord({
           kind: 'filter.set',
           sheetIdx: sheet.idx,
@@ -2813,6 +2883,36 @@ export function createWorkerWorkbookSpreadsheetBackend(
     const beforeEntry = before.filters.find((entry) => entry.sheet === sheetIdx) ?? null
     const afterEntry = after.filters.find((entry) => entry.sheet === sheetIdx) ?? null
     return JSON.stringify(beforeEntry) !== JSON.stringify(afterEntry)
+  }
+
+  /**
+   * Sum of `hiddenRows.length` across every sheet entry in one whole-workbook
+   * filter image — the element count `WORKER_FILTER_SNAPSHOT_MAX` bounds.
+   */
+  function filterSnapshotHiddenRowCount(snapshot: FilterSnapshotWire): number {
+    let total = 0
+    for (const entry of snapshot.filters) total += entry.hiddenRows.length
+    return total
+  }
+
+  /**
+   * The worst per-image hidden-row count when it EXCEEDS `WORKER_FILTER_SNAPSHOT_MAX`,
+   * else null. Both `filtersSnapshot` producers — the structural side payload
+   * (`recordStructuralMutation`) and the standalone `filter.set` record
+   * (`setFilterSortThroughWorker`) — degrade to not-undoable when this returns
+   * non-null, so the two paths share ONE gate. Per-image (before OR after)
+   * against the cap, mirroring the structural cell cap, because the ×2 for
+   * before + after is already folded into the 128 MiB / 200 derivation.
+   */
+  function filterSnapshotOverCap(
+    before: FilterSnapshotWire,
+    after: FilterSnapshotWire,
+  ): number | null {
+    const worst = Math.max(
+      filterSnapshotHiddenRowCount(before),
+      filterSnapshotHiddenRowCount(after),
+    )
+    return worst > WORKER_FILTER_SNAPSHOT_MAX ? worst : null
   }
 
   async function readSheetHiddenStateThroughWorker(
