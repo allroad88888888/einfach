@@ -1144,7 +1144,7 @@ describe('text-to-columns', () => {
       expect(Object.isFrozen(state.target?.anchor)).toBe(true)
       expect(Object.isFrozen(projection)).toBe(true)
       expect(() => {
-        ;(state.target!.range as { rowStart: number }).rowStart = 99
+        (state.target!.range as { rowStart: number }).rowStart = 99
       }).toThrow()
       const writeWithoutTypes = store.setter as unknown as (
         target: unknown,

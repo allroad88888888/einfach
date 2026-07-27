@@ -93,7 +93,7 @@ describe('snapshotAcknowledgement', () => {
     const result = snapshotAcknowledgement(ack, ticket, extractIdentity)
     expect(Object.isFrozen(result)).toBe(true)
     expect(() => {
-      ;(result as { kind: string }).kind = 'hacked'
+      (result as { kind: string }).kind = 'hacked'
     }).toThrow()
   })
 })
