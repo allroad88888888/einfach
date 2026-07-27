@@ -10,7 +10,9 @@
  * Mitigation:
  *   - `jest.setTimeout(30_000)` gives each test a generous budget so slow
  *     parallel workers never time out.
- *   - `waitFor` timeouts are bumped to 10 s where relevant.
+ *   - All waits poll via `waitFor` with a 10 s cap instead of sleeping a
+ *     fixed duration, so a test resolves as soon as the async state settles
+ *     and only burns the full budget under genuine worker starvation.
  *
  * NOT using `jest.retryTimes` — that would only mask the flake.
  */
@@ -143,11 +145,12 @@ describe('async', () => {
       return [state, setState]
     })
 
-    await act(async () => {
-      await new Promise((resolve) => setTimeout(resolve, 10_000))
-    })
-
-    expect(xx.result.current[0]).toBe(state)
+    await waitFor(
+      () => {
+        expect(xx.result.current[0]).toBe(state)
+      },
+      { timeout: 10_000 },
+    )
 
     await act(async () => {
       xx.result.current[1]({
@@ -212,12 +215,12 @@ describe('async', () => {
     render(<App />)
 
     // 等待异步操作完成
-    await act(async () => {
-      await new Promise((resolve) => setTimeout(resolve, 10_000))
-    })
-
-    // 验证初始状态
-    expect(screen.getByTestId('server-info')).toHaveTextContent('ID: 1')
+    await waitFor(
+      () => {
+        expect(screen.getByTestId('server-info')).toHaveTextContent('ID: 1')
+      },
+      { timeout: 10_000 },
+    )
 
     // 点击按钮更新状态
     await act(async () => {
@@ -313,12 +316,14 @@ describe('async', () => {
     expect(screen.getByTestId('loading')).toHaveTextContent('加载用户信息中...')
 
     // 等待异步操作完成
-    await act(async () => {
-      await new Promise((resolve) => setTimeout(resolve, 10_000))
-    })
+    await waitFor(
+      () => {
+        expect(screen.getByTestId('user-name')).toHaveTextContent('张三 (editor)')
+      },
+      { timeout: 10_000 },
+    )
 
     // 验证组合后的数据正确显示
-    expect(screen.getByTestId('user-name')).toHaveTextContent('张三 (editor)')
     expect(screen.getByTestId('user-email')).toHaveTextContent('zhangsan@example.com')
     expect(screen.getByTestId('user-permissions')).toHaveTextContent('编辑权限: 有 | 删除权限: 无')
 
