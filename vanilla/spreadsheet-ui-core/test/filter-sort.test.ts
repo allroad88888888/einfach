@@ -1200,7 +1200,7 @@ describe('Core-owned filter/sort mutation lifecycle', () => {
     expect(store.setter(acquireHistoryProducerReservationAtom)).toBeNull()
 
     await store.setter(retryFilterSortRefreshAtom, {
-      refreshProjection: async (sheetId) => {
+      refreshProjection: async (sheetId: string) => {
         refreshCalls += 1
         expect(sheetId).toBe('A')
       },
@@ -2020,7 +2020,7 @@ describe('shared history producer lane — physical sort', () => {
     expect(store.setter(acquireHistoryProducerReservationAtom)).toBeNull()
 
     await store.setter(retryFilterSortRefreshAtom, {
-      refreshProjection: async (sheetId) => {
+      refreshProjection: async (sheetId: string) => {
         refreshCalls += 1
         expect(sheetId).toBe('A')
       },
@@ -2367,7 +2367,7 @@ describe('shared history producer lane — Reapply', () => {
 
     await store.setter(runPhysicalSortAtom, {
       source: {
-        async sortRange(request) {
+        async sortRange(request: any) {
           physicalRequests.push(request)
           return {
             kind: 'sort-range',
@@ -2635,7 +2635,7 @@ describe('shared history producer lane — Reapply', () => {
     expect(store.setter(acquireHistoryProducerReservationAtom)).toBeNull()
 
     await store.setter(retryFilterSortRefreshAtom, {
-      refreshProjection: async (sheetId) => {
+      refreshProjection: async (sheetId: string) => {
         refreshCalls += 1
         expect(sheetId).toBe('A')
       },

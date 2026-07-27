@@ -172,7 +172,7 @@ function filterRows(store: ReturnType<typeof createStore>, sheetId = SHEET): num
 }
 
 describe('applyViewportFilterHiddenStructuralShiftAtom — displacement', () => {
-  test.each([
+  const SHIFT_TABLE = [
     // [label, seeded, shift, expected]
     ['insert entirely BEFORE the set', [4, 6], { kind: 'insert', index: 0, count: 1 }, [5, 7]],
     ['insert AT a hidden row', [4, 6], { kind: 'insert', index: 4, count: 1 }, [5, 7]],
@@ -183,7 +183,9 @@ describe('applyViewportFilterHiddenStructuralShiftAtom — displacement', () => 
     ['delete INSIDE the set', [4, 6], { kind: 'delete', index: 5, count: 1 }, [4, 5]],
     ['delete entirely AFTER the set', [4, 6], { kind: 'delete', index: 9, count: 2 }, [4, 6]],
     ['multi-row delete before', [4, 6], { kind: 'delete', index: 0, count: 3 }, [1, 3]],
-  ] as const)('%s', (_label, seeded, partial, expected) => {
+  ] as const
+  test.each(SHIFT_TABLE)('%s', (...args: (typeof SHIFT_TABLE)[number]) => {
+    const [_label, seeded, partial, expected] = args
     const store = createStore()
     seedFilterHidden(store, seeded)
     const shift: BackendStructuralShift = { axis: 'row', ...partial }

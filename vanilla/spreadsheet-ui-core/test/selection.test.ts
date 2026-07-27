@@ -6,7 +6,6 @@ import {
   DEFAULT_SELECTION_STATE,
   activeCellAtom,
   addSelectionRegionAtom,
-  clearNonPrimaryRegionsAtom,
   selectAllAtom,
   selectCellAtom,
   selectColumnsAtom,
@@ -35,7 +34,7 @@ describe('selection core', () => {
       anchor: { row: 3, col: 4 },
       focus: { row: 3, col: 4 },
     }
-    const setAndValidateAtom = atom(null, (_get, set): boolean => {
+    const setAndValidateAtom = atom(null, (_get: any, set: any): boolean => {
       const receipt = set(setSelectionWithAuthorityReceiptAtom, selection)
       return receipt !== null && set(selectionAuthorityReceiptIsCurrentAtom, receipt)
     })
@@ -218,7 +217,7 @@ describe('selection core', () => {
     store.setter(selectAllAtom, 'Sheet1')
     const witnessBeforeBounds = store.getter(selectionAuthorityWitnessAtom)
 
-    store.setter(selectionBoundsAtom, (previous) => ({
+    store.setter(selectionBoundsAtom, (previous: any) => ({
       ...previous,
       rowCount: 8,
     }))
@@ -330,7 +329,7 @@ describe('selection core', () => {
     const unsubscribeBounds = store.sub(selectionBoundsAtom, capture)
     const unsubscribeRange = store.sub(selectionRangeAtom, capture)
 
-    store.setter(selectionBoundsAtom, (previous) => ({
+    store.setter(selectionBoundsAtom, (previous: any) => ({
       ...previous,
       rowCount: 6,
       colCount: 7,
@@ -374,7 +373,7 @@ describe('selection core', () => {
       publicBounds.rowCount = 3
     }).toThrow(TypeError)
 
-    store.setter(selectionBoundsAtom, (previous) => {
+    store.setter(selectionBoundsAtom, (previous: any) => {
       expect(Object.isFrozen(previous)).toBe(true)
       previous.rowCount = 6
       return previous

@@ -12,11 +12,9 @@ import {
   nextConditionalFormatSessionId,
   openConditionalFormatEditorAtom,
   runConditionalFormatMutationAtom,
-  selectionBoundsAtom,
   setSelectionAtom,
   setConditionalFormatRulesAtom,
   setWorkspaceActiveSheetAtom,
-  workspaceSessionAtom,
   type CellValueRule,
   type ConditionalFormatMutationAcknowledgement,
   type ConditionalFormatOperationAttempt,
@@ -28,7 +26,6 @@ import {
   type RunConditionalFormatMutationInput,
   type SetConditionalFormatRuleRequest,
   type SpreadsheetCellFormat,
-  type WorkspaceSessionState,
 } from '../src'
 
 function deferred<T>() {
@@ -628,7 +625,7 @@ describe('conditional-formatting core state machine', () => {
       action: 'save',
       sheetId: 'sheet-a',
       scope: copyScope(TARGET_SCOPE),
-      setRule: (request) => {
+      setRule: (request: any) => {
         started.resolve(request)
         return gate.promise
       },
@@ -862,7 +859,7 @@ describe('conditional-formatting core state machine', () => {
       operationId: `conditional-format-${CONDITIONAL_FORMAT_MUTATION_LEDGER_MAX + 1}`,
       requestId: CONDITIONAL_FORMAT_MUTATION_LEDGER_MAX + 1,
     })
-    expect(ledger.every((attempt) => attempt.status === 'acknowledged')).toBe(true)
+    expect(ledger.every((attempt: any) => attempt.status === 'acknowledged')).toBe(true)
   })
 
   test('DisplayCell keeps conditional formatting as projection data beside base format', () => {

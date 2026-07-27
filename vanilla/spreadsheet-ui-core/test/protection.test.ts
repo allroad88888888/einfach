@@ -623,7 +623,7 @@ describe('one-shot hydration seed', () => {
     expect(store.getter(sheetProtectionAtom)['sheet-1'].mode).toBe('protected')
   })
 
-  test.each([
+  const HYDRATE_TABLE = [
     ['mismatched sheetId', { sheetId: 'other-sheet' }],
     ['invalid mode', { protection: { mode: 'locked', unlockedRanges: [] } }],
     [
@@ -640,7 +640,9 @@ describe('one-shot hydration seed', () => {
         },
       },
     ],
-  ] as const)('rejects an invalid payload (%s) with a diagnostic', async (_label, overrides) => {
+  ] as const
+  test.each(HYDRATE_TABLE)('rejects an invalid payload (%s) with a diagnostic', async (...args: (typeof HYDRATE_TABLE)[number]) => {
+    const [_label, overrides] = args
     const store = createStore()
     const source: SheetProtectionPersistencePort = {
       readSheetProtection: async (request) =>
