@@ -15,7 +15,8 @@ const LEGACY_SEVERITY: Record<string, SpreadsheetErrorSeverity> = {
 
 export function gradeSpreadsheetError(
   input: SpreadsheetError,
-): Required<Pick<SpreadsheetError, 'code' | 'message' | 'severity' | 'source'>> & { hint?: string } {
+): Required<Pick<SpreadsheetError, 'code' | 'message' | 'severity' | 'source'>> &
+  { hint?: string } {
   return {
     code: input.code,
     message: input.message,

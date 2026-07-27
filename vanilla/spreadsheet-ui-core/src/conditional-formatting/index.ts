@@ -578,7 +578,7 @@ function snapshotMutationInput(value: unknown): ConditionalFormatMutationInputSn
       removeRule: removeRule as ConditionalFormatMutationInputSnapshot['removeRule'],
       listRules: listRules as ConditionalFormatMutationInputSnapshot['listRules'],
       acceptAcknowledgedResult:
-        acceptAcknowledgedResult as ConditionalFormatMutationInputSnapshot['acceptAcknowledgedResult'],
+        acceptAcknowledgedResult as ConditionalFormatMutationInputSnapshot['acceptAcknowledgedResult'], // eslint-disable-line max-len
     })
   } catch {
     return null

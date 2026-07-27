@@ -206,7 +206,10 @@ export function splitSections(pattern: string): string[] {
 /* ------------------------------------------------------------------------- */
 
 function isDateChar(ch: string): boolean {
-  return ch === 'm' || ch === 'M' || ch === 'd' || ch === 'D' || ch === 'y' || ch === 'Y' || ch === 'h' || ch === 'H' || ch === 's' || ch === 'S'
+  return (
+    ch === 'm' || ch === 'M' || ch === 'd' || ch === 'D' || ch === 'y' ||
+    ch === 'Y' || ch === 'h' || ch === 'H' || ch === 's' || ch === 'S'
+  )
 }
 
 export function parseSection(input: string): NumberFormatSection {
@@ -562,7 +565,11 @@ function analyzeNumericLayout(tokens: NumberFormatToken[]): NumericLayout {
 
   tokens.forEach((token, index) => {
     if (token.kind === 'percent') percentCount += 1
-    if (token.kind === 'digit-required' || token.kind === 'digit-optional' || token.kind === 'digit-space') {
+    if (
+      token.kind === 'digit-required' ||
+      token.kind === 'digit-optional' ||
+      token.kind === 'digit-space'
+    ) {
       hasDigitPlaceholders = true
     }
     if (decimalIndex === -1 || index < decimalIndex) {
@@ -577,7 +584,11 @@ function analyzeNumericLayout(tokens: NumberFormatToken[]): NumericLayout {
     const t = intTokens[i]
     if (t.kind === 'thousands') {
       scaleCommas += 1
-    } else if (t.kind === 'digit-required' || t.kind === 'digit-optional' || t.kind === 'digit-space') {
+    } else if (
+      t.kind === 'digit-required' ||
+      t.kind === 'digit-optional' ||
+      t.kind === 'digit-space'
+    ) {
       break
     }
   }

@@ -127,7 +127,8 @@ export const FORMULA_FUNCTION_SPECS: readonly FormulaFunctionSpec[] = [
       { name: 'col_index_num' },
       { name: 'range_lookup', optional: true },
     ],
-    summary: 'Looks up a value in the first column of a range and returns a value from a column in the same row.',
+    summary: /* eslint-disable-next-line max-len */
+      'Looks up a value in the first column of a range and returns a value from a column in the same row.',
   },
 ]
 

@@ -82,22 +82,27 @@ export const TEXT_TO_COLUMNS_CONTEXT_ERROR =
 export const TEXT_TO_COLUMNS_ACKNOWLEDGEMENT_ERROR =
   'Text to Columns acknowledgement did not match the active request and target.'
 export const TEXT_TO_COLUMNS_OUTCOME_UNKNOWN_ERROR =
-  'Text to Columns may have been applied, but the backend did not return a matching acknowledgement. To avoid a duplicate import, refresh or reload the workbook before trying again.'
+  /* eslint-disable-next-line max-len */
+  'Text to Columns may have been applied, but the backend did not return a matching acknowledgement. ' +
+  'To avoid a duplicate import, refresh or reload the workbook before trying again.'
 export const TEXT_TO_COLUMNS_TRANSPORT_ERROR_PREFIX = 'Text to Columns could not be applied: '
 export const TEXT_TO_COLUMNS_REFRESH_ERROR_PREFIX =
   'Text to Columns was acknowledged, but projection refresh failed: '
 export const TEXT_TO_COLUMNS_ENTRYPOINT_TARGET_ERROR =
   'Text to Columns requires an active single-column selection.'
 export const TEXT_TO_COLUMNS_ENTRYPOINT_PORT_ERROR =
-  'Text to Columns source is unavailable because this workbook does not provide range projection reads.'
+  'Text to Columns source is unavailable because this workbook does not ' +
+  'provide range projection reads.'
 export const TEXT_TO_COLUMNS_ENTRYPOINT_PENDING_ERROR =
   'Text to Columns source loading is already in progress.'
 export const TEXT_TO_COLUMNS_ENTRYPOINT_SESSION_ERROR =
   'Close the current Text to Columns dialog before loading another source.'
 export const TEXT_TO_COLUMNS_ENTRYPOINT_STALE_ERROR =
-  'Text to Columns source was ignored because the active sheet, selection, or dialog session changed.'
+  'Text to Columns source was ignored because the active sheet, selection, ' +
+  'or dialog session changed.'
 export const TEXT_TO_COLUMNS_ENTRYPOINT_RESULT_ERROR =
-  'Text to Columns could not open because the source projection did not match the active request and target.'
+  'Text to Columns could not open because the source projection did not ' +
+  'match the active request and target.'
 export const TEXT_TO_COLUMNS_ENTRYPOINT_TRANSPORT_ERROR_PREFIX =
   'Text to Columns source could not be loaded: '
 

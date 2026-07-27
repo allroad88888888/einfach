@@ -531,7 +531,10 @@ function normalizeRangeTarget(sheetId: string, range: MenuRangeTarget['range']):
   }
 }
 
-function isTargetAllowedForSurface(surface: MenuOpenIntent['surface'], kind: MenuTargetKind): boolean {
+function isTargetAllowedForSurface(
+  surface: MenuOpenIntent['surface'],
+  kind: MenuTargetKind,
+): boolean {
   switch (surface) {
     case 'cell':
       return kind === 'cell' || kind === 'range'

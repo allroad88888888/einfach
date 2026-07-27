@@ -74,9 +74,11 @@ export const REMOVE_DUPLICATES_REMOVE_CAPABILITY_ERROR =
 export const REMOVE_DUPLICATES_READ_FAILED_ERROR =
   'Remove Duplicates could not load a complete projection for the selected range.'
 export const REMOVE_DUPLICATES_READ_STALE_ERROR =
-  'The selected range changed while Remove Duplicates was loading. Retry from the current selection.'
+  'The selected range changed while Remove Duplicates was loading. ' +
+  'Retry from the current selection.'
 export const REMOVE_DUPLICATES_OUTCOME_UNKNOWN_ERROR =
-  'Rows may have been removed, but the backend did not return a matching acknowledgement. Refresh or reload the workbook before trying again.'
+  'Rows may have been removed, but the backend did not return a matching acknowledgement. ' +
+  'Refresh or reload the workbook before trying again.'
 export const REMOVE_DUPLICATES_REFRESH_ERROR_PREFIX =
   'Rows were removed, but the workbook projection could not be refreshed: '
 export const REMOVE_DUPLICATES_HISTORY_BUSY_ERROR =

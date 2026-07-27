@@ -30,7 +30,8 @@ export * from './types'
 export const PASTE_SPECIAL_CAPABILITY_ERROR =
   'Paste Special is unavailable because this workbook does not provide pasteRange.'
 export const PASTE_SPECIAL_CONTEXT_ERROR =
-  'Paste Special needs a copied range and an active target selection. Close the dialog, copy a range, and try again.'
+  'Paste Special needs a copied range and an active target selection. ' +
+  'Close the dialog, copy a range, and try again.'
 export const PASTE_SPECIAL_UNSUPPORTED_KIND_ERROR =
   'Paste Special for column widths and comments is not supported by the current backend.'
 export const PASTE_SPECIAL_ACKNOWLEDGEMENT_ERROR =

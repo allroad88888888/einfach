@@ -231,7 +231,9 @@ function createIdlePointerState(): PointerSessionState {
   }
 }
 
-function isDragSelectionInput(input: PointerStartInput | PointerUpdateInput): input is PointerSelectionStartInput | PointerSelectionUpdateInput {
+function isDragSelectionInput(
+  input: PointerStartInput | PointerUpdateInput,
+): input is PointerSelectionStartInput | PointerSelectionUpdateInput {
   return input.kind === 'drag-selection'
 }
 

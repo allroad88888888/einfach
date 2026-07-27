@@ -43,6 +43,7 @@ function parseA1(token: string): { row: number; col: number } | null {
 // Group 2: optional sheet prefix (single-quoted, unescaped)
 // Group 3: start cell
 // Group 4: optional ":endCell"
+// eslint-disable-next-line max-len
 const TOKEN_RE = /(?:(?:([A-Za-z_][\w]*)|'((?:[^']|'')+)')!)?(\$?[A-Z]+\$?\d+)(?::(\$?[A-Z]+\$?\d+))?/g
 
 /**
@@ -88,7 +89,8 @@ export function parseFormulaReferences(
       colEnd: Math.max(startCoord.col, endCoord.col),
     }
 
-    const key = `${sheetId ?? '<active>'}:${range.rowStart}:${range.colStart}:${range.rowEnd}:${range.colEnd}`
+    const key =
+      `${sheetId ?? '<active>'}:${range.rowStart}:${range.colStart}:${range.rowEnd}:${range.colEnd}`
     let colorIndex = colorByKey.get(key)
     if (colorIndex === undefined) {
       colorIndex = nextColor

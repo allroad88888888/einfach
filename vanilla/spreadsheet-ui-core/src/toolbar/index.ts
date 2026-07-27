@@ -741,7 +741,8 @@ async function executeMutationTicket(
             acknowledgedRevision,
             acknowledgedCount,
             canRetryRefresh: true,
-            error: `${TOOLBAR_MUTATION_OUTCOME_UNKNOWN_ERROR} ${TOOLBAR_MUTATION_ACKNOWLEDGEMENT_ERROR}`,
+            error:
+              `${TOOLBAR_MUTATION_OUTCOME_UNKNOWN_ERROR} ${TOOLBAR_MUTATION_ACKNOWLEDGEMENT_ERROR}`,
           }),
         )
         return 'outcome-unknown'
@@ -775,7 +776,8 @@ async function executeMutationTicket(
           acknowledgedRevision,
           acknowledgedCount,
           canRetryRefresh: true,
-          error: `${TOOLBAR_MUTATION_OUTCOME_UNKNOWN_ERROR} History rejected the acknowledged mutation.`,
+          error:
+            `${TOOLBAR_MUTATION_OUTCOME_UNKNOWN_ERROR} History rejected the acknowledged mutation.`,
         }),
       )
       return 'outcome-unknown'

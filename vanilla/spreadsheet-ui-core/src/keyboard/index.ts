@@ -214,13 +214,33 @@ function getFormulaReferenceModeIntent(input: KeyboardInput): KeyboardCommandInt
 
   switch (input.key) {
     case 'ArrowUp':
-      return { type: 'formulaReference.arrowPick', rowDelta: -1, colDelta: 0, extend: Boolean(input.shiftKey) }
+      return {
+        type: 'formulaReference.arrowPick',
+        rowDelta: -1,
+        colDelta: 0,
+        extend: Boolean(input.shiftKey),
+      }
     case 'ArrowDown':
-      return { type: 'formulaReference.arrowPick', rowDelta: 1, colDelta: 0, extend: Boolean(input.shiftKey) }
+      return {
+        type: 'formulaReference.arrowPick',
+        rowDelta: 1,
+        colDelta: 0,
+        extend: Boolean(input.shiftKey),
+      }
     case 'ArrowLeft':
-      return { type: 'formulaReference.arrowPick', rowDelta: 0, colDelta: -1, extend: Boolean(input.shiftKey) }
+      return {
+        type: 'formulaReference.arrowPick',
+        rowDelta: 0,
+        colDelta: -1,
+        extend: Boolean(input.shiftKey),
+      }
     case 'ArrowRight':
-      return { type: 'formulaReference.arrowPick', rowDelta: 0, colDelta: 1, extend: Boolean(input.shiftKey) }
+      return {
+        type: 'formulaReference.arrowPick',
+        rowDelta: 0,
+        colDelta: 1,
+        extend: Boolean(input.shiftKey),
+      }
   }
 
   if (input.key.length === 1) {

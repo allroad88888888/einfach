@@ -478,7 +478,8 @@ export const STRUCTURE_OPERATION_UNSUPPORTED_ERROR =
 export const STRUCTURE_OPERATION_ACKNOWLEDGEMENT_ERROR =
   'Structure operation acknowledgement did not exactly match the active ticket.'
 export const STRUCTURE_OPERATION_OUTCOME_UNKNOWN_ERROR =
-  'Structure operation result is unknown. Reload or reconcile workbook data before another structural mutation.'
+  'Structure operation result is unknown. Reload or reconcile workbook data ' +
+  'before another structural mutation.'
 export const STRUCTURE_OPERATION_HISTORY_ERROR =
   'Structure operation was acknowledged, but its history entry could not be recorded.'
 
@@ -1011,7 +1012,8 @@ async function runStructureOperation(
         'outcome-unknown',
         ticket,
         null,
-        `${STRUCTURE_OPERATION_OUTCOME_UNKNOWN_ERROR} Backend detail: ${structureOperationErrorMessage(error)}`,
+        `${STRUCTURE_OPERATION_OUTCOME_UNKNOWN_ERROR} ` +
+        `Backend detail: ${structureOperationErrorMessage(error)}`,
       ),
     )
     return 'outcome-unknown'
@@ -1167,7 +1169,8 @@ async function runStructureOperation(
         'refresh-failed',
         ticket,
         acknowledgement.revision,
-        `Structure operation was acknowledged, but refresh failed: ${structureOperationErrorMessage(error)}`,
+        `Structure operation was acknowledged, ` +
+        `but refresh failed: ${structureOperationErrorMessage(error)}`,
       ),
     )
     return 'refresh-failed'
@@ -1407,7 +1410,8 @@ export const retryStructureOperationRefreshAtom = atom(
           'refresh-failed',
           ticket,
           acknowledgedRevision,
-          `Structure operation was acknowledged, but refresh failed: ${structureOperationErrorMessage(error)}`,
+          `Structure operation was acknowledged, ` +
+        `but refresh failed: ${structureOperationErrorMessage(error)}`,
         ),
       )
       return 'refresh-failed'

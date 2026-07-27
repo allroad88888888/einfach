@@ -983,7 +983,8 @@ async function executeReservedCommentMutation(
   if (deadlineHandle !== null) clearTimeout(deadlineHandle)
 
   if (outcome.kind === 'deadline-exceeded') {
-    const message = `Comment ${reservation.ticket.action} exceeded the Core deadline; outcome is unknown`
+    const message =
+      `Comment ${reservation.ticket.action} exceeded the Core deadline; outcome is unknown`
     set(settleCommentAttemptAtom, {
       ticket: reservation.ticket,
       status: 'outcome-unknown',
