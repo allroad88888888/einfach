@@ -9,7 +9,8 @@
     "project": [
       "./tsconfig.json",
       "./react/*/tsconfig.json",
-      "./vanilla/*/tsconfig.json"
+      "./vanilla/*/tsconfig.json",
+      "./solid/*/tsconfig.json"
     ]
   },
   "plugins": [
@@ -23,7 +24,7 @@
     "browser": true,
     "node": true,
     "es6": true,
-    "jest": true,
+    "jest": true
   },
   "rules": {
     "@stylistic/brace-style": [
@@ -142,12 +143,6 @@
       }
     ],
     "@typescript-eslint/default-param-last": "error",
-    // "@typescript-eslint/dot-notation": [
-    //   "error",
-    //   {
-    //     "allowKeywords": true
-    //   }
-    // ],
     "@typescript-eslint/no-array-constructor": "error",
     "@typescript-eslint/no-dupe-class-members": "error",
     "@typescript-eslint/no-empty-function": [
@@ -161,7 +156,6 @@
       }
     ],
     "no-new-func": "off",
-    // "@typescript-eslint/no-implied-eval": "error",
     "@typescript-eslint/no-loss-of-precision": "error",
     "@typescript-eslint/no-loop-func": "error",
     "@typescript-eslint/no-magic-numbers": [
@@ -175,7 +169,6 @@
     ],
     "@typescript-eslint/no-redeclare": "error",
     "@typescript-eslint/no-shadow": "error",
-    // "@typescript-eslint/no-throw-literal": "error",
     "@typescript-eslint/no-unused-expressions": [
       "error",
       {
@@ -202,7 +195,6 @@
     ],
     "@typescript-eslint/no-useless-constructor": "error",
     "@typescript-eslint/require-await": "off",
-    // "no-return-await": "off",
     "@typescript-eslint/return-await": [
       "error",
       "in-try-catch"
@@ -216,16 +208,12 @@
         "ignoreRegExpLiterals": true,
         "ignoreTrailingComments": true,
         "ignoreStrings": true,
-        "ignoreTemplateLiterals": true,
+        "ignoreTemplateLiterals": true
       }
     ],
-    // support any
     "@typescript-eslint/no-explicit-any": "off",
-    // support ts-ignore
     "@typescript-eslint/ban-ts-comment": "off",
-    // 
     "@typescript-eslint/no-this-alias": "off",
-    // type Function
     "@typescript-eslint/ban-types": "off",
     "strict": [
       "error",
@@ -234,8 +222,8 @@
     "max-len": [
       "error",
       {
-        "code": 100,
-      },
+        "code": 100
+      }
     ],
     "react-hooks/rules-of-hooks": "error",
     "react-hooks/exhaustive-deps": "warn",
@@ -249,7 +237,6 @@
     ],
     "no-console": 2,
     "prefer-const": 2,
-    //导出默认值
     "import/prefer-default-export": 0,
     "import/no-cycle": 0,
     "import/no-extraneous-dependencies": 1,
@@ -268,4 +255,21 @@
     "oxc/only-used-in-recursion": "off",
     "react/no-children-prop": "off"
   },
+  "settings": {
+    "react": {
+      "version": "detect"
+    }
+  },
+  "overrides": [
+    {
+      "files": [
+        "**/*.test.ts",
+        "**/*.test.tsx"
+      ],
+      "rules": {
+        "max-lines-per-function": "off",
+        "no-console": "off"
+      }
+    }
+  ]
 }

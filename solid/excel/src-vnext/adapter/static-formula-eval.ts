@@ -12,6 +12,8 @@
  *   - parentheses
  *   - functions: SUM, AVERAGE, COUNT, MIN, MAX, IF, SUMIF, COUNTIF,
  *     ABS, ROUND, CONCAT, SUBTOTAL
+ *   - error literals: #NULL!, #DIV/0!, #N/A, #REF!, #VALUE!, #NAME?,
+ *     #NUM!, #CYCLE!, #TYPE!, #ARGS!, #SPILL!, #CALC!, #BUSY!
  *
  * Anything beyond this returns the string '#ERROR!'. Division by zero
  * returns '#DIV/0!'. Cyclic references return '#CYCLE!'. Cross-sheet
@@ -184,6 +186,9 @@ const BARE_LITERALS: Record<string, number> = {
   TRUE: 1,
   FALSE: 0,
 }
+
+/** Error literal tokens — 13 Excel error codes aligned with rust/wasm error_token_to_value_error. */
+const ERROR_LITERAL_RE = /^#(NULL!|DIV\/0!|N\/A|REF!|VALUE!|NAME\?|NUM!|CYCLE!|TYPE!|ARGS!|SPILL!|CALC!|BUSY!)/
 
 /**
  * Scan a balanced `[...]` structured-reference suffix starting at
@@ -365,6 +370,16 @@ function tokenize(
       }
       return null
     }
+    // Error literal — 13 Excel error tokens aligned with rust/wasm.
+    if (ch === '#') {
+      const match = ERROR_LITERAL_RE.exec(input.slice(i))
+      if (match) {
+        tokens.push({ kind: 'error', code: match[0] })
+        i += match[0].length
+        continue
+      }
+      return null
+    }
     return null
   }
   return tokens
@@ -479,7 +494,8 @@ class Parser {
     }
     if (tok.kind === 'error') {
       // A resolvable structured reference that evaluates to an Excel error
-      // (`#NAME?` unknown table, `#REF!` unknown column / missing totals row).
+      // (`#NAME?` unknown table, `#REF!` unknown column / missing totals row)
+      // — or an error literal (#REF!, #N/A, etc.).
       this.pos += 1
       return tok.code
     }

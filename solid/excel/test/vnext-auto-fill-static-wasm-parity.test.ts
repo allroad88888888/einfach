@@ -24,15 +24,10 @@
  * `validate_geometry_rejects_a_target_range_over_the_cell_budget`) so the exact numbers are
  * traceable to the canonical Rust behaviour instead of hand-invented.
  *
- * KNOWN, DOCUMENTED PARITY GAP (scenario 7): `static-backend.ts`'s `shiftFormulaRefs`
- * substitutes the literal text `#REF!` into the copied formula string, but the static
- * formula tokenizer (`static-formula-eval.ts`) has no grammar rule for `#REF!` (or any
- * other bare error literal) appearing inside an expression — unlike the Rust parser, which
- * has a dedicated error-literal token (`formula.rs`: `("#REF!", ValueError::InvalidRef)`).
- * The two engines therefore land on DIFFERENT display values for the identical fillRange
- * copy: WASM reads `#REF!`, static reads `#ERROR!`. This is a genuine cross-engine
- * disagreement, not a test-authoring mistake — see the FIXME on that test below. Per the
- * task's escape hatch, the assertion is pinned to the WASM/canon side.
+ * Scenario 7 used to document a real divergence — static's tokenizer could not parse the
+ * `#REF!` literal that `shiftFormulaRefs` substitutes into a copied formula, so it read
+ * `#ERROR!` where WASM read `#REF!`. `static-formula-eval.ts` now has a bare-error-literal
+ * grammar rule, so both engines agree and the scenario asserts one value on both sides.
  *
  * WASM harness mirrors vnext-sort-static-wasm-parity.test.ts: wasm-pkg mocked onto itself
  * with the binary pre-loaded via `initSync`, a fake `self` installed before the runtime
@@ -540,20 +535,11 @@ describe('static ⇄ WASM auto-fill golden parity', () => {
   })
 
   test('7. fillRange formula relative-shift substitutes #REF! when it exits the grid', async () => {
-    // FIXME (genuine cross-engine disagreement, not a test bug — see the file
-    // header): WASM's copy-fill re-renders the shifted formula through
-    // `render_formula(parse_formula(...))`, and the Rust parser has a
-    // dedicated error-literal grammar rule for `#REF!`, so the rewritten
-    // formula "=(#REF!+$C$1)" re-parses cleanly and evaluates to `#REF!`
-    // (matches `formula_copy_renders_ref_when_relative_shift_leaves_the_grid`
-    // in auto_fill.rs). Static's `shiftFormulaRefs` (clipboard/index.ts) does
-    // a purely textual substitution — inserting the literal characters
-    // `#REF!` into the formula string — but the static tokenizer
-    // (static-formula-eval.ts) has NO grammar rule for a bare error literal
-    // inside an expression, so the rewritten formula fails to tokenize and
-    // the cell reads the tokenizer's fallback `#ERROR!` instead of `#REF!`.
-    // Canon is WASM; static needs a bare-error-literal token added to its
-    // formula tokenizer to close this gap.
+    // Both engines re-render the shifted formula as "=(#REF!+$C$1)" and both
+    // now parse the bare error literal: the Rust parser has always had the
+    // error-literal grammar rule (`formula.rs`: `("#REF!", InvalidRef)`), and
+    // the static tokenizer gained one too (static-formula-eval.ts), closing
+    // the divergence this scenario used to document.
     const seed = [[0, 1, '=A1+$C$1']] as const // B1
     const request: FillRangeRequest = {
       kind: 'fill-range',
@@ -589,12 +575,8 @@ describe('static ⇄ WASM auto-fill golden parity', () => {
       colEnd: 1,
     })
 
-    // Canon (WASM / Rust): the shifted formula re-parses and evaluates to a
-    // real #REF! error.
     expect(cellAt(wasmCells, 0, 0)?.displayValue).toBe('#REF!')
-    // Documented divergence: static's tokenizer cannot parse the substituted
-    // `#REF!` literal and falls back to its generic parse-failure error.
-    expect(cellAt(staticCells, 0, 0)?.displayValue).toBe('#ERROR!')
+    expect(cellAt(staticCells, 0, 0)?.displayValue).toBe('#REF!')
 
     wasmBackend.dispose()
   })
