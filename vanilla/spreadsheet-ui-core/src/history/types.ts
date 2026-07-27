@@ -90,6 +90,24 @@ export interface HistoryEntry {
   readonly localSidePayloads?: readonly Readonly<HistoryLocalReplayPayload>[]
 }
 
+declare const historyProducerReservationBrand: unique symbol
+
+/**
+ * Opaque ownership token for the shared history-producer lane.
+ *
+ * Core validates the exact object identity at runtime. The private brand keeps
+ * callers from constructing a token structurally; reservations are obtained
+ * only through `acquireHistoryProducerReservationAtom`.
+ */
+export interface HistoryProducerReservation {
+  readonly [historyProducerReservationBrand]: true
+}
+
+export interface PushReservedHistoryInput {
+  readonly reservation: HistoryProducerReservation
+  readonly entry: HistoryEntry
+}
+
 export interface HistoryStackState {
   readonly entries: readonly HistoryEntry[]
   readonly cursor: number
@@ -142,9 +160,9 @@ export interface HistoryMutationResult {
    * Structured not-applied witness (host-orchestrated undo, design point
    * C). `false` means the backend POSITIVELY confirmed it did not replay
    * the transaction (unknown transactionId, missing/degraded snapshot).
-   * The stack cursor does not move and the acknowledged revision is not
-   * committed; the lifecycle surfaces the outcome-unknown convention so
-   * hosts re-read canonical state. Absent or `true` means applied.
+   * The stack cursor and projection-revision witness do not move, the
+   * correlated ticket is released, and lifecycle reports a retryable
+   * `blocked` result. Absent or `true` means applied.
    */
   readonly applied?: boolean
   /** Human-readable reason accompanying `applied: false`. */

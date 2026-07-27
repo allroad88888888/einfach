@@ -1,9 +1,14 @@
 import { atom } from '@einfach/core'
 import type { Atom, Getter, Setter } from '@einfach/core'
-import type { ProjectionRequestId } from '../backend/types'
+import type { ProjectionRequestId, ProjectionRevision } from '../backend/types'
 import { clipboardStateAtom } from '../clipboard'
 import type { ClipboardPayloadDescriptor, ClipboardRangeDescriptor } from '../clipboard/types'
-import { pushHistoryAtom } from '../history'
+import {
+  acquireHistoryProducerReservationAtom,
+  pushReservedHistoryAtom,
+  releaseHistoryProducerReservationAtom,
+  type HistoryProducerReservation,
+} from '../history'
 import { selectionSnapshotAtom } from '../selection'
 import type { CellRange } from '../shared'
 import { workspaceSessionAtom } from '../workspace'
@@ -31,9 +36,13 @@ export const PASTE_SPECIAL_UNSUPPORTED_KIND_ERROR =
 export const PASTE_SPECIAL_ACKNOWLEDGEMENT_ERROR =
   'Paste Special acknowledgement did not match the active request.'
 export const PASTE_SPECIAL_OUTCOME_UNKNOWN_ERROR =
-  'Paste Special may have been applied, but the backend did not return a matching acknowledgement. To avoid a duplicate paste, this request cannot be sent again. Refresh the workbook or close the dialog.'
+  'Paste Special may have been applied, but the backend did not return a matching ' +
+  'acknowledgement. To avoid a duplicate paste, this request cannot be sent again. ' +
+  'Refresh or reconcile the workbook before continuing.'
 export const PASTE_SPECIAL_REFRESH_ERROR_PREFIX =
   'Paste Special was acknowledged, but projection refresh failed: '
+export const PASTE_SPECIAL_HISTORY_BUSY_ERROR =
+  'Paste Special is blocked because another history producer owns the mutation lane.'
 
 export const SUPPORTED_PASTE_SPECIAL_KINDS: readonly PasteSpecialKind[] = Object.freeze([
   'values',
@@ -59,9 +68,7 @@ export function pasteSpecialBackendKindError(kind: PasteSpecialKind): string {
 function normalizeSupportedKinds(declared: unknown): readonly PasteSpecialKind[] {
   if (!Array.isArray(declared)) return SUPPORTED_PASTE_SPECIAL_KINDS
   const declaredKinds = declared as readonly unknown[]
-  return Object.freeze(
-    SUPPORTED_PASTE_SPECIAL_KINDS.filter((kind) => declaredKinds.includes(kind)),
-  )
+  return Object.freeze(SUPPORTED_PASTE_SPECIAL_KINDS.filter((kind) => declaredKinds.includes(kind)))
 }
 
 const INITIAL_PASTE_SPECIAL_LIFECYCLE: PasteSpecialLifecycleState = Object.freeze({
@@ -75,9 +82,19 @@ interface PasteSpecialMutationTicket {
   readonly sessionId: number
   readonly requestId: ProjectionRequestId
   readonly sheetId: string
+  readonly sessionWitness: PasteSpecialSessionSnapshot
   readonly target: CellRange
   readonly request: PasteRangeRequest
-  readonly acknowledgement: PasteRangeResult | null
+  readonly historyReservation: HistoryProducerReservation
+  readonly acknowledgement: PasteSpecialAcknowledgement | null
+}
+
+interface PasteSpecialAcknowledgement {
+  readonly kind: 'paste-range'
+  readonly sheetId: string
+  readonly requestId: ProjectionRequestId
+  readonly revision: ProjectionRevision
+  readonly affectedRange: CellRange
 }
 
 function errorMessage(error: unknown): string {
@@ -237,39 +254,46 @@ function blocksPasteSpecialClose(status: PasteSpecialLifecycleState['status']): 
   return status === 'pending' || status === 'local-acknowledged' || status === 'refreshing'
 }
 
-function acknowledgementMatches(
+function snapshotAcknowledgement(
   acknowledgement: unknown,
   ticket: PasteSpecialMutationTicket,
-): acknowledgement is PasteRangeResult {
+): PasteSpecialAcknowledgement | null {
   try {
-    return (
-      typeof acknowledgement === 'object' &&
-      acknowledgement !== null &&
-      (acknowledgement as { kind?: unknown }).kind === 'paste-range' &&
-      (acknowledgement as { sheetId?: unknown }).sheetId === ticket.sheetId &&
-      (acknowledgement as { requestId?: unknown }).requestId === ticket.requestId
-    )
+    if (typeof acknowledgement !== 'object' || acknowledgement === null) return null
+    const result = acknowledgement as Partial<PasteRangeResult>
+    const kind = result.kind
+    const sheetId = result.sheetId
+    const requestId = result.requestId
+    const revision = result.revision
+    const affectedRange = result.affectedRange
+    if (
+      kind !== 'paste-range' ||
+      sheetId !== ticket.sheetId ||
+      requestId !== ticket.requestId ||
+      !(
+        (typeof revision === 'number' && Number.isFinite(revision)) ||
+        (typeof revision === 'string' && revision.length > 0)
+      ) ||
+      typeof affectedRange !== 'object' ||
+      affectedRange === null
+    ) {
+      return null
+    }
+    const rowStart = affectedRange.rowStart
+    const rowEnd = affectedRange.rowEnd
+    const colStart = affectedRange.colStart
+    const colEnd = affectedRange.colEnd
+    const rangeSnapshot = Object.freeze({ rowStart, rowEnd, colStart, colEnd })
+    if (!validRange(rangeSnapshot)) return null
+    return Object.freeze({
+      kind,
+      sheetId,
+      requestId,
+      revision,
+      affectedRange: rangeSnapshot,
+    })
   } catch {
-    return false
-  }
-}
-
-function historyRevision(result: PasteRangeResult): number {
-  try {
-    const revision =
-      typeof result.revision === 'number' ? result.revision : Number(result.revision ?? 0)
-    return Number.isFinite(revision) ? revision : 0
-  } catch {
-    return 0
-  }
-}
-
-function historyRange(result: PasteRangeResult, fallback: CellRange): CellRange {
-  try {
-    const affected = snapshotRange(result.affectedRange)
-    return validRange(affected) ? affected : fallback
-  } catch {
-    return fallback
+    return null
   }
 }
 
@@ -346,7 +370,9 @@ export const pasteSpecialCanEditAtom = atom((get) => {
   return (
     get(pasteSpecialOpenAtom) &&
     get(activePasteSpecialMutationAtom) === null &&
-    (lifecycle.status === 'editing' || lifecycle.status === 'error')
+    (lifecycle.status === 'editing' ||
+      lifecycle.status === 'blocked' ||
+      lifecycle.status === 'error')
   )
 })
 pasteSpecialCanEditAtom.debugLabel = 'spreadsheet.pasteSpecial.canEdit'
@@ -356,12 +382,11 @@ export const pasteSpecialCanConfirmAtom = atom((get) => {
   return (
     get(pasteSpecialOpenAtom) &&
     get(pasteSpecialCapabilityAtom) &&
-    sessionBlockReason(
-      get(pasteSpecialSessionAtom),
-      true,
-      get(pasteSpecialSupportedKindsAtom),
-    ) === null &&
-    (lifecycle.status === 'editing' || lifecycle.status === 'error')
+    sessionBlockReason(get(pasteSpecialSessionAtom), true, get(pasteSpecialSupportedKindsAtom)) ===
+      null &&
+    (lifecycle.status === 'editing' ||
+      lifecycle.status === 'blocked' ||
+      lifecycle.status === 'error')
   )
 })
 pasteSpecialCanConfirmAtom.debugLabel = 'spreadsheet.pasteSpecial.canConfirm'
@@ -378,27 +403,51 @@ export const pasteSpecialCanCloseAtom = atom((get) => {
 })
 pasteSpecialCanCloseAtom.debugLabel = 'spreadsheet.pasteSpecial.canClose'
 
+function sessionAuthorityIsCurrent(
+  get: Getter,
+  session: PasteSpecialSessionSnapshot,
+  lifecycle: PasteSpecialLifecycleState,
+): boolean {
+  return (
+    get(activePasteSpecialMutationAtom) === null &&
+    get(pasteSpecialOpenAtom) &&
+    get(pasteSpecialSessionAtom) === session &&
+    get(pasteSpecialSessionIdAtom) === session.sessionId &&
+    get(pasteSpecialLifecycleAtom) === lifecycle
+  )
+}
+
 function ticketIsCurrent(get: Getter, ticket: PasteSpecialMutationTicket): boolean {
   const active = get(activePasteSpecialMutationAtom)
   const lifecycle = get(pasteSpecialLifecycleAtom)
   const session = get(pasteSpecialSessionAtom)
   return (
-    active !== null &&
-    active.sessionId === ticket.sessionId &&
-    active.requestId === ticket.requestId &&
+    active === ticket &&
     get(pasteSpecialOpenAtom) &&
     get(pasteSpecialSessionIdAtom) === ticket.sessionId &&
-    session?.sessionId === ticket.sessionId &&
+    session === ticket.sessionWitness &&
     session.sheetId === ticket.sheetId &&
     lifecycle.sessionId === ticket.sessionId &&
     lifecycle.requestId === ticket.requestId
   )
 }
 
+/**
+ * Closing abandons any retained ticket outright (outcome-unknown or a
+ * refresh-failure never resolve on their own). Excel never traps a dialog:
+ * once acknowledged, the paste itself already reached the backend, so a
+ * stale local reservation must not block the user from dismissing it.
+ */
 function closePasteSpecialSession(get: Getter, set: Setter): void {
   const nextSessionId = nextPasteSpecialSessionId(get(pasteSpecialSessionIdAtom))
   if (nextSessionId !== null) set(pasteSpecialSessionIdBackingAtom, nextSessionId)
   const sessionId = nextSessionId ?? get(pasteSpecialSessionIdAtom)
+  // A retained ticket (outcome-unknown, or an acknowledged paste whose
+  // refresh keeps failing) still owns the history producer reservation.
+  // Abandoning the dialog must release it too, or the shared lane would
+  // stay locked forever with no ticket left to reconcile it.
+  const active = get(activePasteSpecialMutationAtom)
+  if (active !== null) set(releaseHistoryProducerReservationAtom, active.historyReservation)
   set(activePasteSpecialMutationAtom, null)
   set(pasteSpecialOpenBackingAtom, false)
   set(pasteSpecialSessionBackingAtom, null)
@@ -467,6 +516,7 @@ export const openPasteSpecialAtom = atom(null, (get, set) => {
   // Reopening an already-visible dialog is equivalent to replacing its
   // session. Preserve the current owner while acknowledgement/history/refresh
   // bookkeeping is incomplete.
+  if (get(activePasteSpecialMutationAtom) !== null) return
   if (get(pasteSpecialOpenAtom) && blocksPasteSpecialClose(get(pasteSpecialLifecycleAtom).status)) {
     return
   }
@@ -573,18 +623,27 @@ patchPasteSpecialOptionsAtom.debugLabel = 'spreadsheet.pasteSpecial.patchOptions
 export const confirmPasteSpecialAtom = atom(
   null,
   async (get, set, input: ConfirmPasteSpecialInput): Promise<PasteSpecialMutationOutcome> => {
+    let source: PasteSpecialControllerPort
+    let inputSessionId: number
+    let refreshProjection: ((sheetId: string) => Promise<void>) | undefined
+    try {
+      source = input.source
+      inputSessionId = input.sessionId
+      refreshProjection = input.refreshProjection
+    } catch {
+      return 'stale'
+    }
+
     const active = get(activePasteSpecialMutationAtom)
     if (active !== null) {
       const lifecycle = get(pasteSpecialLifecycleAtom)
-      if (active.acknowledgement === null) {
-        return lifecycle.status === 'outcome-unknown' ? 'blocked' : 'stale'
-      }
       if (
-        input.sessionId !== active.sessionId ||
+        active.acknowledgement === null ||
+        inputSessionId !== active.sessionId ||
         lifecycle.status !== 'error' ||
-        typeof input.refreshProjection !== 'function'
+        typeof refreshProjection !== 'function'
       ) {
-        return 'stale'
+        return lifecycle.status === 'outcome-unknown' ? 'blocked' : 'stale'
       }
 
       set(pasteSpecialErrorBackingAtom, '')
@@ -596,7 +655,7 @@ export const confirmPasteSpecialAtom = atom(
       if (!ticketIsCurrent(get, active)) return 'stale'
       set(pasteSpecialLifecycleBackingAtom, get(pasteSpecialLifecycleAtom))
       try {
-        await input.refreshProjection(active.sheetId)
+        await refreshProjection(active.sheetId)
       } catch (error) {
         if (!ticketIsCurrent(get, active)) return 'stale'
         set(
@@ -610,6 +669,19 @@ export const confirmPasteSpecialAtom = atom(
         return 'error'
       }
       if (!ticketIsCurrent(get, active)) return 'stale'
+      if (!set(releaseHistoryProducerReservationAtom, active.historyReservation)) {
+        set(
+          pasteSpecialErrorBackingAtom,
+          `${PASTE_SPECIAL_OUTCOME_UNKNOWN_ERROR} History ownership could not be reconciled ` +
+            'after refresh.',
+        )
+        set(
+          pasteSpecialLifecycleBackingAtom,
+          lifecycleFor('outcome-unknown', active.sessionId, active.sheetId, active.requestId),
+        )
+        return 'outcome-unknown'
+      }
+      set(activePasteSpecialMutationAtom, null)
       closePasteSpecialSession(get, set)
       return 'completed'
     }
@@ -619,9 +691,10 @@ export const confirmPasteSpecialAtom = atom(
     if (
       !get(pasteSpecialOpenAtom) ||
       session === null ||
-      input.sessionId !== session.sessionId ||
+      inputSessionId !== session.sessionId ||
       lifecycle.sessionId !== session.sessionId ||
       lifecycle.status === 'pending' ||
+      lifecycle.status === 'outcome-unknown' ||
       lifecycle.status === 'local-acknowledged' ||
       lifecycle.status === 'refreshing'
     ) {
@@ -633,7 +706,7 @@ export const confirmPasteSpecialAtom = atom(
       get(pasteSpecialCapabilityAtom),
       get(pasteSpecialSupportedKindsAtom),
     )
-    if (reason !== null || typeof input.refreshProjection !== 'function') {
+    if (reason !== null || typeof refreshProjection !== 'function') {
       set(pasteSpecialErrorBackingAtom, reason ?? PASTE_SPECIAL_CONTEXT_ERROR)
       set(
         pasteSpecialLifecycleBackingAtom,
@@ -644,10 +717,11 @@ export const confirmPasteSpecialAtom = atom(
 
     let execute: PasteSpecialControllerPort['pasteRange']
     try {
-      execute = input.source?.pasteRange
+      execute = source?.pasteRange
     } catch {
       execute = undefined
     }
+    if (!sessionAuthorityIsCurrent(get, session, lifecycle)) return 'stale'
     if (typeof execute !== 'function') {
       set(pasteSpecialErrorBackingAtom, PASTE_SPECIAL_CAPABILITY_ERROR)
       set(
@@ -682,12 +756,24 @@ export const confirmPasteSpecialAtom = atom(
       skipBlanks: session.options.skipBlanks,
       requestId,
     })
+    if (!sessionAuthorityIsCurrent(get, session, lifecycle)) return 'stale'
+    const historyReservation = set(acquireHistoryProducerReservationAtom)
+    if (historyReservation === null) {
+      set(pasteSpecialErrorBackingAtom, PASTE_SPECIAL_HISTORY_BUSY_ERROR)
+      set(
+        pasteSpecialLifecycleBackingAtom,
+        lifecycleFor('blocked', session.sessionId, session.sheetId),
+      )
+      return 'blocked'
+    }
     const ticket: PasteSpecialMutationTicket = Object.freeze({
       sessionId: session.sessionId,
       requestId,
       sheetId: session.sheetId!,
+      sessionWitness: session,
       target: session.target!,
       request,
+      historyReservation,
       acknowledgement: null,
     })
     set(pasteSpecialRequestIdBackingAtom, requestId)
@@ -705,7 +791,7 @@ export const confirmPasteSpecialAtom = atom(
 
     let acknowledgement: unknown
     try {
-      acknowledgement = await execute.call(input.source, ticket.request)
+      acknowledgement = await execute.call(source, ticket.request)
     } catch (error) {
       if (!ticketIsCurrent(get, ticket)) return 'stale'
       set(
@@ -720,7 +806,9 @@ export const confirmPasteSpecialAtom = atom(
     }
 
     if (!ticketIsCurrent(get, ticket)) return 'stale'
-    if (!acknowledgementMatches(acknowledgement, ticket)) {
+    const acknowledgementSnapshot = snapshotAcknowledgement(acknowledgement, ticket)
+    if (!ticketIsCurrent(get, ticket)) return 'stale'
+    if (acknowledgementSnapshot === null) {
       set(
         pasteSpecialErrorBackingAtom,
         `${PASTE_SPECIAL_OUTCOME_UNKNOWN_ERROR} ${PASTE_SPECIAL_ACKNOWLEDGEMENT_ERROR}`,
@@ -734,16 +822,32 @@ export const confirmPasteSpecialAtom = atom(
 
     const acknowledgedTicket: PasteSpecialMutationTicket = Object.freeze({
       ...ticket,
-      acknowledgement,
+      acknowledgement: acknowledgementSnapshot,
     })
     set(activePasteSpecialMutationAtom, acknowledgedTicket)
-    set(pushHistoryAtom, {
-      transactionId: `paste-special-${ticket.sessionId}-${ticket.requestId}`,
-      kind: 'cells.import',
-      sheetId: ticket.sheetId,
-      projectionRevision: historyRevision(acknowledgement),
-      affectedRange: historyRange(acknowledgement, ticket.target),
+    const historyRecorded = set(pushReservedHistoryAtom, {
+      reservation: ticket.historyReservation,
+      entry: {
+        transactionId: `paste-special-${ticket.sessionId}-${ticket.requestId}`,
+        kind: 'cells.import',
+        sheetId: ticket.sheetId,
+        projectionRevision: acknowledgementSnapshot.revision,
+        affectedRange: acknowledgementSnapshot.affectedRange,
+      },
     })
+    if (!ticketIsCurrent(get, acknowledgedTicket)) return 'stale'
+    if (!historyRecorded) {
+      set(
+        pasteSpecialErrorBackingAtom,
+        `${PASTE_SPECIAL_OUTCOME_UNKNOWN_ERROR} History ownership was unavailable ` +
+          'after acknowledgement.',
+      )
+      set(
+        pasteSpecialLifecycleBackingAtom,
+        lifecycleFor('outcome-unknown', ticket.sessionId, ticket.sheetId, ticket.requestId),
+      )
+      return 'outcome-unknown'
+    }
     set(
       pasteSpecialLifecycleBackingAtom,
       lifecycleFor('local-acknowledged', ticket.sessionId, ticket.sheetId, ticket.requestId),
@@ -756,7 +860,7 @@ export const confirmPasteSpecialAtom = atom(
       lifecycleFor('refreshing', ticket.sessionId, ticket.sheetId, ticket.requestId),
     )
     try {
-      await input.refreshProjection(ticket.sheetId)
+      await refreshProjection(ticket.sheetId)
     } catch (error) {
       if (!ticketIsCurrent(get, acknowledgedTicket)) return 'stale'
       set(
@@ -770,6 +874,19 @@ export const confirmPasteSpecialAtom = atom(
       return 'error'
     }
     if (!ticketIsCurrent(get, acknowledgedTicket)) return 'stale'
+    if (!set(releaseHistoryProducerReservationAtom, ticket.historyReservation)) {
+      set(
+        pasteSpecialErrorBackingAtom,
+        `${PASTE_SPECIAL_OUTCOME_UNKNOWN_ERROR} History ownership could not be reconciled ` +
+          'after refresh.',
+      )
+      set(
+        pasteSpecialLifecycleBackingAtom,
+        lifecycleFor('outcome-unknown', ticket.sessionId, ticket.sheetId, ticket.requestId),
+      )
+      return 'outcome-unknown'
+    }
+    set(activePasteSpecialMutationAtom, null)
     closePasteSpecialSession(get, set)
     return 'completed'
   },

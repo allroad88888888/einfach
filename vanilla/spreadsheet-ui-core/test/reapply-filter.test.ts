@@ -90,6 +90,7 @@ function makeHost(initialHidden: number[]): FakeHost {
           sheetId: request.sheetId,
           requestId: request.requestId,
           revision: host.calls.length,
+          historyRecorded: false,
         }
         return host.omitHidden ? result : { ...result, hiddenRowIndices: [...host.hidden] }
       },

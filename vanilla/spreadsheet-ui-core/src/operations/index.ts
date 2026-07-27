@@ -10,8 +10,13 @@ import type {
   ProjectionRequestId,
   ProjectionRevision,
 } from '../backend/types'
-import { nextHistoryTransactionId, pushHistoryAtom } from '../history'
-import type { HistoryLocalReplayPayload } from '../history'
+import {
+  acquireHistoryProducerReservationAtom,
+  nextHistoryTransactionId,
+  pushReservedHistoryAtom,
+  releaseHistoryProducerReservationAtom,
+} from '../history'
+import type { HistoryLocalReplayPayload, HistoryProducerReservation } from '../history'
 import {
   applyOutlineStructuralShiftAtom,
   getOutlineGroupsForSheet,
@@ -482,6 +487,7 @@ interface StructureOperationTicket {
   readonly request: StructureOperationRequest
   readonly requestId: ProjectionRequestId
   readonly transactionId: string
+  readonly historyReservation: HistoryProducerReservation
 }
 
 interface StructureOperationAcknowledgement {
@@ -702,68 +708,94 @@ function acknowledgedStructureOperation(
   try {
     if (typeof value !== 'object' || value === null) return null
     const result = value as Partial<BackendMutationResult>
+    const sheetId = result.sheetId
+    const requestId = result.requestId
+    const revision = result.revision
+    const affectedRangeValue = result.affectedRange
+    const structuralShiftValue = result.structuralShift
     if (
-      result.sheetId !== ticket.intent.sheetId ||
-      result.requestId !== ticket.requestId ||
-      !isProjectionRevision(result.revision)
+      sheetId !== ticket.intent.sheetId ||
+      requestId !== ticket.requestId ||
+      !isProjectionRevision(revision)
     ) {
       return null
     }
 
-    const affectedRange = snapshotAffectedRange(result.affectedRange)
-    const structuralShift = snapshotStructuralShift(result.structuralShift)
-    return Object.freeze({
-      revision: result.revision,
-      ...(affectedRange ? { affectedRange } : {}),
-      ...(structuralShift ? { structuralShift } : {}),
-    })
+    const affectedRange = snapshotAffectedRange(affectedRangeValue)
+    const structuralShift = snapshotStructuralShift(structuralShiftValue)
+    if (
+      (affectedRangeValue !== undefined && affectedRange === null) ||
+      (structuralShiftValue !== undefined && structuralShift === null)
+    ) {
+      return null
+    }
+    const acknowledgement: {
+      revision: ProjectionRevision
+      affectedRange?: Readonly<CellRange>
+      structuralShift?: Readonly<BackendStructuralShift>
+    } = { revision }
+    if (affectedRange !== null) acknowledgement.affectedRange = affectedRange
+    if (structuralShift !== null) acknowledgement.structuralShift = structuralShift
+    return Object.freeze(acknowledgement)
   } catch {
     return null
   }
 }
 
 function snapshotStructuralShift(value: unknown): Readonly<BackendStructuralShift> | null {
-  if (typeof value !== 'object' || value === null) return null
-  const shift = value as Partial<BackendStructuralShift>
-  if (
-    (shift.axis !== 'row' && shift.axis !== 'column') ||
-    (shift.kind !== 'insert' && shift.kind !== 'delete') ||
-    !Number.isSafeInteger(shift.index) ||
-    (shift.index as number) < 0 ||
-    !Number.isSafeInteger(shift.count) ||
-    (shift.count as number) <= 0
-  ) {
+  try {
+    if (typeof value !== 'object' || value === null) return null
+    const shift = value as Partial<BackendStructuralShift>
+    const axis = shift.axis
+    const kind = shift.kind
+    const index = shift.index
+    const count = shift.count
+    if (
+      (axis !== 'row' && axis !== 'column') ||
+      (kind !== 'insert' && kind !== 'delete') ||
+      typeof index !== 'number' ||
+      !Number.isSafeInteger(index) ||
+      index < 0 ||
+      typeof count !== 'number' ||
+      !Number.isSafeInteger(count) ||
+      count <= 0
+    ) {
+      return null
+    }
+    return Object.freeze({ axis, kind, index, count })
+  } catch {
     return null
   }
-  return Object.freeze({
-    axis: shift.axis,
-    kind: shift.kind,
-    index: shift.index as number,
-    count: shift.count as number,
-  })
 }
 
 function snapshotAffectedRange(value: unknown): Readonly<CellRange> | null {
-  if (typeof value !== 'object' || value === null) return null
-  const range = value as Partial<CellRange>
-  if (
-    !Number.isInteger(range.rowStart) ||
-    !Number.isInteger(range.rowEnd) ||
-    !Number.isInteger(range.colStart) ||
-    !Number.isInteger(range.colEnd) ||
-    (range.rowStart as number) < 0 ||
-    (range.colStart as number) < 0 ||
-    (range.rowEnd as number) < (range.rowStart as number) ||
-    (range.colEnd as number) < (range.colStart as number)
-  ) {
+  try {
+    if (typeof value !== 'object' || value === null) return null
+    const range = value as Partial<CellRange>
+    const rowStart = range.rowStart
+    const rowEnd = range.rowEnd
+    const colStart = range.colStart
+    const colEnd = range.colEnd
+    if (
+      typeof rowStart !== 'number' ||
+      !Number.isInteger(rowStart) ||
+      typeof rowEnd !== 'number' ||
+      !Number.isInteger(rowEnd) ||
+      typeof colStart !== 'number' ||
+      !Number.isInteger(colStart) ||
+      typeof colEnd !== 'number' ||
+      !Number.isInteger(colEnd) ||
+      rowStart < 0 ||
+      colStart < 0 ||
+      rowEnd < rowStart ||
+      colEnd < colStart
+    ) {
+      return null
+    }
+    return Object.freeze({ rowStart, rowEnd, colStart, colEnd })
+  } catch {
     return null
   }
-  return Object.freeze({
-    rowStart: range.rowStart as number,
-    rowEnd: range.rowEnd as number,
-    colStart: range.colStart as number,
-    colEnd: range.colEnd as number,
-  })
 }
 
 function structureOperationErrorMessage(error: unknown): string {
@@ -859,6 +891,29 @@ function structureOperationTicketIsCurrent(get: Getter, ticket: StructureOperati
   )
 }
 
+const completeStructureOperationTicketAtom = atom(
+  null,
+  (
+    get,
+    set,
+    input: {
+      readonly ticket: StructureOperationTicket
+      readonly acknowledgedRevision: ProjectionRevision
+    },
+  ): boolean => {
+    const { ticket, acknowledgedRevision } = input
+    if (!structureOperationTicketIsCurrent(get, ticket)) return false
+    if (!set(releaseHistoryProducerReservationAtom, ticket.historyReservation)) return false
+    set(activeStructureOperationTicketAtom, null)
+    set(
+      structureOperationLifecycleBackingAtom,
+      structureLifecycleForTicket('completed', ticket, acknowledgedRevision),
+    )
+    return true
+  },
+)
+completeStructureOperationTicketAtom.debugLabel = 'spreadsheet.operations.structure.completeTicket'
+
 async function runStructureOperation(
   get: Getter,
   set: Setter,
@@ -907,11 +962,19 @@ async function runStructureOperation(
     return 'rejected'
   }
 
+  const request = buildStructureOperationRequest(intent, requestId)
+  const historyReservation = set(acquireHistoryProducerReservationAtom)
+  if (historyReservation === null) {
+    return 'stale'
+  }
+  const transactionId = nextHistoryTransactionId('structure')
+
   const ticket: StructureOperationTicket = Object.freeze({
     intent,
-    request: buildStructureOperationRequest(intent, requestId),
+    request,
     requestId,
-    transactionId: nextHistoryTransactionId('structure'),
+    transactionId,
+    historyReservation,
   })
   set(structureOperationRequestSequenceAtom, requestId)
   set(activeStructureOperationTicketAtom, ticket)
@@ -922,6 +985,7 @@ async function runStructureOperation(
   if (!structureOperationTicketIsCurrent(get, ticket)) return 'stale'
   // Einfach publishes the first async-write flush on a post-await setter.
   set(structureOperationLifecycleBackingAtom, get(structureOperationLifecycleBackingAtom))
+  if (!structureOperationTicketIsCurrent(get, ticket)) return 'stale'
 
   set(structureOperationTransportReservationAtom, ticket)
   const transport = Promise.resolve().then(() => execute.call(source, ticket.request))
@@ -967,6 +1031,7 @@ async function runStructureOperation(
     )
     return 'outcome-unknown'
   }
+  if (!structureOperationTicketIsCurrent(get, ticket)) return 'stale'
 
   // W3 structural-shift contract: displaced index space moves UI-core
   // canonical view facts (freeze band, hidden index sets) before anything
@@ -1050,15 +1115,20 @@ async function runStructureOperation(
     })
   }
 
-  const historyRecorded = set(pushHistoryAtom, {
-    transactionId: ticket.transactionId,
-    kind: ticket.intent.kind,
-    sheetId: ticket.intent.sheetId,
-    projectionRevision: acknowledgement.revision,
-    ...(acknowledgement.affectedRange ? { affectedRange: acknowledgement.affectedRange } : {}),
-    ...(localSidePayloads.length > 0 ? { localSidePayloads } : {}),
+  if (!structureOperationTicketIsCurrent(get, ticket)) return 'stale'
+  const historyRecorded = set(pushReservedHistoryAtom, {
+    reservation: ticket.historyReservation,
+    entry: {
+      transactionId: ticket.transactionId,
+      kind: ticket.intent.kind,
+      sheetId: ticket.intent.sheetId,
+      projectionRevision: acknowledgement.revision,
+      ...(acknowledgement.affectedRange ? { affectedRange: acknowledgement.affectedRange } : {}),
+      ...(localSidePayloads.length > 0 ? { localSidePayloads } : {}),
+    },
   })
   if (!historyRecorded) {
+    if (!structureOperationTicketIsCurrent(get, ticket)) return 'stale'
     set(
       structureOperationLifecycleBackingAtom,
       structureLifecycleForTicket(
@@ -1070,6 +1140,7 @@ async function runStructureOperation(
     )
     return 'outcome-unknown'
   }
+  if (!structureOperationTicketIsCurrent(get, ticket)) return 'stale'
 
   set(
     structureOperationLifecycleBackingAtom,
@@ -1103,12 +1174,12 @@ async function runStructureOperation(
   }
 
   if (!structureOperationTicketIsCurrent(get, ticket)) return 'stale'
-  set(activeStructureOperationTicketAtom, null)
-  set(
-    structureOperationLifecycleBackingAtom,
-    structureLifecycleForTicket('completed', ticket, acknowledgement.revision),
-  )
-  return 'completed'
+  return set(completeStructureOperationTicketAtom, {
+    ticket,
+    acknowledgedRevision: acknowledgement.revision,
+  })
+    ? 'completed'
+    : 'stale'
 }
 
 export const runStructureOperationAtom = atom(
@@ -1343,12 +1414,12 @@ export const retryStructureOperationRefreshAtom = atom(
     }
 
     if (!structureOperationTicketIsCurrent(get, ticket)) return 'stale'
-    set(activeStructureOperationTicketAtom, null)
-    set(
-      structureOperationLifecycleBackingAtom,
-      structureLifecycleForTicket('completed', ticket, acknowledgedRevision),
-    )
-    return 'completed'
+    return set(completeStructureOperationTicketAtom, {
+      ticket,
+      acknowledgedRevision,
+    })
+      ? 'completed'
+      : 'stale'
   },
 )
 retryStructureOperationRefreshAtom.debugLabel = 'spreadsheet.operations.structure.retryRefresh'
@@ -1361,7 +1432,9 @@ export const resetStructureOperationLifecycleAtom = atom(null, (get, set): boole
     set(structureOperationLifecycleBackingAtom, INITIAL_STRUCTURE_OPERATION_LIFECYCLE)
     return false
   }
+  if (get(structureOperationTransportReservationAtom) !== null) return false
   const acknowledgedRevision = get(structureOperationLifecycleBackingAtom).acknowledgedRevision
+  if (!set(releaseHistoryProducerReservationAtom, ticket.historyReservation)) return false
   set(activeStructureOperationTicketAtom, null)
   set(
     structureOperationLifecycleBackingAtom,

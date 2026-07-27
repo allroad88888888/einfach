@@ -5,8 +5,12 @@ import type {
   StructureOperationControllerPort,
   StructureOperationRequest,
 } from '../src'
-import type { HistoryControllerPort } from '../src/history'
-import { historyStackAtom, runRedoHistoryAtom, runUndoHistoryAtom } from '../src/history'
+import {
+  acquireHistoryProducerReservationAtom,
+  historyStackAtom,
+  pushReservedHistoryAtom,
+  releaseHistoryProducerReservationAtom,
+} from '../src/history'
 import { setFreezeConfigAtom, viewportFreezeAtom } from '../src/viewport/freeze'
 import { hideRowsAtom, viewportHiddenAtom } from '../src/viewport/hidden'
 import {
@@ -35,6 +39,13 @@ import {
   structureOperationCanRetryRefreshAtom,
   structureOperationLifecycleAtom,
 } from '../src/operations'
+
+function expectHistoryProducerLaneAvailable(store: ReturnType<typeof createStore>): void {
+  const reservation = store.setter(acquireHistoryProducerReservationAtom)
+  expect(reservation).not.toBeNull()
+  if (reservation === null) throw new Error('expected the history producer lane to be available')
+  expect(store.setter(releaseHistoryProducerReservationAtom, reservation)).toBe(true)
+}
 
 describe('operations core', () => {
   test('creates normalized intents for the common spreadsheet mutations', () => {
@@ -240,6 +251,7 @@ describe('operations core', () => {
     expect(
       new Set(store.getter(historyStackAtom).entries.map((entry) => entry.transactionId)).size,
     ).toBe(4)
+    expectHistoryProducerLaneAvailable(store)
     expect(store.getter(structureOperationLifecycleAtom)).toMatchObject({
       status: 'completed',
       operation: 'column.delete',
@@ -287,22 +299,40 @@ describe('operations core', () => {
     expect(store.getter(historyStackAtom).entries).toEqual([])
   })
 
-  test.each([
-    ['transport rejection', new Error('connection reset')],
-    ['missing request id', { sheetId: 'sheet-1', revision: 3 }],
-    ['wrong request id', { sheetId: 'sheet-1', requestId: 99, revision: 3 }],
-    ['missing revision', { sheetId: 'sheet-1', requestId: 1 }],
-    ['wrong sheet', { sheetId: 'sheet-2', requestId: 1, revision: 3 }],
-  ])('keeps %s terminal as outcome-unknown without refresh or history', async (_label, result) => {
+  test(
+    'validates before acquisition and launches zero transport when another producer owns history',
+    async () => {
     const store = createStore()
-    let refreshCount = 0
+    const foreignStore = createStore()
+    const reservation = store.setter(acquireHistoryProducerReservationAtom)
+    const foreignReservation = foreignStore.setter(acquireHistoryProducerReservationAtom)
+    if (reservation === null || foreignReservation === null) {
+      throw new Error('expected both isolated stores to acquire their producer lane')
+    }
+    let mutationCount = 0
     const source: StructureOperationControllerPort = {
-      async insertRows() {
-        if (result instanceof Error) throw result
-        return result
+      async insertRows(request) {
+        mutationCount += 1
+        return {
+          sheetId: request.sheetId,
+          requestId: request.requestId,
+          revision: 2,
+        }
       },
     }
 
+    await expect(
+      store.setter(runStructureOperationAtom, {
+        intent: {
+          kind: 'row.insert',
+          sheetId: 'sheet-1',
+          rowIndex: -1,
+          count: 1,
+        } as never,
+        source,
+        refreshProjection: async () => undefined,
+      }),
+    ).resolves.toBe('rejected')
     await expect(
       store.setter(runStructureOperationAtom, {
         intent: createInsertRowsOperation({
@@ -311,15 +341,300 @@ describe('operations core', () => {
           count: 1,
         }),
         source,
+        refreshProjection: async () => undefined,
+      }),
+    ).resolves.toBe('stale')
+
+    expect(mutationCount).toBe(0)
+    expect(store.getter(historyStackAtom).entries).toEqual([])
+    expect(store.setter(releaseHistoryProducerReservationAtom, foreignReservation)).toBe(false)
+    expect(store.setter(resetStructureOperationLifecycleAtom)).toBe(false)
+    expect(store.setter(acquireHistoryProducerReservationAtom)).toBeNull()
+    expect(store.setter(releaseHistoryProducerReservationAtom, reservation)).toBe(true)
+    expect(store.setter(releaseHistoryProducerReservationAtom, reservation)).toBe(false)
+    expect(store.setter(releaseHistoryProducerReservationAtom, foreignReservation)).toBe(false)
+    expect(foreignStore.setter(releaseHistoryProducerReservationAtom, foreignReservation)).toBe(
+      true,
+    )
+    expectHistoryProducerLaneAvailable(store)
+  })
+
+  test.each([
+    ['transport rejection', new Error('connection reset')],
+    ['missing request id', { sheetId: 'sheet-1', revision: 3 }],
+    ['wrong request id', { sheetId: 'sheet-1', requestId: 99, revision: 3 }],
+    ['missing revision', { sheetId: 'sheet-1', requestId: 1 }],
+    ['wrong sheet', { sheetId: 'sheet-2', requestId: 1, revision: 3 }],
+    [
+      'malformed affected range',
+      {
+        sheetId: 'sheet-1',
+        requestId: 1,
+        revision: 3,
+        affectedRange: { rowStart: 2, rowEnd: 1, colStart: 0, colEnd: 0 },
+      },
+    ],
+    [
+      'malformed structural shift',
+      {
+        sheetId: 'sheet-1',
+        requestId: 1,
+        revision: 3,
+        structuralShift: { axis: 'row', kind: 'insert', index: -1, count: 1 } as const,
+      },
+    ],
+  ])('keeps %s terminal as outcome-unknown without refresh or history', async (_label, result) => {
+    const store = createStore()
+    let mutationCount = 0
+    let refreshCount = 0
+    const source: StructureOperationControllerPort = {
+      async insertRows() {
+        mutationCount += 1
+        if (result instanceof Error) throw result
+        return result
+      },
+    }
+    const input = {
+      intent: createInsertRowsOperation({
+        sheetId: 'sheet-1',
+        rowIndex: 0,
+        count: 1,
+      }),
+      source,
+      refreshProjection: async () => {
+        refreshCount += 1
+      },
+    }
+
+    await expect(store.setter(runStructureOperationAtom, input)).resolves.toBe('outcome-unknown')
+
+    expect(store.getter(structureOperationLifecycleAtom).status).toBe('outcome-unknown')
+    expect(store.getter(historyStackAtom).entries).toEqual([])
+    expect(mutationCount).toBe(1)
+    expect(refreshCount).toBe(0)
+    expect(store.setter(acquireHistoryProducerReservationAtom)).toBeNull()
+    await expect(store.setter(runStructureOperationAtom, input)).resolves.toBe('stale')
+    expect(mutationCount).toBe(1)
+    expect(store.setter(resetStructureOperationLifecycleAtom)).toBe(true)
+    expectHistoryProducerLaneAvailable(store)
+  })
+
+  test('snapshots every top-level and nested ACK getter exactly once', async () => {
+    const store = createStore()
+    store.setter(hideRowsAtom, { sheetId: 'sheet-1', indices: [2] })
+    const historyEntriesBefore = store.getter(historyStackAtom).entries.length
+    const reads = {
+      sheetId: 0,
+      requestId: 0,
+      revision: 0,
+      affectedRange: 0,
+      structuralShift: 0,
+      rowStart: 0,
+      rowEnd: 0,
+      colStart: 0,
+      colEnd: 0,
+      axis: 0,
+      kind: 0,
+      index: 0,
+      count: 0,
+    }
+    type GetterField = keyof typeof reads
+    const statefulValue = <T>(field: GetterField, first: T, later: T): T => {
+      reads[field] += 1
+      return reads[field] === 1 ? first : later
+    }
+    let refreshCount = 0
+    const source: StructureOperationControllerPort = {
+      async insertRows(request) {
+        const affectedRange = {
+          get rowStart() {
+            return statefulValue('rowStart', 1, -1)
+          },
+          get rowEnd() {
+            return statefulValue('rowEnd', 3, -1)
+          },
+          get colStart() {
+            return statefulValue('colStart', 2, -1)
+          },
+          get colEnd() {
+            return statefulValue('colEnd', 4, -1)
+          },
+        }
+        const structuralShift = {
+          get axis() {
+            return statefulValue('axis', 'row', 'invalid-axis')
+          },
+          get kind() {
+            return statefulValue('kind', 'insert', 'invalid-kind')
+          },
+          get index() {
+            return statefulValue('index', 1, -1)
+          },
+          get count() {
+            return statefulValue('count', 1, 0)
+          },
+        }
+        return {
+          get sheetId() {
+            return statefulValue('sheetId', request.sheetId, 'wrong-sheet')
+          },
+          get requestId() {
+            return statefulValue('requestId', request.requestId, -999)
+          },
+          get revision() {
+            return statefulValue('revision', 7, Number.NaN)
+          },
+          get affectedRange() {
+            return statefulValue('affectedRange', affectedRange, null)
+          },
+          get structuralShift() {
+            return statefulValue('structuralShift', structuralShift, null)
+          },
+        } as unknown as BackendMutationResult
+      },
+    }
+
+    await expect(
+      store.setter(runStructureOperationAtom, {
+        intent: createInsertRowsOperation({ sheetId: 'sheet-1', rowIndex: 1, count: 1 }),
+        source,
         refreshProjection: async () => {
           refreshCount += 1
         },
       }),
-    ).resolves.toBe('outcome-unknown')
+    ).resolves.toBe('completed')
 
-    expect(store.getter(structureOperationLifecycleAtom).status).toBe('outcome-unknown')
-    expect(store.getter(historyStackAtom).entries).toEqual([])
+    expect(reads).toEqual({
+      sheetId: 1,
+      requestId: 1,
+      revision: 1,
+      affectedRange: 1,
+      structuralShift: 1,
+      rowStart: 1,
+      rowEnd: 1,
+      colStart: 1,
+      colEnd: 1,
+      axis: 1,
+      kind: 1,
+      index: 1,
+      count: 1,
+    })
+    expect(refreshCount).toBe(1)
+    expect(store.getter(structureOperationLifecycleAtom).acknowledgedRevision).toBe(7)
+    const historyEntries = store.getter(historyStackAtom).entries
+    expect(historyEntries).toHaveLength(historyEntriesBefore + 1)
+    expect(historyEntries[historyEntries.length - 1]).toMatchObject({
+      projectionRevision: 7,
+      affectedRange: { rowStart: 1, rowEnd: 3, colStart: 2, colEnd: 4 },
+    })
+    expect(store.getter(viewportHiddenAtom).rowsBySheet['sheet-1']).toEqual([3])
+    expectHistoryProducerLaneAvailable(store)
+  })
+
+  test.each(['revision', 'affectedRange.rowEnd', 'structuralShift.count'] as const)(
+    'fails closed when the %s ACK getter throws',
+    async (throwingField) => {
+      const store = createStore()
+      let refreshCount = 0
+      const source: StructureOperationControllerPort = {
+        async insertRows(request) {
+          const affectedRange = {
+            rowStart: 0,
+            get rowEnd() {
+              if (throwingField === 'affectedRange.rowEnd') {
+                throw new Error('affected range getter failed')
+              }
+              return 0
+            },
+            colStart: 0,
+            colEnd: 0,
+          }
+          const structuralShift = {
+            axis: 'row' as const,
+            kind: 'insert' as const,
+            index: 0,
+            get count() {
+              if (throwingField === 'structuralShift.count') {
+                throw new Error('structural shift getter failed')
+              }
+              return 1
+            },
+          }
+          return {
+            sheetId: request.sheetId,
+            requestId: request.requestId,
+            get revision() {
+              if (throwingField === 'revision') {
+                throw new Error('revision getter failed')
+              }
+              return 8
+            },
+            affectedRange,
+            structuralShift,
+          }
+        },
+      }
+
+      await expect(
+        store.setter(runStructureOperationAtom, {
+          intent: createInsertRowsOperation({ sheetId: 'sheet-1', rowIndex: 0, count: 1 }),
+          source,
+          refreshProjection: async () => {
+            refreshCount += 1
+          },
+        }),
+      ).resolves.toBe('outcome-unknown')
+
+      expect(store.getter(structureOperationLifecycleAtom).status).toBe('outcome-unknown')
+      expect(store.getter(historyStackAtom).entries).toEqual([])
+      expect(refreshCount).toBe(0)
+      expect(store.setter(acquireHistoryProducerReservationAtom)).toBeNull()
+      expect(store.setter(resetStructureOperationLifecycleAtom)).toBe(true)
+      expectHistoryProducerLaneAvailable(store)
+    },
+  )
+
+  test('retains the ticket and reservation when an exact ACK cannot enter history', async () => {
+    const store = createStore()
+    let mutationCount = 0
+    let refreshCount = 0
+    const source: StructureOperationControllerPort = {
+      async insertRows(request) {
+        mutationCount += 1
+        return {
+          sheetId: request.sheetId,
+          requestId: request.requestId,
+          revision: 'revision-history-rejected',
+        }
+      },
+    }
+    const input = {
+      intent: createInsertRowsOperation({ sheetId: 'sheet-1', rowIndex: 0, count: 1 }),
+      source,
+      refreshProjection: async () => {
+        refreshCount += 1
+      },
+    }
+    const pushReservedHistoryWrite = pushReservedHistoryAtom.write
+    pushReservedHistoryAtom.write = () => false
+    try {
+      await expect(store.setter(runStructureOperationAtom, input)).resolves.toBe('outcome-unknown')
+    } finally {
+      pushReservedHistoryAtom.write = pushReservedHistoryWrite
+    }
+
+    expect(mutationCount).toBe(1)
     expect(refreshCount).toBe(0)
+    expect(store.getter(historyStackAtom).entries).toEqual([])
+    expect(store.getter(structureOperationLifecycleAtom)).toMatchObject({
+      status: 'outcome-unknown',
+      acknowledgedRevision: 'revision-history-rejected',
+    })
+    expect(store.setter(acquireHistoryProducerReservationAtom)).toBeNull()
+    await expect(store.setter(runStructureOperationAtom, input)).resolves.toBe('stale')
+    expect(mutationCount).toBe(1)
+    expect(store.setter(resetStructureOperationLifecycleAtom)).toBe(true)
+    expectHistoryProducerLaneAvailable(store)
   })
 
   test('records history once and retries only refresh after an exact acknowledgement', async () => {
@@ -356,6 +671,18 @@ describe('operations core', () => {
       status: 'refresh-failed',
       acknowledgedRevision: 'revision-2',
     })
+    expect(store.setter(acquireHistoryProducerReservationAtom)).toBeNull()
+    await expect(
+      store.setter(runStructureOperationAtom, {
+        intent: createDeleteRowsOperation({ sheetId: 'sheet-1', rowIndex: 7, count: 2 }),
+        source,
+        refreshProjection: async () => {
+          refreshCount += 1
+        },
+      }),
+    ).resolves.toBe('stale')
+    expect(mutationCount).toBe(1)
+    expect(refreshCount).toBe(1)
 
     await expect(
       store.setter(retryStructureOperationRefreshAtom, {
@@ -371,20 +698,23 @@ describe('operations core', () => {
     expect(store.getter(historyStackAtom).entries).toHaveLength(1)
     expect(store.getter(structureOperationCanRetryRefreshAtom)).toBe(false)
     expect(store.getter(structureOperationLifecycleAtom).status).toBe('completed')
+    expectHistoryProducerLaneAvailable(store)
   })
 
-  test('keeps the mutation lane reserved after a pending ticket reset until transport settles', async () => {
+  test(
+    'fails reset closed while transport is pending and releases only after it settles',
+    async () => {
     const store = createStore()
     let capturedRequest: StructureOperationRequest | null = null
-    let resolveMutation!: (result: BackendMutationResult) => void
+    let rejectMutation!: (reason?: unknown) => void
     let mutationCount = 0
     const source: StructureOperationControllerPort = {
       insertColumns(request) {
         mutationCount += 1
         if (mutationCount === 1) {
           capturedRequest = request as StructureOperationRequest
-          return new Promise((resolve) => {
-            resolveMutation = resolve
+          return new Promise((_resolve, reject) => {
+            rejectMutation = reject
           })
         }
         return Promise.resolve({
@@ -407,28 +737,32 @@ describe('operations core', () => {
     await Promise.resolve()
     await Promise.resolve()
     expect(capturedRequest).not.toBeNull()
-    expect(store.setter(resetStructureOperationLifecycleAtom)).toBe(true)
+    expect(store.setter(resetStructureOperationLifecycleAtom)).toBe(false)
+    expect(store.setter(acquireHistoryProducerReservationAtom)).toBeNull()
     await expect(store.setter(runStructureOperationAtom, input)).resolves.toBe('stale')
     expect(mutationCount).toBe(1)
 
-    resolveMutation({
-      sheetId: 'sheet-1',
-      requestId: capturedRequest!.requestId,
-      revision: 8,
-    })
+    rejectMutation(new Error('late transport rejection'))
 
-    await expect(run).resolves.toBe('stale')
-    expect(store.getter(structureOperationLifecycleAtom).status).toBe('stale')
+    await expect(run).resolves.toBe('outcome-unknown')
+    expect(store.getter(structureOperationLifecycleAtom).status).toBe('outcome-unknown')
     expect(store.getter(historyStackAtom).entries).toEqual([])
     expect(refreshCount).toBe(0)
+    expect(store.setter(acquireHistoryProducerReservationAtom)).toBeNull()
+    expect(store.setter(resetStructureOperationLifecycleAtom)).toBe(true)
+    expect(store.getter(structureOperationLifecycleAtom).status).toBe('stale')
+    expectHistoryProducerLaneAvailable(store)
 
     await expect(store.setter(runStructureOperationAtom, input)).resolves.toBe('completed')
     expect(mutationCount).toBe(2)
     expect(store.getter(historyStackAtom).entries).toHaveLength(1)
     expect(refreshCount).toBe(1)
+    expectHistoryProducerLaneAvailable(store)
   })
 
-  test('keeps the mutation lane reserved after timeout and reset until transport settles', async () => {
+  test(
+    'keeps the mutation lane reserved after timeout until transport settles and reset succeeds',
+    async () => {
     const store = createStore()
     let capturedRequest: StructureOperationRequest | null = null
     let resolveMutation!: (result: BackendMutationResult) => void
@@ -460,7 +794,9 @@ describe('operations core', () => {
     }
 
     await expect(store.setter(runStructureOperationAtom, input)).resolves.toBe('outcome-unknown')
-    expect(store.setter(resetStructureOperationLifecycleAtom)).toBe(true)
+    expect(store.setter(acquireHistoryProducerReservationAtom)).toBeNull()
+    expect(store.setter(resetStructureOperationLifecycleAtom)).toBe(false)
+    expect(store.setter(acquireHistoryProducerReservationAtom)).toBeNull()
     await expect(store.setter(runStructureOperationAtom, input)).resolves.toBe('stale')
     expect(mutationCount).toBe(1)
 
@@ -472,10 +808,15 @@ describe('operations core', () => {
     await Promise.resolve()
     await Promise.resolve()
 
+    expect(store.setter(acquireHistoryProducerReservationAtom)).toBeNull()
+    expect(store.setter(resetStructureOperationLifecycleAtom)).toBe(true)
+    expectHistoryProducerLaneAvailable(store)
+
     await expect(store.setter(runStructureOperationAtom, input)).resolves.toBe('completed')
     expect(mutationCount).toBe(2)
     expect(store.getter(historyStackAtom).entries).toHaveLength(1)
     expect(refreshCount).toBe(1)
+    expectHistoryProducerLaneAvailable(store)
   })
 
   test('reserves the pending ticket before transport so same-tick re-entry is stale', async () => {
@@ -499,6 +840,7 @@ describe('operations core', () => {
     }
 
     const first = store.setter(runStructureOperationAtom, input)
+    expect(store.setter(acquireHistoryProducerReservationAtom)).toBeNull()
     await expect(store.setter(runStructureOperationAtom, input)).resolves.toBe('stale')
     await Promise.resolve()
     await Promise.resolve()
@@ -511,6 +853,7 @@ describe('operations core', () => {
     await expect(first).resolves.toBe('completed')
     expect(mutationCount).toBe(1)
     expect(store.getter(historyStackAtom).entries).toHaveLength(1)
+    expectHistoryProducerLaneAvailable(store)
   })
 
   test('allocates safe request ids across rollover and stops at exhaustion', () => {
@@ -842,9 +1185,9 @@ describe('operations / delete rows over a filtered region (§8.3)', () => {
     expect(planFilterVisibleRowDeletions({ rowIndex: 4, count: 3 })).toEqual([
       { rowIndex: 4, count: 3 },
     ])
-    expect(
-      planFilterVisibleRowDeletions({ rowIndex: 4, count: 3, filterHiddenRows: [] }),
-    ).toEqual([{ rowIndex: 4, count: 3 }])
+    expect(planFilterVisibleRowDeletions({ rowIndex: 4, count: 3, filterHiddenRows: [] })).toEqual([
+      { rowIndex: 4, count: 3 },
+    ])
     expect(
       planFilterVisibleRowDeletions({ rowIndex: 4, count: 3, filterHiddenRows: [99] }),
     ).toEqual([{ rowIndex: 4, count: 3 }])
@@ -914,7 +1257,7 @@ describe('operations / delete rows over a filtered region (§8.3)', () => {
     // subtracted. `hideRowsAtom` must not shrink the deletion.
     const store = createStore()
     const { requests, source, refreshProjection } = deleteRowsHarness()
-    store.setter(hideRowsAtom, { sheetId: 'sheet-1', rows: [3, 4] })
+    store.setter(hideRowsAtom, { sheetId: 'sheet-1', indices: [3, 4] })
 
     await expect(
       store.setter(runFilterVisibleRowDeleteAtom, {
@@ -953,7 +1296,7 @@ describe('operations / delete rows over a filtered region (§8.3)', () => {
 
   test('each run is its own history entry so undo unwinds them one at a time', async () => {
     const store = createStore()
-    const { source, refreshProjection } = deleteRowsHarness()
+    const { requests, source, refreshProjection } = deleteRowsHarness()
     store.setter(setViewportFilterHiddenRowsAtom, { sheetId: 'sheet-1', rows: [3] })
 
     await expect(
@@ -967,7 +1310,10 @@ describe('operations / delete rows over a filtered region (§8.3)', () => {
     ).resolves.toBe('completed')
 
     const entries = store.getter(historyStackAtom).entries
+    expect(requests).toHaveLength(2)
     expect(entries.filter((entry) => entry.kind === 'row.delete')).toHaveLength(2)
+    expect(new Set(entries.map((entry) => entry.transactionId)).size).toBe(2)
+    expectHistoryProducerLaneAvailable(store)
   })
 
   test('a failing run stops the sequence and surfaces that run outcome', async () => {

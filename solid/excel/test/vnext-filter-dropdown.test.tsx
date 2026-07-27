@@ -51,7 +51,13 @@ function createFakeBackend(overrides: Partial<SpreadsheetBackend> = {}): Spreads
       throw new Error('not used')
     },
     async setFilterSort(req) {
-      return { sheetId: req.sheetId, requestId: req.requestId, revision: 1 }
+      return {
+        sheetId: req.sheetId,
+        requestId: req.requestId,
+        revision: 1,
+        historyRecorded: false,
+        hiddenRowIndices: [],
+      }
     },
     ...overrides,
   }
@@ -181,6 +187,8 @@ describe('vNext SpreadsheetFilterDropdown', () => {
       sheetId: calls[0]!.sheetId,
       requestId: calls[0]!.requestId,
       revision: 1,
+      historyRecorded: false,
+      hiddenRowIndices: [],
     })
     await waitFor(() => {
       expect(store.getter(filterSortStateAtom)['sheet-1']?.rules).toEqual([equalsRule(0, 'alpha')])
@@ -210,7 +218,13 @@ describe('vNext SpreadsheetFilterDropdown', () => {
     expect(store.getter(filterSortLifecycleAtom).status).toBe('pending')
     expect(store.getter(filterSortStateAtom)['sheet-1']).toBeUndefined()
 
-    ack.resolve({ sheetId: 'sheet-1', requestId: calls[0]!.requestId, revision: 1 })
+    ack.resolve({
+      sheetId: 'sheet-1',
+      requestId: calls[0]!.requestId,
+      revision: 1,
+      historyRecorded: false,
+      hiddenRowIndices: [],
+    })
     // The first mutation settles and its OK closes the dropdown.
     await waitFor(() => expect(store.getter(filterDropdownAtom).status).toBe('closed'))
   })
@@ -273,7 +287,13 @@ describe('vNext SpreadsheetFilterDropdown', () => {
       colIndex: 0,
     })
 
-    firstAck.resolve({ sheetId: 'sheet-1', requestId: calls[0]!.requestId, revision: 1 })
+    firstAck.resolve({
+      sheetId: 'sheet-1',
+      requestId: calls[0]!.requestId,
+      revision: 1,
+      historyRecorded: false,
+      hiddenRowIndices: [],
+    })
     // The settled OK applies column 0's draft and then closes the dropdown
     // (Excel parity); the inert reopen to column 1 never took effect.
     await waitFor(() => expect(store.getter(filterDropdownAtom).status).toBe('closed'))
@@ -465,7 +485,13 @@ describe('vNext SpreadsheetFilterDropdown', () => {
     })
     const backend = createFakeBackend({
       async setFilterSort(req) {
-        return { sheetId: req.sheetId, requestId: req.requestId, revision: 2 }
+        return {
+          sheetId: req.sheetId,
+          requestId: req.requestId,
+          revision: 2,
+          historyRecorded: false,
+          hiddenRowIndices: [],
+        }
       },
       async readVisibleProjection(req) {
         reads.push(req)
@@ -595,7 +621,13 @@ describe('vNext SpreadsheetFilterDropdown — physical sort (design-engine-sort 
     return createFakeBackend({
       async setFilterSort(req) {
         filterRequests.push(req)
-        return { sheetId: req.sheetId, requestId: req.requestId, revision: 1 }
+        return {
+          sheetId: req.sheetId,
+          requestId: req.requestId,
+          revision: 1,
+          historyRecorded: false,
+          hiddenRowIndices: [],
+        }
       },
       async resolveDataEdge(req: ResolveDataEdgeRequest) {
         return {
@@ -687,7 +719,13 @@ describe('vNext SpreadsheetFilterDropdown — physical sort (design-engine-sort 
     const backend = createFakeBackend({
       async setFilterSort(req) {
         filterRequests.push(req)
-        return { sheetId: req.sheetId, requestId: req.requestId, revision: 1 }
+        return {
+          sheetId: req.sheetId,
+          requestId: req.requestId,
+          revision: 1,
+          historyRecorded: false,
+          hiddenRowIndices: [],
+        }
       },
     })
     openDropdown(store, 3)
@@ -700,6 +738,8 @@ describe('vNext SpreadsheetFilterDropdown — physical sort (design-engine-sort 
     // Filtering still works on the same host — only sort is withheld.
     applyEqualsDraft(container, 'x')
     await waitFor(() => expect(filterRequests).toHaveLength(1))
-    expect(store.getter(filterSortStateAtom)['sheet-1']?.rules).toEqual([equalsRule(3, 'x')])
+    await waitFor(() =>
+      expect(store.getter(filterSortStateAtom)['sheet-1']?.rules).toEqual([equalsRule(3, 'x')]),
+    )
   })
 })

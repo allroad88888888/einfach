@@ -8,6 +8,7 @@ import {
   runUndoHistoryAtom,
   setViewportFilterHiddenRowsAtom,
   type HistoryAction,
+  type HistoryCommandOutcome,
   type HistoryEntry,
   type SheetHiddenStateRequest,
   type SpreadsheetBackend,
@@ -183,15 +184,64 @@ export function recordHistoryEntry(
   return store.setter(pushHistoryAtom, entry)
 }
 
+const HISTORY_LANE_RETRY_ATTEMPTS = 5
+
+function historyStackWitness(store: Store): { cursor: number; entries: unknown } {
+  const stack = store.getter(historyStackAtom)
+  return { cursor: stack.cursor, entries: stack.entries }
+}
+
+/**
+ * `runUndoHistoryAtom` / `runRedoHistoryAtom` return `blocked` as soon as
+ * another producer (auto-fill, editing, …) still owns the shared history
+ * producer-reservation lane — and it can hold that lane for a few
+ * microtasks even after ITS OWN UI-visible result (grid text, history
+ * entry) is already showing, because the reservation is released only
+ * after that producer's own refresh settles. A Ctrl+Z/Ctrl+Y fired in that
+ * narrow window would otherwise see one `blocked` result and never retry,
+ * silently dropping the keystroke — a real user-visible undo regression.
+ * Retry a bounded number of times, yielding a macrotask between attempts,
+ * but only while the stack witness (cursor + entries identity) this
+ * dispatch is targeting stays exactly what it started with — any other
+ * `blocked` reason (missing capability, invalid revision, nothing to undo)
+ * reproduces identically on every attempt and exhausts the retry budget
+ * harmlessly.
+ */
+async function runHistoryDispatchWithLaneRetry(
+  store: Store,
+  run: () => Promise<HistoryCommandOutcome>,
+): Promise<HistoryCommandOutcome> {
+  const witness = historyStackWitness(store)
+  let outcome = await run()
+  let attempt = 0
+  while (
+    outcome === 'blocked' &&
+    attempt < HISTORY_LANE_RETRY_ATTEMPTS &&
+    historyStackWitness(store).cursor === witness.cursor &&
+    historyStackWitness(store).entries === witness.entries
+  ) {
+    attempt += 1
+    // A macrotask yield, not just a microtask: the producer releasing the
+    // lane may itself be waiting on a macrotask-scheduled continuation
+    // (e.g. a real transport round-trip), which a `Promise.resolve()`
+    // microtask yield would not wait out.
+    await new Promise((resolve) => setTimeout(resolve, 0))
+    outcome = await run()
+  }
+  return outcome
+}
+
 export async function dispatchUndo(
   store: Store,
   backend: SpreadsheetBackend,
 ): Promise<boolean> {
   const targetSheetId = peekHistoryTargetSheetId(store, 'undo')
-  const outcome = await store.setter(runUndoHistoryAtom, {
-    source: backend,
-    refreshProjection: () => refreshAfterHistory(store, backend, targetSheetId),
-  })
+  const outcome = await runHistoryDispatchWithLaneRetry(store, () =>
+    store.setter(runUndoHistoryAtom, {
+      source: backend,
+      refreshProjection: () => refreshAfterHistory(store, backend, targetSheetId),
+    }),
+  )
   return outcome === 'completed'
 }
 
@@ -200,10 +250,12 @@ export async function dispatchRedo(
   backend: SpreadsheetBackend,
 ): Promise<boolean> {
   const targetSheetId = peekHistoryTargetSheetId(store, 'redo')
-  const outcome = await store.setter(runRedoHistoryAtom, {
-    source: backend,
-    refreshProjection: () => refreshAfterHistory(store, backend, targetSheetId),
-  })
+  const outcome = await runHistoryDispatchWithLaneRetry(store, () =>
+    store.setter(runRedoHistoryAtom, {
+      source: backend,
+      refreshProjection: () => refreshAfterHistory(store, backend, targetSheetId),
+    }),
+  )
   return outcome === 'completed'
 }
 

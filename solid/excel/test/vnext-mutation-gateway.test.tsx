@@ -12,7 +12,11 @@ import type {
   SpreadsheetBackend,
   VisibleProjectionResult,
 } from '@einfach/spreadsheet-ui-core'
-import { clipboardStateAtom, setSheetProtectionAtom } from '@einfach/spreadsheet-ui-core'
+import {
+  clipboardStateAtom,
+  getFillHandleWriteRange,
+  setSheetProtectionAtom,
+} from '@einfach/spreadsheet-ui-core'
 import { SpreadsheetGrid } from '../src-vnext/grid'
 import { SpreadsheetUiProvider } from '../src-vnext/provider'
 
@@ -78,11 +82,34 @@ function createGatewayBackend() {
     },
     async fillRange(request) {
       fillRangeRequests.push(request)
-      return { sheetId: request.sheetId, affectedRange: request.targetRange }
+      return {
+        sheetId: request.sheetId,
+        revision: 24,
+        affectedRange: getFillHandleWriteRange(
+          request.sourceRange,
+          request.targetRange,
+          request.direction,
+        )!,
+        applied: true,
+        historyTransactionCount: 1,
+        historyDisposition: 'undoable',
+      }
     },
     async fillSeries(request) {
       fillSeriesRequests.push(request)
-      return { sheetId: request.sheetId, requestId: request.requestId, revision: 24 }
+      return {
+        sheetId: request.sheetId,
+        requestId: request.requestId,
+        revision: 24,
+        affectedRange: getFillHandleWriteRange(
+          request.sourceRange,
+          request.targetRange,
+          request.direction,
+        )!,
+        applied: true,
+        historyTransactionCount: 1,
+        historyDisposition: 'undoable',
+      }
     },
   }
 
@@ -135,9 +162,12 @@ describe('vNext mutation gateway — grid paths', () => {
     await waitForGrid(container)
 
     fireEvent.click(container.querySelector('[data-cell-addr="A1"] .spreadsheet-grid-cell-button')!)
-    fireEvent.click(container.querySelector('[data-cell-addr="B2"] .spreadsheet-grid-cell-button')!, {
-      shiftKey: true,
-    })
+    fireEvent.click(
+      container.querySelector('[data-cell-addr="B2"] .spreadsheet-grid-cell-button')!,
+      {
+        shiftKey: true,
+      },
+    )
     fireEvent.keyDown(container.querySelector('[data-testid="grid"]')!, { key: 'Delete' })
 
     await flushMicrotasks()
@@ -177,12 +207,8 @@ describe('vNext mutation gateway — grid paths', () => {
 
   it('fill onto locked cells is blocked with zero transport', async () => {
     const store = createStore()
-    const {
-      backend,
-      setCellInputRequests,
-      fillRangeRequests,
-      fillSeriesRequests,
-    } = createGatewayBackend()
+    const { backend, setCellInputRequests, fillRangeRequests, fillSeriesRequests } =
+      createGatewayBackend()
     // Only the source cell A1 is unlocked; the fill targets stay locked.
     store.setter(setSheetProtectionAtom, {
       sheetId: 'sheet-1',

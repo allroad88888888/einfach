@@ -5,10 +5,16 @@ import type {
   DisplayCell,
   ProjectionRequestId,
   ProjectionRevision,
+  RangeProjectionRequest,
   RangeProjectionResult,
 } from '../backend/types'
-import { pushHistoryAtom } from '../history'
-import type { HistoryLocalReplayPayload } from '../history'
+import { resolveContentMutationAtom } from '../editing/mutation-gateway'
+import {
+  acquireHistoryProducerReservationAtom,
+  pushReservedHistoryAtom,
+  releaseHistoryProducerReservationAtom,
+} from '../history'
+import type { HistoryLocalReplayPayload, HistoryProducerReservation } from '../history'
 import {
   primarySelectionRegionAtom,
   selectionAuthorityWitnessAtom,
@@ -73,6 +79,9 @@ export const REMOVE_DUPLICATES_OUTCOME_UNKNOWN_ERROR =
   'Rows may have been removed, but the backend did not return a matching acknowledgement. Refresh or reload the workbook before trying again.'
 export const REMOVE_DUPLICATES_REFRESH_ERROR_PREFIX =
   'Rows were removed, but the workbook projection could not be refreshed: '
+export const REMOVE_DUPLICATES_HISTORY_BUSY_ERROR =
+  'Remove Duplicates is blocked while another mutation owns the history lane.'
+export const DEFAULT_REMOVE_DUPLICATES_TIMEOUT_MS = 15_000
 
 interface RemoveDuplicatesReadTicket {
   readonly sessionId: number
@@ -81,6 +90,10 @@ interface RemoveDuplicatesReadTicket {
   readonly range: Readonly<CellRange>
   readonly selectionWitness: SelectionAuthorityWitness
   readonly workspaceActiveSheetWitness: WorkspaceActiveSheetAuthorityWitness
+  readonly source: RemoveDuplicatesControllerPort
+  readonly execute: NonNullable<RemoveDuplicatesControllerPort['readRangeProjection']>
+  readonly request: Readonly<RangeProjectionRequest>
+  readonly timeoutMs: number
 }
 
 interface RemoveDuplicatesMutationTicket {
@@ -89,7 +102,18 @@ interface RemoveDuplicatesMutationTicket {
   readonly workspaceActiveSheetWitness: WorkspaceActiveSheetAuthorityWitness
   readonly target: RemoveDuplicatesMutationTarget
   readonly request: RemoveRowsExactRequest
+  readonly historyReservation: HistoryProducerReservation
   readonly acknowledgement: RemoveRowsExactResult | null
+  readonly source: RemoveDuplicatesControllerPort
+  readonly execute: NonNullable<RemoveDuplicatesControllerPort['removeRowsExact']>
+  readonly refreshProjection: (sheetId: string) => Promise<void>
+  readonly timeoutMs: number
+  readonly readRequestId: ProjectionRequestId | null
+}
+
+type ExactRemoveRowsAcknowledgement = Omit<RemoveRowsExactResult, 'affectedRange'> & {
+  readonly affectedRange: NonNullable<RemoveRowsExactResult['affectedRange']>
+  readonly historyRecorded: boolean
 }
 
 /** `Object.freeze(new Set())` is still writable; expose a mutation-free facade. */
@@ -234,17 +258,44 @@ function validRevision(revision: unknown): revision is ProjectionRevision {
   )
 }
 
-function numericHistoryRevision(revision: unknown): revision is number {
-  return typeof revision === 'number' && Number.isFinite(revision)
-}
-
 function errorMessage(error: unknown): string {
-  if (error instanceof Error && error.message.length > 0) return error.message
+  try {
+    if (error instanceof Error) {
+      const message = error.message
+      if (message.length > 0) return message
+    }
+  } catch {
+    return 'Unknown transport failure.'
+  }
   try {
     return String(error)
   } catch {
     return 'Unknown transport failure.'
   }
+}
+
+async function withRemoveDuplicatesTimeout<Value>(
+  operation: Promise<Value>,
+  timeoutMs: number,
+  label: string,
+): Promise<Value> {
+  let timeoutHandle: ReturnType<typeof setTimeout> | undefined
+  try {
+    return await Promise.race([
+      operation,
+      new Promise<never>((_resolve, reject) => {
+        timeoutHandle = setTimeout(() => reject(new Error(`${label} timed out.`)), timeoutMs)
+      }),
+    ])
+  } finally {
+    if (timeoutHandle !== undefined) clearTimeout(timeoutHandle)
+  }
+}
+
+function normalizeRemoveDuplicatesTimeout(timeoutMs: unknown): number {
+  return typeof timeoutMs === 'number' && Number.isFinite(timeoutMs) && timeoutMs > 0
+    ? timeoutMs
+    : DEFAULT_REMOVE_DUPLICATES_TIMEOUT_MS
 }
 
 function lifecycleFor(
@@ -495,11 +546,11 @@ export const removeDuplicatesCanConfirmAtom = atom((get) => {
 })
 
 function closeSession(get: Getter, set: Setter): void {
+  const activeRead = get(activeRemoveDuplicatesReadAtom)
+  const activeMutation = get(activeRemoveDuplicatesMutationAtom)
   const nextSessionId = nextRemoveDuplicatesSessionId(get(removeDuplicatesSessionSequenceStateAtom))
   if (nextSessionId !== null) set(removeDuplicatesSessionSequenceStateAtom, nextSessionId)
   const sessionId = nextSessionId ?? get(removeDuplicatesSessionSequenceStateAtom)
-  set(activeRemoveDuplicatesReadAtom, null)
-  set(activeRemoveDuplicatesMutationAtom, null)
   set(removeDuplicatesOpenStateAtom, false)
   set(removeDuplicatesRangeStateAtom, null)
   set(removeDuplicatesCellsStateAtom, EMPTY_CELLS)
@@ -507,6 +558,10 @@ function closeSession(get: Getter, set: Setter): void {
   set(removeDuplicatesSessionStateAtom, null)
   set(removeDuplicatesErrorStateAtom, '')
   set(removeDuplicatesLifecycleStateAtom, lifecycleFor('closed', sessionId, null))
+  // Clearing an active ticket is the final observable write. A synchronous
+  // subscriber may start a replacement operation from this notification.
+  if (activeRead !== null) set(activeRemoveDuplicatesReadAtom, null)
+  else if (activeMutation !== null) set(activeRemoveDuplicatesMutationAtom, null)
 }
 
 export const closeRemoveDuplicatesAtom = atom(null, (get, set): boolean => {
@@ -593,6 +648,7 @@ export const openRemoveDuplicatesAtom = atom(
   (get, set, range: RemoveDuplicatesRange, cells: readonly DisplayCell[]): number | null => {
     const lifecycle = get(removeDuplicatesLifecycleAtom)
     if (
+      get(activeRemoveDuplicatesReadAtom) !== null ||
       get(activeRemoveDuplicatesMutationAtom) !== null ||
       lifecycle.status === 'read-pending' ||
       blocksClose(lifecycle.status)
@@ -603,8 +659,6 @@ export const openRemoveDuplicatesAtom = atom(
     if (sessionId === null) return null
     const rangeSnapshot = snapshotRemoveDuplicatesRange(range)
     set(removeDuplicatesSessionSequenceStateAtom, sessionId)
-    set(activeRemoveDuplicatesReadAtom, null)
-    set(activeRemoveDuplicatesMutationAtom, null)
     set(removeDuplicatesSessionStateAtom, null)
     set(removeDuplicatesRangeStateAtom, rangeSnapshot)
     set(removeDuplicatesCellsStateAtom, snapshotCells(cells))
@@ -644,60 +698,153 @@ function markReadStale(
   set: Setter,
   ticket: RemoveDuplicatesReadTicket,
 ): RemoveDuplicatesReadOutcome {
-  set(activeRemoveDuplicatesReadAtom, null)
   set(removeDuplicatesErrorStateAtom, REMOVE_DUPLICATES_READ_STALE_ERROR)
   set(
     removeDuplicatesLifecycleStateAtom,
     lifecycleFor('read-stale', ticket.sessionId, ticket.sheetId, ticket.requestId),
   )
+  set(activeRemoveDuplicatesReadAtom, null)
   return 'stale'
+}
+
+interface ExactReadAcknowledgementSnapshot {
+  readonly kind: 'range'
+  readonly requestId: ProjectionRequestId
+  readonly sheetId: string
+  readonly range: Readonly<CellRange>
+  readonly revision: ProjectionRevision
+  readonly truncated: boolean | undefined
+  readonly cells: readonly DisplayCell[]
+}
+
+type ReadAcknowledgementClassification =
+  | Readonly<{
+      status: 'exact'
+      acknowledgement: ExactReadAcknowledgementSnapshot
+    }>
+  | Readonly<{ status: 'stale' }>
+  | Readonly<{ status: 'failed'; retainTicket: boolean }>
+
+const STALE_READ_ACKNOWLEDGEMENT: ReadAcknowledgementClassification = Object.freeze({
+  status: 'stale',
+})
+const FAILED_READ_ACKNOWLEDGEMENT: ReadAcknowledgementClassification = Object.freeze({
+  status: 'failed',
+  retainTicket: false,
+})
+const THREW_READING_READ_ACKNOWLEDGEMENT: ReadAcknowledgementClassification = Object.freeze({
+  status: 'failed',
+  retainTicket: true,
+})
+
+function validDisplayCellValueKind(value: unknown): value is DisplayCell['valueKind'] {
+  return (
+    value === undefined ||
+    value === 'blank' ||
+    value === 'number' ||
+    value === 'string' ||
+    value === 'boolean' ||
+    value === 'error'
+  )
 }
 
 function classifyReadAcknowledgement(
   acknowledgement: unknown,
   ticket: RemoveDuplicatesReadTicket,
-): 'exact' | 'stale' | 'failed' {
+): ReadAcknowledgementClassification {
   try {
-    if (typeof acknowledgement !== 'object' || acknowledgement === null) return 'failed'
+    if (typeof acknowledgement !== 'object' || acknowledgement === null) {
+      return FAILED_READ_ACKNOWLEDGEMENT
+    }
     const result = acknowledgement as RangeProjectionResult
-    if (result.kind !== 'range') return 'failed'
+    // Snapshot every caller-owned top-level field exactly once before
+    // classification. No downstream consumer may touch `result` again.
+    const kind = result.kind
+    const requestId = result.requestId
+    const sheetId = result.sheetId
+    const rangeValue = result.range
+    const revision = result.revision
+    const truncated = result.truncated
+    const cellsValue = result.cells
+
+    if (typeof rangeValue !== 'object' || rangeValue === null) {
+      return FAILED_READ_ACKNOWLEDGEMENT
+    }
+    const range = snapshotRange(rangeValue)
     if (
-      result.requestId !== ticket.requestId ||
-      result.sheetId !== ticket.sheetId ||
-      !sameRange(result.range, ticket.range)
+      kind !== 'range' ||
+      !Number.isSafeInteger(requestId) ||
+      typeof sheetId !== 'string' ||
+      !validRange(range)
     ) {
-      return 'stale'
+      return FAILED_READ_ACKNOWLEDGEMENT
     }
     if (
-      (result.truncated !== undefined && typeof result.truncated !== 'boolean') ||
-      result.truncated === true ||
-      !validRevision(result.revision)
+      (truncated !== undefined && typeof truncated !== 'boolean') ||
+      truncated === true ||
+      !validRevision(revision) ||
+      !Array.isArray(cellsValue)
     ) {
-      return 'failed'
+      return FAILED_READ_ACKNOWLEDGEMENT
     }
-    if (!Array.isArray(result.cells)) return 'failed'
+
+    const length = cellsValue.length
+    if (!Number.isSafeInteger(length) || length < 0) return FAILED_READ_ACKNOWLEDGEMENT
+    const cells: DisplayCell[] = []
     const seenCoordinates = new Set<string>()
-    for (const cell of result.cells) {
-      if (
-        typeof cell !== 'object' ||
-        cell === null ||
-        !Number.isSafeInteger(cell.row) ||
-        !Number.isSafeInteger(cell.col) ||
-        cell.row < ticket.range.rowStart ||
-        cell.row > ticket.range.rowEnd ||
-        cell.col < ticket.range.colStart ||
-        cell.col > ticket.range.colEnd ||
-        typeof cell.displayValue !== 'string'
-      ) {
-        return 'failed'
+    for (let index = 0; index < length; index += 1) {
+      const cellValue = cellsValue[index]
+      if (typeof cellValue !== 'object' || cellValue === null) {
+        return FAILED_READ_ACKNOWLEDGEMENT
       }
-      const coordinateKey = `${cell.row}:${cell.col}`
-      if (seenCoordinates.has(coordinateKey)) return 'failed'
+      const row = cellValue.row
+      const col = cellValue.col
+      const displayValue = cellValue.displayValue
+      const valueKind = cellValue.valueKind
+      if (
+        typeof row !== 'number' ||
+        !Number.isSafeInteger(row) ||
+        typeof col !== 'number' ||
+        !Number.isSafeInteger(col) ||
+        row < ticket.range.rowStart ||
+        row > ticket.range.rowEnd ||
+        col < ticket.range.colStart ||
+        col > ticket.range.colEnd ||
+        typeof displayValue !== 'string' ||
+        !validDisplayCellValueKind(valueKind)
+      ) {
+        return FAILED_READ_ACKNOWLEDGEMENT
+      }
+      const coordinateKey = `${row}:${col}`
+      if (seenCoordinates.has(coordinateKey)) return FAILED_READ_ACKNOWLEDGEMENT
       seenCoordinates.add(coordinateKey)
+      cells.push(
+        valueKind === undefined
+          ? Object.freeze({ row, col, displayValue })
+          : Object.freeze({ row, col, displayValue, valueKind }),
+      )
     }
-    return 'exact'
+    if (
+      requestId !== ticket.requestId ||
+      sheetId !== ticket.sheetId ||
+      !sameRange(range, ticket.range)
+    ) {
+      return STALE_READ_ACKNOWLEDGEMENT
+    }
+    return Object.freeze({
+      status: 'exact',
+      acknowledgement: Object.freeze({
+        kind,
+        requestId,
+        sheetId,
+        range,
+        revision,
+        truncated,
+        cells: Object.freeze(cells),
+      }),
+    })
   } catch {
-    return 'failed'
+    return THREW_READING_READ_ACKNOWLEDGEMENT
   }
 }
 
@@ -705,7 +852,9 @@ export const openRemoveDuplicatesFromSelectionAtom = atom(
   null,
   async (get, set, input: OpenRemoveDuplicatesInput): Promise<RemoveDuplicatesReadOutcome> => {
     const lifecycle = get(removeDuplicatesLifecycleAtom)
+    const initialActiveRead = get(activeRemoveDuplicatesReadAtom)
     if (
+      initialActiveRead !== null ||
       lifecycle.status === 'read-pending' ||
       get(activeRemoveDuplicatesMutationAtom) !== null ||
       blocksClose(lifecycle.status)
@@ -720,10 +869,43 @@ export const openRemoveDuplicatesFromSelectionAtom = atom(
     const selectionSheetId = get(primarySelectionRegionAtom).sheetId
     const workspaceActiveSheetWitness = get(workspaceActiveSheetAuthorityWitnessAtom)
     const workspaceActiveSheetId = get(workspaceSessionAtom).activeSheetId
+    const initialOpen = get(removeDuplicatesOpenAtom)
+
+    let source: RemoveDuplicatesControllerPort | undefined
+    let compatibilitySheetId: string | undefined
+    let execute: RemoveDuplicatesControllerPort['readRangeProjection']
+    let removeExecute: RemoveDuplicatesControllerPort['removeRowsExact']
+    let timeoutMs = DEFAULT_REMOVE_DUPLICATES_TIMEOUT_MS
+    let captureFailed = false
+    try {
+      // Caller-owned accessors are a capture boundary. Every value used after
+      // this point is a detached local and every transport port is read once.
+      source = input.source
+      compatibilitySheetId = input.sheetId
+      timeoutMs = normalizeRemoveDuplicatesTimeout(input.timeoutMs)
+      execute = source?.readRangeProjection
+      removeExecute = source?.removeRowsExact
+    } catch {
+      captureFailed = true
+    }
+
+    const invocationIsCurrent =
+      get(removeDuplicatesLifecycleAtom) === lifecycle &&
+      get(activeRemoveDuplicatesReadAtom) === initialActiveRead &&
+      get(activeRemoveDuplicatesMutationAtom) === null &&
+      get(removeDuplicatesOpenAtom) === initialOpen &&
+      get(selectionAuthorityWitnessAtom) === selectionWitness &&
+      get(workspaceActiveSheetAuthorityWitnessAtom) === workspaceActiveSheetWitness &&
+      get(primarySelectionRegionAtom).sheetId === selectionSheetId &&
+      get(workspaceSessionAtom).activeSheetId === workspaceActiveSheetId &&
+      sameRange(get(selectionRangeAtom), range)
+    if (!invocationIsCurrent) return 'blocked'
+
     const compatibilitySheetMatches =
-      input.sheetId === undefined ||
-      (typeof input.sheetId === 'string' && input.sheetId === selectionSheetId)
+      compatibilitySheetId === undefined ||
+      (typeof compatibilitySheetId === 'string' && compatibilitySheetId === selectionSheetId)
     if (
+      captureFailed ||
       sessionId === null ||
       requestId === null ||
       selectionSheetId.length === 0 ||
@@ -739,28 +921,20 @@ export const openRemoveDuplicatesFromSelectionAtom = atom(
       return 'failed'
     }
 
-    let execute: RemoveDuplicatesControllerPort['readRangeProjection']
-    let canRemove = false
-    try {
-      execute = input.source?.readRangeProjection
-      canRemove = typeof input.source?.removeRowsExact === 'function'
-    } catch {
-      execute = undefined
-    }
     const canRead = typeof execute === 'function'
+    const canRemove = typeof removeExecute === 'function'
+    const removeDuplicatesRange = toRemoveDuplicatesRange(range)
     set(removeDuplicatesCapabilityStateAtom, Object.freeze({ canRead, canRemove }))
     set(removeDuplicatesSessionSequenceStateAtom, sessionId)
     set(removeDuplicatesReadSequenceStateAtom, requestId)
-    set(activeRemoveDuplicatesMutationAtom, null)
     set(removeDuplicatesSessionStateAtom, null)
-    set(removeDuplicatesRangeStateAtom, toRemoveDuplicatesRange(range))
+    set(removeDuplicatesRangeStateAtom, removeDuplicatesRange)
     set(removeDuplicatesCellsStateAtom, EMPTY_CELLS)
-    set(removeDuplicatesKeyColumnsStateAtom, allColumnsInRange(toRemoveDuplicatesRange(range)))
+    set(removeDuplicatesKeyColumnsStateAtom, allColumnsInRange(removeDuplicatesRange))
     set(removeDuplicatesOpenStateAtom, true)
     set(removeDuplicatesErrorStateAtom, '')
 
-    if (!canRead || execute === undefined) {
-      set(activeRemoveDuplicatesReadAtom, null)
+    if (!canRead || execute === undefined || source === undefined) {
       set(removeDuplicatesErrorStateAtom, REMOVE_DUPLICATES_READ_CAPABILITY_ERROR)
       set(
         removeDuplicatesLifecycleStateAtom,
@@ -769,6 +943,13 @@ export const openRemoveDuplicatesFromSelectionAtom = atom(
       return 'failed'
     }
 
+    const request: Readonly<RangeProjectionRequest> = Object.freeze({
+      kind: 'range',
+      sheetId: selectionSheetId,
+      range,
+      requestId,
+      reason: 'selection',
+    })
     const ticket: RemoveDuplicatesReadTicket = Object.freeze({
       sessionId,
       requestId,
@@ -776,12 +957,16 @@ export const openRemoveDuplicatesFromSelectionAtom = atom(
       range,
       selectionWitness,
       workspaceActiveSheetWitness,
+      source,
+      execute,
+      request,
+      timeoutMs,
     })
-    set(activeRemoveDuplicatesReadAtom, ticket)
     set(
       removeDuplicatesLifecycleStateAtom,
       lifecycleFor('read-pending', sessionId, ticket.sheetId, requestId),
     )
+    set(activeRemoveDuplicatesReadAtom, ticket)
 
     await Promise.resolve()
     if (!readTicketContextIsCurrent(get, ticket)) return 'stale'
@@ -790,66 +975,62 @@ export const openRemoveDuplicatesFromSelectionAtom = atom(
 
     let acknowledgement: unknown
     try {
-      acknowledgement = await execute.call(input.source, {
-        kind: 'range',
-        sheetId: ticket.sheetId,
-        range: ticket.range,
-        requestId: ticket.requestId,
-        reason: 'selection',
-      })
+      acknowledgement = await withRemoveDuplicatesTimeout(
+        Reflect.apply(ticket.execute, ticket.source, [ticket.request]),
+        ticket.timeoutMs,
+        'Remove Duplicates read',
+      )
     } catch (error) {
+      const detail = errorMessage(error)
       if (!readTicketContextIsCurrent(get, ticket)) return 'stale'
       if (!readTicketAuthorityIsCurrent(get, ticket)) {
         return markReadStale(set, ticket)
       }
-      set(activeRemoveDuplicatesReadAtom, null)
-      set(
-        removeDuplicatesErrorStateAtom,
-        `${REMOVE_DUPLICATES_READ_FAILED_ERROR} ${errorMessage(error)}`,
-      )
+      set(removeDuplicatesErrorStateAtom, `${REMOVE_DUPLICATES_READ_FAILED_ERROR} ${detail}`)
       set(
         removeDuplicatesLifecycleStateAtom,
         lifecycleFor('read-failed', sessionId, ticket.sheetId, requestId),
       )
+      set(activeRemoveDuplicatesReadAtom, null)
       return 'failed'
     }
 
     if (!readTicketContextIsCurrent(get, ticket)) return 'stale'
     if (!readTicketAuthorityIsCurrent(get, ticket)) return markReadStale(set, ticket)
     const classification = classifyReadAcknowledgement(acknowledgement, ticket)
-    if (classification !== 'exact') {
-      set(activeRemoveDuplicatesReadAtom, null)
+    if (!readTicketContextIsCurrent(get, ticket)) return 'stale'
+    if (!readTicketAuthorityIsCurrent(get, ticket)) return markReadStale(set, ticket)
+    if (classification.status !== 'exact') {
       set(
         removeDuplicatesErrorStateAtom,
-        classification === 'stale'
+        classification.status === 'stale'
           ? REMOVE_DUPLICATES_READ_STALE_ERROR
           : REMOVE_DUPLICATES_READ_FAILED_ERROR,
       )
       set(
         removeDuplicatesLifecycleStateAtom,
         lifecycleFor(
-          classification === 'stale' ? 'read-stale' : 'read-failed',
+          classification.status === 'stale' ? 'read-stale' : 'read-failed',
           sessionId,
           ticket.sheetId,
           requestId,
         ),
       )
-      return classification
+      set(activeRemoveDuplicatesReadAtom, null)
+      return classification.status
     }
 
-    const result = acknowledgement as RangeProjectionResult
-    const cells = snapshotCells(result.cells)
-    const rangeSnapshot = toRemoveDuplicatesRange(ticket.range)
+    const exactAcknowledgement = classification.acknowledgement
+    const rangeSnapshot = toRemoveDuplicatesRange(exactAcknowledgement.range)
     const session: RemoveDuplicatesSessionSnapshot = Object.freeze({
       sessionId,
-      sheetId: ticket.sheetId,
+      sheetId: exactAcknowledgement.sheetId,
       range: rangeSnapshot,
       selectionWitness: ticket.selectionWitness,
       workspaceActiveSheetWitness: ticket.workspaceActiveSheetWitness,
-      projectionRevision: result.revision as ProjectionRevision,
-      cells,
+      projectionRevision: exactAcknowledgement.revision,
+      cells: exactAcknowledgement.cells,
     })
-    set(activeRemoveDuplicatesReadAtom, null)
     set(removeDuplicatesSessionStateAtom, session)
     set(removeDuplicatesRangeStateAtom, session.range)
     set(removeDuplicatesCellsStateAtom, session.cells)
@@ -859,6 +1040,7 @@ export const openRemoveDuplicatesFromSelectionAtom = atom(
       removeDuplicatesLifecycleStateAtom,
       lifecycleFor('editing', sessionId, ticket.sheetId, requestId),
     )
+    set(activeRemoveDuplicatesReadAtom, null)
     return 'editing'
   },
 )
@@ -907,9 +1089,7 @@ function mutationTicketIsCurrent(get: Getter, ticket: RemoveDuplicatesMutationTi
   const lifecycle = get(removeDuplicatesLifecycleAtom)
   const active = get(activeRemoveDuplicatesMutationAtom)
   return (
-    active !== null &&
-    active.sessionId === ticket.sessionId &&
-    active.target.requestId === ticket.target.requestId &&
+    active === ticket &&
     get(removeDuplicatesOpenAtom) &&
     get(removeDuplicatesSessionAtom)?.sessionId === ticket.sessionId &&
     lifecycle.sessionId === ticket.sessionId &&
@@ -944,16 +1124,25 @@ function mutationTicketAuthorityIsCurrent(
 }
 
 function markMutationStaleBeforeTransport(
+  get: Getter,
   set: Setter,
   ticket: RemoveDuplicatesMutationTicket,
   readRequestId: ProjectionRequestId | null,
 ): RemoveDuplicatesMutationOutcome {
-  set(activeRemoveDuplicatesMutationAtom, null)
+  if (!set(releaseHistoryProducerReservationAtom, ticket.historyReservation)) {
+    return markOutcomeUnknown(
+      set,
+      ticket,
+      'History ownership could not be reconciled before transport.',
+    )
+  }
+  if (!mutationTicketIsCurrent(get, ticket)) return 'stale'
   set(removeDuplicatesErrorStateAtom, REMOVE_DUPLICATES_READ_STALE_ERROR)
   set(
     removeDuplicatesLifecycleStateAtom,
     lifecycleFor('read-stale', ticket.sessionId, ticket.target.sheetId, readRequestId),
   )
+  set(activeRemoveDuplicatesMutationAtom, null)
   return 'stale'
 }
 
@@ -984,38 +1173,120 @@ function descendingRowDeleteShifts(
   return shifts
 }
 
-function acknowledgementMatches(
+function snapshotCellRangeValue(value: unknown): Readonly<CellRange> | null {
+  try {
+    if (typeof value !== 'object' || value === null) return null
+    const range = value as CellRange
+    const rowStart = range.rowStart
+    const rowEnd = range.rowEnd
+    const colStart = range.colStart
+    const colEnd = range.colEnd
+    const snapshot = Object.freeze({ rowStart, rowEnd, colStart, colEnd })
+    return validRange(snapshot) ? snapshot : null
+  } catch {
+    return null
+  }
+}
+
+function snapshotRemovedRows(value: unknown): readonly number[] | null {
+  try {
+    if (!Array.isArray(value)) return null
+    const length = value.length
+    if (!Number.isSafeInteger(length) || length < 0) return null
+    const rows: number[] = []
+    let previous = -1
+    for (let index = 0; index < length; index += 1) {
+      const row = value[index]
+      if (!Number.isSafeInteger(row) || row < 0 || row <= previous) return null
+      rows.push(row)
+      previous = row
+    }
+    return Object.freeze(rows)
+  } catch {
+    return null
+  }
+}
+
+function snapshotAffectedRangeValue(value: unknown): RemoveRowsExactResult['affectedRange'] {
+  try {
+    if (typeof value !== 'object' || value === null) return null
+    const range = value as NonNullable<RemoveRowsExactResult['affectedRange']>
+    const startRow = range.startRow
+    const endRow = range.endRow
+    const startCol = range.startCol
+    const endCol = range.endCol
+    if (
+      !Number.isSafeInteger(startRow) ||
+      !Number.isSafeInteger(endRow) ||
+      !Number.isSafeInteger(startCol) ||
+      !Number.isSafeInteger(endCol) ||
+      startRow < 0 ||
+      startCol < 0 ||
+      startRow > endRow ||
+      startCol > endCol
+    ) {
+      return null
+    }
+    return Object.freeze({ startRow, endRow, startCol, endCol })
+  } catch {
+    return null
+  }
+}
+
+function snapshotAcknowledgement(
   acknowledgement: unknown,
   ticket: RemoveDuplicatesMutationTicket,
-): acknowledgement is RemoveRowsExactResult {
+): ExactRemoveRowsAcknowledgement | null {
   try {
-    if (typeof acknowledgement !== 'object' || acknowledgement === null) return false
+    if (typeof acknowledgement !== 'object' || acknowledgement === null) return null
     const result = acknowledgement as RemoveRowsExactResult
-    const rows = canonicalRows(result.removedRowIndices)
+    const requestId = result.requestId
+    const sheetId = result.sheetId
+    const targetRangeValue = result.targetRange
+    const removedRowIndicesValue = result.removedRowIndices
+    const removedRows = result.removedRows
+    const affectedRangeValue = result.affectedRange
+    const revision = result.revision
+    const historyRecordedValue = result.historyRecorded
+    const targetRange = snapshotCellRangeValue(targetRangeValue)
+    const rows = snapshotRemovedRows(removedRowIndicesValue)
+    const affectedRange = snapshotAffectedRangeValue(affectedRangeValue)
     if (
-      result.requestId !== ticket.target.requestId ||
-      result.sheetId !== ticket.target.sheetId ||
-      !sameRange(result.targetRange, ticket.target.targetRange) ||
+      requestId !== ticket.target.requestId ||
+      sheetId !== ticket.target.sheetId ||
+      targetRange === null ||
+      !sameRange(targetRange, ticket.target.targetRange) ||
       rows === null ||
-      !sameNumberList(rows, result.removedRowIndices) ||
       !sameNumberList(rows, ticket.target.removedRowIndices) ||
-      result.removedRows !== rows.length ||
-      !numericHistoryRevision(result.revision) ||
-      result.revision === ticket.target.projectionRevision
+      removedRows !== rows.length ||
+      affectedRange === null ||
+      !validRevision(revision) ||
+      (historyRecordedValue !== undefined && typeof historyRecordedValue !== 'boolean') ||
+      Object.is(revision, ticket.target.projectionRevision)
     ) {
-      return false
+      return null
     }
-    if (rows.length === 0) return result.affectedRange === null
-    const affected = result.affectedRange
-    return (
-      affected !== null &&
-      affected.startRow === rows[0] &&
-      affected.endRow === ticket.target.targetRange.rowEnd &&
-      affected.startCol === ticket.target.targetRange.colStart &&
-      affected.endCol === ticket.target.targetRange.colEnd
-    )
+    if (
+      rows.length === 0 ||
+      affectedRange.startRow !== rows[0] ||
+      affectedRange.endRow !== ticket.target.targetRange.rowEnd ||
+      affectedRange.startCol !== ticket.target.targetRange.colStart ||
+      affectedRange.endCol !== ticket.target.targetRange.colEnd
+    ) {
+      return null
+    }
+    return Object.freeze({
+      requestId,
+      sheetId,
+      targetRange,
+      removedRowIndices: rows,
+      removedRows,
+      affectedRange,
+      revision,
+      historyRecorded: historyRecordedValue ?? true,
+    })
   } catch {
-    return false
+    return null
   }
 }
 
@@ -1045,8 +1316,11 @@ async function refreshAcknowledgedMutation(
   get: Getter,
   set: Setter,
   ticket: RemoveDuplicatesMutationTicket,
-  refreshProjection: (sheetId: string) => Promise<void>,
 ): Promise<RemoveDuplicatesMutationOutcome> {
+  if (!mutationTicketIsCurrent(get, ticket)) return 'stale'
+  if (!mutationTicketAuthorityIsCurrent(get, ticket)) {
+    return markOutcomeUnknown(set, ticket)
+  }
   set(removeDuplicatesErrorStateAtom, '')
   set(
     removeDuplicatesLifecycleStateAtom,
@@ -1060,15 +1334,23 @@ async function refreshAcknowledgedMutation(
   )
   await Promise.resolve()
   if (!mutationTicketIsCurrent(get, ticket)) return 'stale'
+  if (!mutationTicketAuthorityIsCurrent(get, ticket)) {
+    return markOutcomeUnknown(set, ticket)
+  }
   set(removeDuplicatesLifecycleStateAtom, get(removeDuplicatesLifecycleAtom))
   try {
-    await refreshProjection(ticket.target.sheetId)
-  } catch (error) {
-    if (!mutationTicketIsCurrent(get, ticket)) return 'stale'
-    set(
-      removeDuplicatesErrorStateAtom,
-      `${REMOVE_DUPLICATES_REFRESH_ERROR_PREFIX}${errorMessage(error)}`,
+    await withRemoveDuplicatesTimeout(
+      Reflect.apply(ticket.refreshProjection, undefined, [ticket.target.sheetId]),
+      ticket.timeoutMs,
+      'Remove Duplicates refresh',
     )
+  } catch (error) {
+    const detail = errorMessage(error)
+    if (!mutationTicketIsCurrent(get, ticket)) return 'stale'
+    if (!mutationTicketAuthorityIsCurrent(get, ticket)) {
+      return markOutcomeUnknown(set, ticket)
+    }
+    set(removeDuplicatesErrorStateAtom, `${REMOVE_DUPLICATES_REFRESH_ERROR_PREFIX}${detail}`)
     set(
       removeDuplicatesLifecycleStateAtom,
       lifecycleFor(
@@ -1082,6 +1364,20 @@ async function refreshAcknowledgedMutation(
     return 'refresh-failed'
   }
   if (!mutationTicketIsCurrent(get, ticket)) return 'stale'
+  if (!mutationTicketAuthorityIsCurrent(get, ticket)) {
+    return markOutcomeUnknown(set, ticket)
+  }
+  if (!set(releaseHistoryProducerReservationAtom, ticket.historyReservation)) {
+    return markOutcomeUnknown(
+      set,
+      ticket,
+      'History ownership could not be reconciled after refresh.',
+    )
+  }
+  if (!mutationTicketIsCurrent(get, ticket)) return 'stale'
+  if (!mutationTicketAuthorityIsCurrent(get, ticket)) {
+    return markOutcomeUnknown(set, ticket)
+  }
   closeSession(get, set)
   return 'completed'
 }
@@ -1096,13 +1392,67 @@ export const runRemoveDuplicatesConfirmAtom = atom(
     const active = get(activeRemoveDuplicatesMutationAtom)
     const lifecycle = get(removeDuplicatesLifecycleAtom)
     if (active !== null) {
-      if (
-        active.acknowledgement !== null &&
-        lifecycle.status === 'refresh-failed' &&
-        input.sessionId === active.sessionId &&
-        typeof input.refreshProjection === 'function'
-      ) {
-        return refreshAcknowledgedMutation(get, set, active, input.refreshProjection)
+      if (active.acknowledgement !== null && lifecycle.status === 'refresh-failed') {
+        if (!mutationTicketIsCurrent(get, active)) return 'stale'
+        if (!mutationTicketAuthorityIsCurrent(get, active)) {
+          return markOutcomeUnknown(set, active)
+        }
+
+        let retrySessionId: number | undefined
+        let refreshProjection: RunRemoveDuplicatesConfirmInput['refreshProjection'] | undefined
+        let timeoutMs = DEFAULT_REMOVE_DUPLICATES_TIMEOUT_MS
+        let captureFailed = false
+        try {
+          // A retry is refresh-only: source and mutation ports are deliberately
+          // not observed again.
+          retrySessionId = input.sessionId
+          refreshProjection = input.refreshProjection
+          timeoutMs = normalizeRemoveDuplicatesTimeout(input.timeoutMs)
+        } catch {
+          captureFailed = true
+        }
+
+        if (
+          get(activeRemoveDuplicatesMutationAtom) !== active ||
+          get(removeDuplicatesLifecycleAtom) !== lifecycle ||
+          !mutationTicketIsCurrent(get, active) ||
+          !mutationTicketAuthorityIsCurrent(get, active)
+        ) {
+          return 'stale'
+        }
+        if (
+          captureFailed ||
+          retrySessionId !== active.sessionId ||
+          typeof refreshProjection !== 'function'
+        ) {
+          if (captureFailed) {
+            set(
+              removeDuplicatesErrorStateAtom,
+              `${REMOVE_DUPLICATES_REFRESH_ERROR_PREFIX}Invalid retry transport input.`,
+            )
+          }
+          return captureFailed ? 'refresh-failed' : 'stale'
+        }
+
+        const retryTicket: RemoveDuplicatesMutationTicket = Object.freeze({
+          ...active,
+          refreshProjection,
+          timeoutMs,
+        })
+        // The status transition closes the retry gate before publishing the
+        // replacement immutable ticket.
+        set(
+          removeDuplicatesLifecycleStateAtom,
+          lifecycleFor(
+            'refreshing',
+            active.sessionId,
+            active.target.sheetId,
+            null,
+            active.target.requestId,
+          ),
+        )
+        set(activeRemoveDuplicatesMutationAtom, retryTicket)
+        return refreshAcknowledgedMutation(get, set, retryTicket)
       }
       return lifecycle.status === 'outcome-unknown' ? 'outcome-unknown' : 'stale'
     }
@@ -1112,7 +1462,6 @@ export const runRemoveDuplicatesConfirmAtom = atom(
       session === null ||
       !get(removeDuplicatesOpenAtom) ||
       lifecycle.status !== 'editing' ||
-      input.sessionId !== session.sessionId ||
       lifecycle.sessionId !== session.sessionId
     ) {
       return 'stale'
@@ -1126,13 +1475,33 @@ export const runRemoveDuplicatesConfirmAtom = atom(
       return 'stale'
     }
 
+    const initialOpen = get(removeDuplicatesOpenAtom)
+    let source: RemoveDuplicatesControllerPort | undefined
+    let capturedSessionId: number | undefined
     let execute: RemoveDuplicatesControllerPort['removeRowsExact']
+    let refreshProjection: RunRemoveDuplicatesConfirmInput['refreshProjection'] | undefined
+    let timeoutMs = DEFAULT_REMOVE_DUPLICATES_TIMEOUT_MS
+    let captureFailed = false
     try {
-      execute = input.source?.removeRowsExact
+      source = input.source
+      capturedSessionId = input.sessionId
+      refreshProjection = input.refreshProjection
+      timeoutMs = normalizeRemoveDuplicatesTimeout(input.timeoutMs)
+      execute = source?.removeRowsExact
     } catch {
-      execute = undefined
+      captureFailed = true
     }
-    if (typeof execute !== 'function') {
+
+    if (
+      get(activeRemoveDuplicatesMutationAtom) !== null ||
+      get(removeDuplicatesLifecycleAtom) !== lifecycle ||
+      get(removeDuplicatesSessionAtom) !== session ||
+      get(removeDuplicatesOpenAtom) !== initialOpen ||
+      !sessionAuthorityIsCurrent(get, session)
+    ) {
+      return 'stale'
+    }
+    if (captureFailed) {
       set(
         removeDuplicatesCapabilityStateAtom,
         Object.freeze({ ...get(removeDuplicatesCapabilityAtom), canRemove: false }),
@@ -1140,11 +1509,18 @@ export const runRemoveDuplicatesConfirmAtom = atom(
       set(removeDuplicatesErrorStateAtom, REMOVE_DUPLICATES_REMOVE_CAPABILITY_ERROR)
       return 'blocked'
     }
-    set(
-      removeDuplicatesCapabilityStateAtom,
-      Object.freeze({ ...get(removeDuplicatesCapabilityAtom), canRemove: true }),
-    )
-    if (typeof input.refreshProjection !== 'function') return 'blocked'
+    if (capturedSessionId !== session.sessionId) {
+      return 'stale'
+    }
+    if (typeof execute !== 'function' || source === undefined) {
+      set(
+        removeDuplicatesCapabilityStateAtom,
+        Object.freeze({ ...get(removeDuplicatesCapabilityAtom), canRemove: false }),
+      )
+      set(removeDuplicatesErrorStateAtom, REMOVE_DUPLICATES_REMOVE_CAPABILITY_ERROR)
+      return 'blocked'
+    }
+    if (typeof refreshProjection !== 'function') return 'blocked'
 
     const preview = get(removeDuplicatesPreviewAtom)
     const rows = preview === null ? null : canonicalRows(preview.duplicateRows)
@@ -1160,6 +1536,30 @@ export const runRemoveDuplicatesConfirmAtom = atom(
       return 'blocked'
     }
 
+    const resolution = set(resolveContentMutationAtom, {
+      kind: 'remove-rows',
+      sheetId: session.sheetId,
+      range: targetRange,
+    })
+    if (
+      get(activeRemoveDuplicatesMutationAtom) !== null ||
+      get(removeDuplicatesLifecycleAtom) !== lifecycle ||
+      get(removeDuplicatesSessionAtom) !== session ||
+      !sessionAuthorityIsCurrent(get, session)
+    ) {
+      return 'stale'
+    }
+    if (resolution.status === 'blocked') {
+      set(removeDuplicatesErrorStateAtom, resolution.diagnostic.message)
+      return 'blocked'
+    }
+    const resolvedRanges = resolution.ranges
+    const resolvedTargetRange =
+      resolvedRanges?.length === 1 ? snapshotCellRangeValue(resolvedRanges[0]) : null
+    if (resolvedTargetRange === null) {
+      return 'blocked'
+    }
+
     const requestId = nextRemoveDuplicatesMutationRequestId(
       get(removeDuplicatesMutationSequenceStateAtom),
     )
@@ -1170,10 +1570,15 @@ export const runRemoveDuplicatesConfirmAtom = atom(
     const target: RemoveDuplicatesMutationTarget = Object.freeze({
       requestId,
       sheetId: session.sheetId,
-      targetRange,
+      targetRange: resolvedTargetRange,
       removedRowIndices: rows,
       projectionRevision: session.projectionRevision,
-      targetKey: targetKeyFor(session.sheetId, targetRange, session.projectionRevision, rows),
+      targetKey: targetKeyFor(
+        session.sheetId,
+        resolvedTargetRange,
+        session.projectionRevision,
+        rows,
+      ),
     })
     const request: RemoveRowsExactRequest = Object.freeze({
       kind: 'remove-rows',
@@ -1183,51 +1588,106 @@ export const runRemoveDuplicatesConfirmAtom = atom(
       rows: target.removedRowIndices,
       revision: target.projectionRevision,
     })
+    if (
+      get(activeRemoveDuplicatesMutationAtom) !== null ||
+      get(removeDuplicatesLifecycleAtom) !== lifecycle ||
+      get(removeDuplicatesSessionAtom) !== session ||
+      !sessionAuthorityIsCurrent(get, session)
+    ) {
+      return 'stale'
+    }
+    const historyReservation = set(acquireHistoryProducerReservationAtom)
+    if (historyReservation === null) {
+      if (
+        get(activeRemoveDuplicatesMutationAtom) === null &&
+        get(removeDuplicatesLifecycleAtom) === lifecycle &&
+        get(removeDuplicatesSessionAtom) === session &&
+        sessionAuthorityIsCurrent(get, session)
+      ) {
+        set(removeDuplicatesErrorStateAtom, REMOVE_DUPLICATES_HISTORY_BUSY_ERROR)
+      }
+      return 'blocked'
+    }
     const ticket: RemoveDuplicatesMutationTicket = Object.freeze({
       sessionId: session.sessionId,
       selectionWitness: session.selectionWitness,
       workspaceActiveSheetWitness: session.workspaceActiveSheetWitness,
       target,
       request,
+      historyReservation,
       acknowledgement: null,
+      source,
+      execute,
+      refreshProjection,
+      timeoutMs,
+      readRequestId: lifecycle.readRequestId,
     })
+    if (
+      get(activeRemoveDuplicatesMutationAtom) !== null ||
+      get(removeDuplicatesLifecycleAtom) !== lifecycle ||
+      get(removeDuplicatesSessionAtom) !== session ||
+      !sessionAuthorityIsCurrent(get, session)
+    ) {
+      set(releaseHistoryProducerReservationAtom, historyReservation)
+      return 'stale'
+    }
     set(removeDuplicatesMutationSequenceStateAtom, requestId)
-    set(activeRemoveDuplicatesMutationAtom, ticket)
     set(removeDuplicatesErrorStateAtom, '')
     set(
       removeDuplicatesLifecycleStateAtom,
       lifecycleFor('mutation-pending', session.sessionId, session.sheetId, null, requestId),
     )
+    set(activeRemoveDuplicatesMutationAtom, ticket)
 
     // Publish the immutable ticket before transport launch; same-tick re-entry is inert.
     await Promise.resolve()
-    if (!mutationTicketIsCurrent(get, ticket)) return 'stale'
+    if (!mutationTicketIsCurrent(get, ticket)) {
+      set(releaseHistoryProducerReservationAtom, ticket.historyReservation)
+      return 'stale'
+    }
     if (!mutationTicketAuthorityIsCurrent(get, ticket)) {
-      return markMutationStaleBeforeTransport(set, ticket, lifecycle.readRequestId)
+      return markMutationStaleBeforeTransport(get, set, ticket, ticket.readRequestId)
     }
     set(removeDuplicatesLifecycleStateAtom, get(removeDuplicatesLifecycleAtom))
 
     let acknowledgement: unknown
     try {
-      acknowledgement = await execute.call(input.source, ticket.request)
+      acknowledgement = await withRemoveDuplicatesTimeout(
+        Reflect.apply(ticket.execute, ticket.source, [ticket.request]),
+        ticket.timeoutMs,
+        'Remove Duplicates mutation',
+      )
     } catch (error) {
+      const detail = errorMessage(error)
       if (!mutationTicketIsCurrent(get, ticket)) return 'stale'
-      return markOutcomeUnknown(set, ticket, `Backend detail: ${errorMessage(error)}`)
+      if (!mutationTicketAuthorityIsCurrent(get, ticket)) {
+        return markOutcomeUnknown(set, ticket)
+      }
+      return markOutcomeUnknown(set, ticket, `Backend detail: ${detail}`)
     }
     if (!mutationTicketIsCurrent(get, ticket)) return 'stale'
-    if (
-      !mutationTicketAuthorityIsCurrent(get, ticket) ||
-      !acknowledgementMatches(acknowledgement, ticket)
-    ) {
+    if (!mutationTicketAuthorityIsCurrent(get, ticket)) {
       return markOutcomeUnknown(set, ticket)
     }
 
-    const exactAcknowledgement = acknowledgement as RemoveRowsExactResult
+    const exactAcknowledgement = snapshotAcknowledgement(acknowledgement, ticket)
+    // Snapshotting hostile caller-owned acknowledgements may synchronously
+    // re-enter Core. Reconcile only after the exact ticket and authority have
+    // survived the complete capture boundary.
+    if (!mutationTicketIsCurrent(get, ticket)) return 'stale'
+    if (!mutationTicketAuthorityIsCurrent(get, ticket)) {
+      return markOutcomeUnknown(set, ticket)
+    }
+    if (exactAcknowledgement === null) return markOutcomeUnknown(set, ticket)
     const acknowledgedTicket: RemoveDuplicatesMutationTicket = Object.freeze({
       ...ticket,
       acknowledgement: exactAcknowledgement,
     })
     set(activeRemoveDuplicatesMutationAtom, acknowledgedTicket)
+    if (!mutationTicketIsCurrent(get, acknowledgedTicket)) return 'stale'
+    if (!mutationTicketAuthorityIsCurrent(get, acknowledgedTicket)) {
+      return markOutcomeUnknown(set, acknowledgedTicket)
+    }
 
     // W3 structural-shift contract, extended to the exact removal path:
     // the acknowledged removedRowIndices fully determine the row-space
@@ -1244,8 +1704,20 @@ export const runRemoveDuplicatesConfirmAtom = atom(
     const hiddenColsBefore = getHiddenColumnsForSheet(hiddenStateBefore, mutatedSheetId)
     for (const shift of descendingRowDeleteShifts(ticket.target.removedRowIndices)) {
       set(applyViewportFreezeStructuralShiftAtom, { sheetId: mutatedSheetId, shift })
+      if (!mutationTicketIsCurrent(get, acknowledgedTicket)) return 'stale'
+      if (!mutationTicketAuthorityIsCurrent(get, acknowledgedTicket)) {
+        return markOutcomeUnknown(set, acknowledgedTicket)
+      }
       set(applyViewportHiddenStructuralShiftAtom, { sheetId: mutatedSheetId, shift })
+      if (!mutationTicketIsCurrent(get, acknowledgedTicket)) return 'stale'
+      if (!mutationTicketAuthorityIsCurrent(get, acknowledgedTicket)) {
+        return markOutcomeUnknown(set, acknowledgedTicket)
+      }
       set(applyViewportFilterHiddenStructuralShiftAtom, { sheetId: mutatedSheetId, shift })
+      if (!mutationTicketIsCurrent(get, acknowledgedTicket)) return 'stale'
+      if (!mutationTicketAuthorityIsCurrent(get, acknowledgedTicket)) {
+        return markOutcomeUnknown(set, acknowledgedTicket)
+      }
     }
     const localSidePayloads: HistoryLocalReplayPayload[] = []
     const freezeAfter = getViewportFreezeForSheet(get(viewportFreezeAtom), mutatedSheetId)
@@ -1281,19 +1753,43 @@ export const runRemoveDuplicatesConfirmAtom = atom(
     // core re-hydrates the render cache from the engine afterwards
     // (`readSheetHiddenState.filterRows`). The forward shift above is the
     // optimistic same-tick projection only.
-    set(pushHistoryAtom, {
-      transactionId: `remove-duplicates-${ticket.sessionId}-${ticket.target.requestId}`,
-      kind: 'row.delete',
-      sheetId: ticket.target.sheetId,
-      projectionRevision: exactAcknowledgement.revision as number,
-      affectedRange: {
-        rowStart: exactAcknowledgement.affectedRange!.startRow,
-        rowEnd: exactAcknowledgement.affectedRange!.endRow,
-        colStart: exactAcknowledgement.affectedRange!.startCol,
-        colEnd: exactAcknowledgement.affectedRange!.endCol,
-      },
-      ...(localSidePayloads.length > 0 ? { localSidePayloads } : {}),
-    })
+    if (!mutationTicketIsCurrent(get, acknowledgedTicket)) return 'stale'
+    if (!mutationTicketAuthorityIsCurrent(get, acknowledgedTicket)) {
+      return markOutcomeUnknown(set, acknowledgedTicket)
+    }
+    if (exactAcknowledgement.historyRecorded) {
+      const historyRecorded = set(pushReservedHistoryAtom, {
+        reservation: ticket.historyReservation,
+        entry: {
+          transactionId: `remove-duplicates-${ticket.sessionId}-${ticket.target.requestId}`,
+          kind: 'row.delete',
+          sheetId: ticket.target.sheetId,
+          projectionRevision: exactAcknowledgement.revision,
+          affectedRange: {
+            rowStart: exactAcknowledgement.affectedRange.startRow,
+            rowEnd: exactAcknowledgement.affectedRange.endRow,
+            colStart: exactAcknowledgement.affectedRange.startCol,
+            colEnd: exactAcknowledgement.affectedRange.endCol,
+          },
+          ...(localSidePayloads.length > 0 ? { localSidePayloads } : {}),
+        },
+      })
+      if (!mutationTicketIsCurrent(get, acknowledgedTicket)) return 'stale'
+      if (!mutationTicketAuthorityIsCurrent(get, acknowledgedTicket)) {
+        return markOutcomeUnknown(set, acknowledgedTicket)
+      }
+      if (!historyRecorded) {
+        return markOutcomeUnknown(
+          set,
+          acknowledgedTicket,
+          'The acknowledged mutation could not be recorded in history.',
+        )
+      }
+    }
+    if (!mutationTicketIsCurrent(get, acknowledgedTicket)) return 'stale'
+    if (!mutationTicketAuthorityIsCurrent(get, acknowledgedTicket)) {
+      return markOutcomeUnknown(set, acknowledgedTicket)
+    }
     set(
       removeDuplicatesLifecycleStateAtom,
       lifecycleFor(
@@ -1306,7 +1802,10 @@ export const runRemoveDuplicatesConfirmAtom = atom(
     )
     await Promise.resolve()
     if (!mutationTicketIsCurrent(get, acknowledgedTicket)) return 'stale'
-    return refreshAcknowledgedMutation(get, set, acknowledgedTicket, input.refreshProjection)
+    if (!mutationTicketAuthorityIsCurrent(get, acknowledgedTicket)) {
+      return markOutcomeUnknown(set, acknowledgedTicket)
+    }
+    return refreshAcknowledgedMutation(get, set, acknowledgedTicket)
   },
 )
 runRemoveDuplicatesConfirmAtom.debugLabel = 'spreadsheet.removeDuplicates.confirm'

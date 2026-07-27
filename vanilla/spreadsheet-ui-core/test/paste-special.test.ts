@@ -2,10 +2,16 @@ import { describe, expect, jest, test } from '@jest/globals'
 import { createStore } from '@einfach/core'
 import type { Atom } from '@einfach/core'
 import { copyClipboardAtom } from '../src/clipboard'
-import { historyStackAtom } from '../src/history'
+import {
+  acquireHistoryProducerReservationAtom,
+  historyStackAtom,
+  pushReservedHistoryAtom,
+  releaseHistoryProducerReservationAtom,
+} from '../src/history'
 import {
   PASTE_SPECIAL_ACKNOWLEDGEMENT_ERROR,
   PASTE_SPECIAL_CAPABILITY_ERROR,
+  PASTE_SPECIAL_HISTORY_BUSY_ERROR,
   PASTE_SPECIAL_OUTCOME_UNKNOWN_ERROR,
   PASTE_SPECIAL_REFRESH_ERROR_PREFIX,
   PASTE_SPECIAL_UNSUPPORTED_KIND_ERROR,
@@ -114,6 +120,14 @@ function openReadySession(store: Store, port: PasteSpecialControllerPort) {
   const session = store.getter(pasteSpecialSessionAtom)
   if (session === null) throw new Error('expected an open Paste Special session')
   return session
+}
+
+function expectHistoryProducerLaneAvailable(store: Store): void {
+  const reservation = store.setter(acquireHistoryProducerReservationAtom)
+  expect(reservation).not.toBeNull()
+  if (reservation !== null) {
+    expect(store.setter(releaseHistoryProducerReservationAtom, reservation)).toBe(true)
+  }
 }
 
 describe('paste-special Core state machine', () => {
@@ -285,12 +299,66 @@ describe('paste-special Core state machine', () => {
     },
   )
 
+  test(
+    'a foreign history producer reservation blocks before ticket publication or transport',
+    async () => {
+    const store = createStore()
+    const foreignStore = createStore()
+    const { pasteRange, port } = createPort()
+    const session = openReadySession(store, port)
+    const sessionWitness = store.getter(pasteSpecialSessionAtom)
+    const requestIdBefore = store.getter(pasteSpecialRequestIdAtom)
+    const reservation = store.setter(acquireHistoryProducerReservationAtom)
+    const foreignReservation = foreignStore.setter(acquireHistoryProducerReservationAtom)
+    expect(reservation).not.toBeNull()
+    expect(foreignReservation).not.toBeNull()
+
+    await expect(
+      store.setter(confirmPasteSpecialAtom, {
+        source: port,
+        sessionId: session.sessionId,
+        refreshProjection: async () => {},
+      }),
+    ).resolves.toBe('blocked')
+
+    expect(store.getter(pasteSpecialSessionAtom)).toBe(sessionWitness)
+    expect(store.getter(pasteSpecialSessionIdAtom)).toBe(session.sessionId)
+    expect(store.getter(pasteSpecialRequestIdAtom)).toBe(requestIdBefore)
+    expect(store.getter(pasteSpecialLifecycleAtom).status).toBe('blocked')
+    expect(store.getter(pasteSpecialErrorAtom)).toBe(PASTE_SPECIAL_HISTORY_BUSY_ERROR)
+    expect(store.getter(pasteSpecialCanConfirmAtom)).toBe(true)
+    expect(pasteRange).not.toHaveBeenCalled()
+    expect(store.getter(historyStackAtom).entries).toHaveLength(0)
+    if (foreignReservation !== null) {
+      expect(store.setter(releaseHistoryProducerReservationAtom, foreignReservation)).toBe(false)
+    }
+    if (reservation !== null) {
+      expect(store.setter(releaseHistoryProducerReservationAtom, reservation)).toBe(true)
+    }
+    if (foreignReservation !== null) {
+      expect(foreignStore.setter(releaseHistoryProducerReservationAtom, foreignReservation)).toBe(
+        true,
+      )
+    }
+
+    await expect(
+      store.setter(confirmPasteSpecialAtom, {
+        source: port,
+        sessionId: session.sessionId,
+        refreshProjection: async () => {},
+      }),
+    ).resolves.toBe('completed')
+    expect(pasteRange).toHaveBeenCalledTimes(1)
+    expect(store.getter(historyStackAtom).entries).toHaveLength(1)
+    expectHistoryProducerLaneAvailable(store)
+  })
+
   test.each([
     ['sheet mismatch', { sheetId: 'sheet-other' }],
     ['request mismatch', { requestId: 999 }],
   ] as const)(
     '%s is outcome-unknown, keeps the request identity, and fails closed',
-    async (_label, mismatch) => {
+    async (...[_label, mismatch]) => {
       const store = createStore()
       const { pasteRange, port } = createPort(async (request) => strictResult(request, mismatch))
       const session = openReadySession(store, port)
@@ -323,8 +391,318 @@ describe('paste-special Core state machine', () => {
       ).resolves.toBe('blocked')
       expect(pasteRange).toHaveBeenCalledTimes(1)
       expect(store.getter(pasteSpecialOpenAtom)).toBe(true)
+      // Excel never traps a dialog: outcome-unknown still permits dismissal.
+      expect(store.getter(pasteSpecialCanCloseAtom)).toBe(true)
+      expect(store.setter(acquireHistoryProducerReservationAtom)).toBeNull()
+      store.setter(closePasteSpecialAtom)
+      expect(store.getter(pasteSpecialOpenAtom)).toBe(false)
+      expectHistoryProducerLaneAvailable(store)
+      store.setter(openPasteSpecialAtom)
+      expect(store.getter(pasteSpecialSessionAtom)?.sessionId).not.toBe(session.sessionId)
     },
   )
+
+  test(
+    'a non-paste acknowledgement kind is outcome-unknown and never reaches history',
+    async () => {
+    const store = createStore()
+    const pasteRange = jest.fn(async (request: PasteRangeRequest) => ({
+      ...strictResult(request),
+      kind: 'other-mutation',
+    }))
+    const port = { pasteRange } as unknown as PasteSpecialControllerPort
+    const session = openReadySession(store, port)
+    const refreshProjection = jest.fn(async () => {})
+
+    await expect(
+      store.setter(confirmPasteSpecialAtom, {
+        source: port,
+        sessionId: session.sessionId,
+        refreshProjection,
+      }),
+    ).resolves.toBe('outcome-unknown')
+    expect(refreshProjection).not.toHaveBeenCalled()
+    expect(store.getter(historyStackAtom).entries).toHaveLength(0)
+    expect(store.setter(acquireHistoryProducerReservationAtom)).toBeNull()
+  })
+
+  test.each([
+    ['number', 17],
+    ['string', 'revision-17'],
+  ] as const)(
+    'strict %s revision and acknowledgement range are recorded without coercion or fallback',
+    async (...[_label, revision]) => {
+      const store = createStore()
+      const affectedRange = Object.freeze({
+        rowStart: 10,
+        rowEnd: 11,
+        colStart: 6,
+        colEnd: 7,
+      })
+      const { port } = createPort(async (request) =>
+        strictResult(request, { revision, affectedRange }),
+      )
+      const session = openReadySession(store, port)
+
+      await expect(
+        store.setter(confirmPasteSpecialAtom, {
+          source: port,
+          sessionId: session.sessionId,
+          refreshProjection: async () => {},
+        }),
+      ).resolves.toBe('completed')
+
+      expect(store.getter(historyStackAtom).entries).toHaveLength(1)
+      expect(store.getter(historyStackAtom).entries[0]).toMatchObject({
+        projectionRevision: revision,
+        affectedRange,
+      })
+      expectHistoryProducerLaneAvailable(store)
+    },
+  )
+
+  test.each([
+    ['missing', undefined],
+    ['not-a-number', Number.NaN],
+    ['infinite', Number.POSITIVE_INFINITY],
+    ['empty-string', ''],
+  ] as const)(
+    'invalid %s revision fails closed and retains the producer lane',
+    async (...[_label, revision]) => {
+      const store = createStore()
+      const pasteRange = jest.fn(async (request: PasteRangeRequest) => ({
+        ...strictResult(request),
+        revision,
+      }))
+      const port = { pasteRange } as PasteSpecialControllerPort
+      const session = openReadySession(store, port)
+      const refreshProjection = jest.fn(async () => {})
+
+      await expect(
+        store.setter(confirmPasteSpecialAtom, {
+          source: port,
+          sessionId: session.sessionId,
+          refreshProjection,
+        }),
+      ).resolves.toBe('outcome-unknown')
+
+      expect(pasteRange).toHaveBeenCalledTimes(1)
+      expect(refreshProjection).not.toHaveBeenCalled()
+      expect(store.getter(historyStackAtom).entries).toHaveLength(0)
+      // Excel never traps a dialog: outcome-unknown still permits dismissal.
+      expect(store.getter(pasteSpecialCanCloseAtom)).toBe(true)
+      expect(store.setter(acquireHistoryProducerReservationAtom)).toBeNull()
+    },
+  )
+
+  test.each([
+    ['missing', undefined],
+    ['negative', { rowStart: -1, rowEnd: 0, colStart: 0, colEnd: 0 }],
+    ['inverted', { rowStart: 2, rowEnd: 1, colStart: 0, colEnd: 0 }],
+    ['fractional', { rowStart: 0.5, rowEnd: 1, colStart: 0, colEnd: 0 }],
+  ] as const)(
+    'invalid %s acknowledgement range fails closed instead of using the target fallback',
+    async (...[_label, affectedRange]) => {
+      const store = createStore()
+      const pasteRange = jest.fn(async (request: PasteRangeRequest) => ({
+        ...strictResult(request),
+        affectedRange,
+      }))
+      const port = { pasteRange } as PasteSpecialControllerPort
+      const session = openReadySession(store, port)
+      const refreshProjection = jest.fn(async () => {})
+
+      await expect(
+        store.setter(confirmPasteSpecialAtom, {
+          source: port,
+          sessionId: session.sessionId,
+          refreshProjection,
+        }),
+      ).resolves.toBe('outcome-unknown')
+
+      expect(refreshProjection).not.toHaveBeenCalled()
+      expect(store.getter(historyStackAtom).entries).toHaveLength(0)
+      // Excel never traps a dialog: outcome-unknown still permits dismissal.
+      expect(store.getter(pasteSpecialCanCloseAtom)).toBe(true)
+      expect(store.setter(acquireHistoryProducerReservationAtom)).toBeNull()
+    },
+  )
+
+  test(
+    'snapshots every acknowledgement getter exactly once before later values can degrade',
+    async () => {
+    const store = createStore()
+    const reads = new Map<string, number>()
+    const once = <T>(name: string, value: T): T => {
+      const count = (reads.get(name) ?? 0) + 1
+      reads.set(name, count)
+      if (count > 1) throw new Error(`${name} was read more than once`)
+      return value
+    }
+    const affectedRange = Object.defineProperties(Object.create(null), {
+      rowStart: { enumerable: true, get: () => once('rowStart', 20) },
+      rowEnd: { enumerable: true, get: () => once('rowEnd', 21) },
+      colStart: { enumerable: true, get: () => once('colStart', 8) },
+      colEnd: { enumerable: true, get: () => once('colEnd', 9) },
+    })
+    const pasteRange = jest.fn(
+      async (request: PasteRangeRequest) =>
+        Object.defineProperties(Object.create(null), {
+          kind: { enumerable: true, get: () => once('kind', 'paste-range') },
+          sheetId: { enumerable: true, get: () => once('sheetId', request.sheetId) },
+          requestId: { enumerable: true, get: () => once('requestId', request.requestId) },
+          revision: { enumerable: true, get: () => once('revision', 'getter-revision') },
+          affectedRange: { enumerable: true, get: () => once('affectedRange', affectedRange) },
+        }) as PasteRangeResult,
+    )
+    const port = { pasteRange } as PasteSpecialControllerPort
+    const session = openReadySession(store, port)
+
+    await expect(
+      store.setter(confirmPasteSpecialAtom, {
+        source: port,
+        sessionId: session.sessionId,
+        refreshProjection: async () => {},
+      }),
+    ).resolves.toBe('completed')
+
+    expect(Object.fromEntries(reads)).toEqual({
+      kind: 1,
+      sheetId: 1,
+      requestId: 1,
+      revision: 1,
+      affectedRange: 1,
+      rowStart: 1,
+      rowEnd: 1,
+      colStart: 1,
+      colEnd: 1,
+    })
+    expect(store.getter(historyStackAtom).entries[0]).toMatchObject({
+      projectionRevision: 'getter-revision',
+      affectedRange: { rowStart: 20, rowEnd: 21, colStart: 8, colEnd: 9 },
+    })
+  })
+
+  test.each([
+    'kind',
+    'sheetId',
+    'requestId',
+    'revision',
+    'affectedRange',
+    'rowStart',
+    'rowEnd',
+    'colStart',
+    'colEnd',
+  ] as const)('a throwing %s acknowledgement getter fails closed', async (throwingField) => {
+    const store = createStore()
+    const pasteRange = jest.fn(async (request: PasteRangeRequest) => {
+      const read = <T>(name: string, value: T): T => {
+        if (name === throwingField) throw new Error(`hostile ${name} getter`)
+        return value
+      }
+      const affectedRange = Object.defineProperties(Object.create(null), {
+        rowStart: { enumerable: true, get: () => read('rowStart', 1) },
+        rowEnd: { enumerable: true, get: () => read('rowEnd', 2) },
+        colStart: { enumerable: true, get: () => read('colStart', 3) },
+        colEnd: { enumerable: true, get: () => read('colEnd', 4) },
+      })
+      return Object.defineProperties(Object.create(null), {
+        kind: { enumerable: true, get: () => read('kind', 'paste-range') },
+        sheetId: { enumerable: true, get: () => read('sheetId', request.sheetId) },
+        requestId: { enumerable: true, get: () => read('requestId', request.requestId) },
+        revision: { enumerable: true, get: () => read('revision', 19) },
+        affectedRange: {
+          enumerable: true,
+          get: () => read('affectedRange', affectedRange),
+        },
+      }) as PasteRangeResult
+    })
+    const port = { pasteRange } as PasteSpecialControllerPort
+    const session = openReadySession(store, port)
+    const refreshProjection = jest.fn(async () => {})
+
+    await expect(
+      store.setter(confirmPasteSpecialAtom, {
+        source: port,
+        sessionId: session.sessionId,
+        refreshProjection,
+      }),
+    ).resolves.toBe('outcome-unknown')
+
+    expect(refreshProjection).not.toHaveBeenCalled()
+    expect(store.getter(historyStackAtom).entries).toHaveLength(0)
+    expect(store.getter(pasteSpecialLifecycleAtom).status).toBe('outcome-unknown')
+    // Excel never traps a dialog: outcome-unknown still permits dismissal.
+    expect(store.getter(pasteSpecialCanCloseAtom)).toBe(true)
+    expect(store.setter(acquireHistoryProducerReservationAtom)).toBeNull()
+  })
+
+  test('a hostile acknowledgement Proxy is contained and fails closed', async () => {
+    const store = createStore()
+    const pasteRange = jest.fn(async (request: PasteRangeRequest) => {
+      const result = strictResult(request)
+      return new Proxy(result, {
+        get(target, property, receiver) {
+          if (property === 'revision') throw new Error('hostile acknowledgement proxy')
+          return Reflect.get(target, property, receiver)
+        },
+      })
+    })
+    const port = { pasteRange } as PasteSpecialControllerPort
+    const session = openReadySession(store, port)
+    const refreshProjection = jest.fn(async () => {})
+
+    await expect(
+      store.setter(confirmPasteSpecialAtom, {
+        source: port,
+        sessionId: session.sessionId,
+        refreshProjection,
+      }),
+    ).resolves.toBe('outcome-unknown')
+    expect(refreshProjection).not.toHaveBeenCalled()
+    expect(store.getter(historyStackAtom).entries).toHaveLength(0)
+    // Excel never traps a dialog: outcome-unknown still permits dismissal.
+    expect(store.getter(pasteSpecialCanCloseAtom)).toBe(true)
+    expect(store.setter(acquireHistoryProducerReservationAtom)).toBeNull()
+  })
+
+  test(
+    'a reserved history push failure retains the exact ticket and never refreshes or resends',
+    async () => {
+    const store = createStore()
+    const { pasteRange, port } = createPort()
+    const session = openReadySession(store, port)
+    const refreshProjection = jest.fn(async () => {})
+    const originalWrite = pushReservedHistoryAtom.write
+    try {
+      pushReservedHistoryAtom.write = () => false
+      await expect(
+        store.setter(confirmPasteSpecialAtom, {
+          source: port,
+          sessionId: session.sessionId,
+          refreshProjection,
+        }),
+      ).resolves.toBe('outcome-unknown')
+    } finally {
+      pushReservedHistoryAtom.write = originalWrite
+    }
+
+    expect(pasteRange).toHaveBeenCalledTimes(1)
+    expect(refreshProjection).not.toHaveBeenCalled()
+    expect(store.getter(historyStackAtom).entries).toHaveLength(0)
+    expect(store.getter(pasteSpecialLifecycleAtom).status).toBe('outcome-unknown')
+    // Excel never traps a dialog: outcome-unknown still permits dismissal.
+    expect(store.getter(pasteSpecialCanCloseAtom)).toBe(true)
+    expect(store.setter(acquireHistoryProducerReservationAtom)).toBeNull()
+    await expect(
+      store.setter(confirmPasteSpecialAtom, {
+        source: port,
+        sessionId: session.sessionId,
+        refreshProjection,
+      }),
+    ).resolves.toBe('blocked')
+    expect(pasteRange).toHaveBeenCalledTimes(1)
+  })
 
   test('transport rejection is outcome-unknown and cannot duplicate paste by retry', async () => {
     const store = createStore()
@@ -353,9 +731,17 @@ describe('paste-special Core state machine', () => {
     expect(pasteRange).toHaveBeenCalledTimes(1)
     expect(store.getter(historyStackAtom).entries).toHaveLength(0)
     expect(store.getter(pasteSpecialOpenAtom)).toBe(true)
+    // Excel never traps a dialog: an outcome-unknown ACK still permits
+    // dismissal, abandoning the retained ticket and its reservation.
     expect(store.getter(pasteSpecialCanCloseAtom)).toBe(true)
+    expect(store.setter(acquireHistoryProducerReservationAtom)).toBeNull()
     store.setter(closePasteSpecialAtom)
     expect(store.getter(pasteSpecialOpenAtom)).toBe(false)
+    expectHistoryProducerLaneAvailable(store)
+
+    store.setter(openPasteSpecialAtom)
+    expect(store.getter(pasteSpecialOpenAtom)).toBe(true)
+    expect(store.getter(pasteSpecialSessionAtom)?.sessionId).not.toBe(session.sessionId)
   })
 
   test('acknowledged refresh failure retries refresh only without duplicate paste or history', async () => {
@@ -378,7 +764,10 @@ describe('paste-special Core state machine', () => {
       `${PASTE_SPECIAL_REFRESH_ERROR_PREFIX}projection offline`,
     )
     expect(store.getter(pasteSpecialOpenAtom)).toBe(true)
+    // Excel never traps a dialog: a refresh failure still permits dismissal;
+    // retrying instead keeps reusing the same retained ticket and session.
     expect(store.getter(pasteSpecialCanCloseAtom)).toBe(true)
+    expect(store.setter(acquireHistoryProducerReservationAtom)).toBeNull()
     expect(pasteRange).toHaveBeenCalledTimes(1)
     expect(store.getter(historyStackAtom).entries).toHaveLength(1)
 
@@ -393,6 +782,7 @@ describe('paste-special Core state machine', () => {
     expect(pasteRange).toHaveBeenCalledTimes(1)
     expect(store.getter(historyStackAtom).entries).toHaveLength(1)
     expect(store.getter(pasteSpecialOpenAtom)).toBe(false)
+    expectHistoryProducerLaneAvailable(store)
   })
 
   test('launched pending work cannot be closed or replaced before its acknowledgement settles', async () => {
@@ -483,6 +873,37 @@ describe('paste-special Core state machine', () => {
     ).resolves.toBe('stale')
     expect(pasteRange).not.toHaveBeenCalled()
     expect(store.getter(pasteSpecialOpenAtom)).toBe(true)
+  })
+
+  test(
+    'authority replacement during transport capability lookup cannot publish a stale ticket',
+    async () => {
+    const store = createStore()
+    const { port } = createPort()
+    const session = openReadySession(store, port)
+    const requestIdBefore = store.getter(pasteSpecialRequestIdAtom)
+    const pasteRange = jest.fn(async (request: PasteRangeRequest) => strictResult(request))
+    const source = Object.defineProperty({} as PasteSpecialControllerPort, 'pasteRange', {
+      get: () => {
+        store.setter(closePasteSpecialAtom)
+        store.setter(openPasteSpecialAtom)
+        return pasteRange
+      },
+    })
+
+    await expect(
+      store.setter(confirmPasteSpecialAtom, {
+        source,
+        sessionId: session.sessionId,
+        refreshProjection: async () => {},
+      }),
+    ).resolves.toBe('stale')
+
+    expect(pasteRange).not.toHaveBeenCalled()
+    expect(store.getter(pasteSpecialRequestIdAtom)).toBe(requestIdBefore)
+    expect(store.getter(pasteSpecialSessionAtom)?.sessionId).not.toBe(session.sessionId)
+    expect(store.getter(historyStackAtom).entries).toHaveLength(0)
+    expectHistoryProducerLaneAvailable(store)
   })
 
   test('same-tick double confirm reserves one transport request', async () => {

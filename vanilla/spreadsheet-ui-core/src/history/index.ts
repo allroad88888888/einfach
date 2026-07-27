@@ -5,11 +5,14 @@ import type {
   HistoryAction,
   HistoryCommandOutcome,
   HistoryEntry,
+  HistoryEntryKind,
   HistoryLifecycleState,
   HistoryMutationResult,
+  HistoryProducerReservation,
   HistoryRedoRequest,
   HistoryStackState,
   HistoryUndoRequest,
+  PushReservedHistoryInput,
   RetryHistoryRefreshInput,
   RunHistoryCommandInput,
 } from './types'
@@ -65,9 +68,39 @@ interface HistoryMutationTicket {
   readonly historyWitness: HistoryStackBackingState
   readonly entry: HistoryEntry
   readonly request: HistoryUndoRequest | HistoryRedoRequest
+  readonly source: object
+  readonly execute: (
+    request: HistoryUndoRequest | HistoryRedoRequest,
+  ) => Promise<HistoryMutationResult>
+  readonly refreshProjection: () => Promise<void>
+  readonly timeoutMs: number
 }
 
 const EMPTY_HISTORY_ENTRIES: readonly HistoryEntry[] = Object.freeze([])
+const MAX_HISTORY_SIDE_PAYLOADS = 64
+const HISTORY_ENTRY_KINDS: readonly HistoryEntryKind[] = Object.freeze([
+  'cell.set-input',
+  'cells.import',
+  'range.clear',
+  'range.fill',
+  'range.merge',
+  'range.unmerge',
+  'range.sort',
+  'row.insert',
+  'row.delete',
+  'column.insert',
+  'column.delete',
+  'sheet.add',
+  'sheet.delete',
+  'sheet.rename',
+  'sheet.reorder',
+  'format.set',
+  'viewport.freeze',
+  'viewport.hidden',
+  'outline',
+  'table.define',
+  'filter.set',
+])
 const INITIAL_HISTORY_STACK: HistoryStackBackingState = Object.freeze({
   entries: EMPTY_HISTORY_ENTRIES,
   cursor: 0,
@@ -84,38 +117,125 @@ const INITIAL_HISTORY_LIFECYCLE: HistoryLifecycleState = Object.freeze({
   error: '',
 })
 
-function snapshotEntry(entry: HistoryEntry): HistoryEntry {
-  const affectedRange = entry.affectedRange ? Object.freeze({ ...entry.affectedRange }) : undefined
-  const localReplay = entry.localReplay
-    ? Object.freeze({
-        applyKey: entry.localReplay.applyKey,
-        sheetId: entry.localReplay.sheetId,
-        before: entry.localReplay.before,
-        after: entry.localReplay.after,
-      })
-    : undefined
-  const localSidePayloads =
-    !localReplay && entry.localSidePayloads && entry.localSidePayloads.length > 0
-      ? Object.freeze(
-          entry.localSidePayloads.map((payload) =>
-            Object.freeze({
-              applyKey: payload.applyKey,
-              sheetId: payload.sheetId,
-              before: payload.before,
-              after: payload.after,
-            }),
-          ),
-        )
-      : undefined
+function snapshotAffectedRange(value: unknown): HistoryEntry['affectedRange'] | null {
+  if (typeof value !== 'object' || value === null) return null
+  const range = value as Record<string, unknown>
+  const rowStart = range.rowStart
+  const rowEnd = range.rowEnd
+  const colStart = range.colStart
+  const colEnd = range.colEnd
+  if (
+    !Number.isSafeInteger(rowStart) ||
+    !Number.isSafeInteger(rowEnd) ||
+    !Number.isSafeInteger(colStart) ||
+    !Number.isSafeInteger(colEnd) ||
+    (rowStart as number) < 0 ||
+    (rowEnd as number) < (rowStart as number) ||
+    (colStart as number) < 0 ||
+    (colEnd as number) < (colStart as number)
+  ) {
+    return null
+  }
   return Object.freeze({
-    transactionId: entry.transactionId,
-    kind: entry.kind,
-    sheetId: entry.sheetId,
-    projectionRevision: entry.projectionRevision,
-    ...(affectedRange ? { affectedRange } : {}),
-    ...(localReplay ? { localReplay } : {}),
-    ...(localSidePayloads ? { localSidePayloads } : {}),
+    rowStart: rowStart as number,
+    rowEnd: rowEnd as number,
+    colStart: colStart as number,
+    colEnd: colEnd as number,
   })
+}
+
+function snapshotLocalReplayPayload(
+  value: unknown,
+): NonNullable<HistoryEntry['localReplay']> | null {
+  if (typeof value !== 'object' || value === null) return null
+  const payload = value as Record<string, unknown>
+  const applyKey = payload.applyKey
+  const sheetId = payload.sheetId
+  const before = payload.before
+  const after = payload.after
+  if (
+    typeof applyKey !== 'string' ||
+    applyKey.length === 0 ||
+    typeof sheetId !== 'string' ||
+    sheetId.length === 0
+  ) {
+    return null
+  }
+  return Object.freeze({ applyKey, sheetId, before, after })
+}
+
+function isHistoryEntryKind(value: unknown): value is HistoryEntryKind {
+  return typeof value === 'string' && HISTORY_ENTRY_KINDS.includes(value as HistoryEntryKind)
+}
+
+/**
+ * Snapshot the public descriptor boundary once. Every supported caller field
+ * is read exactly once; malformed or throwing objects fail closed without
+ * leaking a partial descriptor into the bounded stack.
+ */
+function snapshotEntry(entry: HistoryEntry): HistoryEntry | null {
+  try {
+    const transactionId = entry.transactionId
+    const kind = entry.kind
+    const sheetId = entry.sheetId
+    const projectionRevision = entry.projectionRevision
+    const affectedRangeValue = entry.affectedRange
+    const localReplayValue = entry.localReplay
+    const localSidePayloadsValue = entry.localSidePayloads
+
+    if (
+      typeof transactionId !== 'string' ||
+      transactionId.length === 0 ||
+      !isHistoryEntryKind(kind) ||
+      (sheetId !== null && (typeof sheetId !== 'string' || sheetId.length === 0)) ||
+      !isProjectionRevision(projectionRevision)
+    ) {
+      return null
+    }
+
+    let affectedRange: HistoryEntry['affectedRange']
+    if (affectedRangeValue !== undefined) {
+      affectedRange = snapshotAffectedRange(affectedRangeValue) ?? undefined
+      if (affectedRange === undefined) return null
+    }
+
+    let localReplay: HistoryEntry['localReplay']
+    if (localReplayValue !== undefined) {
+      localReplay = snapshotLocalReplayPayload(localReplayValue) ?? undefined
+      if (localReplay === undefined) return null
+    }
+
+    let localSidePayloads: HistoryEntry['localSidePayloads']
+    if (!localReplay && localSidePayloadsValue !== undefined) {
+      if (!Array.isArray(localSidePayloadsValue)) return null
+      const length = localSidePayloadsValue.length
+      if (!Number.isSafeInteger(length) || length < 0 || length > MAX_HISTORY_SIDE_PAYLOADS) {
+        return null
+      }
+      if (length > 0) {
+        const snapshots: NonNullable<HistoryEntry['localReplay']>[] = []
+        for (let index = 0; index < length; index += 1) {
+          const payloadValue = localSidePayloadsValue[index]
+          const payload = snapshotLocalReplayPayload(payloadValue)
+          if (payload === null) return null
+          snapshots.push(payload)
+        }
+        localSidePayloads = Object.freeze(snapshots)
+      }
+    }
+
+    return Object.freeze({
+      transactionId,
+      kind,
+      sheetId,
+      projectionRevision,
+      ...(affectedRange ? { affectedRange } : {}),
+      ...(localReplay ? { localReplay } : {}),
+      ...(localSidePayloads ? { localSidePayloads } : {}),
+    })
+  } catch {
+    return null
+  }
 }
 
 function stackState(entries: readonly HistoryEntry[], cursor: number): HistoryStackBackingState {
@@ -219,47 +339,68 @@ function isProjectionRevision(value: unknown): value is ProjectionRevision {
   )
 }
 
-/**
- * Structured not-applied detection (design point C). Returns the reason
- * string when the acknowledgement carries `applied: false`; `null`
- * otherwise. A not-applied acknowledgement is a POSITIVE backend
- * statement that nothing was replayed — the cursor must not move and the
- * acknowledged revision must not be committed as the new witness. The
- * lifecycle still lands on the outcome-unknown convention because the
- * UI-visible history stack now disagrees with what the backend can
- * replay; hosts recover by re-reading canonical state.
- */
-function acknowledgementNotApplied(acknowledgement: unknown): string | null {
-  try {
-    if (typeof acknowledgement !== 'object' || acknowledgement === null) return null
-    const result = acknowledgement as Partial<HistoryMutationResult>
-    if (result.applied !== false) return null
-    return typeof result.notAppliedReason === 'string' && result.notAppliedReason.length > 0
-      ? result.notAppliedReason
-      : ''
-  } catch {
-    return null
-  }
-}
+type HistoryAcknowledgementSnapshot =
+  | {
+      readonly kind: 'applied'
+      readonly revision: ProjectionRevision
+    }
+  | {
+      readonly kind: 'not-applied'
+      readonly reason: string
+    }
+  | {
+      readonly kind: 'malformed'
+    }
 
-function acknowledgementRevision(
+/**
+ * Read the entire caller-owned acknowledgement boundary exactly once before
+ * making any decision. `applied: false` is accepted only when it is correlated
+ * to the exact request; it is positive proof that the backend did not mutate.
+ */
+function snapshotAcknowledgement(
   acknowledgement: unknown,
   ticket: HistoryMutationTicket,
-): ProjectionRevision | null {
-  try {
-    if (typeof acknowledgement !== 'object' || acknowledgement === null) return null
-    const result = acknowledgement as Partial<HistoryMutationResult>
-    if (
-      result.transactionId !== ticket.transactionId ||
-      result.requestId !== ticket.requestId ||
-      !isProjectionRevision(result.revision)
-    ) {
-      return null
-    }
-    return result.revision
-  } catch {
-    return null
+): HistoryAcknowledgementSnapshot {
+  if (typeof acknowledgement !== 'object' || acknowledgement === null) {
+    return Object.freeze({ kind: 'malformed' })
   }
+  const result = acknowledgement as Record<string, unknown>
+  let malformed = false
+  const readOnce = (key: string): unknown => {
+    try {
+      return result[key]
+    } catch {
+      malformed = true
+      return undefined
+    }
+  }
+  // Do not short-circuit this boundary: even a throwing field must not make
+  // another field observable twice on a subsequent classification path.
+  const transactionId = readOnce('transactionId')
+  const requestId = readOnce('requestId')
+  const revision = readOnce('revision')
+  const applied = readOnce('applied')
+  const notAppliedReason = readOnce('notAppliedReason')
+
+  if (
+    malformed ||
+    transactionId !== ticket.transactionId ||
+    requestId !== ticket.requestId ||
+    (applied !== undefined && typeof applied !== 'boolean') ||
+    (notAppliedReason !== undefined && typeof notAppliedReason !== 'string')
+  ) {
+    return Object.freeze({ kind: 'malformed' })
+  }
+  if (applied === false) {
+    return Object.freeze({
+      kind: 'not-applied',
+      reason: typeof notAppliedReason === 'string' ? notAppliedReason : '',
+    })
+  }
+  if (!isProjectionRevision(revision)) {
+    return Object.freeze({ kind: 'malformed' })
+  }
+  return Object.freeze({ kind: 'applied', revision })
 }
 
 function isTransportBusy(status: HistoryLifecycleState['status']): boolean {
@@ -277,6 +418,9 @@ historyProjectionRevisionBackingAtom.debugLabel = 'spreadsheet.history.projectio
 
 const activeHistoryTicketAtom = atom<HistoryMutationTicket | null>(null)
 activeHistoryTicketAtom.debugLabel = 'spreadsheet.history.activeTicket'
+
+const activeHistoryProducerReservationAtom = atom<HistoryProducerReservation | null>(null)
+activeHistoryProducerReservationAtom.debugLabel = 'spreadsheet.history.activeProducerReservation'
 
 const historySessionSequenceAtom = atom<number>(0)
 historySessionSequenceAtom.debugLabel = 'spreadsheet.history.sessionSequence'
@@ -306,13 +450,22 @@ historyInFlightAtom.debugLabel = 'spreadsheet.history.inFlight'
 
 export const canUndoAtom = atom((get) => {
   const { entries, cursor } = get(historyStackBackingAtom)
-  return entries.length > 0 && cursor > 0 && get(activeHistoryTicketAtom) === null
+  return (
+    entries.length > 0 &&
+    cursor > 0 &&
+    get(activeHistoryTicketAtom) === null &&
+    get(activeHistoryProducerReservationAtom) === null
+  )
 })
 canUndoAtom.debugLabel = 'spreadsheet.history.canUndo'
 
 export const canRedoAtom = atom((get) => {
   const { entries, cursor } = get(historyStackBackingAtom)
-  return cursor < entries.length && get(activeHistoryTicketAtom) === null
+  return (
+    cursor < entries.length &&
+    get(activeHistoryTicketAtom) === null &&
+    get(activeHistoryProducerReservationAtom) === null
+  )
 })
 canRedoAtom.debugLabel = 'spreadsheet.history.canRedo'
 
@@ -329,32 +482,129 @@ export const historyCanRetryRefreshAtom = atom((get) => {
 })
 historyCanRetryRefreshAtom.debugLabel = 'spreadsheet.history.canRetryRefresh'
 
-export const pushHistoryAtom = atom(
-  (get) => get(historyStackAtom),
-  (get, set, entry: HistoryEntry): boolean => {
-    if (get(activeHistoryTicketAtom) !== null) return false
-    if (!isProjectionRevision(entry.projectionRevision)) return false
-    const state = get(historyStackBackingAtom)
-    const base = state.entries.slice(0, state.cursor)
-    const snapshot = snapshotEntry(entry)
-    const next = [...base, snapshot]
-    const capped =
-      next.length > DEFAULT_HISTORY_CAP ? next.slice(next.length - DEFAULT_HISTORY_CAP) : next
-    set(historyStackBackingAtom, stackState(capped, capped.length))
-    // Local-replay entries never advance the backend revision witness —
-    // their revisions are session-local labels and mixing them into the
-    // strict backend witness would poison later transactional undo.
-    if (!snapshot.localReplay) {
-      set(historyProjectionRevisionBackingAtom, snapshot.projectionRevision)
+function appendHistoryEntry(
+  get: Getter,
+  set: Setter,
+  entry: HistoryEntry,
+  ownsProducerLane: () => boolean,
+): boolean {
+  if (!ownsProducerLane()) return false
+  const snapshot = snapshotEntry(entry)
+  // Snapshotting reads caller-owned input. Re-check the exact lane owner
+  // afterwards so a re-entrant getter cannot release or replace the token and
+  // still commit an entry.
+  if (snapshot === null || !ownsProducerLane()) return false
+  const state = get(historyStackBackingAtom)
+  const base = state.entries.slice(0, state.cursor)
+  const next = [...base, snapshot]
+  const capped =
+    next.length > DEFAULT_HISTORY_CAP ? next.slice(next.length - DEFAULT_HISTORY_CAP) : next
+  set(historyStackBackingAtom, stackState(capped, capped.length))
+  // Local-replay entries never advance the backend revision witness —
+  // their revisions are session-local labels and mixing them into the
+  // strict backend witness would poison later transactional undo.
+  if (!snapshot.localReplay) {
+    set(historyProjectionRevisionBackingAtom, snapshot.projectionRevision)
+  }
+  set(
+    historyLifecycleBackingAtom,
+    lifecycleFor('ready', { sessionId: get(historySessionSequenceAtom) }),
+  )
+  return true
+}
+
+/**
+ * Acquire the shared producer lane synchronously, before launching transport.
+ * A retained terminal history ticket is still an owner even when `inFlight`
+ * projects false, so it blocks producer acquisition until its own workflow
+ * explicitly reconciles.
+ */
+export const acquireHistoryProducerReservationAtom = atom(
+  null,
+  (get, set): HistoryProducerReservation | null => {
+    if (
+      get(activeHistoryTicketAtom) !== null ||
+      get(activeHistoryProducerReservationAtom) !== null
+    ) {
+      return null
     }
-    set(
-      historyLifecycleBackingAtom,
-      lifecycleFor('ready', { sessionId: get(historySessionSequenceAtom) }),
-    )
+    const reservation = Object.freeze(
+      Object.create(null) as Record<PropertyKey, never>,
+    ) as unknown as HistoryProducerReservation
+    set(activeHistoryProducerReservationAtom, reservation)
+    return reservation
+  },
+)
+acquireHistoryProducerReservationAtom.debugLabel = 'spreadsheet.history.acquireProducerReservation'
+
+/**
+ * Append one descriptor for the current producer owner. A producer may call
+ * this once per backend transaction while retaining the same reservation.
+ */
+export const pushReservedHistoryAtom = atom(
+  (get) => get(historyStackAtom),
+  (get, set, input: PushReservedHistoryInput): boolean => {
+    let reservation: HistoryProducerReservation
+    let entry: HistoryEntry
+    try {
+      reservation = input.reservation
+      entry = input.entry
+    } catch {
+      return false
+    }
+    const ownsProducerLane = (): boolean =>
+      get(activeHistoryProducerReservationAtom) === reservation &&
+      get(activeHistoryTicketAtom) === null
+    if (!ownsProducerLane()) return false
+    return appendHistoryEntry(get, set, entry, ownsProducerLane)
+  },
+)
+pushReservedHistoryAtom.debugLabel = 'spreadsheet.history.pushReservedEntry'
+
+/** Release the producer lane only when the exact current owner asks. */
+export const releaseHistoryProducerReservationAtom = atom(
+  null,
+  (get, set, reservation: HistoryProducerReservation): boolean => {
+    if (get(activeHistoryProducerReservationAtom) !== reservation) return false
+    set(activeHistoryProducerReservationAtom, null)
     return true
   },
 )
+releaseHistoryProducerReservationAtom.debugLabel = 'spreadsheet.history.releaseProducerReservation'
+
+export const pushHistoryAtom = atom(
+  (get) => get(historyStackAtom),
+  (get, set, entry: HistoryEntry): boolean => {
+    const reservation = set(acquireHistoryProducerReservationAtom)
+    if (reservation === null) return false
+    const ownsProducerLane = (): boolean =>
+      get(activeHistoryProducerReservationAtom) === reservation &&
+      get(activeHistoryTicketAtom) === null
+    try {
+      return appendHistoryEntry(get, set, entry, ownsProducerLane)
+    } finally {
+      // Exact release is the last write by the legacy push. A synchronous
+      // subscriber may start a replacement producer from this notification.
+      set(releaseHistoryProducerReservationAtom, reservation)
+    }
+  },
+)
 pushHistoryAtom.debugLabel = 'spreadsheet.history.pushEntry'
+
+function historyWitnessOwnsEntry(
+  get: Getter,
+  action: HistoryAction,
+  historyWitness: HistoryStackBackingState,
+  entry: HistoryEntry,
+): boolean {
+  const currentStack = get(historyStackBackingAtom)
+  if (currentStack !== historyWitness || currentStack.cursor !== historyWitness.cursor) return false
+  const expectedEntry =
+    action === 'undo'
+      ? currentStack.entries[historyWitness.cursor - 1]
+      : currentStack.entries[historyWitness.cursor]
+  return expectedEntry === entry
+}
 
 async function runHistoryAction(
   action: HistoryAction,
@@ -362,7 +612,9 @@ async function runHistoryAction(
   set: Setter,
   input: RunHistoryCommandInput,
 ): Promise<HistoryCommandOutcome> {
-  if (get(activeHistoryTicketAtom) !== null) return 'blocked'
+  if (get(activeHistoryTicketAtom) !== null || get(activeHistoryProducerReservationAtom) !== null) {
+    return 'blocked'
+  }
 
   const historyWitness = get(historyStackBackingAtom)
   const entry =
@@ -372,33 +624,85 @@ async function runHistoryAction(
   if (!entry) return 'blocked'
 
   // Local-replay entries close their loop inside UI-core: no backend
-  // transport, no revision witness, no ticket — the applier writes the
-  // recorded payload synchronously, so nothing can drift mid-flight.
-  if (entry.localReplay) {
-    const applier = getHistoryLocalReplayApplier(entry.localReplay.applyKey)
-    const applied =
-      applier !== null && applier(get, set, entry.localReplay, action, input?.source)
-    if (!applied) {
+  // transport, no revision witness, no ticket. The shared producer lane
+  // still guards the full synchronous apply -> cursor/lifecycle commit
+  // window: persistence hooks invoked by an applier are caller-owned code
+  // and may otherwise re-enter a producer or another history action.
+  const localReplay = entry.localReplay
+  if (localReplay) {
+    const reservation = set(acquireHistoryProducerReservationAtom)
+    if (reservation === null) return 'blocked'
+    const ownsReservation = (): boolean =>
+      get(activeHistoryProducerReservationAtom) === reservation &&
+      get(activeHistoryTicketAtom) === null
+    const ownsHistoryWitness = (): boolean =>
+      historyWitnessOwnsEntry(get, action, historyWitness, entry)
+    try {
+      if (!ownsReservation() || !ownsHistoryWitness()) return 'blocked'
+      let source: RunHistoryCommandInput['source']
+      try {
+        // Caller-owned command input is read once, while the exact producer
+        // reservation makes synchronous re-entry inert.
+        source = input.source
+      } catch {
+        if (ownsReservation() && ownsHistoryWitness()) {
+          set(
+            historyLifecycleBackingAtom,
+            lifecycleFor('blocked', {
+              sessionId: get(historySessionSequenceAtom),
+              action,
+              transactionId: entry.transactionId,
+              error: HISTORY_LOCAL_REPLAY_ERROR,
+            }),
+          )
+        }
+        return 'blocked'
+      }
+      if (!ownsReservation() || !ownsHistoryWitness()) return 'blocked'
+      const applier = getHistoryLocalReplayApplier(localReplay.applyKey)
+      const applied = applier !== null && applier(get, set, localReplay, action, source)
+      if (!applied || !ownsReservation()) {
+        if (ownsReservation() && ownsHistoryWitness()) {
+          set(
+            historyLifecycleBackingAtom,
+            lifecycleFor('blocked', {
+              sessionId: get(historySessionSequenceAtom),
+              action,
+              transactionId: entry.transactionId,
+              error: HISTORY_LOCAL_REPLAY_ERROR,
+            }),
+          )
+        }
+        return 'blocked'
+      }
+
+      if (!ownsHistoryWitness()) return 'blocked'
+
+      set(
+        historyStackBackingAtom,
+        stackState(historyWitness.entries, historyWitness.cursor + (action === 'undo' ? -1 : 1)),
+      )
       set(
         historyLifecycleBackingAtom,
-        lifecycleFor('blocked', {
-          sessionId: get(historySessionSequenceAtom),
-          action,
-          transactionId: entry.transactionId,
-          error: HISTORY_LOCAL_REPLAY_ERROR,
-        }),
+        lifecycleFor('ready', { sessionId: get(historySessionSequenceAtom) }),
       )
+      return 'completed'
+    } catch {
+      if (ownsReservation() && ownsHistoryWitness()) {
+        set(
+          historyLifecycleBackingAtom,
+          lifecycleFor('blocked', {
+            sessionId: get(historySessionSequenceAtom),
+            action,
+            transactionId: entry.transactionId,
+            error: HISTORY_LOCAL_REPLAY_ERROR,
+          }),
+        )
+      }
       return 'blocked'
+    } finally {
+      set(releaseHistoryProducerReservationAtom, reservation)
     }
-    set(
-      historyStackBackingAtom,
-      stackState(historyWitness.entries, historyWitness.cursor + (action === 'undo' ? -1 : 1)),
-    )
-    set(
-      historyLifecycleBackingAtom,
-      lifecycleFor('ready', { sessionId: get(historySessionSequenceAtom) }),
-    )
-    return 'completed'
   }
 
   const revision = get(historyProjectionRevisionBackingAtom)
@@ -410,28 +714,6 @@ async function runHistoryAction(
         action,
         transactionId: entry.transactionId,
         error: HISTORY_REVISION_ERROR,
-      }),
-    )
-    return 'blocked'
-  }
-
-  let execute:
-    | ((request: HistoryUndoRequest | HistoryRedoRequest) => Promise<HistoryMutationResult>)
-    | undefined
-  try {
-    execute = (
-      action === 'undo' ? input.source?.undoTransaction : input.source?.redoTransaction
-    ) as typeof execute
-  } catch {
-    execute = undefined
-  }
-  if (typeof execute !== 'function' || typeof input.refreshProjection !== 'function') {
-    set(
-      historyLifecycleBackingAtom,
-      lifecycleFor('blocked', {
-        sessionId: get(historySessionSequenceAtom),
-        action,
-        error: HISTORY_CAPABILITY_ERROR,
       }),
     )
     return 'blocked'
@@ -453,31 +735,114 @@ async function runHistoryAction(
     return 'blocked'
   }
 
-  const request = Object.freeze({
-    kind: action === 'undo' ? ('undo-transaction' as const) : ('redo-transaction' as const),
-    transactionId: entry.transactionId,
-    requestId,
-    revision,
-  }) as HistoryUndoRequest | HistoryRedoRequest
-  const ticket: HistoryMutationTicket = Object.freeze({
-    sessionId,
-    action,
-    transactionId: entry.transactionId,
-    requestId,
-    revision,
-    cursorBefore: historyWitness.cursor,
-    cursorAfter: historyWitness.cursor + (action === 'undo' ? -1 : 1),
-    historyWitness,
-    entry,
-    request,
-  })
-  set(historySessionSequenceAtom, sessionId)
-  set(historyRequestSequenceAtom, requestId)
-  set(activeHistoryTicketAtom, ticket)
-  set(historyLifecycleBackingAtom, lifecycleForTicket('pending', ticket))
+  // Use the shared producer reservation as an atomic preparation guard. It is
+  // acquired before any caller-owned getter, then handed off to the immutable
+  // history ticket without ever opening the lane between the two owners.
+  const preparationReservation = set(acquireHistoryProducerReservationAtom)
+  if (preparationReservation === null) return 'blocked'
+  const ownsPreparation = (): boolean =>
+    get(activeHistoryProducerReservationAtom) === preparationReservation &&
+    get(activeHistoryTicketAtom) === null &&
+    get(historyProjectionRevisionBackingAtom) === revision &&
+    historyWitnessOwnsEntry(get, action, historyWitness, entry)
+
+  let preparedTicket: HistoryMutationTicket | null = null
+  try {
+    if (!ownsPreparation()) return 'blocked'
+
+    let source: RunHistoryCommandInput['source']
+    let execute:
+      | ((request: HistoryUndoRequest | HistoryRedoRequest) => Promise<HistoryMutationResult>)
+      | undefined
+    let refreshProjection: RunHistoryCommandInput['refreshProjection']
+    let timeoutMs: number
+    try {
+      source = input.source
+      if (!ownsPreparation()) return 'blocked'
+      execute = (
+        action === 'undo' ? source?.undoTransaction : source?.redoTransaction
+      ) as typeof execute
+      if (!ownsPreparation()) return 'blocked'
+      refreshProjection = input.refreshProjection
+      if (!ownsPreparation()) return 'blocked'
+      const timeoutValue = input.timeoutMs
+      if (!ownsPreparation()) return 'blocked'
+      timeoutMs = normalizeTimeout(timeoutValue)
+    } catch {
+      if (ownsPreparation()) {
+        set(
+          historyLifecycleBackingAtom,
+          lifecycleFor('blocked', {
+            sessionId: get(historySessionSequenceAtom),
+            action,
+            transactionId: entry.transactionId,
+            revision,
+            error: HISTORY_CAPABILITY_ERROR,
+          }),
+        )
+      }
+      return 'blocked'
+    }
+
+    if (
+      (typeof source !== 'object' && typeof source !== 'function') ||
+      source === null ||
+      typeof execute !== 'function' ||
+      typeof refreshProjection !== 'function' ||
+      !ownsPreparation()
+    ) {
+      if (ownsPreparation()) {
+        set(
+          historyLifecycleBackingAtom,
+          lifecycleFor('blocked', {
+            sessionId: get(historySessionSequenceAtom),
+            action,
+            transactionId: entry.transactionId,
+            revision,
+            error: HISTORY_CAPABILITY_ERROR,
+          }),
+        )
+      }
+      return 'blocked'
+    }
+
+    const request = Object.freeze({
+      kind: action === 'undo' ? ('undo-transaction' as const) : ('redo-transaction' as const),
+      transactionId: entry.transactionId,
+      requestId,
+      revision,
+    }) as HistoryUndoRequest | HistoryRedoRequest
+    preparedTicket = Object.freeze({
+      sessionId,
+      action,
+      transactionId: entry.transactionId,
+      requestId,
+      revision,
+      cursorBefore: historyWitness.cursor,
+      cursorAfter: historyWitness.cursor + (action === 'undo' ? -1 : 1),
+      historyWitness,
+      entry,
+      request,
+      source,
+      execute,
+      refreshProjection,
+      timeoutMs,
+    })
+    set(historySessionSequenceAtom, sessionId)
+    set(historyRequestSequenceAtom, requestId)
+    set(activeHistoryTicketAtom, preparedTicket)
+    set(historyLifecycleBackingAtom, lifecycleForTicket('pending', preparedTicket))
+  } finally {
+    // The active ticket (when preparation succeeded) already blocks re-entry.
+    // Exact reservation release is the final preparation write.
+    set(releaseHistoryProducerReservationAtom, preparationReservation)
+  }
+
+  const ticket = preparedTicket
+  if (ticket === null) return 'blocked'
 
   const ownsTicket = (): boolean => {
-    const lifecycle = get(historyLifecycleAtom)
+    const lifecycle = get(historyLifecycleBackingAtom)
     return (
       get(activeHistoryTicketAtom) === ticket &&
       lifecycle.sessionId === ticket.sessionId &&
@@ -487,22 +852,26 @@ async function runHistoryAction(
       lifecycle.revision === ticket.revision
     )
   }
+  const ownsOriginalAuthority = (): boolean =>
+    ownsTicket() &&
+    get(historyProjectionRevisionBackingAtom) === ticket.revision &&
+    historyWitnessOwnsEntry(get, ticket.action, ticket.historyWitness, ticket.entry)
 
   // Publish the immutable reservation before transport launch. Same-tick re-entry is inert.
   await Promise.resolve()
-  if (!ownsTicket()) return 'blocked'
+  if (!ownsOriginalAuthority()) return 'blocked'
   // Einfach publishes the first async-write flush on a post-await setter.
-  set(historyLifecycleBackingAtom, get(historyLifecycleAtom))
+  set(historyLifecycleBackingAtom, get(historyLifecycleBackingAtom))
 
   let acknowledgement: unknown
   try {
     acknowledgement = await withTimeout(
-      execute.call(input.source, ticket.request),
-      normalizeTimeout(input.timeoutMs),
+      Promise.resolve().then(() => ticket.execute.call(ticket.source, ticket.request)),
+      ticket.timeoutMs,
       `History ${action}`,
     )
   } catch (error) {
-    if (!ownsTicket()) return 'blocked'
+    if (!ownsOriginalAuthority()) return 'blocked'
     set(
       historyLifecycleBackingAtom,
       lifecycleForTicket('outcome-unknown', ticket, null, outcomeUnknownError(errorMessage(error))),
@@ -510,26 +879,34 @@ async function runHistoryAction(
     return 'outcome-unknown'
   }
 
-  if (!ownsTicket()) return 'blocked'
-  const notAppliedReason = acknowledgementNotApplied(acknowledgement)
-  if (notAppliedReason !== null) {
+  if (!ownsOriginalAuthority()) return 'blocked'
+  const acknowledgementSnapshot = snapshotAcknowledgement(acknowledgement, ticket)
+  // Snapshot getters are caller-owned and may synchronously re-enter Core.
+  // Correlation is acted upon only while the exact ticket and pre-ACK stack
+  // witness still own the lane.
+  if (!ownsOriginalAuthority()) return 'blocked'
+  // Structured not-applied detection (design point C). `applied: false`,
+  // once correlated to the exact ticket, is a POSITIVE backend statement
+  // that nothing was replayed — the cursor must not move and the
+  // acknowledged revision must not be committed as the new witness. The
+  // lifecycle still lands on the outcome-unknown convention (rather than a
+  // releasing 'blocked') because the UI-visible history stack now disagrees
+  // with what the backend can replay: re-sending the same undo/redo risks a
+  // double-apply if the backend's "not applied" was itself stale or racy.
+  // The lane stays locked; hosts recover by reloading or reconciling
+  // workbook data before another history action, never by an automatic retry.
+  if (acknowledgementSnapshot.kind === 'not-applied') {
+    const detail =
+      acknowledgementSnapshot.reason.length > 0
+        ? `${HISTORY_NOT_APPLIED_ERROR} ${acknowledgementSnapshot.reason}`
+        : HISTORY_NOT_APPLIED_ERROR
     set(
       historyLifecycleBackingAtom,
-      lifecycleForTicket(
-        'outcome-unknown',
-        ticket,
-        null,
-        outcomeUnknownError(
-          notAppliedReason.length > 0
-            ? `${HISTORY_NOT_APPLIED_ERROR} ${notAppliedReason}`
-            : HISTORY_NOT_APPLIED_ERROR,
-        ),
-      ),
+      lifecycleForTicket('outcome-unknown', ticket, null, outcomeUnknownError(detail)),
     )
     return 'outcome-unknown'
   }
-  const acknowledgedRevision = acknowledgementRevision(acknowledgement, ticket)
-  if (acknowledgedRevision === null) {
+  if (acknowledgementSnapshot.kind === 'malformed') {
     set(
       historyLifecycleBackingAtom,
       lifecycleForTicket(
@@ -541,59 +918,53 @@ async function runHistoryAction(
     )
     return 'outcome-unknown'
   }
-
-  const currentStack = get(historyStackBackingAtom)
-  const expectedEntry =
-    ticket.action === 'undo'
-      ? currentStack.entries[ticket.cursorBefore - 1]
-      : currentStack.entries[ticket.cursorBefore]
-  if (
-    currentStack !== ticket.historyWitness ||
-    currentStack.cursor !== ticket.cursorBefore ||
-    expectedEntry !== ticket.entry
-  ) {
-    set(
-      historyLifecycleBackingAtom,
-      lifecycleForTicket(
-        'outcome-unknown',
-        ticket,
-        acknowledgedRevision,
-        outcomeUnknownError('History stack witness changed before acknowledgement.'),
-      ),
-    )
-    return 'outcome-unknown'
-  }
-
-  set(historyStackBackingAtom, stackState(ticket.historyWitness.entries, ticket.cursorAfter))
+  const acknowledgedRevision = acknowledgementSnapshot.revision
+  const committedStack = stackState(ticket.historyWitness.entries, ticket.cursorAfter)
+  set(historyStackBackingAtom, committedStack)
   set(historyProjectionRevisionBackingAtom, acknowledgedRevision)
+  const ownsCommittedAuthority = (): boolean =>
+    ownsTicket() &&
+    get(historyStackBackingAtom) === committedStack &&
+    get(historyProjectionRevisionBackingAtom) === acknowledgedRevision
   // Backend-transaction entries may carry side payloads for UI-core
   // canonical view facts the transaction displaced (freeze band, hidden
   // sets). The backend has already replayed its own facts; restore the
   // local ones through the same stateless applier registry. The backend
   // outcome is committed, so an applier miss cannot roll it back — the
   // local restore is best-effort by construction.
-  if (ticket.entry.localSidePayloads) {
-    for (const payload of ticket.entry.localSidePayloads) {
+  const localSidePayloads = ticket.entry.localSidePayloads
+  if (localSidePayloads) {
+    for (const payload of localSidePayloads) {
+      if (!ownsCommittedAuthority()) return 'blocked'
       const applier = getHistoryLocalReplayApplier(payload.applyKey)
-      if (applier !== null) applier(get, set, payload, ticket.action, input?.source)
+      if (applier !== null) {
+        try {
+          applier(get, set, payload, ticket.action, ticket.source)
+        } catch {
+          // The backend transaction is already committed. A local side
+          // projection is best-effort and cannot roll the backend back.
+        }
+        if (!ownsCommittedAuthority()) return 'blocked'
+      }
     }
   }
+  if (!ownsCommittedAuthority()) return 'blocked'
   set(
     historyLifecycleBackingAtom,
     lifecycleForTicket('local-acknowledged', ticket, acknowledgedRevision),
   )
 
   await Promise.resolve()
-  if (!ownsTicket()) return 'blocked'
+  if (!ownsCommittedAuthority()) return 'blocked'
   set(historyLifecycleBackingAtom, lifecycleForTicket('refreshing', ticket, acknowledgedRevision))
   try {
     await withTimeout(
-      Promise.resolve().then(input.refreshProjection),
-      normalizeTimeout(input.timeoutMs),
+      Promise.resolve().then(ticket.refreshProjection),
+      ticket.timeoutMs,
       'History refresh',
     )
   } catch (error) {
-    if (!ownsTicket()) return 'blocked'
+    if (!ownsCommittedAuthority()) return 'blocked'
     set(
       historyLifecycleBackingAtom,
       lifecycleForTicket(
@@ -606,9 +977,12 @@ async function runHistoryAction(
     return 'refresh-failed'
   }
 
-  if (!ownsTicket()) return 'blocked'
-  set(activeHistoryTicketAtom, null)
+  if (!ownsCommittedAuthority()) return 'blocked'
   set(historyLifecycleBackingAtom, lifecycleFor('ready', { sessionId: ticket.sessionId }))
+  if (get(activeHistoryTicketAtom) !== ticket) return 'blocked'
+  // Clearing is the last write. A synchronous subscriber may start the next
+  // history command from this notification and the completed call is inert.
+  set(activeHistoryTicketAtom, null)
   return 'completed'
 }
 
@@ -629,9 +1003,8 @@ runRedoHistoryAtom.debugLabel = 'spreadsheet.history.runRedo'
 export const retryHistoryRefreshAtom = atom(
   null,
   async (get, set, input: RetryHistoryRefreshInput): Promise<HistoryCommandOutcome> => {
-    if (typeof input.refreshProjection !== 'function') return 'blocked'
     const ticket = get(activeHistoryTicketAtom)
-    const lifecycle = get(historyLifecycleAtom)
+    const lifecycle = get(historyLifecycleBackingAtom)
     if (
       ticket === null ||
       lifecycle.status !== 'refresh-failed' ||
@@ -642,15 +1015,58 @@ export const retryHistoryRefreshAtom = atom(
       return 'blocked'
     }
     const acknowledgedRevision = lifecycle.acknowledgedRevision
+    const historyWitness = get(historyStackBackingAtom)
+    const projectionRevisionWitness = get(historyProjectionRevisionBackingAtom)
+    const ownsRetryWitness = (): boolean =>
+      get(activeHistoryTicketAtom) === ticket &&
+      get(historyLifecycleBackingAtom) === lifecycle &&
+      get(historyStackBackingAtom) === historyWitness &&
+      get(historyProjectionRevisionBackingAtom) === projectionRevisionWitness
+
+    let refreshProjection: RetryHistoryRefreshInput['refreshProjection']
+    let timeoutMs: number
+    try {
+      refreshProjection = input.refreshProjection
+      if (!ownsRetryWitness()) return 'blocked'
+      const timeoutValue = input.timeoutMs
+      if (!ownsRetryWitness()) return 'blocked'
+      timeoutMs = normalizeTimeout(timeoutValue)
+    } catch {
+      return 'blocked'
+    }
+    if (typeof refreshProjection !== 'function' || !ownsRetryWitness()) return 'blocked'
+
+    const attempt = Object.freeze({
+      ticket,
+      lifecycle,
+      acknowledgedRevision,
+      historyWitness,
+      projectionRevisionWitness,
+      refreshProjection,
+      timeoutMs,
+    })
     set(historyLifecycleBackingAtom, lifecycleForTicket('refreshing', ticket, acknowledgedRevision))
+    const ownsAttempt = (): boolean => {
+      const currentLifecycle = get(historyLifecycleBackingAtom)
+      return (
+        get(activeHistoryTicketAtom) === attempt.ticket &&
+        get(historyStackBackingAtom) === attempt.historyWitness &&
+        get(historyProjectionRevisionBackingAtom) === attempt.projectionRevisionWitness &&
+        currentLifecycle.status === 'refreshing' &&
+        currentLifecycle.sessionId === attempt.ticket.sessionId &&
+        currentLifecycle.requestId === attempt.ticket.requestId &&
+        currentLifecycle.acknowledgedRevision === attempt.acknowledgedRevision
+      )
+    }
+    if (!ownsAttempt()) return 'blocked'
     try {
       await withTimeout(
-        Promise.resolve().then(input.refreshProjection),
-        normalizeTimeout(input.timeoutMs),
+        Promise.resolve().then(attempt.refreshProjection),
+        attempt.timeoutMs,
         'History refresh',
       )
     } catch (error) {
-      if (get(activeHistoryTicketAtom) !== ticket) return 'blocked'
+      if (!ownsAttempt()) return 'blocked'
       set(
         historyLifecycleBackingAtom,
         lifecycleForTicket(
@@ -662,9 +1078,12 @@ export const retryHistoryRefreshAtom = atom(
       )
       return 'refresh-failed'
     }
-    if (get(activeHistoryTicketAtom) !== ticket) return 'blocked'
-    set(activeHistoryTicketAtom, null)
+    if (!ownsAttempt()) return 'blocked'
     set(historyLifecycleBackingAtom, lifecycleFor('ready', { sessionId: ticket.sessionId }))
+    if (get(activeHistoryTicketAtom) !== ticket) return 'blocked'
+    // Final projection/lifecycle is committed before the exact ticket is
+    // cleared. No write from this retry occurs after replacement can start.
+    set(activeHistoryTicketAtom, null)
     return 'completed'
   },
 )
@@ -673,7 +1092,12 @@ retryHistoryRefreshAtom.debugLabel = 'spreadsheet.history.retryRefresh'
 export const clearHistoryAtom = atom(
   (get) => get(historyStackAtom),
   (get, set): boolean => {
-    if (get(activeHistoryTicketAtom) !== null) return false
+    if (
+      get(activeHistoryTicketAtom) !== null ||
+      get(activeHistoryProducerReservationAtom) !== null
+    ) {
+      return false
+    }
     set(historyStackBackingAtom, INITIAL_HISTORY_STACK)
     set(historyProjectionRevisionBackingAtom, null)
     set(

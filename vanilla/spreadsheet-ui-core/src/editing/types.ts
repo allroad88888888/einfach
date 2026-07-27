@@ -66,7 +66,10 @@ export interface EditingCommitAcknowledgement extends BackendMutationResult {
   readonly revision: ProjectionRevision
 }
 
-/** Framework-neutral mutation port. Core never retains this object. */
+/**
+ * Framework-neutral mutation port. A running commit freezes this receiver and
+ * its method into the private ticket so retries can never re-read or resend it.
+ */
 export interface EditingControllerPort {
   setCellInput?: (request: EditingCommitRequest) => Promise<BackendMutationResult>
 }
@@ -103,10 +106,20 @@ export interface RunEditingCommitInput {
   readonly commitSource?: EditingInputSource
   readonly move?: EditingCommitMove
   readonly refreshProjection: (sheetId: string) => Promise<void>
+  /**
+   * Finite mutation and refresh deadline. Missing or invalid values fall back
+   * to the editing command's 15 second default.
+   */
+  readonly timeoutMs?: number
 }
 
 export interface RetryEditingRefreshInput {
   readonly refreshProjection: (sheetId: string) => Promise<void>
+  /**
+   * Finite refresh-only retry deadline. Missing or invalid values fall back to
+   * the editing command's 15 second default.
+   */
+  readonly timeoutMs?: number
 }
 
 export interface EditingCancelIntent {

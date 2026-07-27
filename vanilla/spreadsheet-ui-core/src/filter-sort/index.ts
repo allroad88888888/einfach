@@ -1,13 +1,19 @@
 import { atom } from '@einfach/core'
-import type { Atom, Getter } from '@einfach/core'
+import type { Atom, Getter, Setter } from '@einfach/core'
 import type {
   ProjectionRequestId,
   SortRangeRejectionCode,
   SortRangeRequest,
-  SortRangeResult,
 } from '../backend/types'
 import type { CellRange } from '../shared'
-import { nextHistoryTransactionId, pushHistoryAtom, type HistoryEntry } from '../history'
+import {
+  acquireHistoryProducerReservationAtom,
+  nextHistoryTransactionId,
+  pushReservedHistoryAtom,
+  releaseHistoryProducerReservationAtom,
+  type HistoryEntry,
+  type HistoryProducerReservation,
+} from '../history'
 import { getHiddenRowsForSheet, viewportHiddenAtom } from '../viewport/hidden'
 import {
   getFilterHiddenRowsForSheet,
@@ -44,6 +50,7 @@ import type {
   RunFilterSortMutationInput,
   RunPhysicalSortInput,
   RetryFilterSortRefreshInput,
+  SetFilterSortRequest,
   SortDirection,
   UpdateFilterSortAvailableValuesInput,
   UpdateFilterSortDraftInput,
@@ -67,8 +74,12 @@ export const FILTER_SORT_STALE_OPERATION_ERROR =
   'Filter and sort was ignored because the active sheet or selection changed.'
 export const FILTER_SORT_OUTCOME_UNKNOWN_ERROR =
   'Filter and sort result is unknown. Reload or reconcile workbook data before another change.'
-export const FILTER_SORT_REAPPLY_NO_RULES_ERROR =
-  'Reapply needs an active filter on this sheet.'
+export const FILTER_SORT_REAPPLY_NO_RULES_ERROR = 'Reapply needs an active filter on this sheet.'
+export const FILTER_SORT_DEFAULT_TIMEOUT_MS = 15_000
+export const FILTER_SORT_TRANSPORT_TIMEOUT_ERROR =
+  'Filter and sort transport exceeded the Core deadline.'
+export const FILTER_SORT_REFRESH_TIMEOUT_ERROR =
+  'Filter and sort refresh exceeded the Core deadline.'
 
 const EMPTY_FILTER_SORT_STATE: FilterSortState = Object.freeze({
   rules: Object.freeze([]),
@@ -128,9 +139,15 @@ interface FilterSortMutationTicket {
   readonly sheetId: string
   readonly colIndex: number
   readonly next: FilterSortState
+  readonly request: SetFilterSortRequest
+  readonly sourceWitness: FilterSortControllerPort
+  readonly transport: NonNullable<FilterSortControllerPort['setFilterSort']>
+  readonly refreshProjection: RunFilterSortMutationInput['refreshProjection']
+  readonly timeoutMs: number
+  readonly historyReservation: HistoryProducerReservation
 }
 
-interface FilterSortEntrypointTicket {
+interface FilterSortEntrypointTicketBase {
   readonly operationId: number
   readonly requestId: ProjectionRequestId
   readonly entrypoint: FilterSortEntrypoint
@@ -142,9 +159,89 @@ interface FilterSortEntrypointTicket {
    */
   readonly direction: SortDirection | null
   readonly attempt: number
-  readonly next: FilterSortState
-  readonly selectionWitness: SelectionAuthorityWitness
+  readonly selectionWitness: SelectionAuthorityWitness | null
   readonly workspaceWitness: WorkspaceActiveSheetAuthorityWitness
+  readonly targetAuthority: 'selection' | 'explicit'
+  readonly refreshProjection:
+    | ReapplyFilterInput['refreshProjection']
+    | RunPhysicalSortInput['refreshProjection']
+  readonly timeoutMs: number
+  /**
+   * Every backend-mutating entrypoint owns the shared history-producer lane.
+   * Reapply produces zero descriptors, but it still changes filter visibility
+   * and the backend revision, so it cannot overlap another producer.
+   */
+  readonly historyReservation: HistoryProducerReservation
+}
+
+interface ReapplyFilterTicket extends FilterSortEntrypointTicketBase {
+  readonly kind: 'reapply-filter'
+  readonly direction: null
+  readonly targetAuthority: 'selection'
+  readonly selectionWitness: SelectionAuthorityWitness
+  readonly next: FilterSortState
+  readonly request: SetFilterSortRequest
+  readonly sourceWitness: FilterSortControllerPort
+  readonly transport: NonNullable<FilterSortControllerPort['setFilterSort']>
+}
+
+interface PhysicalSortTicket extends FilterSortEntrypointTicketBase {
+  readonly kind: 'physical-sort'
+  readonly direction: SortDirection
+  readonly request: SortRangeRequest
+  readonly sourceWitness: PhysicalSortControllerPort
+  readonly transport: NonNullable<PhysicalSortControllerPort['sortRange']>
+}
+
+type FilterSortEntrypointTicket = ReapplyFilterTicket | PhysicalSortTicket
+
+type BoundedOperationResult<T> =
+  | { readonly kind: 'fulfilled'; readonly value: T }
+  | { readonly kind: 'rejected'; readonly error: unknown }
+  | { readonly kind: 'timeout' }
+
+function snapshotTimeoutMs(value: unknown): number | null {
+  if (value === undefined) return FILTER_SORT_DEFAULT_TIMEOUT_MS
+  return typeof value === 'number' && Number.isFinite(value) && value > 0 ? value : null
+}
+
+/**
+ * Own the timer and both promise continuations so a late settlement is inert
+ * and a late rejection is always handled. The caller receives one immutable
+ * terminal snapshot and never races the host promise directly.
+ */
+function runBoundedOperation<T>(
+  launch: () => Promise<T>,
+  timeoutMs: number,
+): Promise<BoundedOperationResult<T>> {
+  return new Promise((resolve) => {
+    let active = true
+    const finish = (result: BoundedOperationResult<T>): void => {
+      if (!active) return
+      active = false
+      clearTimeout(timer)
+      resolve(Object.freeze(result))
+    }
+    const timer = setTimeout(() => {
+      finish({ kind: 'timeout' })
+    }, timeoutMs)
+
+    let pending: Promise<T>
+    try {
+      pending = Promise.resolve(launch())
+    } catch (error) {
+      finish({ kind: 'rejected', error })
+      return
+    }
+    pending.then(
+      (value) => {
+        finish({ kind: 'fulfilled', value })
+      },
+      (error) => {
+        finish({ kind: 'rejected', error })
+      },
+    )
+  })
 }
 
 function errorMessage(error: unknown): string {
@@ -397,6 +494,44 @@ function sameFilterSortTarget(
   return left?.sheetId === right?.sheetId && left?.colIndex === right?.colIndex
 }
 
+function mutationTicketAuthorityIsCurrent(get: Getter, ticket: FilterSortMutationTicket): boolean {
+  const dropdown = get(filterDropdownAtom)
+  const draft = get(filterSortDraftAtom)
+  const lifecycle = get(filterSortLifecycleAtom)
+  return (
+    dropdown.status === 'open' &&
+    dropdown.sheetId === ticket.sheetId &&
+    dropdown.colIndex === ticket.colIndex &&
+    get(filterSortSessionIdAtom) === ticket.sessionId &&
+    draft.sessionId === ticket.sessionId &&
+    draft.sheetId === ticket.sheetId &&
+    draft.colIndex === ticket.colIndex &&
+    lifecycle.sessionId === ticket.sessionId &&
+    lifecycle.sheetId === ticket.sheetId &&
+    lifecycle.colIndex === ticket.colIndex &&
+    lifecycle.requestId === ticket.requestId
+  )
+}
+
+/**
+ * Explicit dropdown targets are independent of the selection: only switching
+ * the workspace's active sheet revokes them. Toolbar/menu targets are derived
+ * from selection, so both authority witnesses and the re-resolved target must
+ * still match.
+ */
+function entrypointTicketAuthorityIsCurrent(
+  get: Getter,
+  ticket: FilterSortEntrypointTicket,
+): boolean {
+  if (get(workspaceActiveSheetAuthorityWitnessAtom) !== ticket.workspaceWitness) return false
+  if (ticket.targetAuthority === 'explicit') return true
+  return (
+    ticket.selectionWitness !== null &&
+    get(selectionAuthorityWitnessAtom) === ticket.selectionWitness &&
+    sameFilterSortTarget(resolveFilterSortEntrypointTarget(get), ticket.target)
+  )
+}
+
 function entrypointStateFor(
   status: FilterSortEntrypointState['status'],
   input: {
@@ -581,11 +716,7 @@ export const filterSortEntrypointProjectionAtom = atom((get): FilterSortEntrypoi
   const entrypointOutcomeUnknown = entrypointTransportBusy && state.status === 'outcome-unknown'
   const entrypointRefreshFailed = entrypointTransportBusy && state.status === 'refresh-failed'
   const dropdownOpen = get(filterDropdownAtom).status === 'open'
-  const authorityIsCurrent =
-    active === null ||
-    (get(selectionAuthorityWitnessAtom) === active.selectionWitness &&
-      get(workspaceActiveSheetAuthorityWitnessAtom) === active.workspaceWitness &&
-      sameFilterSortTarget(target, active.target))
+  const authorityIsCurrent = active === null || entrypointTicketAuthorityIsCurrent(get, active)
   const pending = entrypointTransportBusy || dropdownTransportBusy
   const effectiveStatus = dropdownOutcomeUnknown
     ? 'outcome-unknown'
@@ -682,7 +813,8 @@ export const reconcileFilterSortRulesFromEngineAtom = atom(
     )
   },
 )
-reconcileFilterSortRulesFromEngineAtom.debugLabel = 'spreadsheet.filterSort.reconcileRulesFromEngine'
+reconcileFilterSortRulesFromEngineAtom.debugLabel =
+  'spreadsheet.filterSort.reconcileRulesFromEngine'
 
 export const setFilterSortErrorAtom = atom(null, (_get, set, error: unknown) => {
   set(filterSortErrorBackingAtom, error == null ? '' : errorMessage(error))
@@ -965,20 +1097,95 @@ export const updateFilterSortAvailableValuesAtom = atom(
 )
 updateFilterSortAvailableValuesAtom.debugLabel = 'spreadsheet.filterSort.updateAvailableValues'
 
+type FilterSortAcknowledgementSnapshot =
+  | {
+      readonly kind: 'matched'
+      readonly sheetId: string
+      readonly requestId: ProjectionRequestId
+      readonly historyRecorded: boolean
+      readonly revision: HistoryEntry['projectionRevision']
+      readonly hiddenRowIndices: readonly number[]
+    }
+  | { readonly kind: 'invalid' }
+
+function isValidProjectionRevision(value: unknown): value is HistoryEntry['projectionRevision'] {
+  return (
+    (typeof value === 'number' && Number.isFinite(value)) ||
+    (typeof value === 'string' && value.length > 0)
+  )
+}
+
+function snapshotHiddenRowIndices(value: unknown, allowAbsent: boolean): readonly number[] | null {
+  if (value === undefined && allowAbsent) return Object.freeze([])
+  if (!Array.isArray(value)) return null
+
+  // `value` is still host-owned (and may be a Proxy). Read its length and each
+  // indexed item exactly once, then keep only the detached frozen copy.
+  const length = value.length
+  const snapshot = new Array<number>(length)
+  for (let index = 0; index < length; index += 1) {
+    const row = value[index] as unknown
+    if (!Number.isSafeInteger(row) || (row as number) < 0) return null
+    snapshot[index] = row as number
+  }
+  return Object.freeze(snapshot)
+}
+
 /**
- * Filter-hidden source rows carried by a `setFilterSort` ACK, or `[]`.
+ * Correlate and snapshot a set-filter-sort acknowledgement at the host
+ * boundary. Every caller-owned top-level getter and hidden-row item is consumed
+ * exactly once; downstream history and projection writes receive only this
+ * detached frozen value.
  *
- * Defensive by construction: the acknowledgement crosses a host boundary, and
- * a malformed payload must degrade to "nothing hidden" (rules recorded, every
- * row painted) rather than hide rows on garbage. Entry-level sanitation is left
- * to `setViewportFilterHiddenRowsAtom`, which owns the canonical shape.
+ * Apply / Clear requires the host's whole-column visibility answer. Reapply
+ * keeps the established compatibility rule that an absent visibility answer
+ * clears the old set, but its zero-history verdict is still explicit.
  */
-function readAckHiddenRowIndices(acknowledgement: unknown): readonly number[] {
+function classifyFilterSortAcknowledgement(
+  value: unknown,
+  sheetId: string,
+  requestId: ProjectionRequestId,
+  options: {
+    readonly expectedHistoryRecorded: boolean | null
+    readonly allowAbsentHiddenRowIndices: boolean
+  },
+): FilterSortAcknowledgementSnapshot {
   try {
-    const rows = (acknowledgement as { hiddenRowIndices?: unknown }).hiddenRowIndices
-    return Array.isArray(rows) ? (rows as readonly number[]) : []
+    if (typeof value !== 'object' || value === null || Array.isArray(value)) {
+      return Object.freeze({ kind: 'invalid' })
+    }
+    const result = value as Record<PropertyKey, unknown>
+    const acknowledgementSheetId = result.sheetId
+    const acknowledgementRequestId = result.requestId
+    const historyRecorded = result.historyRecorded
+    const revision = result.revision
+    const hiddenRows = result.hiddenRowIndices
+    if (
+      acknowledgementSheetId !== sheetId ||
+      acknowledgementRequestId !== requestId ||
+      typeof historyRecorded !== 'boolean' ||
+      (options.expectedHistoryRecorded !== null &&
+        historyRecorded !== options.expectedHistoryRecorded) ||
+      !isValidProjectionRevision(revision)
+    ) {
+      return Object.freeze({ kind: 'invalid' })
+    }
+    const hiddenRowIndices = snapshotHiddenRowIndices(
+      hiddenRows,
+      options.allowAbsentHiddenRowIndices,
+    )
+    if (hiddenRowIndices === null) return Object.freeze({ kind: 'invalid' })
+
+    return Object.freeze({
+      kind: 'matched',
+      sheetId: acknowledgementSheetId,
+      requestId: acknowledgementRequestId,
+      historyRecorded,
+      revision,
+      hiddenRowIndices,
+    })
   } catch {
-    return []
+    return Object.freeze({ kind: 'invalid' })
   }
 }
 
@@ -989,33 +1196,82 @@ function readAckHiddenRowIndices(acknowledgement: unknown): readonly number[] {
  *
  * The backend is the single decision-maker: it pushed a record iff the apply /
  * clear actually changed the committed filter, and only then does
- * `historyRecorded` read `true`. Recording here on a no-op (or on a legacy
- * backend that omits the field) would offset the stacks by one — every later
- * Ctrl+Z would then revert a step older than the UI believes — so a falsy
- * verdict pushes nothing. The entry carries no local-replay payload: undo/redo
- * restores the engine's owned filter through its own snapshot and the provider
- * re-hydrates the rules + hidden render caches from the engine afterwards.
+ * `historyRecorded` read `true`. Recording here on a no-op would offset the
+ * stacks by one — every later Ctrl+Z would then revert a step older than the UI
+ * believes — so an explicit `false` verdict pushes nothing. An absent or
+ * malformed verdict is rejected before this helper. The entry carries no
+ * local-replay payload: undo/redo restores the engine's owned filter through
+ * its own snapshot and the provider re-hydrates the rules + hidden render
+ * caches from the engine afterwards.
  */
 function recordFilterSortHistory(
-  set: (atomToSet: typeof pushHistoryAtom, value: HistoryEntry) => boolean,
-  acknowledgement: unknown,
+  set: Setter,
+  acknowledgement: FilterSortAcknowledgementSnapshot & { readonly kind: 'matched' },
   sheetId: string,
-): void {
-  let recorded = false
-  let revision: unknown
-  try {
-    recorded = (acknowledgement as { historyRecorded?: unknown }).historyRecorded === true
-    revision = (acknowledgement as { revision?: unknown }).revision
-  } catch {
-    return
-  }
-  if (!recorded) return
-  set(pushHistoryAtom, {
-    transactionId: nextHistoryTransactionId(),
-    kind: 'filter.set',
-    sheetId,
-    projectionRevision: revision as HistoryEntry['projectionRevision'],
+  reservation: HistoryProducerReservation,
+): boolean {
+  if (!acknowledgement.historyRecorded) return true
+  return set(pushReservedHistoryAtom, {
+    reservation,
+    entry: {
+      transactionId: nextHistoryTransactionId(),
+      kind: 'filter.set',
+      sheetId,
+      projectionRevision: acknowledgement.revision,
+    },
   })
+}
+
+type CapturedFilterSortMutationInput =
+  | {
+      readonly kind: 'captured'
+      readonly sourceWitness: FilterSortControllerPort
+      readonly transport: FilterSortControllerPort['setFilterSort']
+      readonly sessionId: number
+      readonly intent: RunFilterSortMutationInput['intent']
+      readonly refreshProjection: RunFilterSortMutationInput['refreshProjection']
+      readonly timeoutMs: number
+    }
+  | { readonly kind: 'invalid' }
+
+function captureFilterSortMutationInput(
+  input: RunFilterSortMutationInput,
+): CapturedFilterSortMutationInput {
+  try {
+    const sourceWitness = input.source
+    const sessionId = input.sessionId
+    const intentValue = input.intent
+    const refreshProjection = input.refreshProjection
+    const timeoutMs = snapshotTimeoutMs(input.timeoutMs)
+    const intentKind = intentValue?.kind
+    if (
+      !Number.isSafeInteger(sessionId) ||
+      typeof refreshProjection !== 'function' ||
+      timeoutMs === null ||
+      (intentKind !== 'clear-filter' &&
+        intentKind !== 'clear-column' &&
+        intentKind !== 'apply-draft')
+    ) {
+      return Object.freeze({ kind: 'invalid' })
+    }
+    let transport: FilterSortControllerPort['setFilterSort']
+    try {
+      transport = sourceWitness?.setFilterSort
+    } catch {
+      transport = undefined
+    }
+    return Object.freeze({
+      kind: 'captured',
+      sourceWitness,
+      transport,
+      sessionId,
+      intent: Object.freeze({ kind: intentKind }),
+      refreshProjection,
+      timeoutMs,
+    })
+  } catch {
+    return Object.freeze({ kind: 'invalid' })
+  }
 }
 
 export const runFilterSortMutationAtom = atom(
@@ -1026,12 +1282,31 @@ export const runFilterSortMutationAtom = atom(
     // Keep one transport lane so acknowledgements cannot commit in a
     // different order from the backend writes.
     if (get(activeFilterSortEntrypointAtom) !== null) return
+
+    // Detach every caller-owned value before even considering a history
+    // reservation. From this point on the command never reads `input` again.
+    const captured = captureFilterSortMutationInput(input)
+    // A hostile caller getter can synchronously re-enter this same command
+    // while `captureFilterSortMutationInput` is reading the boundary. The
+    // nested call may now own either shared lane; the superseded outer call
+    // must become wholly inert before it writes capability/lifecycle state or
+    // attempts a reservation.
+    if (get(activeFilterSortMutationAtom) !== null) return
+    if (get(activeFilterSortEntrypointAtom) !== null) return
     const dropdown = get(filterDropdownAtom)
     const draft = get(filterSortDraftAtom)
     const lifecycle = get(filterSortLifecycleAtom)
+    if (captured.kind === 'invalid') {
+      set(filterSortErrorBackingAtom, FILTER_SORT_INVALID_INPUT_ERROR)
+      set(
+        filterSortLifecycleBackingAtom,
+        lifecycleFor('blocked', draft.sessionId, draft.sheetId, draft.colIndex),
+      )
+      return
+    }
     if (
       dropdown.status !== 'open' ||
-      input.sessionId !== draft.sessionId ||
+      captured.sessionId !== draft.sessionId ||
       lifecycle.sessionId !== draft.sessionId ||
       dropdown.sheetId !== draft.sheetId ||
       dropdown.colIndex !== draft.colIndex ||
@@ -1042,13 +1317,7 @@ export const runFilterSortMutationAtom = atom(
       return
     }
 
-    let execute: FilterSortControllerPort['setFilterSort']
-    try {
-      execute = input.source?.setFilterSort
-    } catch {
-      execute = undefined
-    }
-    if (typeof execute !== 'function') {
+    if (typeof captured.transport !== 'function') {
       set(filterSortCapabilityBackingAtom, false)
       set(filterSortErrorBackingAtom, FILTER_SORT_CAPABILITY_ERROR)
       set(
@@ -1063,17 +1332,9 @@ export const runFilterSortMutationAtom = atom(
     const colIndex = draft.colIndex
     if (sheetId === null || colIndex === null) return
     const current = get(filterSortStateAtom)[sheetId] ?? EMPTY_FILTER_SORT_STATE
-    const derived = deriveMutationState(current, draft, input.intent)
+    const derived = deriveMutationState(current, draft, captured.intent)
     if (derived.state === null) {
       set(filterSortErrorBackingAtom, derived.error ?? FILTER_SORT_INVALID_INPUT_ERROR)
-      set(
-        filterSortLifecycleBackingAtom,
-        lifecycleFor('blocked', draft.sessionId, sheetId, colIndex),
-      )
-      return
-    }
-    if (typeof input.refreshProjection !== 'function') {
-      set(filterSortErrorBackingAtom, FILTER_SORT_INVALID_INPUT_ERROR)
       set(
         filterSortLifecycleBackingAtom,
         lifecycleFor('blocked', draft.sessionId, sheetId, colIndex),
@@ -1090,12 +1351,41 @@ export const runFilterSortMutationAtom = atom(
       )
       return
     }
+    const next = normalizeState(derived.state)
+    const request: SetFilterSortRequest = Object.freeze({
+      kind: 'set-filter-sort',
+      sheetId,
+      rules: next.rules,
+      requestId,
+      // Excel parity: an actual apply / clear is undoable. The host is the
+      // change detector and echoes its exact history verdict in the ACK.
+      recordHistory: true,
+    })
+
+    // All external values and the exact wire request now exist as immutable
+    // snapshots. Reservation acquisition may synchronously notify observers;
+    // none of them can change what this ticket will send.
+    const historyReservation = set(acquireHistoryProducerReservationAtom)
+    if (historyReservation === null) {
+      set(filterSortErrorBackingAtom, FILTER_SORT_PENDING_ERROR)
+      set(
+        filterSortLifecycleBackingAtom,
+        lifecycleFor('blocked', draft.sessionId, sheetId, colIndex),
+      )
+      return
+    }
     const ticket: FilterSortMutationTicket = Object.freeze({
       sessionId: draft.sessionId,
       requestId,
       sheetId,
       colIndex,
-      next: normalizeState(derived.state),
+      next,
+      request,
+      sourceWitness: captured.sourceWitness,
+      transport: captured.transport,
+      refreshProjection: captured.refreshProjection,
+      timeoutMs: captured.timeoutMs,
+      historyReservation,
     })
     set(filterSortSyncTicketBackingAtom, requestId)
     set(activeFilterSortMutationAtom, ticket)
@@ -1105,68 +1395,120 @@ export const runFilterSortMutationAtom = atom(
       lifecycleFor('pending', ticket.sessionId, sheetId, colIndex, requestId),
     )
 
-    const isCurrent = (): boolean => {
-      const currentDropdown = get(filterDropdownAtom)
-      const currentLifecycle = get(filterSortLifecycleAtom)
-      return (
-        get(activeFilterSortMutationAtom) === ticket &&
-        currentDropdown.status === 'open' &&
-        currentDropdown.sheetId === ticket.sheetId &&
-        currentDropdown.colIndex === ticket.colIndex &&
-        get(filterSortSessionIdAtom) === ticket.sessionId &&
-        currentLifecycle.sessionId === ticket.sessionId &&
-        currentLifecycle.requestId === ticket.requestId
+    const ownsTicket = (): boolean => get(activeFilterSortMutationAtom) === ticket
+    const ownsAuthority = (): boolean => mutationTicketAuthorityIsCurrent(get, ticket)
+    const retainStaleAuthority = (): void => {
+      if (!ownsTicket()) return
+      set(filterSortErrorBackingAtom, outcomeUnknownError(FILTER_SORT_STALE_OPERATION_ERROR))
+      set(
+        filterSortLifecycleBackingAtom,
+        lifecycleFor('outcome-unknown', ticket.sessionId, sheetId, colIndex, requestId),
       )
+    }
+    const releaseUnsentStaleAuthority = (): void => {
+      if (!ownsTicket()) return
+      if (!set(releaseHistoryProducerReservationAtom, ticket.historyReservation)) {
+        set(filterSortErrorBackingAtom, outcomeUnknownError(FILTER_SORT_ACKNOWLEDGEMENT_ERROR))
+        set(
+          filterSortLifecycleBackingAtom,
+          lifecycleFor('outcome-unknown', ticket.sessionId, sheetId, colIndex, requestId),
+        )
+        return
+      }
+      if (!ownsTicket()) return
+      set(filterSortErrorBackingAtom, FILTER_SORT_STALE_OPERATION_ERROR)
+      set(
+        filterSortLifecycleBackingAtom,
+        lifecycleFor('blocked', ticket.sessionId, sheetId, colIndex),
+      )
+      // Clearing the lane can synchronously admit a replacement command, so
+      // it is the final write performed by this invocation.
+      set(activeFilterSortMutationAtom, null)
     }
 
     // Expose the reservation before transport launch so same-tick re-entry is inert.
     await Promise.resolve()
-    if (!isCurrent()) return
+    if (!ownsTicket()) return
+    if (!ownsAuthority()) {
+      releaseUnsentStaleAuthority()
+      return
+    }
     // Einfach defers the first flush of an async write until a post-await setter runs.
     // Re-set the owned lifecycle value to publish the already-reserved pending state
     // before the transport can settle, without introducing framework-local state.
     set(filterSortLifecycleBackingAtom, get(filterSortLifecycleAtom))
 
-    let acknowledgement: unknown
-    try {
-      acknowledgement = await execute.call(input.source, {
-        kind: 'set-filter-sort',
-        sheetId,
-        rules: ticket.next.rules,
-        requestId,
-        // Excel parity: an apply / clear that actually changes the committed
-        // filter is undoable. The backend judges "changed" and echoes its
-        // verdict in `historyRecorded`, which we mirror below with one paired
-        // entry (`recordFilterSortHistory`) so the stacks stay aligned.
-        recordHistory: true,
-      })
-    } catch (error) {
-      if (!isCurrent()) return
-      set(filterSortErrorBackingAtom, outcomeUnknownError(errorMessage(error)))
+    const transportResult = await runBoundedOperation(
+      () => ticket.transport.call(ticket.sourceWitness, ticket.request),
+      ticket.timeoutMs,
+    )
+    if (!ownsTicket()) return
+    if (!ownsAuthority()) {
+      retainStaleAuthority()
+      return
+    }
+    if (transportResult.kind === 'timeout') {
+      set(filterSortErrorBackingAtom, outcomeUnknownError(FILTER_SORT_TRANSPORT_TIMEOUT_ERROR))
       set(
         filterSortLifecycleBackingAtom,
         lifecycleFor('outcome-unknown', ticket.sessionId, sheetId, colIndex, requestId),
       )
       return
     }
-
-    if (!isCurrent()) return
-    let acknowledgementMatches = false
-    try {
-      acknowledgementMatches =
-        typeof acknowledgement === 'object' &&
-        acknowledgement !== null &&
-        (acknowledgement as { sheetId?: unknown }).sheetId === sheetId &&
-        (acknowledgement as { requestId?: unknown }).requestId === requestId
-    } catch {
-      acknowledgementMatches = false
+    if (transportResult.kind === 'rejected') {
+      set(filterSortErrorBackingAtom, outcomeUnknownError(errorMessage(transportResult.error)))
+      set(
+        filterSortLifecycleBackingAtom,
+        lifecycleFor('outcome-unknown', ticket.sessionId, sheetId, colIndex, requestId),
+      )
+      return
     }
-    if (!acknowledgementMatches) {
+    const acknowledgementSnapshot = classifyFilterSortAcknowledgement(
+      transportResult.value,
+      sheetId,
+      requestId,
+      {
+        expectedHistoryRecorded: null,
+        allowAbsentHiddenRowIndices: false,
+      },
+    )
+    // ACK fields are caller-owned getters and may synchronously re-enter Core.
+    // Never let their classifier commit, push, or release a replacement.
+    if (!ownsTicket()) return
+    if (!ownsAuthority()) {
+      retainStaleAuthority()
+      return
+    }
+    if (acknowledgementSnapshot.kind === 'invalid') {
       set(filterSortErrorBackingAtom, outcomeUnknownError(FILTER_SORT_ACKNOWLEDGEMENT_ERROR))
       set(
         filterSortLifecycleBackingAtom,
         lifecycleFor('outcome-unknown', ticket.sessionId, sheetId, colIndex, requestId),
       )
+      return
+    }
+    if (!ownsTicket() || !ownsAuthority()) {
+      if (ownsTicket()) retainStaleAuthority()
+      return
+    }
+
+    // Consume the backend's transaction verdict before committing any local
+    // projection. A malformed verdict or a failed reserved push means the
+    // positional stacks cannot be proven aligned; retain both ticket and
+    // reservation for explicit reconciliation and never resend the mutation.
+    if (
+      !recordFilterSortHistory(set, acknowledgementSnapshot, sheetId, ticket.historyReservation)
+    ) {
+      set(filterSortErrorBackingAtom, outcomeUnknownError(FILTER_SORT_ACKNOWLEDGEMENT_ERROR))
+      set(
+        filterSortLifecycleBackingAtom,
+        lifecycleFor('outcome-unknown', ticket.sessionId, sheetId, colIndex, requestId),
+      )
+      return
+    }
+    if (!ownsTicket()) return
+    if (!ownsAuthority()) {
+      retainStaleAuthority()
       return
     }
 
@@ -1178,16 +1520,13 @@ export const runFilterSortMutationAtom = atom(
     // whole-column scan, and a SNAPSHOT — editing a cell afterwards does not
     // move a row in or out of view, which is Excel's model (`Data → Reapply`).
     //
-    // A host that returns no `hiddenRowIndices` CLEARS the set instead of
-    // keeping a stale one: after the rules change, yesterday's answer is not a
-    // conservative fallback, it hides the wrong rows.
+    // Apply / Clear requires an explicit whole-column visibility snapshot.
+    // Missing or malformed rows make the ACK uncertain before either rules or
+    // visibility can commit.
     set(setViewportFilterHiddenRowsAtom, {
       sheetId,
-      rows: readAckHiddenRowIndices(acknowledgement),
+      rows: acknowledgementSnapshot.hiddenRowIndices,
     })
-    // Excel-parity undo: pair the committed apply / clear with one history
-    // entry iff the backend recorded a matching transaction (`historyRecorded`).
-    recordFilterSortHistory(set, acknowledgement, sheetId)
     set(
       filterSortDraftBackingAtom,
       draftFromState(
@@ -1204,29 +1543,64 @@ export const runFilterSortMutationAtom = atom(
     )
 
     await Promise.resolve()
-    if (!isCurrent()) return
+    if (!ownsTicket()) return
+    if (!ownsAuthority()) {
+      retainStaleAuthority()
+      return
+    }
     set(
       filterSortLifecycleBackingAtom,
       lifecycleFor('refreshing', ticket.sessionId, sheetId, colIndex, requestId),
     )
-    try {
-      await input.refreshProjection(sheetId)
-    } catch (error) {
-      if (!isCurrent()) return
-      set(filterSortErrorBackingAtom, refreshFailureError(error))
+    const refreshResult = await runBoundedOperation(
+      () => ticket.refreshProjection(sheetId),
+      ticket.timeoutMs,
+    )
+    if (!ownsTicket()) return
+    if (!ownsAuthority()) {
+      retainStaleAuthority()
+      return
+    }
+    if (refreshResult.kind === 'timeout') {
+      set(filterSortErrorBackingAtom, refreshFailureError(FILTER_SORT_REFRESH_TIMEOUT_ERROR))
       set(
         filterSortLifecycleBackingAtom,
         lifecycleFor('refresh-failed', ticket.sessionId, sheetId, colIndex, requestId),
       )
       return
     }
-    if (!isCurrent()) return
-    set(activeFilterSortMutationAtom, null)
+    if (refreshResult.kind === 'rejected') {
+      set(filterSortErrorBackingAtom, refreshFailureError(refreshResult.error))
+      set(
+        filterSortLifecycleBackingAtom,
+        lifecycleFor('refresh-failed', ticket.sessionId, sheetId, colIndex, requestId),
+      )
+      return
+    }
+    if (!set(releaseHistoryProducerReservationAtom, ticket.historyReservation)) {
+      set(filterSortErrorBackingAtom, outcomeUnknownError(FILTER_SORT_ACKNOWLEDGEMENT_ERROR))
+      set(
+        filterSortLifecycleBackingAtom,
+        lifecycleFor('outcome-unknown', ticket.sessionId, sheetId, colIndex, requestId),
+      )
+      return
+    }
+    if (!ownsTicket()) return
+    if (!ownsAuthority()) {
+      set(filterSortErrorBackingAtom, outcomeUnknownError(FILTER_SORT_STALE_OPERATION_ERROR))
+      set(
+        filterSortLifecycleBackingAtom,
+        lifecycleFor('outcome-unknown', ticket.sessionId, sheetId, colIndex, requestId),
+      )
+      set(activeFilterSortMutationAtom, null)
+      return
+    }
     set(filterSortErrorBackingAtom, '')
     set(
       filterSortLifecycleBackingAtom,
       lifecycleFor('editing', ticket.sessionId, sheetId, colIndex),
     )
+    set(activeFilterSortMutationAtom, null)
   },
 )
 runFilterSortMutationAtom.debugLabel = 'spreadsheet.filterSort.runMutation'
@@ -1293,19 +1667,66 @@ export const reapplyFilterDisabledReasonAtom = atom((get): string | null => {
 })
 reapplyFilterDisabledReasonAtom.debugLabel = 'spreadsheet.filterSort.reapplyDisabledReason'
 
+type CapturedReapplyFilterInput =
+  | {
+      readonly kind: 'captured'
+      readonly sourceWitness: FilterSortControllerPort
+      readonly transport: FilterSortControllerPort['setFilterSort']
+      readonly entrypoint: FilterSortEntrypoint
+      readonly refreshProjection: ReapplyFilterInput['refreshProjection']
+      readonly timeoutMs: number
+    }
+  | { readonly kind: 'invalid' }
+
+function captureReapplyFilterInput(input: ReapplyFilterInput): CapturedReapplyFilterInput {
+  try {
+    const sourceWitness = input.source
+    const entrypoint = input.entrypoint
+    const refreshProjection = input.refreshProjection
+    const timeoutMs = snapshotTimeoutMs(input.timeoutMs)
+    if (
+      (entrypoint !== 'toolbar' && entrypoint !== 'menu-bar') ||
+      typeof refreshProjection !== 'function' ||
+      timeoutMs === null
+    ) {
+      return Object.freeze({ kind: 'invalid' })
+    }
+    let transport: FilterSortControllerPort['setFilterSort']
+    try {
+      transport = sourceWitness?.setFilterSort
+    } catch {
+      transport = undefined
+    }
+    return Object.freeze({
+      kind: 'captured',
+      sourceWitness,
+      transport,
+      entrypoint,
+      refreshProjection,
+      timeoutMs,
+    })
+  } catch {
+    return Object.freeze({ kind: 'invalid' })
+  }
+}
+
 /**
  * Re-run the active sheet's committed filter rules and re-commit the answer.
  *
- * NOT in the undo stack, and no `pushHistoryAtom`. Reapply is an IDENTITY
+ * NOT in the undo stack, and no history descriptor. Reapply is an IDENTITY
  * re-run of the already-committed rules — it never changes WHAT is filtered,
  * only which rows currently satisfy it — so it is not an undo step: a Reapply
  * entry would be a Ctrl+Z whose counterpart the user never issued. It passes
  * `recordHistory: false` so the backend records nothing either (a `true` there
  * would let the engine's before≠after verdict push a record UI core never
- * pairs, skewing the stacks). This is DISTINCT from Apply / Clear, which since
- * the 2026-07-22 filter-undo flip ARE undoable (`runFilterSortMutationAtom`
- * pairs a `filter.set` entry on the backend's `historyRecorded` verdict) —
- * matching Excel, where applying or clearing an AutoFilter is Ctrl+Z-able.
+ * pairs, skewing the stacks). It nevertheless owns the shared producer
+ * reservation for its full transport + refresh lifetime: the backend updates
+ * filter/hidden state and bumps revision even without recording an undo
+ * transaction, so overlap with another history producer would still destroy
+ * revision ordering. This is DISTINCT from Apply / Clear, which since the
+ * 2026-07-22 filter-undo flip ARE undoable (`runFilterSortMutationAtom` pairs a
+ * `filter.set` entry on the backend's `historyRecorded` verdict) — matching
+ * Excel, where applying or clearing an AutoFilter is Ctrl+Z-able.
  * Microsoft documents neither way for Reapply specifically (checked 2026-07-21:
  * the official "Reapply a filter and sort, or clear a filter" page is silent on
  * undo), so keeping Reapply out of the stack is a deliberate identity-not-an-
@@ -1329,16 +1750,21 @@ reapplyFilterDisabledReasonAtom.debugLabel = 'spreadsheet.filterSort.reapplyDisa
 export const reapplyFilterAtom = atom(
   null,
   async (get, set, input: ReapplyFilterInput): Promise<void> => {
-    let available = false
-    try {
-      available = typeof input.source?.setFilterSort === 'function'
-    } catch {
-      available = false
+    if (get(activeFilterSortMutationAtom) !== null) return
+    if (get(activeFilterSortEntrypointAtom) !== null) return
+
+    const captured = captureReapplyFilterInput(input)
+    // Caller getters are re-entrant. A nested mutation/entrypoint may have
+    // claimed the lane while this input was being captured, including before
+    // a getter throws. The old invocation must not overwrite its state.
+    if (get(activeFilterSortMutationAtom) !== null) return
+    if (get(activeFilterSortEntrypointAtom) !== null) return
+    if (captured.kind === 'invalid') return
+    if (typeof captured.transport !== 'function') {
+      set(filterSortCapabilityBackingAtom, false)
+      return
     }
-    set(filterSortCapabilityBackingAtom, available)
-    if (!available) return
-    if (input.entrypoint !== 'toolbar' && input.entrypoint !== 'menu-bar') return
-    if (typeof input.refreshProjection !== 'function') return
+    set(filterSortCapabilityBackingAtom, true)
     if (get(reapplyFilterDisabledReasonAtom) !== null) return
 
     const target = resolveFilterSortEntrypointTarget(get)
@@ -1352,7 +1778,7 @@ export const reapplyFilterAtom = atom(
       set(
         filterSortEntrypointStateBackingAtom,
         entrypointStateFor('blocked', {
-          entrypoint: input.entrypoint,
+          entrypoint: captured.entrypoint,
           target,
           attempt: 1,
           error: 'Filter and sort command identity space is exhausted.',
@@ -1361,19 +1787,58 @@ export const reapplyFilterAtom = atom(
       return
     }
 
+    const next = normalizeState(committed)
+    const request: SetFilterSortRequest = Object.freeze({
+      kind: 'set-filter-sort',
+      sheetId: target.sheetId,
+      rules: next.rules,
+      requestId,
+      // Reapply is NEVER an undo step (identity re-run of committed rules):
+      // it pushes no history descriptor, so the backend must record none.
+      recordHistory: false,
+    })
     const previous = get(filterSortEntrypointStateBackingAtom)
-    const ticket: FilterSortEntrypointTicket = Object.freeze({
+    const attempt = nextEntrypointAttempt(previous, captured.entrypoint, target, null)
+    const selectionWitness = get(selectionAuthorityWitnessAtom)
+    const workspaceWitness = get(workspaceActiveSheetAuthorityWitnessAtom)
+
+    // The complete transport request and every authority/caller witness are
+    // detached before reservation acquisition. Acquiring the shared producer
+    // lane may synchronously notify observers; none can alter this ticket.
+    const historyReservation = set(acquireHistoryProducerReservationAtom)
+    if (historyReservation === null) {
+      set(
+        filterSortEntrypointStateBackingAtom,
+        entrypointStateFor('blocked', {
+          entrypoint: captured.entrypoint,
+          target,
+          attempt: 1,
+          error: FILTER_SORT_PENDING_ERROR,
+        }),
+      )
+      return
+    }
+
+    const ticket: ReapplyFilterTicket = Object.freeze({
+      kind: 'reapply-filter',
       operationId,
       requestId,
-      entrypoint: input.entrypoint,
+      entrypoint: captured.entrypoint,
       target,
       direction: null,
-      attempt: nextEntrypointAttempt(previous, input.entrypoint, target, null),
+      attempt,
       // Identity: Reapply never changes what is filtered, only which rows
       // currently satisfy it. The committed rules go out and come back.
-      next: normalizeState(committed),
-      selectionWitness: get(selectionAuthorityWitnessAtom),
-      workspaceWitness: get(workspaceActiveSheetAuthorityWitnessAtom),
+      next,
+      request,
+      sourceWitness: captured.sourceWitness,
+      transport: captured.transport,
+      refreshProjection: captured.refreshProjection,
+      timeoutMs: captured.timeoutMs,
+      selectionWitness,
+      workspaceWitness,
+      targetAuthority: 'selection',
+      historyReservation,
     })
     set(filterSortEntrypointOperationIdStateAtom, operationId)
     set(filterSortSyncTicketBackingAtom, requestId)
@@ -1381,53 +1846,96 @@ export const reapplyFilterAtom = atom(
     set(filterSortEntrypointStateBackingAtom, entrypointStateForTicket('pending', ticket))
 
     const ownsTicket = (): boolean => get(activeFilterSortEntrypointAtom) === ticket
+    const ownsAuthority = (): boolean => entrypointTicketAuthorityIsCurrent(get, ticket)
+    const retainStaleAuthority = (): void => {
+      if (!ownsTicket()) return
+      set(
+        filterSortEntrypointStateBackingAtom,
+        entrypointStateForTicket('stale', ticket, FILTER_SORT_STALE_OPERATION_ERROR),
+      )
+    }
+    const releaseUnsentStaleAuthority = (): void => {
+      if (!ownsTicket()) return
+      if (!set(releaseHistoryProducerReservationAtom, ticket.historyReservation)) {
+        set(
+          filterSortEntrypointStateBackingAtom,
+          entrypointStateForTicket(
+            'outcome-unknown',
+            ticket,
+            outcomeUnknownError(FILTER_SORT_ACKNOWLEDGEMENT_ERROR),
+          ),
+        )
+        return
+      }
+      // Releasing an exact token may synchronously wake another producer.
+      // Clear only if this exact ticket still owns the entrypoint lane.
+      if (!ownsTicket()) return
+      set(
+        filterSortEntrypointStateBackingAtom,
+        entrypointStateForTicket('stale', ticket, FILTER_SORT_STALE_OPERATION_ERROR),
+      )
+      set(activeFilterSortEntrypointAtom, null)
+    }
 
     // Publish the reservation before transport launch so same-tick re-entry is
     // inert; re-set the owned pending value to flush it (Einfach defers the
     // first flush of an async write until a post-await setter runs).
     await Promise.resolve()
     if (!ownsTicket()) return
+    if (!ownsAuthority()) {
+      releaseUnsentStaleAuthority()
+      return
+    }
     set(filterSortEntrypointStateBackingAtom, get(filterSortEntrypointStateBackingAtom))
 
-    let acknowledgement: unknown
-    try {
-      acknowledgement = await input.source.setFilterSort!.call(input.source, {
-        kind: 'set-filter-sort',
-        sheetId: target.sheetId,
-        rules: ticket.next.rules,
-        requestId,
-        // Reapply is NEVER an undo step (identity re-run of committed rules):
-        // it pushes no history entry here, so it must tell the backend not to
-        // record one either, or the two stacks would skew by one.
-        recordHistory: false,
-      })
-    } catch (error) {
-      if (!ownsTicket()) return
-      set(activeFilterSortEntrypointAtom, null)
+    const transportResult = await runBoundedOperation(
+      () => ticket.transport.call(ticket.sourceWitness, ticket.request),
+      ticket.timeoutMs,
+    )
+    if (!ownsTicket()) return
+    if (!ownsAuthority()) {
+      retainStaleAuthority()
+      return
+    }
+    if (transportResult.kind === 'timeout') {
       set(
         filterSortEntrypointStateBackingAtom,
         entrypointStateForTicket(
           'outcome-unknown',
           ticket,
-          outcomeUnknownError(errorMessage(error)),
+          outcomeUnknownError(FILTER_SORT_TRANSPORT_TIMEOUT_ERROR),
         ),
       )
       return
     }
-
-    if (!ownsTicket()) return
-    let acknowledgementMatches = false
-    try {
-      acknowledgementMatches =
-        typeof acknowledgement === 'object' &&
-        acknowledgement !== null &&
-        (acknowledgement as { sheetId?: unknown }).sheetId === target.sheetId &&
-        (acknowledgement as { requestId?: unknown }).requestId === requestId
-    } catch {
-      acknowledgementMatches = false
+    if (transportResult.kind === 'rejected') {
+      set(
+        filterSortEntrypointStateBackingAtom,
+        entrypointStateForTicket(
+          'outcome-unknown',
+          ticket,
+          outcomeUnknownError(errorMessage(transportResult.error)),
+        ),
+      )
+      return
     }
-    if (!acknowledgementMatches) {
-      set(activeFilterSortEntrypointAtom, null)
+    const acknowledgementSnapshot = classifyFilterSortAcknowledgement(
+      transportResult.value,
+      ticket.target.sheetId,
+      ticket.requestId,
+      {
+        expectedHistoryRecorded: false,
+        allowAbsentHiddenRowIndices: true,
+      },
+    )
+    // Host-owned ACK getters may synchronously re-enter Core. A strict ACK is
+    // useful only while this exact ticket and its authority remain current.
+    if (!ownsTicket()) return
+    if (!ownsAuthority()) {
+      retainStaleAuthority()
+      return
+    }
+    if (acknowledgementSnapshot.kind === 'invalid') {
       set(
         filterSortEntrypointStateBackingAtom,
         entrypointStateForTicket(
@@ -1444,8 +1952,8 @@ export const reapplyFilterAtom = atom(
     // degradation as the dropdown path — Reapply is not a second writer with
     // its own rules, it is the same writer invoked again.
     set(setViewportFilterHiddenRowsAtom, {
-      sheetId: target.sheetId,
-      rows: readAckHiddenRowIndices(acknowledgement),
+      sheetId: ticket.target.sheetId,
+      rows: acknowledgementSnapshot.hiddenRowIndices,
     })
     set(
       filterSortEntrypointStateBackingAtom,
@@ -1454,29 +1962,98 @@ export const reapplyFilterAtom = atom(
 
     await Promise.resolve()
     if (!ownsTicket()) return
+    if (!ownsAuthority()) {
+      retainStaleAuthority()
+      return
+    }
     set(filterSortEntrypointStateBackingAtom, entrypointStateForTicket('refreshing', ticket))
-    try {
-      await input.refreshProjection(target.sheetId)
-    } catch (error) {
-      if (!ownsTicket()) return
+    const refreshResult = await runBoundedOperation(
+      () => ticket.refreshProjection(ticket.target.sheetId),
+      ticket.timeoutMs,
+    )
+    if (!ownsTicket()) return
+    if (!ownsAuthority()) {
+      retainStaleAuthority()
+      return
+    }
+    if (refreshResult.kind === 'timeout') {
       set(
         filterSortEntrypointStateBackingAtom,
-        entrypointStateForTicket('refresh-failed', ticket, refreshFailureError(error)),
+        entrypointStateForTicket(
+          'refresh-failed',
+          ticket,
+          refreshFailureError(FILTER_SORT_REFRESH_TIMEOUT_ERROR),
+        ),
+      )
+      return
+    }
+    if (refreshResult.kind === 'rejected') {
+      set(
+        filterSortEntrypointStateBackingAtom,
+        entrypointStateForTicket(
+          'refresh-failed',
+          ticket,
+          refreshFailureError(refreshResult.error),
+        ),
+      )
+      return
+    }
+    if (!set(releaseHistoryProducerReservationAtom, ticket.historyReservation)) {
+      set(
+        filterSortEntrypointStateBackingAtom,
+        entrypointStateForTicket(
+          'outcome-unknown',
+          ticket,
+          outcomeUnknownError(FILTER_SORT_ACKNOWLEDGEMENT_ERROR),
+        ),
       )
       return
     }
     if (!ownsTicket()) return
-    set(activeFilterSortEntrypointAtom, null)
+    if (!ownsAuthority()) {
+      set(
+        filterSortEntrypointStateBackingAtom,
+        entrypointStateForTicket('stale', ticket, FILTER_SORT_STALE_OPERATION_ERROR),
+      )
+      set(activeFilterSortEntrypointAtom, null)
+      return
+    }
     set(filterSortEntrypointStateBackingAtom, entrypointStateForTicket('idle', ticket))
+    set(activeFilterSortEntrypointAtom, null)
   },
 )
 reapplyFilterAtom.debugLabel = 'spreadsheet.filterSort.reapply'
 
+type CapturedRetryFilterSortRefreshInput =
+  | {
+      readonly kind: 'captured'
+      readonly refreshProjection: RetryFilterSortRefreshInput['refreshProjection']
+      readonly timeoutMs: number
+    }
+  | { readonly kind: 'invalid' }
+
+function captureRetryFilterSortRefreshInput(
+  input: RetryFilterSortRefreshInput,
+): CapturedRetryFilterSortRefreshInput {
+  try {
+    const refreshProjection = input.refreshProjection
+    const timeoutMs = snapshotTimeoutMs(input.timeoutMs)
+    if (typeof refreshProjection !== 'function' || timeoutMs === null) {
+      return Object.freeze({ kind: 'invalid' })
+    }
+    return Object.freeze({ kind: 'captured', refreshProjection, timeoutMs })
+  } catch {
+    return Object.freeze({ kind: 'invalid' })
+  }
+}
+
 export const retryFilterSortRefreshAtom = atom(
   null,
   async (get, set, input: RetryFilterSortRefreshInput): Promise<void> => {
-    if (typeof input.refreshProjection !== 'function') return
-
+    // Select and witness the exact failed ticket before touching caller-owned
+    // retry getters. A getter may synchronously run another retry and advance
+    // this ticket to `refreshing`; the superseded invocation must not attach
+    // its callback or deadline to that in-flight retry.
     const mutationTicket = get(activeFilterSortMutationAtom)
     const mutationLifecycle = get(filterSortLifecycleAtom)
     if (
@@ -1485,6 +2062,12 @@ export const retryFilterSortRefreshAtom = atom(
       mutationLifecycle.sessionId === mutationTicket.sessionId &&
       mutationLifecycle.requestId === mutationTicket.requestId
     ) {
+      if (!mutationTicketAuthorityIsCurrent(get, mutationTicket)) return
+      const captured = captureRetryFilterSortRefreshInput(input)
+      if (get(activeFilterSortMutationAtom) !== mutationTicket) return
+      if (get(filterSortLifecycleAtom) !== mutationLifecycle) return
+      if (!mutationTicketAuthorityIsCurrent(get, mutationTicket)) return
+      if (captured.kind === 'invalid') return
       set(filterSortErrorBackingAtom, '')
       set(
         filterSortLifecycleBackingAtom,
@@ -1496,11 +2079,16 @@ export const retryFilterSortRefreshAtom = atom(
           mutationTicket.requestId,
         ),
       )
-      try {
-        await input.refreshProjection(mutationTicket.sheetId)
-      } catch (error) {
-        if (get(activeFilterSortMutationAtom) !== mutationTicket) return
-        set(filterSortErrorBackingAtom, refreshFailureError(error))
+      if (get(activeFilterSortMutationAtom) !== mutationTicket) return
+      if (!mutationTicketAuthorityIsCurrent(get, mutationTicket)) return
+      const refreshResult = await runBoundedOperation(
+        () => captured.refreshProjection(mutationTicket.sheetId),
+        captured.timeoutMs,
+      )
+      if (get(activeFilterSortMutationAtom) !== mutationTicket) return
+      if (!mutationTicketAuthorityIsCurrent(get, mutationTicket)) return
+      if (refreshResult.kind === 'timeout') {
+        set(filterSortErrorBackingAtom, refreshFailureError(FILTER_SORT_REFRESH_TIMEOUT_ERROR))
         set(
           filterSortLifecycleBackingAtom,
           lifecycleFor(
@@ -1513,8 +2101,50 @@ export const retryFilterSortRefreshAtom = atom(
         )
         return
       }
+      if (refreshResult.kind === 'rejected') {
+        set(filterSortErrorBackingAtom, refreshFailureError(refreshResult.error))
+        set(
+          filterSortLifecycleBackingAtom,
+          lifecycleFor(
+            'refresh-failed',
+            mutationTicket.sessionId,
+            mutationTicket.sheetId,
+            mutationTicket.colIndex,
+            mutationTicket.requestId,
+          ),
+        )
+        return
+      }
+      if (!set(releaseHistoryProducerReservationAtom, mutationTicket.historyReservation)) {
+        set(filterSortErrorBackingAtom, outcomeUnknownError(FILTER_SORT_ACKNOWLEDGEMENT_ERROR))
+        set(
+          filterSortLifecycleBackingAtom,
+          lifecycleFor(
+            'outcome-unknown',
+            mutationTicket.sessionId,
+            mutationTicket.sheetId,
+            mutationTicket.colIndex,
+            mutationTicket.requestId,
+          ),
+        )
+        return
+      }
       if (get(activeFilterSortMutationAtom) !== mutationTicket) return
-      set(activeFilterSortMutationAtom, null)
+      if (!mutationTicketAuthorityIsCurrent(get, mutationTicket)) {
+        set(filterSortErrorBackingAtom, outcomeUnknownError(FILTER_SORT_STALE_OPERATION_ERROR))
+        set(
+          filterSortLifecycleBackingAtom,
+          lifecycleFor(
+            'outcome-unknown',
+            mutationTicket.sessionId,
+            mutationTicket.sheetId,
+            mutationTicket.colIndex,
+            mutationTicket.requestId,
+          ),
+        )
+        set(activeFilterSortMutationAtom, null)
+        return
+      }
       set(filterSortErrorBackingAtom, '')
       set(
         filterSortLifecycleBackingAtom,
@@ -1525,6 +2155,7 @@ export const retryFilterSortRefreshAtom = atom(
           mutationTicket.colIndex,
         ),
       )
+      set(activeFilterSortMutationAtom, null)
       return
     }
 
@@ -1538,23 +2169,61 @@ export const retryFilterSortRefreshAtom = atom(
     ) {
       return
     }
+    const ownsTicket = (): boolean => get(activeFilterSortEntrypointAtom) === entrypointTicket
+    // The retry replays the frozen ticket's captured sheet regardless of
+    // current selection: authority drift does not gate this path (HEAD had
+    // no authority check here). Only ticket ownership (a superseding
+    // dispatch) still gates.
+    const captured = captureRetryFilterSortRefreshInput(input)
+    if (!ownsTicket()) return
+    if (get(filterSortEntrypointStateBackingAtom) !== entrypointState) return
+    if (captured.kind === 'invalid') return
     set(
       filterSortEntrypointStateBackingAtom,
       entrypointStateForTicket('refreshing', entrypointTicket),
     )
-    try {
-      await input.refreshProjection(entrypointTicket.target.sheetId)
-    } catch (error) {
-      if (get(activeFilterSortEntrypointAtom) !== entrypointTicket) return
+    if (!ownsTicket()) return
+    const refreshResult = await runBoundedOperation(
+      () => captured.refreshProjection(entrypointTicket.target.sheetId),
+      captured.timeoutMs,
+    )
+    if (!ownsTicket()) return
+    if (refreshResult.kind === 'timeout') {
       set(
         filterSortEntrypointStateBackingAtom,
-        entrypointStateForTicket('refresh-failed', entrypointTicket, refreshFailureError(error)),
+        entrypointStateForTicket(
+          'refresh-failed',
+          entrypointTicket,
+          refreshFailureError(FILTER_SORT_REFRESH_TIMEOUT_ERROR),
+        ),
       )
       return
     }
-    if (get(activeFilterSortEntrypointAtom) !== entrypointTicket) return
-    set(activeFilterSortEntrypointAtom, null)
+    if (refreshResult.kind === 'rejected') {
+      set(
+        filterSortEntrypointStateBackingAtom,
+        entrypointStateForTicket(
+          'refresh-failed',
+          entrypointTicket,
+          refreshFailureError(refreshResult.error),
+        ),
+      )
+      return
+    }
+    if (!set(releaseHistoryProducerReservationAtom, entrypointTicket.historyReservation)) {
+      set(
+        filterSortEntrypointStateBackingAtom,
+        entrypointStateForTicket(
+          'outcome-unknown',
+          entrypointTicket,
+          outcomeUnknownError(FILTER_SORT_ACKNOWLEDGEMENT_ERROR),
+        ),
+      )
+      return
+    }
+    if (!ownsTicket()) return
     set(filterSortEntrypointStateBackingAtom, entrypointStateForTicket('idle', entrypointTicket))
+    set(activeFilterSortEntrypointAtom, null)
   },
 )
 retryFilterSortRefreshAtom.debugLabel = 'spreadsheet.filterSort.retryRefresh'
@@ -1657,21 +2326,115 @@ export const clearPhysicalSortDiagnosticAtom = atom(null, (_get, set) => {
 })
 clearPhysicalSortDiagnosticAtom.debugLabel = 'spreadsheet.sort.clearDiagnostic'
 
-function normalizeSortRange(range: CellRange): CellRange {
-  return {
-    rowStart: Math.min(range.rowStart, range.rowEnd),
-    rowEnd: Math.max(range.rowStart, range.rowEnd),
-    colStart: Math.min(range.colStart, range.colEnd),
-    colEnd: Math.max(range.colStart, range.colEnd),
-  }
-}
+type CapturedPhysicalSortRange =
+  | { readonly kind: 'range'; readonly value: CellRange }
+  | { readonly kind: 'absent' }
+  | { readonly kind: 'invalid' }
 
-function sanitizeExplicitSortTarget(
-  target: FilterSortEntrypointTarget | undefined,
-): FilterSortEntrypointTarget | null {
-  if (!target || typeof target.sheetId !== 'string' || target.sheetId.length === 0) return null
-  if (!Number.isSafeInteger(target.colIndex) || target.colIndex < 0) return null
-  return Object.freeze({ sheetId: target.sheetId, colIndex: target.colIndex })
+type CapturedPhysicalSortTarget =
+  | { readonly kind: 'selection' }
+  | { readonly kind: 'explicit'; readonly value: FilterSortEntrypointTarget }
+  | { readonly kind: 'invalid' }
+
+type CapturedRunPhysicalSortInput =
+  | {
+      readonly kind: 'captured'
+      readonly sourceWitness: PhysicalSortControllerPort
+      readonly transport: PhysicalSortControllerPort['sortRange']
+      readonly entrypoint: RunPhysicalSortInput['entrypoint']
+      readonly direction: RunPhysicalSortInput['direction']
+      readonly range: CapturedPhysicalSortRange
+      readonly target: CapturedPhysicalSortTarget
+      readonly refreshProjection: RunPhysicalSortInput['refreshProjection']
+      readonly timeoutMs: number | null
+    }
+  | { readonly kind: 'invalid' }
+
+/**
+ * Consume every caller-owned getter once and detach all nested range/target
+ * fields. A later reservation notification or async boundary therefore cannot
+ * change the operation's authority, transport, payload, refresh, or deadline.
+ */
+function captureRunPhysicalSortInput(input: RunPhysicalSortInput): CapturedRunPhysicalSortInput {
+  try {
+    const sourceWitness = input.source
+    let transport: PhysicalSortControllerPort['sortRange']
+    try {
+      transport = sourceWitness?.sortRange
+    } catch {
+      transport = undefined
+    }
+    const entrypoint = input.entrypoint
+    const direction = input.direction
+    const rangeValue = input.range
+    const targetValue = input.target
+    const refreshProjection = input.refreshProjection
+    const timeoutMs = snapshotTimeoutMs(input.timeoutMs)
+
+    let range: CapturedPhysicalSortRange
+    if (rangeValue === null) {
+      range = Object.freeze({ kind: 'absent' })
+    } else if (typeof rangeValue !== 'object') {
+      range = Object.freeze({ kind: 'invalid' })
+    } else {
+      const rowStart = rangeValue.rowStart
+      const rowEnd = rangeValue.rowEnd
+      const colStart = rangeValue.colStart
+      const colEnd = rangeValue.colEnd
+      if (
+        !Number.isSafeInteger(rowStart) ||
+        !Number.isSafeInteger(rowEnd) ||
+        !Number.isSafeInteger(colStart) ||
+        !Number.isSafeInteger(colEnd)
+      ) {
+        range = Object.freeze({ kind: 'invalid' })
+      } else {
+        range = Object.freeze({
+          kind: 'range',
+          value: Object.freeze({
+            rowStart: Math.min(rowStart, rowEnd),
+            rowEnd: Math.max(rowStart, rowEnd),
+            colStart: Math.min(colStart, colEnd),
+            colEnd: Math.max(colStart, colEnd),
+          }),
+        })
+      }
+    }
+
+    let target: CapturedPhysicalSortTarget
+    if (targetValue === undefined) {
+      target = Object.freeze({ kind: 'selection' })
+    } else if (typeof targetValue !== 'object' || targetValue === null) {
+      target = Object.freeze({ kind: 'invalid' })
+    } else {
+      const sheetId = targetValue.sheetId
+      const colIndex = targetValue.colIndex
+      target =
+        typeof sheetId === 'string' &&
+        sheetId.length > 0 &&
+        Number.isSafeInteger(colIndex) &&
+        colIndex >= 0
+          ? Object.freeze({
+              kind: 'explicit',
+              value: Object.freeze({ sheetId, colIndex }),
+            })
+          : Object.freeze({ kind: 'invalid' })
+    }
+
+    return Object.freeze({
+      kind: 'captured',
+      sourceWitness,
+      transport,
+      entrypoint,
+      direction,
+      range,
+      target,
+      refreshProjection,
+      timeoutMs,
+    })
+  } catch {
+    return Object.freeze({ kind: 'invalid' })
+  }
 }
 
 function isValidSortRange(range: CellRange): boolean {
@@ -1690,6 +2453,138 @@ function isValidSortRange(range: CellRange): boolean {
 function sheetHasActiveFilterRules(get: Getter, sheetId: string): boolean {
   const state = get(filterSortStateAtom)[sheetId]
   return state !== undefined && state.rules.length > 0
+}
+
+type PhysicalSortAcknowledgement =
+  | {
+      readonly kind: 'applied'
+      readonly movedRows: number
+      readonly revision: HistoryEntry['projectionRevision']
+      readonly affectedRange: CellRange
+    }
+  | {
+      readonly kind: 'rejected'
+      readonly code: SortRangeRejectionCode
+      readonly message?: string
+      readonly anchor?: string
+    }
+  | { readonly kind: 'invalid' }
+
+function isSortRangeRejectionCode(value: unknown): value is SortRangeRejectionCode {
+  return (
+    value === 'invalid-range' ||
+    value === 'empty-keys' ||
+    value === 'key-out-of-range' ||
+    value === 'spill-in-range' ||
+    value === 'invalid-payload' ||
+    value === 'source-too-large' ||
+    value === 'merge-in-range'
+  )
+}
+
+function sameSortRange(left: CellRange, right: CellRange): boolean {
+  return (
+    left.rowStart === right.rowStart &&
+    left.rowEnd === right.rowEnd &&
+    left.colStart === right.colStart &&
+    left.colEnd === right.colEnd
+  )
+}
+
+/**
+ * Correlate and snapshot the untrusted sort ACK exactly once. The returned
+ * object contains no host-owned getters, so later history/projection writes
+ * cannot be changed by a second read or a re-entrant Proxy.
+ */
+function classifyPhysicalSortAcknowledgement(
+  value: unknown,
+  sheetId: string,
+  requestId: ProjectionRequestId,
+  requestedRange: CellRange,
+): PhysicalSortAcknowledgement {
+  try {
+    if (typeof value !== 'object' || value === null || Array.isArray(value)) {
+      return { kind: 'invalid' }
+    }
+    const result = value as Record<PropertyKey, unknown>
+    const acknowledgementSheetId = result.sheetId
+    const acknowledgementRequestId = result.requestId
+    const applied = result.applied
+    const kind = result.kind
+    if (acknowledgementSheetId !== sheetId || acknowledgementRequestId !== requestId) {
+      return { kind: 'invalid' }
+    }
+    if (applied === false) {
+      const code = result.code
+      const message = result.message
+      const anchor = result.anchor
+      if (
+        kind !== 'sort-range-not-applied' ||
+        !isSortRangeRejectionCode(code) ||
+        (message !== undefined && typeof message !== 'string') ||
+        (anchor !== undefined && typeof anchor !== 'string')
+      ) {
+        return { kind: 'invalid' }
+      }
+      return Object.freeze({
+        kind: 'rejected',
+        code,
+        ...(message === undefined ? {} : { message }),
+        ...(anchor === undefined ? {} : { anchor }),
+      })
+    }
+    const movedRows = result.movedRows
+    const movedCells = result.movedCells
+    if (
+      applied !== true ||
+      kind !== 'sort-range' ||
+      !Number.isSafeInteger(movedRows) ||
+      (movedRows as number) < 0 ||
+      !Number.isSafeInteger(movedCells) ||
+      (movedCells as number) < 0
+    ) {
+      return { kind: 'invalid' }
+    }
+    const affectedRange = result.affectedRange
+    const revision = result.revision
+    if (typeof affectedRange !== 'object' || affectedRange === null) {
+      return { kind: 'invalid' }
+    }
+    const affectedRangeRecord = affectedRange as Record<PropertyKey, unknown>
+    const rowStart = affectedRangeRecord.rowStart
+    const rowEnd = affectedRangeRecord.rowEnd
+    const colStart = affectedRangeRecord.colStart
+    const colEnd = affectedRangeRecord.colEnd
+    if (
+      !Number.isSafeInteger(rowStart) ||
+      !Number.isSafeInteger(rowEnd) ||
+      !Number.isSafeInteger(colStart) ||
+      !Number.isSafeInteger(colEnd)
+    ) {
+      return { kind: 'invalid' }
+    }
+    const range: CellRange = Object.freeze({
+      rowStart: rowStart as number,
+      rowEnd: rowEnd as number,
+      colStart: colStart as number,
+      colEnd: colEnd as number,
+    })
+    if (
+      !isValidSortRange(range) ||
+      !sameSortRange(range, requestedRange) ||
+      !isValidProjectionRevision(revision)
+    ) {
+      return { kind: 'invalid' }
+    }
+    return Object.freeze({
+      kind: 'applied',
+      movedRows: movedRows as number,
+      revision,
+      affectedRange: range,
+    })
+  } catch {
+    return { kind: 'invalid' }
+  }
 }
 
 /**
@@ -1737,14 +2632,32 @@ export const runPhysicalSortAtom = atom(
     // A live dropdown draft owns the same lane; stay inert until it closes.
     if (get(filterDropdownAtom).status === 'open') return
 
-    const port = readSortRangePort(input.source)
-    set(sortRangeCapabilityBackingAtom, port !== undefined)
+    const captured = captureRunPhysicalSortInput(input)
+    // Recheck both lanes after consuming caller-owned getters. A getter may
+    // synchronously dispatch a replacement command and then return or throw;
+    // this superseded invocation must not publish a diagnostic/capability
+    // value or a blocked state over the replacement ticket.
+    if (get(activeFilterSortEntrypointAtom) !== null) return
+    if (get(activeFilterSortMutationAtom) !== null) return
+    if (captured.kind === 'invalid') {
+      const message = physicalSortRejectionMessage('invalid-payload')
+      set(physicalSortDiagnosticBackingAtom, Object.freeze({ code: 'invalid-payload', message }))
+      set(
+        filterSortEntrypointStateBackingAtom,
+        entrypointStateFor('blocked', { attempt: 1, error: message }),
+      )
+      return
+    }
+
+    const portAvailable = typeof captured.transport === 'function'
+    set(sortRangeCapabilityBackingAtom, portAvailable)
 
     // The dropdown supplies its own target (its column, not the selection's);
     // the toolbar / menu omit it and stay selection-authoritative.
+    const explicitTarget = captured.target.kind === 'explicit' ? captured.target.value : null
     const target =
-      sanitizeExplicitSortTarget(input.target) ?? resolveFilterSortEntrypointTarget(get)
-    const range = input.range === null ? null : normalizeSortRange(input.range)
+      captured.target.kind === 'selection' ? resolveFilterSortEntrypointTarget(get) : explicitTarget
+    const range = captured.range.kind === 'range' ? captured.range.value : null
     const rangeIsValid = range !== null && isValidSortRange(range)
     const columnInRange =
       rangeIsValid &&
@@ -1752,35 +2665,46 @@ export const runPhysicalSortAtom = atom(
       target.colIndex >= range!.colStart &&
       target.colIndex <= range!.colEnd
 
-    const directionIsValid = input.direction === 'asc' || input.direction === 'desc'
-    const entrypointIsValid = input.entrypoint === 'toolbar' || input.entrypoint === 'menu-bar'
+    const directionIsValid = captured.direction === 'asc' || captured.direction === 'desc'
+    const entrypointIsValid =
+      captured.entrypoint === 'toolbar' || captured.entrypoint === 'menu-bar'
+    const payloadIsValid =
+      captured.target.kind !== 'invalid' &&
+      captured.range.kind !== 'invalid' &&
+      typeof captured.refreshProjection === 'function' &&
+      captured.timeoutMs !== null
 
     // Fail-closed, no fallback (#24): a host without `sortRange` cannot sort.
     // Filter-active sheets DO sort physically — the filtered-out rows ride in
     // `excludedRows` (design §2.2 / §6.1) so they stay in place.
-    const rejection: PhysicalSortDiagnosticCode | null =
-      port === undefined
-        ? 'unsupported'
-        : !directionIsValid || !entrypointIsValid || typeof input.refreshProjection !== 'function'
-          ? 'invalid-payload'
-          : target === null
-            ? 'empty-keys'
-            : !rangeIsValid || range === null
-              ? 'invalid-range'
-              : !columnInRange
-                ? 'key-out-of-range'
-                : null
+    const rejection: PhysicalSortDiagnosticCode | null = !portAvailable
+      ? 'unsupported'
+      : !payloadIsValid || !directionIsValid || !entrypointIsValid
+        ? 'invalid-payload'
+        : target === null
+          ? 'empty-keys'
+          : !rangeIsValid || range === null
+            ? 'invalid-range'
+            : !columnInRange
+              ? 'key-out-of-range'
+              : null
 
-    if (rejection !== null || port === undefined || target === null || range === null) {
+    if (
+      rejection !== null ||
+      typeof captured.transport !== 'function' ||
+      target === null ||
+      range === null ||
+      captured.timeoutMs === null
+    ) {
       const code = rejection ?? 'invalid-range'
       const message = physicalSortRejectionMessage(code)
       set(physicalSortDiagnosticBackingAtom, Object.freeze({ code, message }))
       set(
         filterSortEntrypointStateBackingAtom,
         entrypointStateFor('blocked', {
-          entrypoint: entrypointIsValid ? input.entrypoint : null,
+          entrypoint: entrypointIsValid ? captured.entrypoint : null,
           target,
-          direction: directionIsValid ? input.direction : null,
+          direction: directionIsValid ? captured.direction : null,
           attempt: 1,
           error: message,
         }),
@@ -1794,9 +2718,9 @@ export const runPhysicalSortAtom = atom(
       set(
         filterSortEntrypointStateBackingAtom,
         entrypointStateFor('blocked', {
-          entrypoint: input.entrypoint,
+          entrypoint: captured.entrypoint,
           target,
-          direction: input.direction,
+          direction: captured.direction,
           attempt: 1,
           error: 'Filter and sort command identity space is exhausted.',
         }),
@@ -1804,20 +2728,60 @@ export const runPhysicalSortAtom = atom(
       return
     }
 
+    const excludedRows = Object.freeze(buildSortExcludedRows(get, target.sheetId, range))
+    const key = Object.freeze({ col: target.colIndex, direction: captured.direction })
+    const keys = Object.freeze([key])
+    const request: SortRangeRequest = Object.freeze({
+      kind: 'sort-range',
+      sheetId: target.sheetId,
+      range,
+      keys,
+      excludedRows,
+      requestId,
+    })
     const previous = get(filterSortEntrypointStateBackingAtom)
-    const currentState = get(filterSortStateAtom)[target.sheetId] ?? EMPTY_FILTER_SORT_STATE
-    const ticket: FilterSortEntrypointTicket = Object.freeze({
+    const attempt = nextEntrypointAttempt(previous, captured.entrypoint, target, captured.direction)
+    const targetAuthority =
+      captured.target.kind === 'explicit' ? ('explicit' as const) : ('selection' as const)
+    // An explicit dropdown target is deliberately independent of selection.
+    const selectionWitness =
+      targetAuthority === 'selection' ? get(selectionAuthorityWitnessAtom) : null
+    const workspaceWitness = get(workspaceActiveSheetAuthorityWitnessAtom)
+
+    // Request, excluded-row snapshot, authority witnesses, caller transport,
+    // refresh callback, and deadline are all finalized before lane acquisition.
+    const historyReservation = set(acquireHistoryProducerReservationAtom)
+    if (historyReservation === null) {
+      set(
+        filterSortEntrypointStateBackingAtom,
+        entrypointStateFor('blocked', {
+          entrypoint: captured.entrypoint,
+          target,
+          direction: captured.direction,
+          attempt: 1,
+          error: FILTER_SORT_PENDING_ERROR,
+        }),
+      )
+      return
+    }
+
+    const ticket: PhysicalSortTicket = Object.freeze({
+      kind: 'physical-sort',
       operationId,
       requestId,
-      entrypoint: input.entrypoint,
+      entrypoint: captured.entrypoint,
       target,
-      direction: input.direction,
-      attempt: nextEntrypointAttempt(previous, input.entrypoint, target, input.direction),
-      // Identity — the physical path never commits sort directives; the field
-      // only exists so the shared entrypoint ticket type is satisfied.
-      next: normalizeState(currentState),
-      selectionWitness: get(selectionAuthorityWitnessAtom),
-      workspaceWitness: get(workspaceActiveSheetAuthorityWitnessAtom),
+      direction: captured.direction,
+      attempt,
+      request,
+      sourceWitness: captured.sourceWitness,
+      transport: captured.transport,
+      refreshProjection: captured.refreshProjection,
+      timeoutMs: captured.timeoutMs,
+      selectionWitness,
+      workspaceWitness,
+      targetAuthority,
+      historyReservation,
     })
     set(filterSortEntrypointOperationIdStateAtom, operationId)
     set(filterSortSyncTicketBackingAtom, requestId)
@@ -1826,71 +2790,157 @@ export const runPhysicalSortAtom = atom(
     set(filterSortEntrypointStateBackingAtom, entrypointStateForTicket('pending', ticket))
 
     const ownsTicket = (): boolean => get(activeFilterSortEntrypointAtom) === ticket
+    const ownsAuthority = (): boolean => entrypointTicketAuthorityIsCurrent(get, ticket)
+    // Once the transport has been dispatched, authority drift never blocks
+    // settling or leaks the lane (unlike the dropdown-mutation lane): a
+    // well-formed matching ACK must still be processed to completion. The
+    // authority gate below is only valid BEFORE dispatch.
+    const releaseUnsentStaleAuthority = (): void => {
+      if (!ownsTicket()) return
+      if (!set(releaseHistoryProducerReservationAtom, ticket.historyReservation)) {
+        set(
+          filterSortEntrypointStateBackingAtom,
+          entrypointStateForTicket(
+            'outcome-unknown',
+            ticket,
+            outcomeUnknownError(FILTER_SORT_ACKNOWLEDGEMENT_ERROR),
+          ),
+        )
+        return
+      }
+      if (!ownsTicket()) return
+      set(
+        filterSortEntrypointStateBackingAtom,
+        entrypointStateForTicket('stale', ticket, FILTER_SORT_STALE_OPERATION_ERROR),
+      )
+      set(activeFilterSortEntrypointAtom, null)
+    }
 
     // Publish the reservation before transport launch so same-tick re-entry
     // is inert; re-set the owned pending value to flush it (see the display
     // entrypoint for the same Einfach deferral note).
     await Promise.resolve()
     if (!ownsTicket()) return
+    // No backend effect is possible yet, so authority drift at this boundary
+    // can release the exact reservation and clear only this unsent ticket.
+    if (!ownsAuthority()) {
+      releaseUnsentStaleAuthority()
+      return
+    }
     set(filterSortEntrypointStateBackingAtom, get(filterSortEntrypointStateBackingAtom))
 
-    const request: SortRangeRequest = {
-      kind: 'sort-range',
-      sheetId: target.sheetId,
-      range,
-      keys: [{ col: target.colIndex, direction: input.direction }],
-      excludedRows: buildSortExcludedRows(get, target.sheetId, range),
-      requestId,
+    const transportResult = await runBoundedOperation(
+      () => ticket.transport.call(ticket.sourceWitness, ticket.request),
+      ticket.timeoutMs,
+    )
+    if (!ownsTicket()) return
+    if (transportResult.kind === 'timeout') {
+      set(
+        filterSortEntrypointStateBackingAtom,
+        entrypointStateForTicket(
+          'outcome-unknown',
+          ticket,
+          outcomeUnknownError(FILTER_SORT_TRANSPORT_TIMEOUT_ERROR),
+        ),
+      )
+      return
     }
-
-    let result: SortRangeResult
-    try {
-      result = await port.call(input.source, request)
-    } catch (error) {
-      if (!ownsTicket()) return
+    if (transportResult.kind === 'rejected') {
+      // A transport-level rejection is positive proof nothing was sent to the
+      // backend (matches the pre-refactor catch-block contract): release the
+      // lane so the user can retry the mutation.
       set(activeFilterSortEntrypointAtom, null)
       set(
         filterSortEntrypointStateBackingAtom,
         entrypointStateForTicket(
           'outcome-unknown',
           ticket,
-          outcomeUnknownError(errorMessage(error)),
+          outcomeUnknownError(errorMessage(transportResult.error)),
         ),
       )
       return
     }
 
+    const acknowledgement = classifyPhysicalSortAcknowledgement(
+      transportResult.value,
+      ticket.request.sheetId,
+      ticket.requestId,
+      ticket.request.range,
+    )
+    // Host getters can be re-entrant. Once transport began, authority drift
+    // no longer gates a well-formed matching ACK — it must still be
+    // processed to completion (history push, projection refresh, lane
+    // release). Only ticket ownership (a superseding dispatch) still gates.
     if (!ownsTicket()) return
+    if (acknowledgement.kind === 'invalid') {
+      set(
+        filterSortEntrypointStateBackingAtom,
+        entrypointStateForTicket(
+          'outcome-unknown',
+          ticket,
+          outcomeUnknownError(FILTER_SORT_ACKNOWLEDGEMENT_ERROR),
+        ),
+      )
+      return
+    }
 
-    // Structured rejection (a gated request resolves, it does NOT reject the
-    // promise): nothing was written, no undo entry recorded, no history push.
-    if (!result || result.applied === false) {
-      const code: SortRangeRejectionCode = result ? result.code : 'invalid-payload'
-      const message = physicalSortRejectionMessage(code, result?.message)
-      set(activeFilterSortEntrypointAtom, null)
+    // A strictly correlated structured rejection is positive proof that no
+    // backend mutation or undo record exists. Release only this ticket's
+    // reservation before clearing it; a failed exact release is uncertainty,
+    // never permission to clear another producer's lane.
+    if (acknowledgement.kind === 'rejected') {
+      if (!set(releaseHistoryProducerReservationAtom, ticket.historyReservation)) {
+        set(
+          filterSortEntrypointStateBackingAtom,
+          entrypointStateForTicket(
+            'outcome-unknown',
+            ticket,
+            outcomeUnknownError(FILTER_SORT_ACKNOWLEDGEMENT_ERROR),
+          ),
+        )
+        return
+      }
+      if (!ownsTicket()) return
+      const message = physicalSortRejectionMessage(acknowledgement.code, acknowledgement.message)
       set(
         physicalSortDiagnosticBackingAtom,
         Object.freeze({
-          code,
+          code: acknowledgement.code,
           message,
-          ...(result && result.anchor !== undefined ? { anchor: result.anchor } : {}),
+          ...(acknowledgement.anchor === undefined ? {} : { anchor: acknowledgement.anchor }),
         }),
       )
       set(filterSortEntrypointStateBackingAtom, entrypointStateForTicket('error', ticket, message))
+      set(activeFilterSortEntrypointAtom, null)
       return
     }
 
     // Applied. A no-op (movedRows === 0) resolves successfully but records NO
     // history entry — an identity sort is not an undo step (design §7).
-    if (result.movedRows > 0) {
-      set(pushHistoryAtom, {
-        transactionId: `range-sort-${target.sheetId}-${requestId}`,
-        kind: 'range.sort',
-        sheetId: target.sheetId,
-        projectionRevision: result.revision ?? requestId,
-        affectedRange: result.affectedRange ?? range,
+    if (
+      acknowledgement.movedRows > 0 &&
+      !set(pushReservedHistoryAtom, {
+        reservation: ticket.historyReservation,
+        entry: {
+          transactionId: `range-sort-${ticket.target.sheetId}-${ticket.requestId}`,
+          kind: 'range.sort',
+          sheetId: ticket.target.sheetId,
+          projectionRevision: acknowledgement.revision,
+          affectedRange: acknowledgement.affectedRange,
+        },
       })
+    ) {
+      set(
+        filterSortEntrypointStateBackingAtom,
+        entrypointStateForTicket(
+          'outcome-unknown',
+          ticket,
+          outcomeUnknownError(FILTER_SORT_ACKNOWLEDGEMENT_ERROR),
+        ),
+      )
+      return
     }
+    if (!ownsTicket()) return
     set(physicalSortDiagnosticBackingAtom, null)
     set(
       filterSortEntrypointStateBackingAtom,
@@ -1900,19 +2950,47 @@ export const runPhysicalSortAtom = atom(
     await Promise.resolve()
     if (!ownsTicket()) return
     set(filterSortEntrypointStateBackingAtom, entrypointStateForTicket('refreshing', ticket))
-    try {
-      await input.refreshProjection(target.sheetId)
-    } catch (error) {
-      if (!ownsTicket()) return
+    const refreshResult = await runBoundedOperation(
+      () => ticket.refreshProjection(ticket.target.sheetId),
+      ticket.timeoutMs,
+    )
+    if (!ownsTicket()) return
+    if (refreshResult.kind === 'timeout') {
       set(
         filterSortEntrypointStateBackingAtom,
-        entrypointStateForTicket('refresh-failed', ticket, refreshFailureError(error)),
+        entrypointStateForTicket(
+          'refresh-failed',
+          ticket,
+          refreshFailureError(FILTER_SORT_REFRESH_TIMEOUT_ERROR),
+        ),
+      )
+      return
+    }
+    if (refreshResult.kind === 'rejected') {
+      set(
+        filterSortEntrypointStateBackingAtom,
+        entrypointStateForTicket(
+          'refresh-failed',
+          ticket,
+          refreshFailureError(refreshResult.error),
+        ),
+      )
+      return
+    }
+    if (!set(releaseHistoryProducerReservationAtom, ticket.historyReservation)) {
+      set(
+        filterSortEntrypointStateBackingAtom,
+        entrypointStateForTicket(
+          'outcome-unknown',
+          ticket,
+          outcomeUnknownError(FILTER_SORT_ACKNOWLEDGEMENT_ERROR),
+        ),
       )
       return
     }
     if (!ownsTicket()) return
-    set(activeFilterSortEntrypointAtom, null)
     set(filterSortEntrypointStateBackingAtom, entrypointStateForTicket('idle', ticket))
+    set(activeFilterSortEntrypointAtom, null)
   },
 )
 runPhysicalSortAtom.debugLabel = 'spreadsheet.sort.runPhysical'

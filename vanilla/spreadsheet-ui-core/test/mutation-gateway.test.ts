@@ -106,6 +106,24 @@ describe('mutation gateway — target passthrough', () => {
     })
   })
 
+  test('remove-rows is a first-class range mutation and preserves its exact target', () => {
+    const store = createStore()
+    const range = { rowStart: 1, rowEnd: 8, colStart: 2, colEnd: 5 }
+
+    const resolution = store.setter(resolveContentMutationAtom, {
+      kind: 'remove-rows',
+      sheetId: SHEET,
+      range,
+    })
+
+    expect(resolution).toEqual({
+      status: 'allowed',
+      kind: 'remove-rows',
+      sheetId: SHEET,
+      ranges: [range],
+    })
+  })
+
   /**
    * Regression nail (#27 S6). Filtering hides rows instead of compacting them,
    * so a mutation target is a source coordinate no matter what the projection
@@ -228,6 +246,7 @@ describe('mutation gateway — protection gate', () => {
       'fill-series',
       'paste-range',
       'import-cell-chunks',
+      'remove-rows',
       'set-format-range',
     ] as const) {
       const resolution = store.setter(resolveContentMutationAtom, {
@@ -373,5 +392,4 @@ describe('mutation gateway — editing commit integration', () => {
       error: 'The target cells are locked on a protected sheet.',
     })
   })
-
 })

@@ -47,6 +47,14 @@ export interface RemoveRowsExactResult {
   readonly removedRows: number
   readonly affectedRange: RemoveRowsAffectedRange | null
   readonly revision: ProjectionRevision
+  /**
+   * Compatibility verdict for adapters migrating to the shared history lane.
+   *
+   * Omitted currently preserves legacy adapter behaviour and is treated as
+   * `true`; adapters should return an explicit boolean so this can become
+   * required after the compatibility window.
+   */
+  readonly historyRecorded?: boolean
 }
 
 /**
@@ -195,6 +203,8 @@ export interface RemoveDuplicatesControllerPort {
 
 export interface OpenRemoveDuplicatesInput {
   readonly source: RemoveDuplicatesControllerPort
+  /** Per-attempt transport deadline. Defaults to 15 seconds. */
+  readonly timeoutMs?: number
   /**
    * Optional compatibility witness for legacy callers. Core derives the
    * authoritative sheet from selection/workspace state and only validates
@@ -207,6 +217,8 @@ export interface RunRemoveDuplicatesConfirmInput {
   readonly source: RemoveDuplicatesControllerPort
   readonly sessionId: number
   readonly refreshProjection: (sheetId: string) => Promise<void>
+  /** Per-attempt mutation/refresh deadline. Defaults to 15 seconds. */
+  readonly timeoutMs?: number
 }
 
 export type RemoveDuplicatesReadOutcome = 'editing' | 'failed' | 'stale' | 'blocked'

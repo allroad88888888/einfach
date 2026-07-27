@@ -2,6 +2,9 @@ import { describe, expect, jest, test } from '@jest/globals'
 import { createStore } from '@einfach/core'
 import {
   DEFAULT_HISTORY_CAP,
+  DEFAULT_HISTORY_TIMEOUT_MS,
+  HISTORY_LOCAL_REPLAY_ERROR,
+  acquireHistoryProducerReservationAtom,
   canRedoAtom,
   canUndoAtom,
   clearHistoryAtom,
@@ -10,6 +13,8 @@ import {
   historyLifecycleAtom,
   historyStackAtom,
   pushHistoryAtom,
+  pushReservedHistoryAtom,
+  releaseHistoryProducerReservationAtom,
   retryHistoryRefreshAtom,
   runRedoHistoryAtom,
   runUndoHistoryAtom,
@@ -17,6 +22,7 @@ import {
   type HistoryEntry,
   type HistoryMutationResult,
   type HistoryRedoRequest,
+  type RunHistoryCommandInput,
   type HistoryUndoRequest,
 } from '../src/history'
 import { setFreezeConfigAtom, viewportFreezeAtom } from '../src/viewport/freeze'
@@ -102,6 +108,554 @@ describe('history Core lifecycle', () => {
     expect(state.cursor).toBe(DEFAULT_HISTORY_CAP)
     expect(state.entries[0].transactionId).toBe('tx-5')
     expect(state.entries.at(-1)?.transactionId).toBe(`tx-${DEFAULT_HISTORY_CAP + 4}`)
+  })
+
+  test(
+    'producer reservation is opaque, identity-owned, and supports one push per backend transaction',
+    () => {
+    const store = createStore()
+    const foreignStore = createStore()
+    const reservation = store.setter(acquireHistoryProducerReservationAtom)
+    const foreignReservation = foreignStore.setter(acquireHistoryProducerReservationAtom)
+    if (reservation === null || foreignReservation === null) {
+      throw new Error('expected both isolated stores to acquire their producer lane')
+    }
+
+    expect(Object.isFrozen(reservation)).toBe(true)
+    expect(Object.keys(reservation)).toEqual([])
+    expect(Object.getPrototypeOf(reservation)).toBeNull()
+    expect(
+      store.setter(pushReservedHistoryAtom, {
+        reservation: foreignReservation,
+        entry: makeEntry('tx-foreign', 1),
+      }),
+    ).toBe(false)
+    expect(store.setter(releaseHistoryProducerReservationAtom, foreignReservation)).toBe(false)
+    expect(store.setter(pushHistoryAtom, makeEntry('tx-ordinary', 1))).toBe(false)
+
+    expect(
+      store.setter(pushReservedHistoryAtom, {
+        reservation,
+        entry: makeEntry('tx-1', 1),
+      }),
+    ).toBe(true)
+    expect(
+      store.setter(pushReservedHistoryAtom, {
+        reservation,
+        entry: makeEntry('tx-2', 2),
+      }),
+    ).toBe(true)
+    expect(store.getter(historyStackAtom).entries.map((entry) => entry.transactionId)).toEqual([
+      'tx-1',
+      'tx-2',
+    ])
+
+    expect(store.setter(releaseHistoryProducerReservationAtom, reservation)).toBe(true)
+    expect(store.setter(releaseHistoryProducerReservationAtom, reservation)).toBe(false)
+    expect(
+      store.setter(pushReservedHistoryAtom, {
+        reservation,
+        entry: makeEntry('tx-after-release', 3),
+      }),
+    ).toBe(false)
+    expect(store.setter(pushHistoryAtom, makeEntry('tx-ordinary', 3))).toBe(true)
+  })
+
+  test(
+    'legacy push reserves atomically while snapshotting each hostile descriptor field once',
+    () => {
+    const store = createStore()
+    const reads: Record<string, number> = {}
+    const read = <T>(key: string, value: T): T => {
+      reads[key] = (reads[key] ?? 0) + 1
+      return value
+    }
+    const nestedPushes: boolean[] = []
+    const nestedClears: boolean[] = []
+    const nestedReservations: unknown[] = []
+
+    const affectedRange = Object.defineProperties(
+      {},
+      {
+        rowStart: { get: () => read('range.rowStart', 0) },
+        rowEnd: { get: () => read('range.rowEnd', 1) },
+        colStart: { get: () => read('range.colStart', 2) },
+        colEnd: { get: () => read('range.colEnd', 3) },
+      },
+    )
+    const sidePayload = Object.defineProperties(
+      {},
+      {
+        applyKey: { get: () => read('payload.applyKey', 'viewport.freeze') },
+        sheetId: { get: () => read('payload.sheetId', 'sheet-1') },
+        before: { get: () => read('payload.before', null) },
+        after: { get: () => read('payload.after', { rows: 1, cols: 0 }) },
+      },
+    )
+    const sidePayloads: unknown[] = []
+    Object.defineProperty(sidePayloads, '0', {
+      configurable: true,
+      get: () => read('sidePayloads[0]', sidePayload),
+    })
+
+    const entry = Object.defineProperties(
+      {},
+      {
+        transactionId: {
+          get() {
+            reads.transactionId = (reads.transactionId ?? 0) + 1
+            nestedPushes.push(store.setter(pushHistoryAtom, makeEntry('tx-interloper', 9)))
+            nestedClears.push(store.setter(clearHistoryAtom))
+            nestedReservations.push(store.setter(acquireHistoryProducerReservationAtom))
+            return 'tx-hostile'
+          },
+        },
+        kind: { get: () => read('kind', 'range.fill') },
+        sheetId: { get: () => read('sheetId', 'sheet-1') },
+        projectionRevision: { get: () => read('projectionRevision', 1) },
+        affectedRange: { get: () => read('affectedRange', affectedRange) },
+        localReplay: { get: () => read('localReplay', undefined) },
+        localSidePayloads: { get: () => read('localSidePayloads', sidePayloads) },
+      },
+    ) as HistoryEntry
+
+    expect(store.setter(pushHistoryAtom, entry)).toBe(true)
+    expect(nestedPushes).toEqual([false])
+    expect(nestedClears).toEqual([false])
+    expect(nestedReservations).toEqual([null])
+    expect(reads).toEqual({
+      transactionId: 1,
+      kind: 1,
+      sheetId: 1,
+      projectionRevision: 1,
+      affectedRange: 1,
+      localReplay: 1,
+      localSidePayloads: 1,
+      'range.rowStart': 1,
+      'range.rowEnd': 1,
+      'range.colStart': 1,
+      'range.colEnd': 1,
+      'sidePayloads[0]': 1,
+      'payload.applyKey': 1,
+      'payload.sheetId': 1,
+      'payload.before': 1,
+      'payload.after': 1,
+    })
+    expect(store.getter(historyStackAtom).entries[0]).toMatchObject({
+      transactionId: 'tx-hostile',
+      affectedRange: { rowStart: 0, rowEnd: 1, colStart: 2, colEnd: 3 },
+    })
+
+    const throwingEntry = Object.defineProperty({}, 'transactionId', {
+      get() {
+        throw new Error('hostile entry')
+      },
+    }) as HistoryEntry
+    expect(store.setter(pushHistoryAtom, throwingEntry)).toBe(false)
+    expect(
+      store.setter(pushHistoryAtom, {
+        ...makeEntry('tx-invalid-kind', 2),
+        kind: 'range.unknown' as HistoryEntry['kind'],
+      }),
+    ).toBe(false)
+    expect(store.setter(pushHistoryAtom, makeEntry('tx-after-throw', 2))).toBe(true)
+  })
+
+  test('same-tick producer/history races admit only the first owner in either order', async () => {
+    const producerFirst = createStore()
+    producerFirst.setter(pushHistoryAtom, makeEntry('tx-producer-first', 1))
+    const reservation = producerFirst.setter(acquireHistoryProducerReservationAtom)
+    if (reservation === null) throw new Error('expected producer reservation')
+    const blockedUndo = jest.fn(async (request: HistoryUndoRequest) =>
+      exactAcknowledgement(request, 2),
+    )
+
+    await expect(
+      producerFirst.setter(runUndoHistoryAtom, {
+        source: { undoTransaction: blockedUndo },
+        refreshProjection: async () => {},
+      }),
+    ).resolves.toBe('blocked')
+    expect(blockedUndo).not.toHaveBeenCalled()
+    expect(producerFirst.setter(acquireHistoryProducerReservationAtom)).toBeNull()
+    expect(producerFirst.setter(releaseHistoryProducerReservationAtom, reservation)).toBe(true)
+
+    const historyFirst = createStore()
+    historyFirst.setter(pushHistoryAtom, makeEntry('tx-history-first', 1))
+    const acknowledgement = deferred<HistoryMutationResult>()
+    let request: HistoryUndoRequest | null = null
+    const undo = jest.fn((nextRequest: HistoryUndoRequest) => {
+      request = nextRequest
+      return acknowledgement.promise
+    })
+    const operation = historyFirst.setter(runUndoHistoryAtom, {
+      source: { undoTransaction: undo },
+      refreshProjection: async () => {},
+    })
+
+    expect(historyFirst.setter(acquireHistoryProducerReservationAtom)).toBeNull()
+    await flushMicrotasks()
+    expect(undo).toHaveBeenCalledTimes(1)
+    acknowledgement.resolve(exactAcknowledgement(request!, 2))
+    await expect(operation).resolves.toBe('completed')
+  })
+
+  test(
+    'producer ownership blocks both history directions, local replay, clear, and capability flags',
+    async () => {
+    const store = createStore()
+    store.setter(pushHistoryAtom, {
+      transactionId: 'tx-local',
+      kind: 'viewport.freeze',
+      sheetId: 'sheet-1',
+      projectionRevision: 'local',
+      localReplay: {
+        applyKey: 'viewport.freeze',
+        sheetId: 'sheet-1',
+        before: null,
+        after: { rows: 1, cols: 0 },
+      },
+    })
+    store.setter(pushHistoryAtom, makeEntry('tx-backend', 2))
+    const undo = jest.fn(async (request: HistoryUndoRequest) => exactAcknowledgement(request, 3))
+    const redo = jest.fn(async (request: HistoryRedoRequest) => exactAcknowledgement(request, 4))
+    const source: HistoryControllerPort = { undoTransaction: undo, redoTransaction: redo }
+    await expect(
+      store.setter(runUndoHistoryAtom, { source, refreshProjection: async () => {} }),
+    ).resolves.toBe('completed')
+    expect(store.getter(canUndoAtom)).toBe(true)
+    expect(store.getter(canRedoAtom)).toBe(true)
+
+    const reservation = store.setter(acquireHistoryProducerReservationAtom)
+    if (reservation === null) throw new Error('expected producer reservation')
+    expect(store.getter(canUndoAtom)).toBe(false)
+    expect(store.getter(canRedoAtom)).toBe(false)
+    await expect(
+      store.setter(runUndoHistoryAtom, { source, refreshProjection: async () => {} }),
+    ).resolves.toBe('blocked')
+    await expect(
+      store.setter(runRedoHistoryAtom, { source, refreshProjection: async () => {} }),
+    ).resolves.toBe('blocked')
+    expect(undo).toHaveBeenCalledTimes(1)
+    expect(redo).not.toHaveBeenCalled()
+    expect(store.getter(historyStackAtom)).toMatchObject({ cursor: 1 })
+    expect(store.setter(clearHistoryAtom)).toBe(false)
+
+    expect(store.setter(releaseHistoryProducerReservationAtom, reservation)).toBe(true)
+    expect(store.getter(canUndoAtom)).toBe(true)
+    expect(store.getter(canRedoAtom)).toBe(true)
+  })
+
+  test(
+    'local replay owns the producer lane across persistence getter and synchronous method re-entry',
+    async () => {
+    const store = createStore()
+    store.setter(setFreezeConfigAtom, { sheetId: 'sheet-1', rows: 2, cols: 1 })
+    const nestedOutcomes: Array<Promise<unknown>> = []
+    const nestedPushes: boolean[] = []
+    const nestedClears: boolean[] = []
+    const nestedReservations: unknown[] = []
+    const observedCursors: number[] = []
+
+    const attemptReentry = (action: 'undo' | 'redo') => {
+      observedCursors.push(store.getter(historyStackAtom).cursor)
+      nestedPushes.push(store.setter(pushHistoryAtom, makeEntry(`tx-${action}-interloper`, 9)))
+      nestedClears.push(store.setter(clearHistoryAtom))
+      nestedReservations.push(store.setter(acquireHistoryProducerReservationAtom))
+      nestedOutcomes.push(
+        store.setter(action === 'undo' ? runUndoHistoryAtom : runRedoHistoryAtom, {
+          source: {},
+          refreshProjection: async () => {},
+        }),
+      )
+    }
+
+    const persist = jest.fn(() => {
+      attemptReentry('redo')
+      return new Promise<never>(() => {})
+    })
+    const persistenceSource = Object.defineProperty({}, 'setFreezeConfig', {
+      get() {
+        attemptReentry('undo')
+        return persist
+      },
+    }) as HistoryControllerPort
+
+    await expect(
+      store.setter(runUndoHistoryAtom, {
+        source: persistenceSource,
+        refreshProjection: async () => {
+          throw new Error('local replay must not refresh')
+        },
+      }),
+    ).resolves.toBe('completed')
+    await expect(Promise.all(nestedOutcomes)).resolves.toEqual(['blocked', 'blocked'])
+
+    expect(observedCursors).toEqual([1, 1])
+    expect(nestedPushes).toEqual([false, false])
+    expect(nestedClears).toEqual([false, false])
+    expect(nestedReservations).toEqual([null, null])
+    expect(persist).toHaveBeenCalledTimes(1)
+    expect(store.getter(historyStackAtom)).toMatchObject({ cursor: 0 })
+    expect(store.getter(historyStackAtom).entries.map((entry) => entry.transactionId)).toHaveLength(
+      1,
+    )
+    expect(store.getter(historyLifecycleAtom).status).toBe('ready')
+
+    const releasedLane = store.setter(acquireHistoryProducerReservationAtom)
+    expect(releasedLane).not.toBeNull()
+    if (releasedLane !== null) {
+      expect(store.setter(releaseHistoryProducerReservationAtom, releasedLane)).toBe(true)
+    }
+  })
+
+  test(
+    'local replay reserves the producer lane before reading the command source getter',
+    async () => {
+    const store = createStore()
+    store.setter(setFreezeConfigAtom, { sheetId: 'sheet-1', rows: 2, cols: 1 })
+    const nestedOutcomes: Array<Promise<unknown>> = []
+    const observedCanUndo: boolean[] = []
+    const nestedPushes: boolean[] = []
+    const nestedClears: boolean[] = []
+    const nestedReservations: unknown[] = []
+    let sourceReads = 0
+    const command = Object.defineProperty({ refreshProjection: async () => {} }, 'source', {
+      get() {
+        sourceReads += 1
+        observedCanUndo.push(store.getter(canUndoAtom))
+        nestedPushes.push(store.setter(pushHistoryAtom, makeEntry('tx-source-interloper', 9)))
+        nestedClears.push(store.setter(clearHistoryAtom))
+        nestedReservations.push(store.setter(acquireHistoryProducerReservationAtom))
+        nestedOutcomes.push(
+          store.setter(runUndoHistoryAtom, {
+            source: {},
+            refreshProjection: async () => {},
+          }),
+          store.setter(runRedoHistoryAtom, {
+            source: {},
+            refreshProjection: async () => {},
+          }),
+        )
+        throw new Error('command source getter failed')
+      },
+    }) as RunHistoryCommandInput
+
+    await expect(store.setter(runUndoHistoryAtom, command)).resolves.toBe('blocked')
+    await expect(Promise.all(nestedOutcomes)).resolves.toEqual(['blocked', 'blocked'])
+    expect(sourceReads).toBe(1)
+    expect(observedCanUndo).toEqual([false])
+    expect(nestedPushes).toEqual([false])
+    expect(nestedClears).toEqual([false])
+    expect(nestedReservations).toEqual([null])
+    expect(store.getter(historyStackAtom)).toMatchObject({ cursor: 1 })
+    expect(store.getter(historyLifecycleAtom)).toMatchObject({
+      status: 'blocked',
+      error: HISTORY_LOCAL_REPLAY_ERROR,
+    })
+
+    const releasedLane = store.setter(acquireHistoryProducerReservationAtom)
+    expect(releasedLane).not.toBeNull()
+    if (releasedLane !== null) {
+      expect(store.setter(releaseHistoryProducerReservationAtom, releasedLane)).toBe(true)
+    }
+  })
+
+  test('local replay releases its exact reservation when a persistence getter throws', async () => {
+    const store = createStore()
+    store.setter(setFreezeConfigAtom, { sheetId: 'sheet-1', rows: 2, cols: 1 })
+    const persistenceSource = Object.defineProperty({}, 'setFreezeConfig', {
+      get() {
+        throw new Error('persistence getter failed')
+      },
+    }) as HistoryControllerPort
+
+    await expect(
+      store.setter(runUndoHistoryAtom, {
+        source: persistenceSource,
+        refreshProjection: async () => {},
+      }),
+    ).resolves.toBe('blocked')
+    expect(store.getter(historyStackAtom)).toMatchObject({ cursor: 1 })
+    expect(store.getter(historyLifecycleAtom)).toMatchObject({
+      status: 'blocked',
+      error: HISTORY_LOCAL_REPLAY_ERROR,
+    })
+    expect(store.getter(canUndoAtom)).toBe(true)
+
+    await expect(
+      store.setter(runUndoHistoryAtom, {
+        source: {},
+        refreshProjection: async () => {},
+      }),
+    ).resolves.toBe('completed')
+    expect(store.getter(historyStackAtom).cursor).toBe(0)
+  })
+
+  test('local replay releases its reservation after synchronous persistence failure', async () => {
+    const store = createStore()
+    store.setter(setFreezeConfigAtom, { sheetId: 'sheet-1', rows: 2, cols: 1 })
+    const nestedOutcomes: Array<Promise<unknown>> = []
+    const persistenceSource = {
+      setFreezeConfig() {
+        expect(store.setter(pushHistoryAtom, makeEntry('tx-sync-interloper', 9))).toBe(false)
+        expect(store.setter(acquireHistoryProducerReservationAtom)).toBeNull()
+        nestedOutcomes.push(
+          store.setter(runUndoHistoryAtom, {
+            source: {},
+            refreshProjection: async () => {},
+          }),
+        )
+        throw new Error('synchronous persistence failure')
+      },
+    } as HistoryControllerPort
+
+    await expect(
+      store.setter(runUndoHistoryAtom, {
+        source: persistenceSource,
+        refreshProjection: async () => {},
+      }),
+    ).resolves.toBe('completed')
+    await expect(Promise.all(nestedOutcomes)).resolves.toEqual(['blocked'])
+    expect(store.getter(historyStackAtom)).toMatchObject({ cursor: 0 })
+    expect(store.getter(historyLifecycleAtom).status).toBe('ready')
+
+    await expect(
+      store.setter(runRedoHistoryAtom, {
+        source: {},
+        refreshProjection: async () => {},
+      }),
+    ).resolves.toBe('completed')
+    expect(store.getter(historyStackAtom).cursor).toBe(1)
+  })
+
+  test(
+    'local replay descriptors never replace the backend projection revision witness',
+    async () => {
+    const store = createStore()
+    expect(store.setter(pushHistoryAtom, makeEntry('tx-backend', 'backend-base'))).toBe(true)
+    expect(store.setter(setFreezeConfigAtom, { sheetId: 'sheet-1', rows: 2, cols: 1 })).toBe(
+      'committed',
+    )
+
+    await expect(
+      store.setter(runUndoHistoryAtom, {
+        source: {},
+        refreshProjection: async () => {
+          throw new Error('local replay must not refresh')
+        },
+      }),
+    ).resolves.toBe('completed')
+
+    const undo = jest.fn(async (request: HistoryUndoRequest) =>
+      exactAcknowledgement(request, 'backend-next'),
+    )
+    await expect(
+      store.setter(runUndoHistoryAtom, {
+        source: { undoTransaction: undo },
+        refreshProjection: async () => {},
+      }),
+    ).resolves.toBe('completed')
+    expect(undo).toHaveBeenCalledTimes(1)
+    expect(undo.mock.calls[0]![0]).toMatchObject({
+      transactionId: 'tx-backend',
+      revision: 'backend-base',
+    })
+  })
+
+  test('rejected fire-and-forget local persistence does not retain the producer lane', async () => {
+    const store = createStore()
+    store.setter(setFreezeConfigAtom, { sheetId: 'sheet-1', rows: 2, cols: 1 })
+    const persistenceSource = {
+      setFreezeConfig() {
+        return Promise.reject(new Error('asynchronous persistence failure'))
+      },
+    } as HistoryControllerPort
+
+    await expect(
+      store.setter(runUndoHistoryAtom, {
+        source: persistenceSource,
+        refreshProjection: async () => {},
+      }),
+    ).resolves.toBe('completed')
+    await flushMicrotasks()
+
+    const releasedLane = store.setter(acquireHistoryProducerReservationAtom)
+    expect(releasedLane).not.toBeNull()
+    if (releasedLane !== null) {
+      expect(store.setter(releaseHistoryProducerReservationAtom, releasedLane)).toBe(true)
+    }
+    expect(store.getter(historyStackAtom).cursor).toBe(0)
+  })
+
+  test('blocked ordinary push preserves the redo tail owned by an active producer', async () => {
+    const store = createStore()
+    store.setter(pushHistoryAtom, makeEntry('tx-1', 1))
+    store.setter(pushHistoryAtom, makeEntry('tx-2', 2))
+    const source: HistoryControllerPort = {
+      async undoTransaction(request) {
+        return exactAcknowledgement(request, 3)
+      },
+      async redoTransaction(request) {
+        return exactAcknowledgement(request, 4)
+      },
+    }
+    await expect(
+      store.setter(runUndoHistoryAtom, { source, refreshProjection: async () => {} }),
+    ).resolves.toBe('completed')
+
+    const reservation = store.setter(acquireHistoryProducerReservationAtom)
+    if (reservation === null) throw new Error('expected producer reservation')
+    expect(store.setter(pushHistoryAtom, makeEntry('tx-interloper', 9))).toBe(false)
+    expect(store.getter(historyStackAtom).cursor).toBe(1)
+    expect(store.getter(historyStackAtom).entries.map((entry) => entry.transactionId)).toEqual([
+      'tx-1',
+      'tx-2',
+    ])
+    expect(store.setter(releaseHistoryProducerReservationAtom, reservation)).toBe(true)
+
+    await expect(
+      store.setter(runRedoHistoryAtom, { source, refreshProjection: async () => {} }),
+    ).resolves.toBe('completed')
+    expect(store.getter(historyStackAtom).cursor).toBe(2)
+  })
+
+  test(
+    'terminal history tickets block producer acquisition even when inFlight is false',
+    async () => {
+    const outcomeUnknownStore = createStore()
+    outcomeUnknownStore.setter(pushHistoryAtom, makeEntry('tx-unknown', 1))
+    await expect(
+      outcomeUnknownStore.setter(runUndoHistoryAtom, {
+        source: {
+          async undoTransaction() {
+            throw new Error('connection lost after dispatch')
+          },
+        },
+        refreshProjection: async () => {},
+      }),
+    ).resolves.toBe('outcome-unknown')
+    expect(outcomeUnknownStore.getter(historyInFlightAtom)).toBe(false)
+    expect(outcomeUnknownStore.getter(historyLifecycleAtom).status).toBe('outcome-unknown')
+    expect(outcomeUnknownStore.setter(acquireHistoryProducerReservationAtom)).toBeNull()
+
+    const refreshFailedStore = createStore()
+    refreshFailedStore.setter(pushHistoryAtom, makeEntry('tx-refresh-failed', 1))
+    await expect(
+      refreshFailedStore.setter(runUndoHistoryAtom, {
+        source: {
+          async undoTransaction(request) {
+            return exactAcknowledgement(request, 2)
+          },
+        },
+        refreshProjection: async () => {
+          throw new Error('projection refresh failed')
+        },
+      }),
+    ).resolves.toBe('refresh-failed')
+    expect(refreshFailedStore.getter(historyInFlightAtom)).toBe(false)
+    expect(refreshFailedStore.getter(historyLifecycleAtom).status).toBe('refresh-failed')
+    expect(refreshFailedStore.setter(acquireHistoryProducerReservationAtom)).toBeNull()
   })
 
   test('publishes a frozen ticket before transport and does not move cursor before exact ACK', async () => {
@@ -241,6 +795,100 @@ describe('history Core lifecycle', () => {
     expect(store.getter(historyLifecycleAtom)).toBe(initialLifecycle)
   })
 
+  test(
+    'freezes command ports under one-read getters and executes through the captured receiver',
+    async () => {
+    const store = createStore()
+    store.setter(pushHistoryAtom, makeEntry('tx-1', 1))
+    const reads = {
+      source: 0,
+      capability: 0,
+      refreshProjection: 0,
+      timeoutMs: 0,
+    }
+    const nestedPushes: boolean[] = []
+    const attemptReentry = () => {
+      nestedPushes.push(store.setter(pushHistoryAtom, makeEntry('tx-interloper', 9)))
+    }
+    let receiver: unknown
+    function execute(this: object, request: HistoryUndoRequest): Promise<HistoryMutationResult> {
+      receiver = this
+      return Promise.resolve(exactAcknowledgement(request, 2))
+    }
+    const source = Object.defineProperty({}, 'undoTransaction', {
+      get() {
+        reads.capability += 1
+        attemptReentry()
+        return execute
+      },
+    }) as HistoryControllerPort
+    const refresh = jest.fn(async () => {})
+    const command = Object.defineProperties(
+      {},
+      {
+        source: {
+          get() {
+            reads.source += 1
+            attemptReentry()
+            return source
+          },
+        },
+        refreshProjection: {
+          get() {
+            reads.refreshProjection += 1
+            attemptReentry()
+            return refresh
+          },
+        },
+        timeoutMs: {
+          get() {
+            reads.timeoutMs += 1
+            attemptReentry()
+            return 100
+          },
+        },
+      },
+    ) as RunHistoryCommandInput
+
+    await expect(store.setter(runUndoHistoryAtom, command)).resolves.toBe('completed')
+    expect(reads).toEqual({
+      source: 1,
+      capability: 1,
+      refreshProjection: 1,
+      timeoutMs: 1,
+    })
+    expect(nestedPushes).toEqual([false, false, false, false])
+    expect(receiver).toBe(source)
+    expect(refresh).toHaveBeenCalledTimes(1)
+    expect(store.getter(historyStackAtom).cursor).toBe(0)
+  })
+
+  test('invalid command timeouts normalize once to the positive finite default', async () => {
+    const timeoutSpy = jest.spyOn(globalThis, 'setTimeout')
+    try {
+      for (const timeoutMs of [0, -1, Number.NaN, Number.POSITIVE_INFINITY]) {
+        const store = createStore()
+        store.setter(pushHistoryAtom, makeEntry('tx-1', 1))
+        await expect(
+          store.setter(runUndoHistoryAtom, {
+            source: {
+              async undoTransaction(request) {
+                return exactAcknowledgement(request, 2)
+              },
+            },
+            refreshProjection: async () => {},
+            timeoutMs,
+          }),
+        ).resolves.toBe('completed')
+      }
+      expect(timeoutSpy.mock.calls.map((call) => call[1])).toEqual(
+        Array(8).fill(DEFAULT_HISTORY_TIMEOUT_MS),
+      )
+    } finally {
+      timeoutSpy.mockRestore()
+    }
+  })
+
   test('same-lane re-entry and duplicate dispatch are blocked before transport settles', async () => {
     const store = createStore()
     store.setter(pushHistoryAtom, makeEntry('tx-1', 1))
@@ -306,6 +954,146 @@ describe('history Core lifecycle', () => {
     expect(store.getter(canUndoAtom)).toBe(false)
     await expect(store.setter(runUndoHistoryAtom, input)).resolves.toBe('blocked')
     expect(undo).toHaveBeenCalledTimes(1)
+  })
+
+  test(
+    'strict ACK snapshots every field once and blocks getter re-entry before commit',
+    async () => {
+    const store = createStore()
+    store.setter(pushHistoryAtom, makeEntry('tx-1', 1))
+    const reads = {
+      transactionId: 0,
+      requestId: 0,
+      revision: 0,
+      applied: 0,
+      notAppliedReason: 0,
+    }
+    const nestedOutcomes: Array<Promise<unknown>> = []
+    const nestedPushes: boolean[] = []
+    const nestedReservations: unknown[] = []
+    const source: HistoryControllerPort = {
+      async undoTransaction(request) {
+        return Object.defineProperties(
+          {},
+          {
+            transactionId: {
+              get() {
+                reads.transactionId += 1
+                nestedPushes.push(store.setter(pushHistoryAtom, makeEntry('tx-interloper', 9)))
+                nestedReservations.push(store.setter(acquireHistoryProducerReservationAtom))
+                nestedOutcomes.push(
+                  store.setter(runUndoHistoryAtom, {
+                    source,
+                    refreshProjection: async () => {},
+                  }),
+                )
+                return request.transactionId
+              },
+            },
+            requestId: {
+              get() {
+                reads.requestId += 1
+                return request.requestId
+              },
+            },
+            revision: {
+              get() {
+                reads.revision += 1
+                return 2
+              },
+            },
+            applied: {
+              get() {
+                reads.applied += 1
+                return true
+              },
+            },
+            notAppliedReason: {
+              get() {
+                reads.notAppliedReason += 1
+                return undefined
+              },
+            },
+          },
+        ) as HistoryMutationResult
+      },
+    }
+
+    await expect(
+      store.setter(runUndoHistoryAtom, { source, refreshProjection: async () => {} }),
+    ).resolves.toBe('completed')
+    await expect(Promise.all(nestedOutcomes)).resolves.toEqual(['blocked'])
+    expect(reads).toEqual({
+      transactionId: 1,
+      requestId: 1,
+      revision: 1,
+      applied: 1,
+      notAppliedReason: 1,
+    })
+    expect(nestedPushes).toEqual([false])
+    expect(nestedReservations).toEqual([null])
+    expect(store.getter(historyStackAtom).cursor).toBe(0)
+  })
+
+  test(
+    'a throwing ACK field is malformed, but every classifier field is still observed once',
+    async () => {
+    const store = createStore()
+    store.setter(pushHistoryAtom, makeEntry('tx-1', 1))
+    const reads = new Map<string, number>()
+    const count = (key: string) => reads.set(key, (reads.get(key) ?? 0) + 1)
+    const source: HistoryControllerPort = {
+      async undoTransaction(request) {
+        return Object.defineProperties(
+          {},
+          {
+            transactionId: {
+              get() {
+                count('transactionId')
+                return request.transactionId
+              },
+            },
+            requestId: {
+              get() {
+                count('requestId')
+                throw new Error('hostile ACK')
+              },
+            },
+            revision: {
+              get() {
+                count('revision')
+                return 2
+              },
+            },
+            applied: {
+              get() {
+                count('applied')
+                return true
+              },
+            },
+            notAppliedReason: {
+              get() {
+                count('notAppliedReason')
+                return undefined
+              },
+            },
+          },
+        ) as HistoryMutationResult
+      },
+    }
+
+    await expect(
+      store.setter(runUndoHistoryAtom, { source, refreshProjection: async () => {} }),
+    ).resolves.toBe('outcome-unknown')
+    expect(Object.fromEntries(reads)).toEqual({
+      transactionId: 1,
+      requestId: 1,
+      revision: 1,
+      applied: 1,
+      notAppliedReason: 1,
+    })
+    expect(store.getter(historyStackAtom).cursor).toBe(1)
+    expect(store.getter(canUndoAtom)).toBe(false)
   })
 
   test('transport rejection becomes OutcomeUnknown and never resends the mutation', async () => {
@@ -397,32 +1185,83 @@ describe('history Core lifecycle', () => {
     expect(undo).toHaveBeenCalledTimes(1)
 
     const retryRefresh = jest.fn(async () => {})
+    let replacement: Promise<unknown> | null = null
+    const unsubscribe = store.sub(canRedoAtom, () => {
+      if (replacement !== null || !store.getter(canRedoAtom)) return
+      replacement = store.setter(runRedoHistoryAtom, {
+        source,
+        refreshProjection: async () => {},
+      })
+    })
     await expect(
       store.setter(retryHistoryRefreshAtom, { refreshProjection: retryRefresh }),
     ).resolves.toBe('completed')
     expect(retryRefresh).toHaveBeenCalledTimes(1)
     expect(undo).toHaveBeenCalledTimes(1)
+    expect(replacement).not.toBeNull()
+    await expect(replacement!).resolves.toBe('completed')
+    unsubscribe()
     expect(store.getter(historyLifecycleAtom).status).toBe('ready')
-    expect(store.getter(canRedoAtom)).toBe(true)
-
-    await expect(
-      store.setter(runRedoHistoryAtom, { source, refreshProjection: async () => {} }),
-    ).resolves.toBe('completed')
     expect(redo).toHaveBeenCalledTimes(1)
     expect(redo.mock.calls[0]![0]).toMatchObject({ revision: 2 })
     expect(store.getter(historyStackAtom).cursor).toBe(1)
   })
 
-  test('refresh timeout is RefreshFailed, not OutcomeUnknown, and retry never calls transport', async () => {
+  test(
+    'retry snapshots the failed ticket before getters and rejects getter-driven replacement',
+    async () => {
+    const store = createStore()
+    store.setter(pushHistoryAtom, makeEntry('tx-1', 1))
+    const undo = jest.fn(async (request: HistoryUndoRequest) => exactAcknowledgement(request, 2))
+    await expect(
+      store.setter(runUndoHistoryAtom, {
+        source: { undoTransaction: undo },
+        refreshProjection: async () => {
+          throw new Error('first refresh failed')
+        },
+      }),
+    ).resolves.toBe('refresh-failed')
+
+    const nestedRefresh = jest.fn(async () => {})
+    const outerRefresh = jest.fn(async () => {})
+    let nestedOperation: Promise<unknown> | null = null
+    let refreshGetterReads = 0
+    const hostileRetry = Object.defineProperty({}, 'refreshProjection', {
+      get() {
+        refreshGetterReads += 1
+        nestedOperation = store.setter(retryHistoryRefreshAtom, {
+          refreshProjection: nestedRefresh,
+        })
+        return outerRefresh
+      },
+    })
+
+    await expect(
+      store.setter(retryHistoryRefreshAtom, hostileRetry as RunHistoryCommandInput),
+    ).resolves.toBe('blocked')
+    expect(nestedOperation).not.toBeNull()
+    await expect(nestedOperation!).resolves.toBe('completed')
+    expect(refreshGetterReads).toBe(1)
+    expect(outerRefresh).not.toHaveBeenCalled()
+    expect(nestedRefresh).toHaveBeenCalledTimes(1)
+    expect(undo).toHaveBeenCalledTimes(1)
+    expect(store.getter(historyLifecycleAtom).status).toBe('ready')
+    expect(store.getter(canRedoAtom)).toBe(true)
+  })
+
+  test(
+    'refresh timeout retains a refresh-only ticket and late completion is inert after retry',
+    async () => {
     const store = createStore()
     store.setter(pushHistoryAtom, makeEntry('tx-1', 1))
     const undo = jest.fn(async (request: HistoryUndoRequest) => exactAcknowledgement(request, 2))
     const source: HistoryControllerPort = { undoTransaction: undo }
+    const lateRefresh = deferred<void>()
 
     await expect(
       store.setter(runUndoHistoryAtom, {
         source,
-        refreshProjection: () => new Promise<void>(() => {}),
+        refreshProjection: () => lateRefresh.promise,
         timeoutMs: 1,
       }),
     ).resolves.toBe('refresh-failed')
@@ -433,6 +1272,48 @@ describe('history Core lifecycle', () => {
       store.setter(retryHistoryRefreshAtom, { refreshProjection: async () => {} }),
     ).resolves.toBe('completed')
     expect(undo).toHaveBeenCalledTimes(1)
+    lateRefresh.resolve()
+    await flushMicrotasks()
+    expect(store.getter(historyLifecycleAtom).status).toBe('ready')
+    expect(store.getter(historyStackAtom).cursor).toBe(0)
+  })
+
+  test(
+    'successful finalization clears its ticket last so a subscriber replacement survives',
+    async () => {
+    const store = createStore()
+    store.setter(pushHistoryAtom, makeEntry('tx-1', 1))
+    const undo = jest.fn(async (request: HistoryUndoRequest) => exactAcknowledgement(request, 2))
+    const redo = jest.fn(async (request: HistoryRedoRequest) => exactAcknowledgement(request, 3))
+    const source: HistoryControllerPort = { undoTransaction: undo, redoTransaction: redo }
+    let replacementStarted = false
+    let replacement: Promise<unknown> | null = null
+    const unsubscribe = store.sub(canRedoAtom, () => {
+      if (replacementStarted || !store.getter(canRedoAtom)) return
+      replacementStarted = true
+      replacement = store.setter(runRedoHistoryAtom, {
+        source,
+        refreshProjection: async () => {},
+      })
+    })
+
+    await expect(
+      store.setter(runUndoHistoryAtom, {
+        source,
+        refreshProjection: async () => {},
+      }),
+    ).resolves.toBe('completed')
+    expect(replacementStarted).toBe(true)
+    expect(replacement).not.toBeNull()
+    await expect(replacement!).resolves.toBe('completed')
+    unsubscribe()
+
+    expect(undo).toHaveBeenCalledTimes(1)
+    expect(redo).toHaveBeenCalledTimes(1)
+    expect(redo.mock.calls[0]![0]).toMatchObject({ revision: 2 })
+    expect(store.getter(historyStackAtom).cursor).toBe(1)
+    expect(store.getter(historyLifecycleAtom).status).toBe('ready')
+    expect(store.getter(canUndoAtom)).toBe(true)
   })
 
   test('missing capability blocks without consuming the entry and a valid later port may proceed', async () => {

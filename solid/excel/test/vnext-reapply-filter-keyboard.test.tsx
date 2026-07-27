@@ -85,6 +85,7 @@ function createBackend(opts: {
         sheetId: request.sheetId,
         requestId: request.requestId,
         revision: 3,
+        historyRecorded: false,
         hiddenRowIndices: [2, 5],
       }
     }

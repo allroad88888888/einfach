@@ -11,9 +11,9 @@ import type { CellCoord, CellRange } from '../shared'
  * Unified content-mutation gateway.
  *
  * Every content mutation (set-cell-input, clear-range, fill-range,
- * fill-series, paste-range, import-cell-chunks) and every format write
- * (set-format-range) resolves through this module before any transport is
- * launched:
+ * fill-series, paste-range, import-cell-chunks, remove-rows) and every
+ * format write (set-format-range) resolves through this module before any
+ * transport is launched:
  *
  * 1. Target validity. Coordinates must be safe non-negative integers and
  *    ranges must be non-inverted, else `invalid-target`.
@@ -41,6 +41,7 @@ export type ContentMutationKind =
   | 'fill-series'
   | 'paste-range'
   | 'import-cell-chunks'
+  | 'remove-rows'
   | 'set-format-range'
 
 export interface ResolveContentMutationCellInput {

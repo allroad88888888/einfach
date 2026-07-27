@@ -6,14 +6,27 @@ import type {
   RangeProjectionRequest,
   RangeProjectionResult,
 } from '../src/backend/types'
-import { historyStackAtom } from '../src/history'
+import { contentMutationLastBlockAtom } from '../src/editing/mutation-gateway'
+import {
+  acquireHistoryProducerReservationAtom,
+  historyStackAtom,
+  pushReservedHistoryAtom,
+  releaseHistoryProducerReservationAtom,
+  type HistoryProducerReservation,
+} from '../src/history'
+import { setSheetProtectionAtom } from '../src/protection'
 import { selectionAtom } from '../src/selection'
+import type { CellRange } from '../src/shared'
 import {
   getFilterHiddenRowsForSheet,
   setViewportFilterHiddenRowsAtom,
   viewportFilterHiddenAtom,
 } from '../src/viewport/effective-hidden'
-import { setFreezeConfigAtom, viewportFreezeAtom } from '../src/viewport/freeze'
+import {
+  applyViewportFreezeStructuralShiftAtom,
+  setFreezeConfigAtom,
+  viewportFreezeAtom,
+} from '../src/viewport/freeze'
 import { hideRowsAtom, viewportHiddenAtom } from '../src/viewport/hidden'
 import {
   setWorkspaceActiveSheetAtom,
@@ -21,12 +34,14 @@ import {
 } from '../src/workspace'
 import {
   closeRemoveDuplicatesAtom,
+  DEFAULT_REMOVE_DUPLICATES_TIMEOUT_MS,
   dispatchRemoveDuplicatesIntentAtom,
   findDuplicateRows,
   nextRemoveDuplicatesMutationRequestId,
   nextRemoveDuplicatesReadRequestId,
   nextRemoveDuplicatesSessionId,
   openRemoveDuplicatesFromSelectionAtom,
+  REMOVE_DUPLICATES_HISTORY_BUSY_ERROR,
   removeDuplicatesCanCloseAtom,
   removeDuplicatesCanConfirmAtom,
   removeDuplicatesComparisonAtom,
@@ -39,16 +54,16 @@ import {
   removeDuplicatesOpenAtom,
   removeDuplicatesPreviewAtom,
   removeDuplicatesReadRequestIdAtom,
-  removeDuplicatesRangeAtom,
-  removeDuplicatesScanInputCellsAtom,
   removeDuplicatesSessionAtom,
   removeDuplicatesSessionIdAtom,
   retryRemoveDuplicatesReadAtom,
   runRemoveDuplicatesConfirmAtom,
+  type OpenRemoveDuplicatesInput,
   type RemoveDuplicatesControllerPort,
   type RemoveDuplicatesRange,
   type RemoveRowsExactRequest,
   type RemoveRowsExactResult,
+  type RunRemoveDuplicatesConfirmInput,
 } from '../src/remove-duplicates'
 
 function cell(
@@ -478,7 +493,7 @@ function rangeAcknowledgement(
 
 function mutationAcknowledgement(
   request: RemoveRowsExactRequest,
-  revision = 2,
+  revision: number | string = 2,
 ): RemoveRowsExactResult {
   return {
     requestId: request.requestId,
@@ -517,6 +532,13 @@ function selectRegionColumnOnly(store: Store): void {
     }),
   ).toBe(true)
   expect(store.getter(removeDuplicatesPreviewAtom)?.duplicateRows).toEqual([3])
+}
+
+function expectHistoryLaneAvailable(store: Store): void {
+  const reservation = store.setter(acquireHistoryProducerReservationAtom)
+  expect(reservation).not.toBeNull()
+  if (reservation === null) throw new Error('expected history producer reservation')
+  expect(store.setter(releaseHistoryProducerReservationAtom, reservation)).toBe(true)
 }
 
 describe('remove-duplicates Core lifecycle', () => {
@@ -567,6 +589,205 @@ describe('remove-duplicates Core lifecycle', () => {
     expect((columns as unknown as { add?: unknown }).add).toBeUndefined()
   })
 
+  test(
+    'captures read input and source ports exactly once, preserving receiver and frozen request',
+    async () => {
+    const store = createStore()
+    seedSelection(store)
+    const reads = new Map<string, number>()
+    const count: (key: string) => void = (key) => reads.set(key, (reads.get(key) ?? 0) + 1)
+    const source: RemoveDuplicatesControllerPort = {} as RemoveDuplicatesControllerPort
+    const execute: NonNullable<RemoveDuplicatesControllerPort['readRangeProjection']> = function (
+      this: RemoveDuplicatesControllerPort,
+      request,
+    ) {
+      expect(this).toBe(source)
+      expect(Object.isFrozen(request)).toBe(true)
+      expect(Object.isFrozen(request.range)).toBe(true)
+      expect(request).toMatchObject({
+        kind: 'range',
+        sheetId: SHEET_ID,
+        range: SELECTION_RANGE,
+        reason: 'selection',
+      })
+      return Promise.resolve(rangeAcknowledgement(request))
+    }
+    Object.defineProperties(source, {
+      readRangeProjection: {
+        get() {
+          count('source.readRangeProjection')
+          return execute
+        },
+      },
+      removeRowsExact: {
+        get() {
+          count('source.removeRowsExact')
+          return undefined
+        },
+      },
+    })
+    const input = Object.defineProperties(
+      {},
+      {
+        source: {
+          get() {
+            count('input.source')
+            return source
+          },
+        },
+        sheetId: {
+          get() {
+            count('input.sheetId')
+            return SHEET_ID
+          },
+        },
+        timeoutMs: {
+          get() {
+            count('input.timeoutMs')
+            return 1234
+          },
+        },
+      },
+    ) as OpenRemoveDuplicatesInput
+
+    await expect(store.setter(openRemoveDuplicatesFromSelectionAtom, input)).resolves.toBe(
+      'editing',
+    )
+
+    for (const key of [
+      'input.source',
+      'input.sheetId',
+      'input.timeoutMs',
+      'source.readRangeProjection',
+      'source.removeRowsExact',
+    ]) {
+      expect(reads.get(key)).toBe(1)
+    }
+  })
+
+  test.each(['source', 'sheetId', 'timeoutMs', 'readRangeProjection', 'removeRowsExact'] as const)(
+    'a throwing read capture getter for %s fails closed before transport',
+    async (field) => {
+      const store = createStore()
+      seedSelection(store)
+      const transport = jest.fn(async (request: RangeProjectionRequest) =>
+        rangeAcknowledgement(request),
+      )
+      const source = new Proxy<RemoveDuplicatesControllerPort>(
+        { readRangeProjection: transport },
+        {
+          get(target, property, receiver) {
+            if (property === field) throw new Error(`hostile ${field} getter`)
+            return Reflect.get(target, property, receiver)
+          },
+        },
+      )
+      const input = new Proxy<OpenRemoveDuplicatesInput>(
+        { source, sheetId: SHEET_ID, timeoutMs: 25 },
+        {
+          get(target, property, receiver) {
+            if (property === field) throw new Error(`hostile ${field} getter`)
+            return Reflect.get(target, property, receiver)
+          },
+        },
+      )
+
+      await expect(store.setter(openRemoveDuplicatesFromSelectionAtom, input)).resolves.toBe(
+        'failed',
+      )
+
+      expect(transport).not.toHaveBeenCalled()
+      expect(store.getter(removeDuplicatesLifecycleAtom).status).toBe('read-failed')
+      expect(store.getter(removeDuplicatesSessionAtom)).toBeNull()
+      expect(store.getter(removeDuplicatesReadRequestIdAtom)).toBe(0)
+    },
+  )
+
+  test(
+    'read input getter re-entry gives the published inner owner precedence without outer clobber',
+    async () => {
+    const store = createStore()
+    seedSelection(store)
+    const innerTransport = jest.fn(async (request: RangeProjectionRequest) =>
+      rangeAcknowledgement(request),
+    )
+    const outerTransport = jest.fn(async (request: RangeProjectionRequest) =>
+      rangeAcknowledgement(request),
+    )
+    const innerSource: RemoveDuplicatesControllerPort = {
+      readRangeProjection: innerTransport,
+    }
+    const outerSource: RemoveDuplicatesControllerPort = {
+      readRangeProjection: outerTransport,
+    }
+    let innerOpening: Promise<unknown> | undefined
+    let sourceReads = 0
+    const outerInput = Object.defineProperties(
+      {},
+      {
+        source: {
+          get() {
+            sourceReads += 1
+            innerOpening = store.setter(openRemoveDuplicatesFromSelectionAtom, {
+              source: innerSource,
+            })
+            return outerSource
+          },
+        },
+      },
+    ) as OpenRemoveDuplicatesInput
+
+    await expect(store.setter(openRemoveDuplicatesFromSelectionAtom, outerInput)).resolves.toBe(
+      'blocked',
+    )
+    expect(innerOpening).toBeDefined()
+    await expect(innerOpening!).resolves.toBe('editing')
+
+    expect(sourceReads).toBe(1)
+    expect(innerTransport).toHaveBeenCalledTimes(1)
+    expect(outerTransport).not.toHaveBeenCalled()
+    expect(store.getter(removeDuplicatesLifecycleAtom).status).toBe('editing')
+    expect(store.getter(removeDuplicatesErrorAtom)).toBe('')
+  })
+
+  test('read timeout clears its ticket and ignores a late exact acknowledgement', async () => {
+    jest.useFakeTimers()
+    try {
+      const store = createStore()
+      seedSelection(store)
+      const read = deferred<RangeProjectionResult>()
+      let request!: RangeProjectionRequest
+      const opening = store.setter(openRemoveDuplicatesFromSelectionAtom, {
+        source: {
+          readRangeProjection(nextRequest) {
+            request = nextRequest
+            return read.promise
+          },
+        },
+        timeoutMs: 25,
+      })
+      await Promise.resolve()
+      expect(request).toBeDefined()
+
+      jest.advanceTimersByTime(25)
+      await expect(opening).resolves.toBe('failed')
+      const lifecycleAfterTimeout = store.getter(removeDuplicatesLifecycleAtom)
+      const errorAfterTimeout = store.getter(removeDuplicatesErrorAtom)
+      expect(lifecycleAfterTimeout.status).toBe('read-failed')
+      expect(errorAfterTimeout).toContain('timed out')
+
+      read.resolve(rangeAcknowledgement(request))
+      await Promise.resolve()
+      await Promise.resolve()
+
+      expect(store.getter(removeDuplicatesLifecycleAtom)).toBe(lifecycleAfterTimeout)
+      expect(store.getter(removeDuplicatesErrorAtom)).toBe(errorAfterTimeout)
+      expect(store.getter(removeDuplicatesSessionAtom)).toBeNull()
+    } finally {
+      jest.useRealTimers()
+    }
+  })
+
   test('accepts a matching optional legacy sheet witness without using it as authority', async () => {
     const store = createStore()
     seedSelection(store)
@@ -607,6 +828,176 @@ describe('remove-duplicates Core lifecycle', () => {
     expect(store.getter(removeDuplicatesSessionAtom)?.cells).toEqual(sparseCells)
   })
 
+  test(
+    'snapshots a hostile stateful projection graph exactly ' +
+      'once and stores only detached functional fields',
+    async () => {
+    const store = createStore()
+    seedSelection(store)
+    const reads = new Map<string, number>()
+    const tracked = <Value extends object>(value: Value, prefix: string): Value =>
+      new Proxy(value, {
+        get(target, property, receiver) {
+          if (typeof property === 'string' && property !== 'then') {
+            if (property === 'formula') {
+              throw new Error('non-functional cell fields must not be read')
+            }
+            const key = `${prefix}.${property}`
+            const count = (reads.get(key) ?? 0) + 1
+            reads.set(key, count)
+            if (count > 1) throw new Error(`${key} was read more than once`)
+          }
+          return Reflect.get(target, property, receiver)
+        },
+      })
+    const source: RemoveDuplicatesControllerPort = {
+      async readRangeProjection(request) {
+        const cells = tracked(
+          [
+            tracked(
+              {
+                row: 0,
+                col: 0,
+                displayValue: 'Region',
+                valueKind: 'string' as const,
+                formula: '=SHOULD_NOT_BE_READ()',
+              },
+              'cell[0]',
+            ),
+            tracked(
+              {
+                row: 1,
+                col: 0,
+                displayValue: 'North',
+                valueKind: undefined,
+              },
+              'cell[1]',
+            ),
+          ],
+          'cells',
+        )
+        return tracked(
+          {
+            kind: 'range' as const,
+            requestId: request.requestId,
+            sheetId: request.sheetId,
+            range: tracked({ ...request.range }, 'range'),
+            revision: 'opaque-r1',
+            truncated: false,
+            cells,
+          },
+          'acknowledgement',
+        )
+      },
+    }
+
+    await expect(store.setter(openRemoveDuplicatesFromSelectionAtom, { source })).resolves.toBe(
+      'editing',
+    )
+
+    const session = store.getter(removeDuplicatesSessionAtom)
+    expect(session).not.toBeNull()
+    expect(session?.projectionRevision).toBe('opaque-r1')
+    expect(session?.cells).toEqual([
+      { row: 0, col: 0, displayValue: 'Region', valueKind: 'string' },
+      { row: 1, col: 0, displayValue: 'North' },
+    ])
+    expect(Object.isFrozen(session?.cells)).toBe(true)
+    expect(Object.isFrozen(session?.cells[0])).toBe(true)
+    expect('formula' in session!.cells[0]).toBe(false)
+    expect(store.getter(removeDuplicatesPreviewAtom)).not.toBeNull()
+
+    for (const field of [
+      'kind',
+      'requestId',
+      'sheetId',
+      'range',
+      'revision',
+      'truncated',
+      'cells',
+    ]) {
+      expect(reads.get(`acknowledgement.${field}`)).toBe(1)
+    }
+    for (const field of ['rowStart', 'rowEnd', 'colStart', 'colEnd']) {
+      expect(reads.get(`range.${field}`)).toBe(1)
+    }
+    expect(reads.get('cells.length')).toBe(1)
+    for (const index of [0, 1]) {
+      expect(reads.get(`cells.${index}`)).toBe(1)
+      for (const field of ['row', 'col', 'displayValue', 'valueKind']) {
+        expect(reads.get(`cell[${index}].${field}`)).toBe(1)
+      }
+    }
+    expect(reads.get('cell[0].formula')).toBeUndefined()
+  })
+
+  test(
+    'snapshots the first value from a stateful acknowledgement accessor exactly once',
+    async () => {
+    const store = createStore()
+    seedSelection(store)
+    let revisionReads = 0
+    const source: RemoveDuplicatesControllerPort = {
+      async readRangeProjection(request) {
+        return {
+          ...rangeAcknowledgement(request, []),
+          get revision() {
+            revisionReads += 1
+            return revisionReads === 1 ? 'first-revision' : 'changed-revision'
+          },
+        }
+      },
+    }
+
+    await expect(store.setter(openRemoveDuplicatesFromSelectionAtom, { source })).resolves.toBe(
+      'editing',
+    )
+
+    expect(revisionReads).toBe(1)
+    expect(store.getter(removeDuplicatesSessionAtom)?.projectionRevision).toBe('first-revision')
+  })
+
+  test(
+    'a hostile read acknowledgement getter cannot clobber a replacement read owner',
+    async () => {
+    const store = createStore()
+    seedSelection(store)
+    const replacementTransport = jest.fn(async (request: RangeProjectionRequest) =>
+      rangeAcknowledgement(request, [], 'replacement-revision'),
+    )
+    let replacementOpening: Promise<unknown> | undefined
+    let revisionReads = 0
+    const firstSource: RemoveDuplicatesControllerPort = {
+      async readRangeProjection(request) {
+        return {
+          ...rangeAcknowledgement(request, []),
+          get revision() {
+            revisionReads += 1
+            expect(store.setter(closeRemoveDuplicatesAtom)).toBe(true)
+            replacementOpening = store.setter(openRemoveDuplicatesFromSelectionAtom, {
+              source: { readRangeProjection: replacementTransport },
+            })
+            return 'superseded-revision'
+          },
+        }
+      },
+    }
+
+    await expect(
+      store.setter(openRemoveDuplicatesFromSelectionAtom, { source: firstSource }),
+    ).resolves.toBe('stale')
+    expect(replacementOpening).toBeDefined()
+    await expect(replacementOpening!).resolves.toBe('editing')
+
+    expect(revisionReads).toBe(1)
+    expect(replacementTransport).toHaveBeenCalledTimes(1)
+    expect(store.getter(removeDuplicatesLifecycleAtom).status).toBe('editing')
+    expect(store.getter(removeDuplicatesSessionAtom)?.projectionRevision).toBe(
+      'replacement-revision',
+    )
+    expect(store.getter(removeDuplicatesErrorAtom)).toBe('')
+  })
+
   test.each(['optional-sheet-witness', 'selection-sheet', 'workspace-sheet'] as const)(
     'rejects mismatched %s authority before launching a read transport',
     async (mismatch) => {
@@ -645,6 +1036,25 @@ describe('remove-duplicates Core lifecycle', () => {
       name: 'duplicate visual coordinate',
       cells: [...SESSION_CELLS, cell(1, 0, 'duplicate-coordinate')],
     },
+    {
+      name: 'row outside the requested range',
+      cells: [cell(SELECTION_RANGE.rowEnd + 1, 0, 'outside')],
+    },
+    {
+      name: 'column outside the requested range',
+      cells: [cell(0, SELECTION_RANGE.colEnd + 1, 'outside')],
+    },
+    {
+      name: 'unsupported valueKind',
+      cells: [
+        {
+          row: 0,
+          col: 0,
+          displayValue: 'invalid-kind',
+          valueKind: 'date',
+        } as unknown as DisplayCell,
+      ],
+    },
   ])('rejects a malformed projection with $name', async ({ cells }) => {
     const store = createStore()
     seedSelection(store)
@@ -662,6 +1072,118 @@ describe('remove-duplicates Core lifecycle', () => {
     expect(store.getter(removeDuplicatesLifecycleAtom).status).toBe('read-failed')
     expect(store.getter(removeDuplicatesSessionAtom)).toBeNull()
   })
+
+  test('structural failure wins over a simultaneous request identity mismatch', async () => {
+    const store = createStore()
+    seedSelection(store)
+
+    await expect(
+      store.setter(openRemoveDuplicatesFromSelectionAtom, {
+        source: {
+          async readRangeProjection(request) {
+            return {
+              ...rangeAcknowledgement(request, [cell(0, 0, 'first'), cell(0, 0, 'duplicate')]),
+              requestId: request.requestId + 1,
+            }
+          },
+        },
+      }),
+    ).resolves.toBe('failed')
+
+    expect(store.getter(removeDuplicatesLifecycleAtom).status).toBe('read-failed')
+    expect(store.getter(removeDuplicatesSessionAtom)).toBeNull()
+  })
+
+  test.each([
+    {
+      name: 'request identity',
+      change: (result: RangeProjectionResult): RangeProjectionResult => ({
+        ...result,
+        requestId: result.requestId + 1,
+      }),
+    },
+    {
+      name: 'sheet identity',
+      change: (result: RangeProjectionResult): RangeProjectionResult => ({
+        ...result,
+        sheetId: 'sheet-2',
+      }),
+    },
+    {
+      name: 'exact range',
+      change: (result: RangeProjectionResult): RangeProjectionResult => ({
+        ...result,
+        range: { ...result.range, rowStart: result.range.rowStart + 1 },
+      }),
+    },
+  ])('classifies a valid $name mismatch as stale', async ({ change }) => {
+    const store = createStore()
+    seedSelection(store)
+
+    await expect(
+      store.setter(openRemoveDuplicatesFromSelectionAtom, {
+        source: {
+          async readRangeProjection(request) {
+            return change(rangeAcknowledgement(request))
+          },
+        },
+      }),
+    ).resolves.toBe('stale')
+
+    expect(store.getter(removeDuplicatesLifecycleAtom).status).toBe('read-stale')
+    expect(store.getter(removeDuplicatesSessionAtom)).toBeNull()
+  })
+
+  test.each(['top-level revision', 'range rowStart', 'cells length', 'cell displayValue'] as const)(
+    'a throwing caller-owned %s getter fails closed without leaking the exception',
+    async (throwAt) => {
+      const store = createStore()
+      seedSelection(store)
+      const throwOn = <Value extends object>(value: Value, propertyToThrow: PropertyKey): Value =>
+        new Proxy(value, {
+          get(target, property, receiver) {
+            if (property === propertyToThrow) throw new Error(`hostile ${String(property)} getter`)
+            return Reflect.get(target, property, receiver)
+          },
+        })
+      const source: RemoveDuplicatesControllerPort = {
+        async readRangeProjection(request) {
+          const rangeValue =
+            throwAt === 'range rowStart'
+              ? throwOn({ ...request.range }, 'rowStart')
+              : { ...request.range }
+          const cellValue =
+            throwAt === 'cell displayValue'
+              ? throwOn(cell(0, 0, 'Region'), 'displayValue')
+              : cell(0, 0, 'Region')
+          const cellsValue =
+            throwAt === 'cells length' ? throwOn([cellValue], 'length') : [cellValue]
+          const result = {
+            kind: 'range' as const,
+            requestId: request.requestId,
+            sheetId: request.sheetId,
+            range: rangeValue,
+            revision: 1,
+            truncated: false,
+            cells: cellsValue,
+          }
+          return (
+            throwAt === 'top-level revision' ? throwOn(result, 'revision') : result
+          ) as RangeProjectionResult
+        },
+      }
+
+      await expect(store.setter(openRemoveDuplicatesFromSelectionAtom, { source })).resolves.toBe(
+        'failed',
+      )
+      expect(store.getter(removeDuplicatesLifecycleAtom).status).toBe('read-failed')
+      expect(store.getter(removeDuplicatesSessionAtom)).toBeNull()
+      expect(store.getter(removeDuplicatesOpenAtom)).toBe(true)
+      expect(store.getter(removeDuplicatesErrorAtom)).toBe(
+        'Remove Duplicates could not load a complete projection for the selected range.',
+      )
+    },
+  )
 
   test('selection drift makes a late exact read stale and close invalidates late responses', async () => {
     const store = createStore()
@@ -879,7 +1401,443 @@ describe('remove-duplicates Core lifecycle', () => {
     expect(store.getter(removeDuplicatesLifecycleAtom).status).toBe('read-stale')
   })
 
-  test('same-tick confirm is single-flight, freezes the full target, records once, refreshes, then closes', async () => {
+  test(
+    'captures confirm input and mutation port exactly once, preserving receiver and frozen request',
+    async () => {
+    const store = createStore()
+    const hydrationSource: RemoveDuplicatesControllerPort = {
+      async readRangeProjection(request) {
+        return rangeAcknowledgement(request)
+      },
+      async removeRowsExact(request) {
+        return mutationAcknowledgement(request)
+      },
+    }
+    const sessionId = await hydrate(store, hydrationSource)
+    selectRegionColumnOnly(store)
+    const reads = new Map<string, number>()
+    const count: (key: string) => void = (key) => reads.set(key, (reads.get(key) ?? 0) + 1)
+    const source: RemoveDuplicatesControllerPort = {} as RemoveDuplicatesControllerPort
+    const execute: NonNullable<RemoveDuplicatesControllerPort['removeRowsExact']> = function (
+      this: RemoveDuplicatesControllerPort,
+      request,
+    ) {
+      expect(this).toBe(source)
+      expect(Object.isFrozen(request)).toBe(true)
+      expect(Object.isFrozen(request.targetRange)).toBe(true)
+      expect(Object.isFrozen(request.rows)).toBe(true)
+      expect(request).toMatchObject({
+        kind: 'remove-rows',
+        sheetId: SHEET_ID,
+        targetRange: SELECTION_RANGE,
+        rows: [3],
+        revision: 1,
+      })
+      return Promise.resolve(mutationAcknowledgement(request))
+    }
+    Object.defineProperties(source, {
+      readRangeProjection: {
+        get() {
+          count('source.readRangeProjection')
+          throw new Error('confirm must not observe the read port')
+        },
+      },
+      removeRowsExact: {
+        get() {
+          count('source.removeRowsExact')
+          return execute
+        },
+      },
+    })
+    const refreshProjection = function (this: undefined, sheetId: string): Promise<void> {
+      expect(this).toBeUndefined()
+      expect(sheetId).toBe(SHEET_ID)
+      return Promise.resolve()
+    }
+    const input = Object.defineProperties(
+      {},
+      {
+        source: {
+          get() {
+            count('input.source')
+            return source
+          },
+        },
+        sessionId: {
+          get() {
+            count('input.sessionId')
+            return sessionId
+          },
+        },
+        refreshProjection: {
+          get() {
+            count('input.refreshProjection')
+            return refreshProjection
+          },
+        },
+        timeoutMs: {
+          get() {
+            count('input.timeoutMs')
+            return 1234
+          },
+        },
+      },
+    ) as RunRemoveDuplicatesConfirmInput
+
+    await expect(store.setter(runRemoveDuplicatesConfirmAtom, input)).resolves.toBe('completed')
+
+    for (const key of [
+      'input.source',
+      'input.sessionId',
+      'input.refreshProjection',
+      'input.timeoutMs',
+      'source.removeRowsExact',
+    ]) {
+      expect(reads.get(key)).toBe(1)
+    }
+    expect(reads.get('source.readRangeProjection')).toBeUndefined()
+    expect(store.getter(historyStackAtom).entries).toHaveLength(1)
+    expectHistoryLaneAvailable(store)
+  })
+
+  test.each(['source', 'sessionId', 'refreshProjection', 'timeoutMs', 'removeRowsExact'] as const)(
+    'a throwing confirm capture getter for %s blocks before reservation or transport',
+    async (field) => {
+      const store = createStore()
+      const hydrationSource: RemoveDuplicatesControllerPort = {
+        async readRangeProjection(request) {
+          return rangeAcknowledgement(request)
+        },
+        async removeRowsExact(request) {
+          return mutationAcknowledgement(request)
+        },
+      }
+      const sessionId = await hydrate(store, hydrationSource)
+      selectRegionColumnOnly(store)
+      const transport = jest.fn(async (request: RemoveRowsExactRequest) =>
+        mutationAcknowledgement(request),
+      )
+      const source = new Proxy<RemoveDuplicatesControllerPort>(
+        { removeRowsExact: transport },
+        {
+          get(target, property, receiver) {
+            if (property === field) throw new Error(`hostile ${field} getter`)
+            return Reflect.get(target, property, receiver)
+          },
+        },
+      )
+      const input = new Proxy<RunRemoveDuplicatesConfirmInput>(
+        {
+          source,
+          sessionId,
+          refreshProjection: async () => undefined,
+          timeoutMs: 25,
+        },
+        {
+          get(target, property, receiver) {
+            if (property === field) throw new Error(`hostile ${field} getter`)
+            return Reflect.get(target, property, receiver)
+          },
+        },
+      )
+
+      await expect(store.setter(runRemoveDuplicatesConfirmAtom, input)).resolves.toBe('blocked')
+
+      expect(transport).not.toHaveBeenCalled()
+      expect(store.getter(removeDuplicatesLifecycleAtom).status).toBe('editing')
+      expect(store.getter(removeDuplicatesMutationTargetAtom)).toBeNull()
+      expect(store.getter(removeDuplicatesMutationRequestIdAtom)).toBe(0)
+      expectHistoryLaneAvailable(store)
+    },
+  )
+
+  test(
+    'confirm input getter re-entry lets one owner reserve and send without outer clobber',
+    async () => {
+    const store = createStore()
+    const hydrationSource: RemoveDuplicatesControllerPort = {
+      async readRangeProjection(request) {
+        return rangeAcknowledgement(request)
+      },
+      async removeRowsExact(request) {
+        return mutationAcknowledgement(request)
+      },
+    }
+    const sessionId = await hydrate(store, hydrationSource)
+    selectRegionColumnOnly(store)
+    const innerTransport = jest.fn(async (request: RemoveRowsExactRequest) =>
+      mutationAcknowledgement(request),
+    )
+    const outerTransport = jest.fn(async (request: RemoveRowsExactRequest) =>
+      mutationAcknowledgement(request),
+    )
+    const innerRefresh = jest.fn(async () => undefined)
+    const outerRefresh = jest.fn(async () => undefined)
+    const innerSource: RemoveDuplicatesControllerPort = { removeRowsExact: innerTransport }
+    const outerSource: RemoveDuplicatesControllerPort = { removeRowsExact: outerTransport }
+    let innerConfirmation: Promise<unknown> | undefined
+    let sourceReads = 0
+    const outerInput: RunRemoveDuplicatesConfirmInput = {
+      get source() {
+        sourceReads += 1
+        innerConfirmation = store.setter(runRemoveDuplicatesConfirmAtom, {
+          source: innerSource,
+          sessionId,
+          refreshProjection: innerRefresh,
+        })
+        return outerSource
+      },
+      sessionId,
+      refreshProjection: outerRefresh,
+    }
+
+    await expect(store.setter(runRemoveDuplicatesConfirmAtom, outerInput)).resolves.toBe('stale')
+    expect(innerConfirmation).toBeDefined()
+    await expect(innerConfirmation!).resolves.toBe('completed')
+
+    expect(sourceReads).toBe(1)
+    expect(innerTransport).toHaveBeenCalledTimes(1)
+    expect(innerRefresh).toHaveBeenCalledTimes(1)
+    expect(outerTransport).not.toHaveBeenCalled()
+    expect(outerRefresh).not.toHaveBeenCalled()
+    expect(store.getter(historyStackAtom).entries).toHaveLength(1)
+    expect(store.getter(removeDuplicatesLifecycleAtom).status).toBe('closed')
+    expect(store.getter(removeDuplicatesErrorAtom)).toBe('')
+    expectHistoryLaneAvailable(store)
+  })
+
+  test('a foreign history producer blocks before ticket publication or transport', async () => {
+    const store = createStore()
+    const removeRowsExact = jest.fn(async (request: RemoveRowsExactRequest) =>
+      mutationAcknowledgement(request),
+    )
+    const source: RemoveDuplicatesControllerPort = {
+      async readRangeProjection(request) {
+        return rangeAcknowledgement(request)
+      },
+      removeRowsExact,
+    }
+    const sessionId = await hydrate(store, source)
+    selectRegionColumnOnly(store)
+    const externalReservation = store.setter(acquireHistoryProducerReservationAtom)
+    if (externalReservation === null) throw new Error('expected external reservation')
+
+    await expect(
+      store.setter(runRemoveDuplicatesConfirmAtom, {
+        source,
+        sessionId,
+        refreshProjection: async () => undefined,
+      }),
+    ).resolves.toBe('blocked')
+
+    expect(removeRowsExact).not.toHaveBeenCalled()
+    expect(store.getter(historyStackAtom).entries).toHaveLength(0)
+    expect(store.getter(removeDuplicatesMutationTargetAtom)).toBeNull()
+    expect(store.getter(removeDuplicatesErrorAtom)).toBe(REMOVE_DUPLICATES_HISTORY_BUSY_ERROR)
+    expect(store.setter(releaseHistoryProducerReservationAtom, externalReservation)).toBe(true)
+  })
+
+  test(
+    'authority drift after ticket publication releases before transport and leaves no ticket',
+    async () => {
+    const store = createStore()
+    const removeRowsExact = jest.fn(async (request: RemoveRowsExactRequest) =>
+      mutationAcknowledgement(request),
+    )
+    const source: RemoveDuplicatesControllerPort = {
+      async readRangeProjection(request) {
+        return rangeAcknowledgement(request)
+      },
+      removeRowsExact,
+    }
+    const sessionId = await hydrate(store, source)
+    selectRegionColumnOnly(store)
+
+    const outcome = store.setter(runRemoveDuplicatesConfirmAtom, {
+      source,
+      sessionId,
+      refreshProjection: async () => undefined,
+    })
+    expect(store.getter(removeDuplicatesLifecycleAtom).status).toBe('mutation-pending')
+    expect(store.setter(acquireHistoryProducerReservationAtom)).toBeNull()
+    store.setter(selectionAtom, {
+      kind: 'cell',
+      sheetId: SHEET_ID,
+      anchor: { row: 9, col: 9 },
+      focus: { row: 9, col: 9 },
+    })
+
+    await expect(outcome).resolves.toBe('stale')
+    expect(removeRowsExact).not.toHaveBeenCalled()
+    expect(store.getter(removeDuplicatesMutationTargetAtom)).toBeNull()
+    expect(store.getter(historyStackAtom).entries).toHaveLength(0)
+    expectHistoryLaneAvailable(store)
+  })
+
+  test('pre-transport authority drift retains the ticket when exact release fails', async () => {
+    const store = createStore()
+    const removeRowsExact = jest.fn(async (request: RemoveRowsExactRequest) =>
+      mutationAcknowledgement(request),
+    )
+    const source: RemoveDuplicatesControllerPort = {
+      async readRangeProjection(request) {
+        return rangeAcknowledgement(request)
+      },
+      removeRowsExact,
+    }
+    const sessionId = await hydrate(store, source)
+    selectRegionColumnOnly(store)
+    const releaseHistoryReservationWrite = releaseHistoryProducerReservationAtom.write
+    releaseHistoryProducerReservationAtom.write = () => false
+    try {
+      const outcome = store.setter(runRemoveDuplicatesConfirmAtom, {
+        source,
+        sessionId,
+        refreshProjection: async () => undefined,
+      })
+      store.setter(selectionAtom, {
+        kind: 'cell',
+        sheetId: SHEET_ID,
+        anchor: { row: 9, col: 9 },
+        focus: { row: 9, col: 9 },
+      })
+      await expect(outcome).resolves.toBe('outcome-unknown')
+    } finally {
+      releaseHistoryProducerReservationAtom.write = releaseHistoryReservationWrite
+    }
+
+    expect(removeRowsExact).not.toHaveBeenCalled()
+    expect(store.getter(removeDuplicatesMutationTargetAtom)).not.toBeNull()
+    expect(store.getter(removeDuplicatesLifecycleAtom).status).toBe('outcome-unknown')
+    expect(store.setter(closeRemoveDuplicatesAtom)).toBe(false)
+    expect(store.setter(acquireHistoryProducerReservationAtom)).toBeNull()
+  })
+
+  test.each([
+    {
+      protection: 'fully locked',
+      unlockedRanges: [] as CellRange[],
+    },
+    {
+      protection: 'partially unlocked',
+      unlockedRanges: [{ rowStart: 3, rowEnd: 3, colStart: 0, colEnd: 1 }],
+    },
+  ])(
+    'a $protection target is gateway-blocked with zero producer-side effects',
+    async ({ unlockedRanges }) => {
+      const store = createStore()
+      const removeRowsExact = jest.fn(async (request: RemoveRowsExactRequest) =>
+        mutationAcknowledgement(request),
+      )
+      const source: RemoveDuplicatesControllerPort = {
+        async readRangeProjection(request) {
+          return rangeAcknowledgement(request)
+        },
+        removeRowsExact,
+      }
+      const sessionId = await hydrate(store, source)
+      selectRegionColumnOnly(store)
+      store.setter(setSheetProtectionAtom, {
+        sheetId: SHEET_ID,
+        state: { mode: 'protected', unlockedRanges },
+      })
+      const requestSequenceBefore = store.getter(removeDuplicatesMutationRequestIdAtom)
+      const freezeBefore = store.getter(viewportFreezeAtom)
+      const hiddenBefore = store.getter(viewportHiddenAtom)
+      const filterHiddenBefore = store.getter(viewportFilterHiddenAtom)
+
+      await expect(
+        store.setter(runRemoveDuplicatesConfirmAtom, {
+          source,
+          sessionId,
+          refreshProjection: async () => undefined,
+        }),
+      ).resolves.toBe('blocked')
+
+      expect(removeRowsExact).not.toHaveBeenCalled()
+      expect(store.getter(removeDuplicatesMutationRequestIdAtom)).toBe(requestSequenceBefore)
+      expect(store.getter(removeDuplicatesMutationTargetAtom)).toBeNull()
+      expect(store.getter(historyStackAtom).entries).toHaveLength(0)
+      expect(store.getter(viewportFreezeAtom)).toEqual(freezeBefore)
+      expect(store.getter(viewportHiddenAtom)).toEqual(hiddenBefore)
+      expect(store.getter(viewportFilterHiddenAtom)).toEqual(filterHiddenBefore)
+      expect(store.getter(contentMutationLastBlockAtom)).toMatchObject({
+        status: 'blocked',
+        kind: 'remove-rows',
+        sheetId: SHEET_ID,
+        reason: 'locked',
+        diagnostic: {
+          code: 'MUTATION_BLOCKED_LOCKED',
+          range: SELECTION_RANGE,
+        },
+      })
+      expect(store.getter(removeDuplicatesLifecycleAtom).status).toBe('editing')
+      expect(store.getter(removeDuplicatesOpenAtom)).toBe(true)
+      expect(store.getter(removeDuplicatesCanConfirmAtom)).toBe(true)
+      expect(store.getter(removeDuplicatesCanCloseAtom)).toBe(true)
+      expectHistoryLaneAvailable(store)
+    },
+  )
+
+  test.each([
+    {
+      protection: 'fully unlocked protected',
+      mode: 'protected' as const,
+      unlockedRanges: [SELECTION_RANGE],
+    },
+    {
+      protection: 'open',
+      mode: 'open' as const,
+      unlockedRanges: [] as CellRange[],
+    },
+  ])(
+    'a $protection sheet passes the remove-rows gateway and commits once',
+    async ({ mode, unlockedRanges }) => {
+      const store = createStore()
+      const removeRowsExact = jest.fn(async (request: RemoveRowsExactRequest) =>
+        mutationAcknowledgement(request),
+      )
+      const refreshProjection = jest.fn(async () => undefined)
+      const source: RemoveDuplicatesControllerPort = {
+        async readRangeProjection(request) {
+          return rangeAcknowledgement(request)
+        },
+        removeRowsExact,
+      }
+      const sessionId = await hydrate(store, source)
+      selectRegionColumnOnly(store)
+      store.setter(setSheetProtectionAtom, {
+        sheetId: SHEET_ID,
+        state: { mode, unlockedRanges },
+      })
+
+      await expect(
+        store.setter(runRemoveDuplicatesConfirmAtom, {
+          source,
+          sessionId,
+          refreshProjection,
+        }),
+      ).resolves.toBe('completed')
+
+      expect(removeRowsExact).toHaveBeenCalledTimes(1)
+      expect(removeRowsExact.mock.calls[0]?.[0]).toMatchObject({
+        kind: 'remove-rows',
+        sheetId: SHEET_ID,
+        targetRange: SELECTION_RANGE,
+        rows: [3],
+      })
+      expect(refreshProjection).toHaveBeenCalledTimes(1)
+      expect(store.getter(historyStackAtom).entries).toHaveLength(1)
+      expect(store.getter(removeDuplicatesMutationRequestIdAtom)).toBe(1)
+      expect(store.getter(removeDuplicatesLifecycleAtom).status).toBe('closed')
+      expectHistoryLaneAvailable(store)
+    },
+  )
+
+  test(
+    'same-tick confirm is single-flight, freezes the full target, records once, ' +
+      'refreshes, then closes',
+    async () => {
     const store = createStore()
     const mutation = deferred<RemoveRowsExactResult>()
     const refresh = deferred<void>()
@@ -911,6 +1869,7 @@ describe('remove-duplicates Core lifecycle', () => {
     expect(store.getter(removeDuplicatesLifecycleAtom).status).toBe('mutation-pending')
     expect(store.getter(removeDuplicatesCanCloseAtom)).toBe(false)
     expect(store.setter(closeRemoveDuplicatesAtom)).toBe(false)
+    expect(store.setter(acquireHistoryProducerReservationAtom)).toBeNull()
     await expect(second).resolves.toBe('stale')
     await Promise.resolve()
     expect(mutationCalls).toBe(1)
@@ -927,6 +1886,8 @@ describe('remove-duplicates Core lifecycle', () => {
     mutation.resolve(mutationAcknowledgement(request!))
     await Promise.resolve()
     await Promise.resolve()
+    await Promise.resolve()
+    await Promise.resolve()
     expect(store.getter(historyStackAtom).entries).toHaveLength(1)
     expect(store.getter(removeDuplicatesLifecycleAtom).status).toBe('refreshing')
     refresh.resolve()
@@ -935,7 +1896,49 @@ describe('remove-duplicates Core lifecycle', () => {
     expect(store.getter(historyStackAtom).entries).toHaveLength(1)
     expect(store.getter(removeDuplicatesOpenAtom)).toBe(false)
     expect(store.getter(removeDuplicatesLifecycleAtom).status).toBe('closed')
+    expectHistoryLaneAvailable(store)
   })
+
+  test.each([
+    { requestRevision: 1, acknowledgementRevision: 2 },
+    { requestRevision: 'opaque-r1', acknowledgementRevision: 'opaque-r2' },
+  ])(
+    'accepts $requestRevision → $acknowledgementRevision and records exactly one descriptor',
+    async ({ requestRevision, acknowledgementRevision }) => {
+      const store = createStore()
+      let mutationCalls = 0
+      const source: RemoveDuplicatesControllerPort = {
+        async readRangeProjection(request) {
+          return rangeAcknowledgement(request, SESSION_CELLS, requestRevision)
+        },
+        async removeRowsExact(request) {
+          mutationCalls += 1
+          return mutationAcknowledgement(request, acknowledgementRevision)
+        },
+      }
+      const sessionId = await hydrate(store, source)
+      selectRegionColumnOnly(store)
+
+      await expect(
+        store.setter(runRemoveDuplicatesConfirmAtom, {
+          source,
+          sessionId,
+          refreshProjection: async () => undefined,
+        }),
+      ).resolves.toBe('completed')
+
+      expect(mutationCalls).toBe(1)
+      expect(store.getter(historyStackAtom).entries).toEqual([
+        expect.objectContaining({
+          kind: 'row.delete',
+          sheetId: SHEET_ID,
+          projectionRevision: acknowledgementRevision,
+          affectedRange: { rowStart: 3, rowEnd: 4, colStart: 0, colEnd: 1 },
+        }),
+      ])
+      expectHistoryLaneAvailable(store)
+    },
+  )
 
   test.each(['mismatch', 'revision-echo', 'reject'] as const)(
     '%s mutation outcome stays unknown with no history, close, or resend',
@@ -968,6 +1971,7 @@ describe('remove-duplicates Core lifecycle', () => {
       expect(store.getter(historyStackAtom).entries).toHaveLength(0)
       expect(store.getter(removeDuplicatesCanCloseAtom)).toBe(false)
       expect(store.setter(closeRemoveDuplicatesAtom)).toBe(false)
+      expect(store.setter(acquireHistoryProducerReservationAtom)).toBeNull()
 
       await expect(
         store.setter(runRemoveDuplicatesConfirmAtom, {
@@ -979,6 +1983,412 @@ describe('remove-duplicates Core lifecycle', () => {
       expect(calls).toBe(1)
     },
   )
+
+  test('a strict acknowledgement is snapshotted with every field read once', async () => {
+    const store = createStore()
+    const reads = new Map<string, number>()
+    const tracked = <Value extends object>(value: Value, prefix: string): Value =>
+      new Proxy(value, {
+        get(target, property, receiver) {
+          if (typeof property === 'string' && property !== 'then') {
+            const key = `${prefix}.${property}`
+            reads.set(key, (reads.get(key) ?? 0) + 1)
+          }
+          return Reflect.get(target, property, receiver)
+        },
+      })
+    const source: RemoveDuplicatesControllerPort = {
+      async readRangeProjection(request) {
+        return rangeAcknowledgement(request)
+      },
+      async removeRowsExact(request) {
+        const acknowledgement = mutationAcknowledgement(request, 'opaque-r2')
+        return tracked(
+          {
+            ...acknowledgement,
+            targetRange: tracked({ ...acknowledgement.targetRange }, 'targetRange'),
+            removedRowIndices: tracked([...acknowledgement.removedRowIndices], 'removedRowIndices'),
+            affectedRange: tracked({ ...acknowledgement.affectedRange! }, 'affectedRange'),
+          },
+          'acknowledgement',
+        )
+      },
+    }
+    const sessionId = await hydrate(store, source)
+    selectRegionColumnOnly(store)
+
+    await expect(
+      store.setter(runRemoveDuplicatesConfirmAtom, {
+        source,
+        sessionId,
+        refreshProjection: async () => undefined,
+      }),
+    ).resolves.toBe('completed')
+
+    for (const field of [
+      'requestId',
+      'sheetId',
+      'targetRange',
+      'removedRowIndices',
+      'removedRows',
+      'affectedRange',
+      'revision',
+      'historyRecorded',
+    ]) {
+      expect(reads.get(`acknowledgement.${field}`)).toBe(1)
+    }
+    for (const field of ['rowStart', 'rowEnd', 'colStart', 'colEnd']) {
+      expect(reads.get(`targetRange.${field}`)).toBe(1)
+    }
+    expect(reads.get('removedRowIndices.length')).toBe(1)
+    expect(reads.get('removedRowIndices.0')).toBe(1)
+    for (const field of ['startRow', 'endRow', 'startCol', 'endCol']) {
+      expect(reads.get(`affectedRange.${field}`)).toBe(1)
+    }
+    expect(store.getter(historyStackAtom).entries).toHaveLength(1)
+  })
+
+  test.each([
+    { verdict: 'omitted', historyRecorded: undefined, expectedHistoryEntries: 1 },
+    { verdict: 'true', historyRecorded: true, expectedHistoryEntries: 1 },
+    { verdict: 'false', historyRecorded: false, expectedHistoryEntries: 0 },
+  ] as const)(
+    'historyRecorded=$verdict commits with $expectedHistoryEntries shared history entries',
+    async ({ verdict, historyRecorded, expectedHistoryEntries }) => {
+      const store = createStore()
+      let refreshCalls = 0
+      const source: RemoveDuplicatesControllerPort = {
+        async readRangeProjection(request) {
+          return rangeAcknowledgement(request)
+        },
+        async removeRowsExact(request) {
+          const acknowledgement = mutationAcknowledgement(request)
+          return verdict === 'omitted' ? acknowledgement : { ...acknowledgement, historyRecorded }
+        },
+      }
+      const sessionId = await hydrate(store, source)
+      selectRegionColumnOnly(store)
+
+      await expect(
+        store.setter(runRemoveDuplicatesConfirmAtom, {
+          source,
+          sessionId,
+          refreshProjection: async () => {
+            refreshCalls += 1
+          },
+        }),
+      ).resolves.toBe('completed')
+
+      expect(refreshCalls).toBe(1)
+      expect(store.getter(historyStackAtom).entries).toHaveLength(expectedHistoryEntries)
+      expect(store.getter(removeDuplicatesLifecycleAtom).status).toBe('closed')
+      expectHistoryLaneAvailable(store)
+    },
+  )
+
+  test.each([
+    { verdict: 'null', value: null },
+    { verdict: 'zero', value: 0 },
+    { verdict: 'string', value: 'true' },
+    { verdict: 'object', value: Object.freeze({}) },
+  ])(
+    'historyRecorded=$verdict is outcome-unknown and retains the exact lane',
+    async ({ value }) => {
+      const store = createStore()
+      let mutationCalls = 0
+      let refreshCalls = 0
+      const source: RemoveDuplicatesControllerPort = {
+        async readRangeProjection(request) {
+          return rangeAcknowledgement(request)
+        },
+        async removeRowsExact(request) {
+          mutationCalls += 1
+          return {
+            ...mutationAcknowledgement(request),
+            historyRecorded: value,
+          } as unknown as RemoveRowsExactResult
+        },
+      }
+      const sessionId = await hydrate(store, source)
+      selectRegionColumnOnly(store)
+
+      await expect(
+        store.setter(runRemoveDuplicatesConfirmAtom, {
+          source,
+          sessionId,
+          refreshProjection: async () => {
+            refreshCalls += 1
+          },
+        }),
+      ).resolves.toBe('outcome-unknown')
+
+      expect(mutationCalls).toBe(1)
+      expect(refreshCalls).toBe(0)
+      expect(store.getter(historyStackAtom).entries).toHaveLength(0)
+      expect(store.getter(removeDuplicatesLifecycleAtom).status).toBe('outcome-unknown')
+      expect(store.getter(removeDuplicatesMutationTargetAtom)).not.toBeNull()
+      expect(store.setter(acquireHistoryProducerReservationAtom)).toBeNull()
+    },
+  )
+
+  test(
+    'a hostile mutation acknowledgement getter cannot ' +
+      'reconcile against same-range replacement authority',
+    async () => {
+    const store = createStore()
+    let revisionReads = 0
+    let refreshCalls = 0
+    const source: RemoveDuplicatesControllerPort = {
+      async readRangeProjection(request) {
+        return rangeAcknowledgement(request)
+      },
+      async removeRowsExact(request) {
+        return {
+          ...mutationAcknowledgement(request),
+          get revision() {
+            revisionReads += 1
+            store.setter(selectionAtom, {
+              kind: 'range',
+              sheetId: SHEET_ID,
+              anchor: { row: SELECTION_RANGE.rowEnd, col: SELECTION_RANGE.colEnd },
+              focus: { row: SELECTION_RANGE.rowStart, col: SELECTION_RANGE.colStart },
+            })
+            return 2
+          },
+        }
+      },
+    }
+    const sessionId = await hydrate(store, source)
+    selectRegionColumnOnly(store)
+
+    await expect(
+      store.setter(runRemoveDuplicatesConfirmAtom, {
+        source,
+        sessionId,
+        refreshProjection: async () => {
+          refreshCalls += 1
+        },
+      }),
+    ).resolves.toBe('outcome-unknown')
+
+    expect(revisionReads).toBe(1)
+    expect(refreshCalls).toBe(0)
+    expect(store.getter(historyStackAtom).entries).toHaveLength(0)
+    expect(store.getter(removeDuplicatesLifecycleAtom).status).toBe('outcome-unknown')
+    expect(store.getter(removeDuplicatesMutationTargetAtom)).not.toBeNull()
+    expect(store.setter(acquireHistoryProducerReservationAtom)).toBeNull()
+  })
+
+  test(
+    'mutation timeout retains its immutable ticket and ignores a late exact acknowledgement',
+    async () => {
+    jest.useFakeTimers()
+    try {
+      const store = createStore()
+      const mutation = deferred<RemoveRowsExactResult>()
+      let request!: RemoveRowsExactRequest
+      let mutationCalls = 0
+      let refreshCalls = 0
+      const source: RemoveDuplicatesControllerPort = {
+        async readRangeProjection(readRequest) {
+          return rangeAcknowledgement(readRequest)
+        },
+        removeRowsExact(nextRequest) {
+          request = nextRequest
+          mutationCalls += 1
+          return mutation.promise
+        },
+      }
+      const sessionId = await hydrate(store, source)
+      selectRegionColumnOnly(store)
+      const input = {
+        source,
+        sessionId,
+        refreshProjection: async () => {
+          refreshCalls += 1
+        },
+      }
+
+      const outcome = store.setter(runRemoveDuplicatesConfirmAtom, input)
+      await Promise.resolve()
+      expect(mutationCalls).toBe(1)
+      expect(request).toBeDefined()
+      jest.advanceTimersByTime(DEFAULT_REMOVE_DUPLICATES_TIMEOUT_MS)
+      await expect(outcome).resolves.toBe('outcome-unknown')
+      const lifecycleAfterTimeout = store.getter(removeDuplicatesLifecycleAtom)
+      const errorAfterTimeout = store.getter(removeDuplicatesErrorAtom)
+      const targetAfterTimeout = store.getter(removeDuplicatesMutationTargetAtom)
+      expect(lifecycleAfterTimeout.status).toBe('outcome-unknown')
+      expect(errorAfterTimeout).toContain('timed out')
+      expect(targetAfterTimeout).not.toBeNull()
+      expect(store.getter(historyStackAtom).entries).toHaveLength(0)
+      expect(refreshCalls).toBe(0)
+      expect(store.setter(acquireHistoryProducerReservationAtom)).toBeNull()
+
+      mutation.resolve(mutationAcknowledgement(request))
+      await Promise.resolve()
+      await Promise.resolve()
+
+      expect(store.getter(removeDuplicatesLifecycleAtom)).toBe(lifecycleAfterTimeout)
+      expect(store.getter(removeDuplicatesErrorAtom)).toBe(errorAfterTimeout)
+      expect(store.getter(removeDuplicatesMutationTargetAtom)).toBe(targetAfterTimeout)
+      expect(store.getter(historyStackAtom).entries).toHaveLength(0)
+      expect(refreshCalls).toBe(0)
+      expect(store.setter(acquireHistoryProducerReservationAtom)).toBeNull()
+      await expect(store.setter(runRemoveDuplicatesConfirmAtom, input)).resolves.toBe(
+        'outcome-unknown',
+      )
+      expect(mutationCalls).toBe(1)
+    } finally {
+      jest.useRealTimers()
+    }
+  })
+
+  test(
+    'an acknowledged mutation retains its ticket and reservation when history push fails',
+    async () => {
+    const store = createStore()
+    let mutationCalls = 0
+    let refreshCalls = 0
+    const source: RemoveDuplicatesControllerPort = {
+      async readRangeProjection(request) {
+        return rangeAcknowledgement(request)
+      },
+      async removeRowsExact(request) {
+        mutationCalls += 1
+        return mutationAcknowledgement(request)
+      },
+    }
+    const sessionId = await hydrate(store, source)
+    selectRegionColumnOnly(store)
+    const input = {
+      source,
+      sessionId,
+      refreshProjection: async () => {
+        refreshCalls += 1
+      },
+    }
+    const pushReservedHistoryWrite = pushReservedHistoryAtom.write
+    pushReservedHistoryAtom.write = () => false
+    try {
+      await expect(store.setter(runRemoveDuplicatesConfirmAtom, input)).resolves.toBe(
+        'outcome-unknown',
+      )
+    } finally {
+      pushReservedHistoryAtom.write = pushReservedHistoryWrite
+    }
+
+    expect(mutationCalls).toBe(1)
+    expect(refreshCalls).toBe(0)
+    expect(store.getter(historyStackAtom).entries).toHaveLength(0)
+    expect(store.getter(removeDuplicatesLifecycleAtom).status).toBe('outcome-unknown')
+    expect(store.setter(closeRemoveDuplicatesAtom)).toBe(false)
+    expect(store.setter(acquireHistoryProducerReservationAtom)).toBeNull()
+    await expect(store.setter(runRemoveDuplicatesConfirmAtom, input)).resolves.toBe(
+      'outcome-unknown',
+    )
+    expect(mutationCalls).toBe(1)
+  })
+
+  test('a stale release cannot clear a replacement history reservation', async () => {
+    const store = createStore()
+    const source: RemoveDuplicatesControllerPort = {
+      async readRangeProjection(request) {
+        return rangeAcknowledgement(request)
+      },
+      async removeRowsExact(request) {
+        return mutationAcknowledgement(request)
+      },
+    }
+    const sessionId = await hydrate(store, source)
+    selectRegionColumnOnly(store)
+    let replacementReservation: HistoryProducerReservation | null = null
+    const pushReservedHistoryWrite = pushReservedHistoryAtom.write
+    pushReservedHistoryAtom.write = (get, set, input) => {
+      const recorded = pushReservedHistoryWrite(get, set, input)
+      if (!recorded) return false
+      expect(set(releaseHistoryProducerReservationAtom, input.reservation)).toBe(true)
+      replacementReservation = set(acquireHistoryProducerReservationAtom)
+      expect(replacementReservation).not.toBeNull()
+      return true
+    }
+    try {
+      await expect(
+        store.setter(runRemoveDuplicatesConfirmAtom, {
+          source,
+          sessionId,
+          refreshProjection: async () => undefined,
+        }),
+      ).resolves.toBe('outcome-unknown')
+    } finally {
+      pushReservedHistoryAtom.write = pushReservedHistoryWrite
+    }
+
+    expect(store.getter(removeDuplicatesLifecycleAtom).status).toBe('outcome-unknown')
+    expect(store.getter(historyStackAtom).entries).toHaveLength(1)
+    expect(store.setter(acquireHistoryProducerReservationAtom)).toBeNull()
+    if (replacementReservation === null) throw new Error('expected replacement reservation')
+    expect(store.setter(releaseHistoryProducerReservationAtom, replacementReservation)).toBe(true)
+  })
+
+  test(
+    'authority drift after acknowledgement but before history push retains the ticket ' +
+      'and reservation',
+    async () => {
+    const store = createStore()
+    let mutationCalls = 0
+    let refreshCalls = 0
+    const source: RemoveDuplicatesControllerPort = {
+      async readRangeProjection(request) {
+        return rangeAcknowledgement(request)
+      },
+      async removeRowsExact(request) {
+        mutationCalls += 1
+        return mutationAcknowledgement(request)
+      },
+    }
+    const sessionId = await hydrate(store, source)
+    selectRegionColumnOnly(store)
+    const applyFreezeShiftWrite = applyViewportFreezeStructuralShiftAtom.write
+    let drifted = false
+    applyViewportFreezeStructuralShiftAtom.write = (get, set, input) => {
+      const result = applyFreezeShiftWrite(get, set, input)
+      if (!drifted) {
+        drifted = true
+        set(selectionAtom, {
+          kind: 'cell',
+          sheetId: SHEET_ID,
+          anchor: { row: 9, col: 9 },
+          focus: { row: 9, col: 9 },
+        })
+      }
+      return result
+    }
+    try {
+      await expect(
+        store.setter(runRemoveDuplicatesConfirmAtom, {
+          source,
+          sessionId,
+          refreshProjection: async () => {
+            refreshCalls += 1
+          },
+        }),
+      ).resolves.toBe('outcome-unknown')
+    } finally {
+      applyViewportFreezeStructuralShiftAtom.write = applyFreezeShiftWrite
+    }
+
+    expect(drifted).toBe(true)
+    expect(mutationCalls).toBe(1)
+    expect(refreshCalls).toBe(0)
+    expect(store.getter(historyStackAtom).entries).toHaveLength(0)
+    expect(store.getter(removeDuplicatesLifecycleAtom).status).toBe('outcome-unknown')
+    expect(store.getter(removeDuplicatesOpenAtom)).toBe(true)
+    expect(store.getter(removeDuplicatesMutationTargetAtom)).not.toBeNull()
+    expect(store.getter(removeDuplicatesCanCloseAtom)).toBe(false)
+    expect(store.setter(closeRemoveDuplicatesAtom)).toBe(false)
+    expect(store.setter(acquireHistoryProducerReservationAtom)).toBeNull()
+  })
 
   test('selection drift after transport launch makes even an exact acknowledgement outcome-unknown', async () => {
     const store = createStore()
@@ -1010,6 +2420,56 @@ describe('remove-duplicates Core lifecycle', () => {
     mutation.resolve(mutationAcknowledgement(request))
     await expect(result).resolves.toBe('outcome-unknown')
     expect(store.getter(historyStackAtom).entries).toHaveLength(0)
+  })
+
+  test(
+    'authority drift while the initial refresh settles retains the acknowledged ticket ' +
+      'and reservation',
+    async () => {
+    const store = createStore()
+    const refresh = deferred<void>()
+    const refreshStarted = deferred<void>()
+    let mutationCalls = 0
+    let refreshCalls = 0
+    const source: RemoveDuplicatesControllerPort = {
+      async readRangeProjection(request) {
+        return rangeAcknowledgement(request)
+      },
+      async removeRowsExact(request) {
+        mutationCalls += 1
+        return mutationAcknowledgement(request)
+      },
+    }
+    const sessionId = await hydrate(store, source)
+    selectRegionColumnOnly(store)
+    const result = store.setter(runRemoveDuplicatesConfirmAtom, {
+      source,
+      sessionId,
+      refreshProjection: async () => {
+        refreshCalls += 1
+        refreshStarted.resolve()
+        return refresh.promise
+      },
+    })
+    await refreshStarted.promise
+    store.setter(selectionAtom, {
+      kind: 'cell',
+      sheetId: SHEET_ID,
+      anchor: { row: 9, col: 9 },
+      focus: { row: 9, col: 9 },
+    })
+    refresh.resolve()
+
+    await expect(result).resolves.toBe('outcome-unknown')
+    expect(mutationCalls).toBe(1)
+    expect(refreshCalls).toBe(1)
+    expect(store.getter(historyStackAtom).entries).toHaveLength(1)
+    expect(store.getter(removeDuplicatesLifecycleAtom).status).toBe('outcome-unknown')
+    expect(store.getter(removeDuplicatesOpenAtom)).toBe(true)
+    expect(store.getter(removeDuplicatesMutationTargetAtom)).not.toBeNull()
+    expect(store.getter(removeDuplicatesCanCloseAtom)).toBe(false)
+    expect(store.setter(closeRemoveDuplicatesAtom)).toBe(false)
+    expect(store.setter(acquireHistoryProducerReservationAtom)).toBeNull()
   })
 
   test('workspace A→B→A after transport launch makes an exact acknowledgement outcome-unknown', async () => {
@@ -1071,6 +2531,7 @@ describe('remove-duplicates Core lifecycle', () => {
     expect(store.getter(removeDuplicatesCanConfirmAtom)).toBe(true)
     expect(store.getter(removeDuplicatesCanCloseAtom)).toBe(false)
     expect(store.getter(historyStackAtom).entries).toHaveLength(1)
+    expect(store.setter(acquireHistoryProducerReservationAtom)).toBeNull()
 
     await expect(
       store.setter(runRemoveDuplicatesConfirmAtom, {
@@ -1086,6 +2547,336 @@ describe('remove-duplicates Core lifecycle', () => {
     expect(store.getter(historyStackAtom).entries).toHaveLength(1)
     expect(store.getter(removeDuplicatesMutationRequestIdAtom)).toBe(1)
     expect(store.getter(removeDuplicatesLifecycleAtom).status).toBe('closed')
+    expectHistoryLaneAvailable(store)
+  })
+
+  test(
+    'refresh retry snapshots only retry fields and ignores source or mutation getters',
+    async () => {
+    const store = createStore()
+    let mutationCalls = 0
+    let initialRefreshCalls = 0
+    let retryRefreshCalls = 0
+    const source: RemoveDuplicatesControllerPort = {
+      async readRangeProjection(request) {
+        return rangeAcknowledgement(request)
+      },
+      async removeRowsExact(request) {
+        mutationCalls += 1
+        return mutationAcknowledgement(request)
+      },
+    }
+    const sessionId = await hydrate(store, source)
+    selectRegionColumnOnly(store)
+    await expect(
+      store.setter(runRemoveDuplicatesConfirmAtom, {
+        source,
+        sessionId,
+        refreshProjection: async () => {
+          initialRefreshCalls += 1
+          throw new Error('refresh offline')
+        },
+      }),
+    ).resolves.toBe('refresh-failed')
+
+    let inputSourceReads = 0
+    let mutationPortReads = 0
+    let sessionIdReads = 0
+    let refreshReads = 0
+    let timeoutReads = 0
+    const hostileRetrySource = Object.defineProperties(
+      {},
+      {
+        removeRowsExact: {
+          get() {
+            mutationPortReads += 1
+            throw new Error('retry must not observe the mutation port')
+          },
+        },
+      },
+    ) as RemoveDuplicatesControllerPort
+    const retryInput = Object.defineProperties(
+      {},
+      {
+        source: {
+          get() {
+            inputSourceReads += 1
+            return hostileRetrySource
+          },
+        },
+        sessionId: {
+          get() {
+            sessionIdReads += 1
+            return sessionId
+          },
+        },
+        refreshProjection: {
+          get() {
+            refreshReads += 1
+            return async () => {
+              retryRefreshCalls += 1
+            }
+          },
+        },
+        timeoutMs: {
+          get() {
+            timeoutReads += 1
+            return 1234
+          },
+        },
+      },
+    ) as RunRemoveDuplicatesConfirmInput
+
+    await expect(store.setter(runRemoveDuplicatesConfirmAtom, retryInput)).resolves.toBe(
+      'completed',
+    )
+
+    expect(inputSourceReads).toBe(0)
+    expect(mutationPortReads).toBe(0)
+    expect(sessionIdReads).toBe(1)
+    expect(refreshReads).toBe(1)
+    expect(timeoutReads).toBe(1)
+    expect(mutationCalls).toBe(1)
+    expect(initialRefreshCalls).toBe(1)
+    expect(retryRefreshCalls).toBe(1)
+    expect(store.getter(historyStackAtom).entries).toHaveLength(1)
+    expect(store.getter(removeDuplicatesMutationRequestIdAtom)).toBe(1)
+    expect(store.getter(removeDuplicatesLifecycleAtom).status).toBe('closed')
+    expectHistoryLaneAvailable(store)
+  })
+
+  test('retry refresh getter re-entry gives the inner refresh-only owner precedence', async () => {
+    const store = createStore()
+    const innerRefresh = deferred<void>()
+    const innerRefreshStarted = deferred<void>()
+    let mutationCalls = 0
+    let initialRefreshCalls = 0
+    let innerRefreshCalls = 0
+    let outerRefreshCalls = 0
+    const source: RemoveDuplicatesControllerPort = {
+      async readRangeProjection(request) {
+        return rangeAcknowledgement(request)
+      },
+      async removeRowsExact(request) {
+        mutationCalls += 1
+        return mutationAcknowledgement(request)
+      },
+    }
+    const sessionId = await hydrate(store, source)
+    selectRegionColumnOnly(store)
+    await expect(
+      store.setter(runRemoveDuplicatesConfirmAtom, {
+        source,
+        sessionId,
+        refreshProjection: async () => {
+          initialRefreshCalls += 1
+          throw new Error('refresh offline')
+        },
+      }),
+    ).resolves.toBe('refresh-failed')
+
+    let inputSourceReads = 0
+    let refreshGetterReads = 0
+    let innerRetry: Promise<unknown> | undefined
+    const outerInput = Object.defineProperties(
+      {},
+      {
+        source: {
+          get() {
+            inputSourceReads += 1
+            throw new Error('retry must not observe source')
+          },
+        },
+        sessionId: {
+          get() {
+            return sessionId
+          },
+        },
+        refreshProjection: {
+          get() {
+            refreshGetterReads += 1
+            innerRetry = store.setter(runRemoveDuplicatesConfirmAtom, {
+              source,
+              sessionId,
+              refreshProjection: async () => {
+                innerRefreshCalls += 1
+                innerRefreshStarted.resolve()
+                return innerRefresh.promise
+              },
+              timeoutMs: 1234,
+            })
+            return async () => {
+              outerRefreshCalls += 1
+            }
+          },
+        },
+        timeoutMs: {
+          get() {
+            return 1234
+          },
+        },
+      },
+    ) as RunRemoveDuplicatesConfirmInput
+
+    await expect(store.setter(runRemoveDuplicatesConfirmAtom, outerInput)).resolves.toBe('stale')
+    expect(innerRetry).toBeDefined()
+    await innerRefreshStarted.promise
+    expect(inputSourceReads).toBe(0)
+    expect(refreshGetterReads).toBe(1)
+    expect(outerRefreshCalls).toBe(0)
+    expect(mutationCalls).toBe(1)
+
+    innerRefresh.resolve()
+    await expect(innerRetry!).resolves.toBe('completed')
+
+    expect(initialRefreshCalls).toBe(1)
+    expect(innerRefreshCalls).toBe(1)
+    expect(outerRefreshCalls).toBe(0)
+    expect(mutationCalls).toBe(1)
+    expect(store.getter(historyStackAtom).entries).toHaveLength(1)
+    expect(store.getter(removeDuplicatesMutationRequestIdAtom)).toBe(1)
+    expect(store.getter(removeDuplicatesLifecycleAtom).status).toBe('closed')
+    expectHistoryLaneAvailable(store)
+  })
+
+  test(
+    'release precedes the last active-ticket clear so a clear subscriber can open a replacement',
+    async () => {
+    const store = createStore()
+    let mutationCalls = 0
+    let replacementReadCalls = 0
+    const source: RemoveDuplicatesControllerPort = {
+      async readRangeProjection(request) {
+        return rangeAcknowledgement(request)
+      },
+      async removeRowsExact(request) {
+        mutationCalls += 1
+        return mutationAcknowledgement(request)
+      },
+    }
+    const replacementSource: RemoveDuplicatesControllerPort = {
+      async readRangeProjection(request) {
+        replacementReadCalls += 1
+        return rangeAcknowledgement(request, SESSION_CELLS, 7)
+      },
+    }
+    const sessionId = await hydrate(store, source)
+    selectRegionColumnOnly(store)
+
+    let sawOwnedTarget = false
+    let laneWasAvailableAtClear = false
+    let replacementOpening: Promise<unknown> | undefined
+    const unsubscribe = store.sub(removeDuplicatesMutationTargetAtom, () => {
+      const target = store.getter(removeDuplicatesMutationTargetAtom)
+      if (target !== null) {
+        sawOwnedTarget = true
+        return
+      }
+      if (
+        !sawOwnedTarget ||
+        replacementOpening !== undefined ||
+        store.getter(removeDuplicatesLifecycleAtom).status !== 'closed'
+      ) {
+        return
+      }
+      const reservation = store.setter(acquireHistoryProducerReservationAtom)
+      laneWasAvailableAtClear = reservation !== null
+      if (reservation === null) throw new Error('history lane must be released before active clear')
+      expect(store.setter(releaseHistoryProducerReservationAtom, reservation)).toBe(true)
+      replacementOpening = store.setter(openRemoveDuplicatesFromSelectionAtom, {
+        source: replacementSource,
+      })
+    })
+
+    try {
+      await expect(
+        store.setter(runRemoveDuplicatesConfirmAtom, {
+          source,
+          sessionId,
+          refreshProjection: async () => undefined,
+        }),
+      ).resolves.toBe('completed')
+      expect(replacementOpening).toBeDefined()
+      await expect(replacementOpening!).resolves.toBe('editing')
+    } finally {
+      unsubscribe()
+    }
+
+    expect(sawOwnedTarget).toBe(true)
+    expect(laneWasAvailableAtClear).toBe(true)
+    expect(mutationCalls).toBe(1)
+    expect(replacementReadCalls).toBe(1)
+    expect(store.getter(historyStackAtom).entries).toHaveLength(1)
+    expect(store.getter(removeDuplicatesLifecycleAtom)).toMatchObject({
+      status: 'editing',
+      sheetId: SHEET_ID,
+    })
+    expect(store.getter(removeDuplicatesSessionAtom)?.projectionRevision).toBe(7)
+    expect(store.getter(removeDuplicatesOpenAtom)).toBe(true)
+    expect(store.getter(removeDuplicatesErrorAtom)).toBe('')
+    expectHistoryLaneAvailable(store)
+  })
+
+  const authorityDriftRetryTestName =
+    'authority drift while a refresh retry settles never ' +
+    'resends or releases the acknowledged mutation'
+  test(authorityDriftRetryTestName, async () => {
+    const store = createStore()
+    const retryRefresh = deferred<void>()
+    const retryRefreshStarted = deferred<void>()
+    let mutationCalls = 0
+    let refreshCalls = 0
+    const source: RemoveDuplicatesControllerPort = {
+      async readRangeProjection(request) {
+        return rangeAcknowledgement(request)
+      },
+      async removeRowsExact(request) {
+        mutationCalls += 1
+        return mutationAcknowledgement(request)
+      },
+    }
+    const sessionId = await hydrate(store, source)
+    selectRegionColumnOnly(store)
+    await expect(
+      store.setter(runRemoveDuplicatesConfirmAtom, {
+        source,
+        sessionId,
+        refreshProjection: async () => {
+          refreshCalls += 1
+          throw new Error('refresh offline')
+        },
+      }),
+    ).resolves.toBe('refresh-failed')
+
+    const retryResult = store.setter(runRemoveDuplicatesConfirmAtom, {
+      source,
+      sessionId,
+      refreshProjection: async () => {
+        refreshCalls += 1
+        retryRefreshStarted.resolve()
+        return retryRefresh.promise
+      },
+    })
+    await retryRefreshStarted.promise
+    store.setter(selectionAtom, {
+      kind: 'cell',
+      sheetId: SHEET_ID,
+      anchor: { row: 9, col: 9 },
+      focus: { row: 9, col: 9 },
+    })
+    retryRefresh.resolve()
+
+    await expect(retryResult).resolves.toBe('outcome-unknown')
+    expect(mutationCalls).toBe(1)
+    expect(refreshCalls).toBe(2)
+    expect(store.getter(historyStackAtom).entries).toHaveLength(1)
+    expect(store.getter(removeDuplicatesMutationRequestIdAtom)).toBe(1)
+    expect(store.getter(removeDuplicatesLifecycleAtom).status).toBe('outcome-unknown')
+    expect(store.getter(removeDuplicatesOpenAtom)).toBe(true)
+    expect(store.getter(removeDuplicatesMutationTargetAtom)).not.toBeNull()
+    expect(store.getter(removeDuplicatesCanCloseAtom)).toBe(false)
+    expect(store.setter(closeRemoveDuplicatesAtom)).toBe(false)
+    expect(store.setter(acquireHistoryProducerReservationAtom)).toBeNull()
   })
 })
 

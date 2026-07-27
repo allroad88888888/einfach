@@ -58,6 +58,8 @@ function createBackend(overrides: Partial<SpreadsheetBackend> = {}): Spreadsheet
         sheetId: request.sheetId,
         requestId: request.requestId,
         revision: 1,
+        historyRecorded: false,
+        hiddenRowIndices: [],
       }
     },
     // Sort is a physical engine mutation and the display permutation is

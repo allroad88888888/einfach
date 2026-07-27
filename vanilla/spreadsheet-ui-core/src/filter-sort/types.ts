@@ -54,15 +54,24 @@ export interface FilterSortMutationResult extends SheetRef {
   requestId?: ProjectionRequestId
   revision?: ProjectionRevision
   /**
+   * Exact backend transaction verdict for Apply / Clear. `true` pairs with
+   * one UI-core `filter.set` descriptor; explicit `false` proves that the
+   * adapter recorded no undo step. Current mutation commands reject absence as
+   * an uncertain outcome so the UI and backend undo stacks cannot silently
+   * skew.
+   */
+  historyRecorded?: boolean
+  /**
    * 0-based SOURCE rows the applied rules filtered out, for the WHOLE scanned
    * extent — never a window-bounded subset (`design-filter-hidden-rows` §4.2).
    * UI core stores this verbatim in `viewportFilterHiddenAtom`, which is the
    * canonical answer to "is this row painted?" from then on; nothing re-derives
    * it from the projection.
    *
-   * ABSENT means the host cannot compute visibility, and UI core CLEARS the set
-   * rather than guessing: rules recorded, nothing hidden. An empty array is the
-   * distinct statement "the rules hid nothing", and does the same thing.
+   * Apply / Clear requires this explicit whole-column snapshot. Reapply keeps
+   * the compatibility behaviour that ABSENT clears the old set when a host
+   * cannot recompute visibility. An empty array explicitly says the rules hid
+   * nothing.
    */
   hiddenRowIndices?: readonly number[]
 }
@@ -130,10 +139,14 @@ export interface ReapplyFilterInput {
   readonly source: FilterSortControllerPort
   readonly entrypoint: FilterSortEntrypoint
   readonly refreshProjection: (sheetId: string) => Promise<void>
+  /** Core-owned deadline for each transport / refresh phase. Defaults to 15s. */
+  readonly timeoutMs?: number
 }
 
 export interface RetryFilterSortRefreshInput {
   readonly refreshProjection: (sheetId: string) => Promise<void>
+  /** Core-owned deadline for this refresh attempt. Defaults to 15s. */
+  readonly timeoutMs?: number
 }
 
 export type FilterConditionKind = 'none' | 'equals' | 'contains' | 'range'
@@ -196,6 +209,8 @@ export interface RunFilterSortMutationInput {
   readonly sessionId: number
   readonly intent: FilterSortMutationIntent
   readonly refreshProjection: (sheetId: string) => Promise<void>
+  /** Core-owned deadline for each transport / refresh phase. Defaults to 15s. */
+  readonly timeoutMs?: number
 }
 
 export interface UpdateFilterSortDraftInput {
@@ -248,6 +263,8 @@ export interface RunPhysicalSortInput {
    */
   readonly target?: FilterSortEntrypointTarget
   readonly refreshProjection: (sheetId: string) => Promise<void>
+  /** Core-owned deadline for each transport / refresh phase. Defaults to 15s. */
+  readonly timeoutMs?: number
 }
 
 /**
