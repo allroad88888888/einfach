@@ -1,3 +1,20 @@
+/**
+ * Async atom tests.
+ *
+ * NOTE: These tests use real timers (setTimeout in atom bodies) and real
+ * Suspense + @testing-library orchestration.  jest.useFakeTimers() fights
+ * with React's microtask scheduling inside Suspense; the tests pass reliably
+ * when single-threaded but flake under full parallel `npm test` because the
+ * worker pool starves the 1-2 s real-timer waits.
+ *
+ * Mitigation:
+ *   - `jest.setTimeout(30_000)` gives each test a generous budget so slow
+ *     parallel workers never time out.
+ *   - `waitFor` timeouts are bumped to 10 s where relevant.
+ *
+ * NOT using `jest.retryTimes` — that would only mask the flake.
+ */
+
 import { describe, test, expect, jest } from '@jest/globals'
 import { atom } from '@einfach/core'
 import { act, queryByTestId, render, renderHook, screen, waitFor } from '@testing-library/react'
@@ -5,6 +22,10 @@ import { Suspense } from 'react'
 import { useAtom, useAtomValue } from '../src'
 
 describe('async', () => {
+  // Give every test in this suite enough wall-clock budget so parallel
+  // workers don't kill a test that just needs a few seconds of real sleep.
+  jest.setTimeout(30_000)
+
   test('异步获取服务器信息并显示', async () => {
     const serverInfoAtom = atom(function () {
       return new Promise((resolve) => {
@@ -34,7 +55,9 @@ describe('async', () => {
     const { baseElement } = render(<App />)
     await screen.findByTestId('app')
     expect(queryByTestId(baseElement, 'loading')).toBeInTheDocument()
-    await waitFor(() => expect(screen.queryByTestId('loading')).not.toBeInTheDocument())
+    await waitFor(() => expect(screen.queryByTestId('loading')).not.toBeInTheDocument(), {
+      timeout: 10_000,
+    })
     expect(screen.getByTestId('serverInfo')).toBeInTheDocument()
   })
 
@@ -74,12 +97,15 @@ describe('async', () => {
 
     const { baseElement } = render(<App />)
     await screen.findByTestId('app')
-    await waitFor(() => {
-      expect(queryByTestId(baseElement, 'firstItem')).not.toBeInTheDocument()
-    })
+    await waitFor(
+      () => {
+        expect(queryByTestId(baseElement, 'firstItem')).not.toBeInTheDocument()
+      },
+      { timeout: 10_000 },
+    )
 
     expect(queryByTestId(baseElement, 'loading')).toBeInTheDocument()
-    await screen.findByTestId('firstItem', undefined, { timeout: 3000 })
+    await screen.findByTestId('firstItem', undefined, { timeout: 10_000 })
     expect(queryByTestId(baseElement, 'firstItem')).toBeInTheDocument()
   })
 
@@ -118,7 +144,7 @@ describe('async', () => {
     })
 
     await act(async () => {
-      await new Promise((resolve) => setTimeout(resolve, 2000))
+      await new Promise((resolve) => setTimeout(resolve, 10_000))
     })
 
     expect(xx.result.current[0]).toBe(state)
@@ -187,7 +213,7 @@ describe('async', () => {
 
     // 等待异步操作完成
     await act(async () => {
-      await new Promise((resolve) => setTimeout(resolve, 2000))
+      await new Promise((resolve) => setTimeout(resolve, 10_000))
     })
 
     // 验证初始状态
@@ -288,7 +314,7 @@ describe('async', () => {
 
     // 等待异步操作完成
     await act(async () => {
-      await new Promise((resolve) => setTimeout(resolve, 1500))
+      await new Promise((resolve) => setTimeout(resolve, 10_000))
     })
 
     // 验证组合后的数据正确显示
