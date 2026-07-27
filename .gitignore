@@ -45,6 +45,7 @@ playwright/.cache/
 
 # CodeGraph local index (machine-local, rebuilt by `codegraph sync`)
 .codegraph/
+.codex-artifacts/
 
 # agent-harness conversation archives (never commit)
 .agent-archive/
