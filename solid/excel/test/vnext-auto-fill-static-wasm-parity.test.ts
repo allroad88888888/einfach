@@ -210,6 +210,13 @@ function normalizeFormat(value: unknown): unknown {
       }
       out[key] = normalized
     }
+    // Normalize numberFormat.kind: B 链 (SALVAGE_PLAN_REVISIONS §二) 将
+    // WASM 规范名统一为 "number"，static 后端仍回显 "decimal"。两者语义等价，
+    // 此处统一为规范名 "number" 以消除 parity 假阳性。
+    if (out.numberFormat && typeof out.numberFormat === 'object') {
+      const nf = out.numberFormat as Record<string, unknown>
+      if (nf.kind === 'decimal') nf.kind = 'number'
+    }
     return out
   }
   return value
