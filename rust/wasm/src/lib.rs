@@ -304,7 +304,7 @@ struct BorderSpecJSON {
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 struct NumberFormatJSON {
-    /// One of "general" | "decimal" | "percent" | "currency" | "date" | "custom".
+    /// One of "general" | "number" | "decimal" | "percent" | "percentage" | "currency" | "date" | "custom".
     kind: String,
     #[serde(default)]
     digits: Option<u8>,
@@ -690,11 +690,11 @@ impl ViewportSizeSnapshotJSON {
 impl NumberFormatJSON {
     fn into_number_format(self) -> NumberFormat {
         match self.kind.as_str() {
-            "decimal" => NumberFormat::Decimal {
+            "number" | "decimal" => NumberFormat::Decimal {
                 digits: self.digits.unwrap_or(2),
                 thousands: self.thousands.unwrap_or(false),
             },
-            "percent" => NumberFormat::Percent {
+            "percent" | "percentage" => NumberFormat::Percent {
                 digits: self.digits.unwrap_or(0),
             },
             "currency" => NumberFormat::Currency {
@@ -720,7 +720,7 @@ impl NumberFormatJSON {
                 thousands: None,
             },
             NumberFormat::Decimal { digits, thousands } => NumberFormatJSON {
-                kind: "decimal".into(),
+                kind: "number".into(),
                 digits: Some(*digits),
                 symbol: None,
                 pattern: None,
@@ -5283,6 +5283,34 @@ mod tests {
             demote_busy_for_custom_return(ValueError::Spill),
             ValueError::Spill
         );
+    }
+
+    #[test]
+    fn number_format_kind_aliases() {
+        // "number" is the canonical TS name, accepted as input
+        let json = NumberFormatJSON {
+            kind: "number".into(),
+            digits: Some(3),
+            thousands: Some(true),
+            symbol: None,
+            pattern: None,
+        };
+        let nf = json.into_number_format();
+        assert!(matches!(nf, NumberFormat::Decimal {
+            digits: 3,
+            thousands: true
+        }));
+
+        // "percentage" is a documented TS synonym for "percent"
+        let pct = NumberFormatJSON {
+            kind: "percentage".into(),
+            digits: Some(1),
+            thousands: None,
+            symbol: None,
+            pattern: None,
+        };
+        let nf_pct = pct.into_number_format();
+        assert!(matches!(nf_pct, NumberFormat::Percent { digits: 1 }));
     }
 
     #[test]
