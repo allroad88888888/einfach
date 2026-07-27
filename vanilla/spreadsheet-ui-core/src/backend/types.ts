@@ -1,4 +1,5 @@
 import type { CellCoord, CellRange, SheetRef, SpreadsheetError } from '../shared'
+import type { SelectionState } from '../selection/types'
 import type { ColumnFilterRule, SetFilterSortRequest, SortDirection } from '../filter-sort/types'
 import type {
   ReadPrintConfigRequest,
@@ -1285,7 +1286,7 @@ export interface SetFreezeConfigRequest extends SheetRef {
 
 export interface PublishLocalPresenceRequest extends SheetRef {
   kind: 'publish-presence'
-  selection: import('../selection/types').SelectionState
+  selection: SelectionState
   requestId?: ProjectionRequestId
   revision?: ProjectionRevision
 }
