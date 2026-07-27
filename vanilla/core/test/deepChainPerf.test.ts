@@ -152,7 +152,9 @@ describe('deep chain — 性能钉(闭式计数 + 宽松墙钟)', () => {
 
     expect(totalRuns()).toBe(coldTotal)
     expect(runs.get(1)).toBe(1)
-    expect(equalWriteMs).toBeLessThan(200)
+    // 200ms 在全量并行 npm test 下稳定超标(实测 229-332ms,单独跑仅个位数 ms);
+    // 剪枝正确性由上面两条闭式计数钉住,墙钟只兜 O(n) 级崩坏,放宽到 1s。
+    expect(equalWriteMs).toBeLessThan(1_000)
 
     // 真变更后再等值写:进 pending → 直接依赖者恰好复核一次即剪枝
     store.setter(head, 11)
