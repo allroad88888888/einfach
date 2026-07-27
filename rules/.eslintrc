@@ -268,7 +268,15 @@
       ],
       "rules": {
         "max-lines-per-function": "off",
-        "no-console": "off"
+        "no-console": "off",
+        "max-len": [
+          "error",
+          {
+            "code": 100,
+            "ignoreStrings": true,
+            "ignoreTemplateLiterals": true
+          }
+        ]
       }
     }
   ]

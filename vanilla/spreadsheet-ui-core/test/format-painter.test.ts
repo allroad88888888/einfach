@@ -18,6 +18,7 @@ import {
 } from '../src/format-painter'
 import { setSelectionAtom } from '../src/selection'
 import { setWorkspaceActiveSheetAtom } from '../src/workspace'
+import type { SetFormatRangeRequest } from '../src'
 
 const SOURCE = { rowStart: 0, rowEnd: 0, colStart: 0, colEnd: 0 }
 const TARGET = { rowStart: 2, rowEnd: 3, colStart: 4, colEnd: 5 }
@@ -203,7 +204,7 @@ describe('format-painter Core authority and mutation lifecycle', () => {
 
   test('uses only the frozen base format, accepts an exact receipt, refreshes, then exits armed', async () => {
     const store = prepare()
-    const setFormatRange = jest.fn((request) => ({
+    const setFormatRange = jest.fn((request: SetFormatRangeRequest) => ({
       sheetId: request.sheetId,
       requestId: request.requestId,
       affectedRange: request.range,
@@ -233,7 +234,7 @@ describe('format-painter Core authority and mutation lifecycle', () => {
 
   test('sticky mode stays armed after exact acknowledgement and suppresses the same target', async () => {
     const store = prepare('sticky')
-    const setFormatRange = jest.fn((request) => ({
+    const setFormatRange = jest.fn((request: SetFormatRangeRequest) => ({
       sheetId: request.sheetId,
       requestId: request.requestId,
       affectedRange: request.range,
@@ -274,7 +275,7 @@ describe('format-painter Core authority and mutation lifecycle', () => {
   test('blocks duplicate dispatch while pending', async () => {
     const store = prepare()
     const transport = deferred<unknown>()
-    const setFormatRange = jest.fn(() => transport.promise)
+    const setFormatRange = jest.fn((_request: SetFormatRangeRequest) => transport.promise)
     const first = store.setter(
       applyFormatPainterAtom,
       successfulPorts({ setFormatRange, timeoutMs: 1_000 }),

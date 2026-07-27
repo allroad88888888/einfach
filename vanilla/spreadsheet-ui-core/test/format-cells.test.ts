@@ -13,10 +13,10 @@ import {
   runFormatCellsSaveAtom,
   saveFormatCellsAtom,
   setFormatCellsActiveTabAtom,
-  type CellRange,
   type FormatCellsDraft,
   type RunFormatCellsSaveInput,
 } from '../src/format-cells'
+import type { CellRange } from '../src'
 
 const RANGE = { rowStart: 0, rowEnd: 0, colStart: 0, colEnd: 0 }
 
@@ -375,7 +375,7 @@ describe('format-cells Core-owned save lifecycle', () => {
       successfulPorts({
         setFormatRange: (request) => ({
           sheetId: request.sheetId,
-          requestId: request.requestId + 1,
+          requestId: (request.requestId ?? 0) + 1,
           affectedRange: request.range,
         }),
       }),
@@ -416,7 +416,7 @@ describe('format-cells Core-owned save lifecycle', () => {
       setFormatRange: (request) => {
         requestSnapshot = {
           sheetId: request.sheetId,
-          requestId: request.requestId,
+          requestId: request.requestId ?? 0,
           affectedRange: request.range,
         }
         return pendingAck.promise

@@ -1237,7 +1237,7 @@ describe('W2 gateway enforcement without protection ports (worker-parity contrac
     expect(blocked.status).toBe('blocked')
 
     store.setter(openProtectionUnlockAtom, { sheetId: 'sheet-1', range: TARGET_RANGE })
-    store.setter(submitProtectionUnlockAtom, { source: backend })
+    store.setter(submitProtectionUnlockAtom, { source: {} })
 
     expect(store.getter(protectionUnlockStateAtom).phase).toBe('closed')
     const allowed = store.setter(resolveContentMutationAtom, {

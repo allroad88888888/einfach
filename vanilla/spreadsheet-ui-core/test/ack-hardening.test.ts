@@ -1,10 +1,5 @@
-import { describe, expect, test } from '@jest/globals'
-import {
-  snapshotAcknowledgement,
-  runBoundedOperation,
-  type AcknowledgementSnapshot,
-  type BoundedOperationResult,
-} from '../src/internal/ack-hardening'
+import { describe, expect, jest, test } from '@jest/globals'
+import { snapshotAcknowledgement, runBoundedOperation } from '../src/internal/ack-hardening'
 
 // ---------------------------------------------------------------------------
 // snapshotAcknowledgement

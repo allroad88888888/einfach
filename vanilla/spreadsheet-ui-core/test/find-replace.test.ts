@@ -459,7 +459,7 @@ describe('find/replace search correlation and focus', () => {
   test.each([
     ['empty needle', { needle: '' }, 'FIND_REPLACE_EMPTY_NEEDLE'],
     ['invalid regex', { needle: '[', regex: true }, 'FIND_REPLACE_INVALID_REGEX'],
-    ['workbook scope', { scope: 'workbook' }, 'FIND_REPLACE_WORKBOOK_UNAVAILABLE'],
+    ['workbook scope', { scope: 'workbook' as const }, 'FIND_REPLACE_WORKBOOK_UNAVAILABLE'],
   ])('%s fails validation before dispatch', async (_label, patch, expectedCode) => {
     const store = createStore()
     prepareStore(store)
@@ -1048,7 +1048,11 @@ describe('find/replace exact-once mutation and refresh recovery', () => {
 
   test('missing revision, revision mismatch and missing ports never dispatch mutation', async () => {
     const cases = [
-      { revision: null, expected: 'FIND_REPLACE_RESULT_REVISION_REQUIRED' },
+      {
+        revision: null,
+        inputRevision: undefined,
+        expected: 'FIND_REPLACE_RESULT_REVISION_REQUIRED',
+      },
       { revision: 1, inputRevision: 2, expected: 'FIND_REPLACE_REVISION_MISMATCH' },
     ] as const
     for (const entry of cases) {

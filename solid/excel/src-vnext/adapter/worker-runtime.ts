@@ -1,7 +1,11 @@
 /// <reference lib="WebWorker" />
 
 import init, { WasmWorkbook } from '../../wasm-pkg/einfach_wasm.js'
-import { createAsyncCustomPump, type AsyncCustomRequest } from './async-custom-pump'
+import {
+  createAsyncCustomPump,
+  type AsyncCustomArg,
+  type AsyncCustomRequest,
+} from './async-custom-pump'
 import { sparseRangeToTSV } from './range-tsv'
 import type {
   AutoFillReportWire,
@@ -338,9 +342,7 @@ const snapshotSessions = new Map<number, SnapshotSession>()
  * bridge is available; if the bridge is missing we still remember the
  * compiled fn so a re-registration cycle is a clean replace.
  */
-type CustomFormulaCallable = (
-  args: Array<number | string | boolean | null>,
-) => unknown
+type CustomFormulaCallable = (args: AsyncCustomArg[]) => unknown
 const customFormulas = new Map<string, { fn: CustomFormulaCallable; isAsync: boolean }>()
 
 /**

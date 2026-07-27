@@ -18,7 +18,6 @@ import {
   menuTargetAtom,
   openMenuAtom,
   type MenuCloseReason,
-  type MenuCommandIntent,
   type MenuCommandKind,
   type MenuIntent,
   type MenuOpenInput,
@@ -144,9 +143,14 @@ describe('menu core', () => {
     ])
     expect(COMMAND_WRITE_SIGNATURES).toHaveLength(6)
     expect(COMMAND_WRITE_RESULTS).toHaveLength(6)
-    expect(commandAtoms.map((commandAtom) => store.getter(commandAtom))).toEqual(
-      COMMAND_READ_VALUES,
-    )
+    expect([
+      store.getter(dispatchMenuIntentAtom),
+      store.getter(openMenuAtom),
+      store.getter(closeMenuAtom),
+      store.getter(updateMenuHighlightAtom),
+      store.getter(dispatchMenuCommandAtom),
+      store.getter(clearMenuIntentAtom),
+    ]).toEqual(COMMAND_READ_VALUES)
 
     const opened = store.setter(openMenuAtom, {
       surface: 'cell',

@@ -12,6 +12,7 @@ import {
   keyboardModeAtom,
   lastKeyboardIntentAtom,
   type KeyboardCommandIntent,
+  type KeyboardInput,
 } from '../src/keyboard'
 
 describe('keyboard core', () => {
@@ -672,7 +673,7 @@ function expectMoveIntent(intent: KeyboardCommandIntent, to: { row: number; col:
 // Kept out of `describe('keyboard core')` on purpose: that block is already at
 // the 320-line cap, and folding these in would push it over.
 describe('Ctrl+Alt+L reapply shortcut', () => {
-  function dispatch(input: Record<string, unknown>) {
+  function dispatch(input: KeyboardInput) {
     const store = createStore()
     store.setter(setSelectionBoundsAtom, { rowCount: 10, colCount: 5 })
     store.setter(setSelectionAtom, {

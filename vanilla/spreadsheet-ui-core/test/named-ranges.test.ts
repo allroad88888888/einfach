@@ -51,7 +51,7 @@ import { setSelectionAtom } from '../src/selection'
 
 const CAPABILITIES: NamedRangeBackendCapabilities = Object.freeze({
   runtime: 'static-session',
-  scopes: Object.freeze(['workbook', 'sheet']),
+  scopes: Object.freeze(['workbook', 'sheet'] as const),
   bindings: Object.freeze({ range: true, constant: true, lambda: true }),
   delete: true,
   rangeSemantics: 'stored-definition',

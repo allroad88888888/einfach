@@ -717,7 +717,7 @@ describe('go-to special async state machine', () => {
     const store = createStore()
     const initialSelection = prepareSpecialStore(store, { rowCount: 100_001, colCount: 1 })
     store.setter(setGoToLocatorAtom, { kind: 'comments' })
-    let captured: RangeProjectionRequest | null = null
+    let captured!: RangeProjectionRequest
 
     await store.setter(runGoToSpecialScanAtom, {
       port: {
@@ -728,7 +728,7 @@ describe('go-to special async state machine', () => {
       },
     })
 
-    expect(captured?.range).toEqual({ rowStart: 0, rowEnd: 99_999, colStart: 0, colEnd: 0 })
+    expect(captured.range).toEqual({ rowStart: 0, rowEnd: 99_999, colStart: 0, colEnd: 0 })
     expect(store.getter(selectionAtom)).toEqual(initialSelection)
     expect(store.getter(goToOpenAtom)).toBe(true)
     expect(store.getter(goToErrorAtom)).toBeNull()

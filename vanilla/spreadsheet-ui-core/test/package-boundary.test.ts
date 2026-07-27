@@ -242,7 +242,10 @@ describe('package boundary', () => {
 
     const store = createStore()
     expect(store.getter(setFormulaReferenceCaretAtom)).toBeNull()
-    const before = publicStateAtoms.map((stateAtom) => store.getter(stateAtom))
+    const before = [
+      store.getter(formulaReferenceSessionAtom),
+      store.getter(formulaReferenceCaretAtom),
+    ]
     const attemptedValues = [
       {
         anchorCell: { row: 0, col: 0 },
@@ -258,7 +261,10 @@ describe('package boundary', () => {
         Reflect.apply(store.setter, store, [stateAtom, attemptedValues[index]]),
       ).toThrow()
     }
-    expect(publicStateAtoms.map((stateAtom) => store.getter(stateAtom))).toEqual(before)
+    expect([
+      store.getter(formulaReferenceSessionAtom),
+      store.getter(formulaReferenceCaretAtom),
+    ]).toEqual(before)
 
     const source = readFileSync(join(SRC_ROOT, 'formula-reference/index.ts'), 'utf8')
     for (const name of ['formulaReferenceSessionAtom', 'formulaReferenceCaretAtom']) {
