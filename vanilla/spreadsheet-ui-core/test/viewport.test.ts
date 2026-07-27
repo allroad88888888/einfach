@@ -58,7 +58,7 @@ describe('viewport chrome state', () => {
     }
   })
 
-  test.each([
+  const TOGGLE_CASES = [
     [
       'gridlines',
       viewportShowGridlinesAtom,
@@ -77,9 +77,11 @@ describe('viewport chrome state', () => {
       toggleFormulaBarAtom,
       'spreadsheet.viewport.toggleFormulaBar',
     ],
-  ] as const)(
+  ] as const
+  test.each(TOGGLE_CASES)(
     '%s toggle is the writable state transition',
-    (_label, stateAtom, toggleAtom, debugLabel) => {
+    (...args: (typeof TOGGLE_CASES)[number]) => {
+      const [_label, stateAtom, toggleAtom, debugLabel] = args
       const store = createStore()
 
       expect(toggleAtom.debugLabel).toBe(debugLabel)

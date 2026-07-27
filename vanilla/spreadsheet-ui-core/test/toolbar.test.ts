@@ -168,7 +168,7 @@ describe('toolbar core', () => {
     expect(store.getter(packageToolbarUiStateAtom).activeSurface).toBeNull()
   })
 
-  test.each([
+  const MUTATION_IDENTITY_CASES = [
     ['zero', 0, 1],
     ['positive boundary', Number.MAX_SAFE_INTEGER - 1, Number.MAX_SAFE_INTEGER],
     ['positive rollover', Number.MAX_SAFE_INTEGER, -1],
@@ -181,9 +181,14 @@ describe('toolbar core', () => {
     ['positive infinity', Number.POSITIVE_INFINITY, null],
     ['negative infinity', Number.NEGATIVE_INFINITY, null],
     ['NaN', Number.NaN, null],
-  ] as const)('allocates safe mutation identities at the %s case', (_case, input, expected) => {
-    expect(nextToolbarMutationIdentity(input)).toBe(expected)
-  })
+  ] as const
+  test.each(MUTATION_IDENTITY_CASES)(
+    'allocates safe mutation identities at the %s case',
+    (...args: (typeof MUTATION_IDENTITY_CASES)[number]) => {
+      const [_case, input, expected] = args
+      expect(nextToolbarMutationIdentity(input)).toBe(expected)
+    },
+  )
 
   test('plans all session and request ids atomically and fails closed on exhaustion', () => {
     expect(planToolbarMutationIdentities(0, Number.MAX_SAFE_INTEGER, 3)).toEqual({

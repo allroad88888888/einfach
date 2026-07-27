@@ -26,6 +26,7 @@ import {
   viewportHiddenDiagnosticAtom,
   type HideColumnsRequest,
   type HideRowsRequest,
+  type HistoryControllerPort,
   type UnhideColumnsRequest,
   type UnhideRowsRequest,
   type ViewportHiddenPersistencePort,
@@ -65,7 +66,10 @@ function createPersistencePort(
   const unhideRows: UnhideRowsRequest[] = []
   const hideColumns: HideColumnsRequest[] = []
   const unhideColumns: UnhideColumnsRequest[] = []
-  const port: ViewportHiddenPersistencePort = {
+  // Also structurally satisfies HistoryControllerPort (both methods optional)
+  // so this same mock can double as the `source` for runUndoHistoryAtom in
+  // the local-replay history tests below without widening to `{}`.
+  const port: ViewportHiddenPersistencePort & HistoryControllerPort = {
     async readViewportSizeProjection(request) {
       reads.push(request)
       return {

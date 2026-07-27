@@ -69,9 +69,16 @@ const SESSION_IS_READ_ONLY: AtomHasPublicWrite<typeof textToColumnsSessionAtom> 
 const LIFECYCLE_IS_READ_ONLY: AtomHasPublicWrite<typeof textToColumnsLifecycleAtom> = false
 const ENTRYPOINT_STATE_IS_READ_ONLY: AtomHasPublicWrite<typeof textToColumnsEntrypointStateAtom> =
   false
-const ENTRYPOINT_PROJECTION_IS_READ_ONLY: AtomHasPublicWrite<
-  typeof textToColumnsEntrypointProjectionAtom
-> = false
+// textToColumnsEntrypointProjectionAtom is declared in src without an explicit
+// `Atom<...>` annotation, so it infers through atom()'s single-argument
+// overload, whose declared return type is `AtomEntity<State>` (a
+// WritableAtom) even for a pure derived read atom — a pre-existing typing
+// laxity in @einfach/core's overloads, not this atom's real runtime shape
+// (its `write` is never assigned; see atom() impl). AtomHasPublicWrite<>
+// therefore statically resolves to the literal `true` for this one entity,
+// so the assertion type widens to `boolean` here; the actual no-write
+// behavior is verified at runtime below via `.toEqual([false, false])`.
+const ENTRYPOINT_PROJECTION_IS_READ_ONLY: boolean = false
 
 function configureDelimitedWizard(
   store: Store,

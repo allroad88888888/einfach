@@ -14,6 +14,7 @@ import {
   setFreezeConfigAtom,
   viewportFreezeAtom,
   viewportFreezeDiagnosticAtom,
+  type HistoryControllerPort,
   type ReadFreezeConfigRequest,
   type SetFreezeConfigRequest,
   type ViewportFreezePersistencePort,
@@ -58,7 +59,10 @@ function createPersistencePort(seed: { rows: number; cols: number } = { rows: 0,
   const freezeBySheet = new Map<string, { rows: number; cols: number }>()
   const setRequests: SetFreezeConfigRequest[] = []
   let readCalls = 0
-  const port: ViewportFreezePersistencePort = {
+  // Also structurally satisfies HistoryControllerPort (both methods optional)
+  // so this same mock can double as the `source` for runUndoHistoryAtom in
+  // the local-replay history tests below without widening to `{}`.
+  const port: ViewportFreezePersistencePort & HistoryControllerPort = {
     async readFreezeConfig(request: ReadFreezeConfigRequest) {
       readCalls += 1
       const freeze = freezeBySheet.get(request.sheetId) ?? seed
@@ -376,16 +380,21 @@ describe('freeze history local replay', () => {
 })
 
 describe('freeze structural shift remap', () => {
-  test.each([
+  const REMAP_CASES = [
     ['insert above the freeze line grows the band', 3, { kind: 'insert', index: 1, count: 2 }, 5],
     ['insert at the freeze line is untouched', 3, { kind: 'insert', index: 3, count: 2 }, 3],
     ['delete fully inside the band shrinks by count', 4, { kind: 'delete', index: 1, count: 2 }, 2],
     ['delete over the line shrinks by overlap', 3, { kind: 'delete', index: 2, count: 5 }, 2],
     ['delete past the freeze line is untouched', 2, { kind: 'delete', index: 2, count: 3 }, 2],
     ['zero frozen stays zero', 0, { kind: 'insert', index: 0, count: 2 }, 0],
-  ] as const)('remapFrozenLeadingBand: %s', (_label, frozen, shift, expected) => {
-    expect(remapFrozenLeadingBand(frozen, { axis: 'row', ...shift })).toBe(expected)
-  })
+  ] as const
+  test.each(REMAP_CASES)(
+    'remapFrozenLeadingBand: %s',
+    (...args: (typeof REMAP_CASES)[number]) => {
+      const [_label, frozen, shift, expected] = args
+      expect(remapFrozenLeadingBand(frozen, { axis: 'row', ...shift })).toBe(expected)
+    },
+  )
 
   test('applyViewportFreezeStructuralShiftAtom moves the frozen rows and leaves cols alone', () => {
     const store = createStore()
