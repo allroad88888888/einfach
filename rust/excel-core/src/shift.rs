@@ -533,7 +533,10 @@ fn scan_abs_addr_token(b: &[u8], i: usize) -> Option<(CellAddress, bool, bool, u
             return None;
         }
     }
-    let row: u32 = std::str::from_utf8(&b[digits_start..j]).ok()?.parse().ok()?;
+    let row: u32 = std::str::from_utf8(&b[digits_start..j])
+        .ok()?
+        .parse()
+        .ok()?;
     if row == 0 {
         return None;
     }
@@ -1857,10 +1860,7 @@ mod tests {
         );
         // Cross-sheet absolute refs are NOT shifted by a within-sheet edit.
         assert_eq!(
-            rewrite_parked_source(
-                "=Data!$A$1+$B$2",
-                ShiftEdit::RowInsert { at: 0, count: 1 }
-            ),
+            rewrite_parked_source("=Data!$A$1+$B$2", ShiftEdit::RowInsert { at: 0, count: 1 }),
             SourceRewrite::Rewritten("=Data!$A$1+$B$3".into())
         );
         // Absolute whole-column / whole-row keep `$` on the bounded axis.

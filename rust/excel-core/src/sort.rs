@@ -81,7 +81,9 @@ pub enum SortRangeError {
     KeyOutOfRange,
     /// The range intersects an active spill (anchor or target). Aligned
     /// with Excel's "can't change part of an array" rejection.
-    SpillIntersectsRange { anchor: CellAddress },
+    SpillIntersectsRange {
+        anchor: CellAddress,
+    },
 }
 
 // === Comparator (§3.2, normative) ===
@@ -254,10 +256,7 @@ impl Sheet {
             let (rows, cols) = self.spill_info(anchor).unwrap_or((1, 1));
             let rect = CellRange::new(
                 anchor,
-                CellAddress::new(
-                    anchor.row + rows.max(1) - 1,
-                    anchor.col + cols.max(1) - 1,
-                ),
+                CellAddress::new(anchor.row + rows.max(1) - 1, anchor.col + cols.max(1) - 1),
             );
             if ranges_intersect(rect, range)
                 && hit.is_none_or(|h| (anchor.row, anchor.col) < (h.row, h.col))
@@ -594,14 +593,23 @@ mod tests {
     #[test]
     fn sort_cmp_text_case_fold_default_and_case_sensitive() {
         // Default: case-insensitive code-point order.
-        assert_eq!(sort_cmp(&text("apple"), &text("Banana"), false), Ordering::Less);
-        assert_eq!(sort_cmp(&text("APPLE"), &text("apple"), false), Ordering::Equal);
+        assert_eq!(
+            sort_cmp(&text("apple"), &text("Banana"), false),
+            Ordering::Less
+        );
+        assert_eq!(
+            sort_cmp(&text("APPLE"), &text("apple"), false),
+            Ordering::Equal
+        );
         // Case-sensitive: plain code-point order ('B' < 'a').
         assert_eq!(
             sort_cmp(&text("Banana"), &text("apple"), true),
             Ordering::Less
         );
-        assert_eq!(sort_cmp(&text("APPLE"), &text("apple"), true), Ordering::Less);
+        assert_eq!(
+            sort_cmp(&text("APPLE"), &text("apple"), true),
+            Ordering::Less
+        );
         // Non-ASCII fold: 'É' folds to 'é'.
         assert_eq!(sort_cmp(&text("É"), &text("é"), false), Ordering::Equal);
     }
@@ -651,15 +659,16 @@ mod tests {
         sheet.set_cell("B2", text("one"));
         sheet.set_cell("B3", text("two"));
 
-        let report = sheet
-            .sort_range(range("A1", "B3"), &[asc(0)], &[])
-            .unwrap();
+        let report = sheet.sort_range(range("A1", "B3"), &[asc(0)], &[]).unwrap();
         assert_eq!(report.moved_rows, 3);
         assert_eq!(report.moved_cells, 6);
         // Slot ← previous occupant: slot 0 ← row 1, slot 1 ← row 2, slot 2 ← row 0.
         assert_eq!(report.row_permutation, vec![(0, 1), (1, 2), (2, 0)]);
 
-        assert_eq!(col_values(&sheet, "A", 3), vec![num(1.0), num(2.0), num(3.0)]);
+        assert_eq!(
+            col_values(&sheet, "A", 3),
+            vec![num(1.0), num(2.0), num(3.0)]
+        );
         assert_eq!(
             col_values(&sheet, "B", 3),
             vec![text("one"), text("two"), text("three")]
@@ -798,7 +807,10 @@ mod tests {
             vec![num(1.0), text("PINNED"), num(2.0), num(4.0)]
         );
         // Permutation touches visible slots only.
-        assert!(report.row_permutation.iter().all(|&(slot, src)| slot != 1 && src != 1));
+        assert!(report
+            .row_permutation
+            .iter()
+            .all(|&(slot, src)| slot != 1 && src != 1));
     }
 
     #[test]
@@ -967,9 +979,7 @@ mod tests {
         };
         sheet.set_format_range(range("A1", "D5"), red.clone());
 
-        sheet
-            .sort_range(range("B2", "C4"), &[asc(1)], &[])
-            .unwrap();
+        sheet.sort_range(range("B2", "C4"), &[asc(1)], &[]).unwrap();
         // Inside: every cell was layer-covered → materialized red rides
         // along; all slots still show red.
         for r in 2..=4 {
@@ -1056,11 +1066,7 @@ mod tests {
     fn spill_anchor_inside_range_rejects() {
         let mut sheet = Sheet::new();
         sheet.set_cell("A1", num(2.0));
-        let arr = Arc::new(ArrayData::new(
-            2,
-            1,
-            vec![num(7.0), num(8.0)],
-        ));
+        let arr = Arc::new(ArrayData::new(2, 1, vec![num(7.0), num(8.0)]));
         sheet.set_array("A2", arr).unwrap();
 
         let err = sheet
@@ -1077,11 +1083,7 @@ mod tests {
     #[test]
     fn spill_target_only_intersection_rejects_with_anchor() {
         let mut sheet = Sheet::new();
-        let arr = Arc::new(ArrayData::new(
-            3,
-            1,
-            vec![num(1.0), num(2.0), num(3.0)],
-        ));
+        let arr = Arc::new(ArrayData::new(3, 1, vec![num(1.0), num(2.0), num(3.0)]));
         sheet.set_array("A5", arr).unwrap(); // spills A5:A7
         sheet.set_cell("A8", num(9.0));
 

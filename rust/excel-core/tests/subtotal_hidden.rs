@@ -58,8 +58,16 @@ fn subtotal_109_excludes_hidden_rows_while_9_includes_them() {
     wb.set_eval_hidden_rows(0, &[1, 3]);
 
     // 9 unaffected; 109 drops the hidden rows: 1 + 3 + 5 = 9.
-    assert_eq!(num(&wb, "Sheet1", "C1"), 15.0, "SUBTOTAL(9) must ignore hidden");
-    assert_eq!(num(&wb, "Sheet1", "C2"), 9.0, "SUBTOTAL(109) must exclude hidden");
+    assert_eq!(
+        num(&wb, "Sheet1", "C1"),
+        15.0,
+        "SUBTOTAL(9) must ignore hidden"
+    );
+    assert_eq!(
+        num(&wb, "Sheet1", "C2"),
+        9.0,
+        "SUBTOTAL(109) must exclude hidden"
+    );
     assert_ne!(
         num(&wb, "Sheet1", "C1"),
         num(&wb, "Sheet1", "C2"),
@@ -91,17 +99,17 @@ fn all_subtotal_variants_101_to_111_exclude_hidden() {
 
     // (function_num, expected over visible-only, expected over all rows)
     let cases: [(u32, f64, f64); 11] = [
-        (1, mean(&visible), mean(&all)),                       // AVERAGE
-        (2, visible.len() as f64, all.len() as f64),           // COUNT
-        (3, visible.len() as f64, all.len() as f64),           // COUNTA
-        (4, 50.0, 100.0),                                      // MAX
-        (5, 3.0, 1.0),                                         // MIN
-        (6, visible.iter().product(), all.iter().product()),   // PRODUCT
-        (7, var(&visible, true).sqrt(), var(&all, true).sqrt()), // STDEV
+        (1, mean(&visible), mean(&all)),                           // AVERAGE
+        (2, visible.len() as f64, all.len() as f64),               // COUNT
+        (3, visible.len() as f64, all.len() as f64),               // COUNTA
+        (4, 50.0, 100.0),                                          // MAX
+        (5, 3.0, 1.0),                                             // MIN
+        (6, visible.iter().product(), all.iter().product()),       // PRODUCT
+        (7, var(&visible, true).sqrt(), var(&all, true).sqrt()),   // STDEV
         (8, var(&visible, false).sqrt(), var(&all, false).sqrt()), // STDEVP
-        (9, visible.iter().sum(), all.iter().sum()),           // SUM
-        (10, var(&visible, true), var(&all, true)),            // VAR
-        (11, var(&visible, false), var(&all, false)),          // VARP
+        (9, visible.iter().sum(), all.iter().sum()),               // SUM
+        (10, var(&visible, true), var(&all, true)),                // VAR
+        (11, var(&visible, false), var(&all, false)),              // VARP
     ];
 
     for (base, want_visible, want_all) in cases {
@@ -182,11 +190,19 @@ fn hidden_push_is_full_replace_and_empty_clears() {
 
     // Replace with {row 3 (=4)} — NOT a union: 1+2+3+5 = 11.
     wb.set_eval_hidden_rows(0, &[3]);
-    assert_eq!(num(&wb, "Sheet1", "C1"), 11.0, "second push must fully replace the first");
+    assert_eq!(
+        num(&wb, "Sheet1", "C1"),
+        11.0,
+        "second push must fully replace the first"
+    );
 
     // Empty push clears the set → full total again.
     wb.set_eval_hidden_rows(0, &[]);
-    assert_eq!(num(&wb, "Sheet1", "C1"), 15.0, "empty push must restore the unfiltered total");
+    assert_eq!(
+        num(&wb, "Sheet1", "C1"),
+        15.0,
+        "empty push must restore the unfiltered total"
+    );
 }
 
 // ===================== cross-sheet independence =====================
@@ -209,7 +225,11 @@ fn cross_sheet_subtotal_uses_referenced_sheet_hidden_set() {
 
     // Hide row 1 on Sheet1 ONLY.
     wb.set_eval_hidden_rows(0, &[1]);
-    assert_eq!(num(&wb, "Sheet1", "C1"), 4.0, "same-sheet 109 drops Sheet1 row 1 (=2)");
+    assert_eq!(
+        num(&wb, "Sheet1", "C1"),
+        4.0,
+        "same-sheet 109 drops Sheet1 row 1 (=2)"
+    );
     assert_eq!(
         num(&wb, "Sheet1", "C2"),
         60.0,
@@ -218,7 +238,11 @@ fn cross_sheet_subtotal_uses_referenced_sheet_hidden_set() {
 
     // Now hide row 1 on Sheet2 ONLY.
     wb.set_eval_hidden_rows(1, &[1]);
-    assert_eq!(num(&wb, "Sheet1", "C1"), 4.0, "Sheet1 result unchanged by a Sheet2 push");
+    assert_eq!(
+        num(&wb, "Sheet1", "C1"),
+        4.0,
+        "Sheet1 result unchanged by a Sheet2 push"
+    );
     assert_eq!(
         num(&wb, "Sheet1", "C2"),
         40.0,
@@ -254,7 +278,11 @@ fn push_to_out_of_range_sheet_is_a_no_op() {
     assert_eq!(num(&wb, "Sheet1", "C1"), 6.0);
 
     wb.set_eval_hidden_rows(99, &[0, 1, 2]); // no such sheet
-    assert_eq!(num(&wb, "Sheet1", "C1"), 6.0, "unrelated sheet push must not affect Sheet1");
+    assert_eq!(
+        num(&wb, "Sheet1", "C1"),
+        6.0,
+        "unrelated sheet push must not affect Sheet1"
+    );
 }
 
 /// A hidden row that falls outside the SUBTOTAL's referenced range simply

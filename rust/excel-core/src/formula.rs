@@ -683,7 +683,9 @@ impl Parser {
     fn at_ident_continuation(&self) -> bool {
         match self.peek() {
             Some(c) if c.is_ascii_alphanumeric() || c == '_' => true,
-            Some('.') => matches!(self.peek_at(1), Some(n) if n.is_ascii_alphanumeric() || n == '_'),
+            Some('.') => {
+                matches!(self.peek_at(1), Some(n) if n.is_ascii_alphanumeric() || n == '_')
+            }
             _ => false,
         }
     }
@@ -1438,9 +1440,10 @@ mod tests {
     fn parse_negation() {
         assert_eq!(
             parse_formula("=-A1"),
-            Some(Expr::Negate(Box::new(Expr::CellRef(CellAddress::new(
-                0, 0
-            ), RefAbs::REL))))
+            Some(Expr::Negate(Box::new(Expr::CellRef(
+                CellAddress::new(0, 0),
+                RefAbs::REL
+            ))))
         );
     }
 
@@ -1506,7 +1509,7 @@ mod tests {
                     start: CellAddress::new(0, 0),
                     end: CellAddress::new(2, 1),
                     unbounded: RangeBounds::None,
-                abs: RangeAbs::REL,
+                    abs: RangeAbs::REL,
                 }],
             }
         );
@@ -1525,7 +1528,7 @@ mod tests {
                     start: CellAddress::new(0, 0),
                     end: CellAddress::new(u32::MAX, 0),
                     unbounded: RangeBounds::Rows,
-                abs: RangeAbs::REL,
+                    abs: RangeAbs::REL,
                 }],
             }
         );
@@ -1543,7 +1546,7 @@ mod tests {
                     start: CellAddress::new(0, 0),
                     end: CellAddress::new(u32::MAX, 2),
                     unbounded: RangeBounds::Rows,
-                abs: RangeAbs::REL,
+                    abs: RangeAbs::REL,
                 }],
             }
         );
@@ -1561,7 +1564,7 @@ mod tests {
                     start: CellAddress::new(0, 0),
                     end: CellAddress::new(0, u32::MAX),
                     unbounded: RangeBounds::Cols,
-                abs: RangeAbs::REL,
+                    abs: RangeAbs::REL,
                 }],
             }
         );
@@ -1579,7 +1582,7 @@ mod tests {
                     start: CellAddress::new(0, 0),
                     end: CellAddress::new(2, u32::MAX),
                     unbounded: RangeBounds::Cols,
-                abs: RangeAbs::REL,
+                    abs: RangeAbs::REL,
                 }],
             }
         );
@@ -1668,7 +1671,7 @@ mod tests {
             Expr::SheetRef {
                 sheet: "Sheet2".into(),
                 addr: CellAddress::new(0, 0),
-            abs: RefAbs::REL,
+                abs: RefAbs::REL,
             }
         );
     }
@@ -1685,7 +1688,7 @@ mod tests {
                     start: CellAddress::new(0, 0),
                     end: CellAddress::new(99, 0),
                     unbounded: RangeBounds::None,
-                abs: RangeAbs::REL,
+                    abs: RangeAbs::REL,
                 }],
             }
         );
@@ -1700,9 +1703,10 @@ mod tests {
     fn parse_spill_ref() {
         assert_eq!(
             parse_formula("=A1#"),
-            Some(Expr::SpillRef(Box::new(Expr::CellRef(CellAddress::new(
-                0, 0
-            ), RefAbs::REL))))
+            Some(Expr::SpillRef(Box::new(Expr::CellRef(
+                CellAddress::new(0, 0),
+                RefAbs::REL
+            ))))
         );
     }
 
@@ -1718,7 +1722,7 @@ mod tests {
             Some(Expr::SpillRef(Box::new(Expr::SheetRef {
                 sheet: "Sheet2".into(),
                 addr: CellAddress::new(0, 0),
-            abs: RefAbs::REL,
+                abs: RefAbs::REL,
             })))
         );
     }
@@ -1767,7 +1771,7 @@ mod tests {
                 left: Box::new(Expr::SheetRef {
                     sheet: "Sheet2".into(),
                     addr: CellAddress::new(0, 0),
-                abs: RefAbs::REL,
+                    abs: RefAbs::REL,
                 }),
                 right: Box::new(Expr::Number(5.0)),
             }
@@ -1797,7 +1801,7 @@ mod tests {
                         start: CellAddress::new(0, 0),
                         end: CellAddress::new(2, 0),
                         unbounded: RangeBounds::None,
-                    abs: RangeAbs::REL,
+                        abs: RangeAbs::REL,
                     },
                 ],
             }
@@ -1817,7 +1821,7 @@ mod tests {
                         start: CellAddress::new(0, 0),
                         end: CellAddress::new(2, 0),
                         unbounded: RangeBounds::None,
-                    abs: RangeAbs::REL,
+                        abs: RangeAbs::REL,
                     },
                     Expr::Number(0.5),
                 ],
@@ -2157,7 +2161,7 @@ mod tests {
                     start: CellAddress::new(0, 0),
                     end: CellAddress::new(1, 1),
                     unbounded: RangeBounds::None,
-                abs: RangeAbs::REL,
+                    abs: RangeAbs::REL,
                 },
                 Expr::CellRef(CellAddress::new(4, 3), RefAbs::REL),
             ])
@@ -2275,7 +2279,10 @@ mod tests {
     fn parse_absolute_cell_ref_all_four_forms() {
         assert_eq!(
             parse_formula("=$A$1"),
-            Some(Expr::CellRef(CellAddress::new(0, 0), RefAbs::new(true, true)))
+            Some(Expr::CellRef(
+                CellAddress::new(0, 0),
+                RefAbs::new(true, true)
+            ))
         );
         assert_eq!(
             parse_formula("=$A1"),

@@ -29,7 +29,11 @@ use einfach_excel_core::Workbook;
 /// MANUAL store).
 fn seed(wb: &mut Workbook, sheet_idx: usize) {
     for i in 0..5 {
-        wb.set_cell(sheet_idx, &format!("A{}", i + 1), Value::Number((i + 1) as f64));
+        wb.set_cell(
+            sheet_idx,
+            &format!("A{}", i + 1),
+            Value::Number((i + 1) as f64),
+        );
     }
     assert!(wb.set_formula(sheet_idx, "C1", "=SUBTOTAL(109, A1:A5)"));
     assert!(wb.set_formula(sheet_idx, "C2", "=SUBTOTAL(9, A1:A5)"));
@@ -66,8 +70,16 @@ fn remove_sheet_keeps_manual_hidden_rows_with_their_sheet() {
 
     // Hide rows 1 and 3 (0-based) on Sheet3 → 1 + 3 + 5 = 9.
     wb.set_eval_hidden_rows(2, &[1, 3]);
-    assert_eq!(num(&wb, "Sheet3", "C1"), 9.0, "precondition: 109 excludes on Sheet3");
-    assert_eq!(num(&wb, "Sheet1", "C1"), 15.0, "precondition: Sheet1 has no hidden rows");
+    assert_eq!(
+        num(&wb, "Sheet3", "C1"),
+        9.0,
+        "precondition: 109 excludes on Sheet3"
+    );
+    assert_eq!(
+        num(&wb, "Sheet1", "C1"),
+        15.0,
+        "precondition: Sheet1 has no hidden rows"
+    );
 
     // Delete Sheet2 → Sheet3 slides from index 2 to index 1.
     assert!(wb.remove_sheet(1).is_some());
@@ -80,7 +92,11 @@ fn remove_sheet_keeps_manual_hidden_rows_with_their_sheet() {
         "SUBTOTAL(109) on Sheet3 must still exclude its hidden rows after an \
          earlier sheet is removed"
     );
-    assert_eq!(num(&wb, "Sheet3", "C2"), 15.0, "SUBTOTAL(9) stays unaffected");
+    assert_eq!(
+        num(&wb, "Sheet3", "C2"),
+        15.0,
+        "SUBTOTAL(9) stays unaffected"
+    );
 }
 
 /// The mis-attribution half: a sheet that slides INTO the vacated index must
@@ -90,12 +106,20 @@ fn remove_sheet_does_not_leak_hidden_rows_onto_the_shifted_in_sheet() {
     let mut wb = workbook_with_sheets(4);
 
     wb.set_eval_hidden_rows(2, &[1, 3]); // Sheet3
-    assert_eq!(num(&wb, "Sheet4", "C1"), 15.0, "precondition: Sheet4 has no hidden rows");
+    assert_eq!(
+        num(&wb, "Sheet4", "C1"),
+        15.0,
+        "precondition: Sheet4 has no hidden rows"
+    );
 
     // Delete Sheet1 → Sheet3 lands on 1, Sheet4 lands on 2 (Sheet3's old key).
     assert!(wb.remove_sheet(0).is_some());
 
-    assert_eq!(num(&wb, "Sheet3", "C1"), 9.0, "Sheet3 keeps its own hidden set");
+    assert_eq!(
+        num(&wb, "Sheet3", "C1"),
+        9.0,
+        "Sheet3 keeps its own hidden set"
+    );
     assert_eq!(
         num(&wb, "Sheet4", "C1"),
         15.0,
@@ -129,7 +153,11 @@ fn remove_sheet_keeps_filter_hidden_rows_with_their_sheet() {
     let mut wb = workbook_with_sheets(3);
 
     wb.set_eval_filter_hidden_rows(2, &[1, 3]); // Sheet3
-    assert_eq!(num(&wb, "Sheet3", "C2"), 9.0, "precondition: 9 excludes filter-hidden");
+    assert_eq!(
+        num(&wb, "Sheet3", "C2"),
+        9.0,
+        "precondition: 9 excludes filter-hidden"
+    );
 
     assert!(wb.remove_sheet(1).is_some());
 
@@ -158,7 +186,11 @@ fn move_sheet_backwards_carries_hidden_rows() {
     // Sheet3 to the front: order becomes Sheet3, Sheet1, Sheet2.
     assert!(wb.move_sheet(2, 0));
 
-    assert_eq!(num(&wb, "Sheet3", "C1"), 9.0, "Sheet3 keeps its hidden set at its new index");
+    assert_eq!(
+        num(&wb, "Sheet3", "C1"),
+        9.0,
+        "Sheet3 keeps its hidden set at its new index"
+    );
     assert_eq!(num(&wb, "Sheet1", "C1"), 15.0, "Sheet1 stays clean");
     assert_eq!(
         num(&wb, "Sheet2", "C1"),
@@ -178,7 +210,11 @@ fn move_sheet_forwards_carries_hidden_rows() {
     // Sheet1 to the back: order becomes Sheet2, Sheet3, Sheet1.
     assert!(wb.move_sheet(0, 2));
 
-    assert_eq!(num(&wb, "Sheet1", "C1"), 9.0, "Sheet1 keeps its hidden set at index 2");
+    assert_eq!(
+        num(&wb, "Sheet1", "C1"),
+        9.0,
+        "Sheet1 keeps its hidden set at index 2"
+    );
     assert_eq!(
         num(&wb, "Sheet2", "C1"),
         15.0,
@@ -196,7 +232,11 @@ fn move_sheet_leaves_untouched_sheets_alone() {
 
     assert!(wb.move_sheet(0, 1)); // swap Sheet1/Sheet2 only
 
-    assert_eq!(num(&wb, "Sheet4", "C1"), 9.0, "Sheet4 is outside the rotation");
+    assert_eq!(
+        num(&wb, "Sheet4", "C1"),
+        9.0,
+        "Sheet4 is outside the rotation"
+    );
     assert_eq!(num(&wb, "Sheet1", "C1"), 15.0);
     assert_eq!(num(&wb, "Sheet2", "C1"), 15.0);
 }
@@ -228,8 +268,16 @@ fn move_sheet_carries_both_stores_at_once() {
 
     assert!(wb.move_sheet(2, 0));
 
-    assert_eq!(num(&wb, "Sheet3", "C1"), 9.0, "manual + filter both follow Sheet3");
-    assert_eq!(num(&wb, "Sheet3", "C2"), 11.0, "filter-only layer follows too");
+    assert_eq!(
+        num(&wb, "Sheet3", "C1"),
+        9.0,
+        "manual + filter both follow Sheet3"
+    );
+    assert_eq!(
+        num(&wb, "Sheet3", "C2"),
+        11.0,
+        "filter-only layer follows too"
+    );
 }
 
 /// A no-op move must not disturb anything.
@@ -256,7 +304,11 @@ fn add_sheet_leaves_hidden_rows_in_place() {
     assert_eq!(wb.add_sheet("Sheet3"), 2);
     seed(&mut wb, 2);
 
-    assert_eq!(num(&wb, "Sheet2", "C1"), 9.0, "Sheet2 keeps its set across an append");
+    assert_eq!(
+        num(&wb, "Sheet2", "C1"),
+        9.0,
+        "Sheet2 keeps its set across an append"
+    );
     assert_eq!(num(&wb, "Sheet3", "C1"), 15.0, "the new sheet starts clean");
 }
 
@@ -270,6 +322,10 @@ fn rename_sheet_leaves_hidden_rows_in_place() {
     wb.set_eval_hidden_rows(1, &[1, 3]);
     assert!(wb.rename_sheet(1, "Renamed"));
 
-    assert_eq!(num(&wb, "Renamed", "C1"), 9.0, "a rename must not move the hidden set");
+    assert_eq!(
+        num(&wb, "Renamed", "C1"),
+        9.0,
+        "a rename must not move the hidden set"
+    );
     assert_eq!(num(&wb, "Sheet1", "C1"), 15.0);
 }

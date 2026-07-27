@@ -98,8 +98,8 @@ fn aggregate_ignore_hidden_bit_full_option_matrix() {
 
     const FULL_SUM: f64 = 63.0; // 1+2+4+8+16+32
     const VISIBLE_SUM: f64 = 43.0; // 63 - 4 (manual) - 16 (filter)
-    // Guard the counter-example: the two sums MUST differ or the assertions
-    // below could not tell IncludeAll from ExcludeFilterAndManual.
+                                   // Guard the counter-example: the two sums MUST differ or the assertions
+                                   // below could not tell IncludeAll from ExcludeFilterAndManual.
     assert_ne!(FULL_SUM, VISIBLE_SUM);
 
     // Bit CLEAR: keep everything (even the filter-hidden 16) -> 63.

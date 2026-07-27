@@ -71,7 +71,11 @@ fn subtotal_two_layer_rule_matrix() {
         13.0,
         "SUBTOTAL(9) must EXCLUDE filter-hidden rows (the rule this slice adds)"
     );
-    assert_eq!(num(&wb, "Sheet1", "C2"), 13.0, "SUBTOTAL(109) must exclude filter-hidden rows");
+    assert_eq!(
+        num(&wb, "Sheet1", "C2"),
+        13.0,
+        "SUBTOTAL(109) must exclude filter-hidden rows"
+    );
 
     // --- manual-hidden ONLY: row 1 (=2) → only 101-111 excludes it ---
     wb.set_eval_filter_hidden_rows(0, &[]);
@@ -81,7 +85,11 @@ fn subtotal_two_layer_rule_matrix() {
         15.0,
         "SUBTOTAL(9) must INCLUDE manually hidden rows (Excel parity, unchanged)"
     );
-    assert_eq!(num(&wb, "Sheet1", "C2"), 13.0, "SUBTOTAL(109) must exclude manually hidden rows");
+    assert_eq!(
+        num(&wb, "Sheet1", "C2"),
+        13.0,
+        "SUBTOTAL(109) must exclude manually hidden rows"
+    );
 
     // --- BOTH, disjoint: manual {1} (=2), filter {3} (=4) ---
     wb.set_eval_filter_hidden_rows(0, &[3]);
@@ -183,10 +191,10 @@ fn the_two_sets_do_not_interfere() {
 
     // Churn the MANUAL set: 9 must stay 14 throughout.
     for (manual, want_109) in [
-        (vec![1u32], 12.0),      // drop 2 as well
-        (vec![1, 2], 9.0),       // drop 2 and 3
-        (vec![4], 9.0),          // full replace, not a delta: drop 5 (2+3+4)
-        (vec![], 14.0),          // empty clears
+        (vec![1u32], 12.0), // drop 2 as well
+        (vec![1, 2], 9.0),  // drop 2 and 3
+        (vec![4], 9.0),     // full replace, not a delta: drop 5 (2+3+4)
+        (vec![], 14.0),     // empty clears
     ] {
         wb.set_eval_hidden_rows(0, &manual);
         assert_eq!(
@@ -200,10 +208,10 @@ fn the_two_sets_do_not_interfere() {
     // Now pin manual = {4} (=5) and churn the FILTER set; 109 tracks both.
     wb.set_eval_hidden_rows(0, &[4]);
     for (filter, want_9, want_109) in [
-        (vec![0u32], 14.0, 9.0),  // 2+3+4+5 / 2+3+4
-        (vec![0, 1], 12.0, 7.0),  // 3+4+5 / 3+4
-        (vec![2], 12.0, 7.0),     // full replace: 1+2+4+5 / 1+2+4
-        (vec![], 15.0, 10.0),     // empty clears: all / all-but-manual
+        (vec![0u32], 14.0, 9.0), // 2+3+4+5 / 2+3+4
+        (vec![0, 1], 12.0, 7.0), // 3+4+5 / 3+4
+        (vec![2], 12.0, 7.0),    // full replace: 1+2+4+5 / 1+2+4
+        (vec![], 15.0, 10.0),    // empty clears: all / all-but-manual
     ] {
         wb.set_eval_filter_hidden_rows(0, &filter);
         assert_eq!(num(&wb, "Sheet1", "C1"), want_9, "filter push {filter:?}");
@@ -225,16 +233,32 @@ fn filter_push_is_full_replace_and_empty_clears() {
     assert_eq!(num(&wb, "Sheet1", "C1"), 13.0);
 
     wb.set_eval_filter_hidden_rows(0, &[3]); // NOT a union: 1+2+3+5
-    assert_eq!(num(&wb, "Sheet1", "C1"), 11.0, "second push must fully replace the first");
+    assert_eq!(
+        num(&wb, "Sheet1", "C1"),
+        11.0,
+        "second push must fully replace the first"
+    );
 
     wb.set_eval_filter_hidden_rows(0, &[3, 3, 3]); // idempotent / dedup
-    assert_eq!(num(&wb, "Sheet1", "C1"), 11.0, "duplicate indices are one row");
+    assert_eq!(
+        num(&wb, "Sheet1", "C1"),
+        11.0,
+        "duplicate indices are one row"
+    );
 
     wb.set_eval_filter_hidden_rows(0, &[9]); // outside A1:A5
-    assert_eq!(num(&wb, "Sheet1", "C1"), 15.0, "a row outside the range filters nothing");
+    assert_eq!(
+        num(&wb, "Sheet1", "C1"),
+        15.0,
+        "a row outside the range filters nothing"
+    );
 
     wb.set_eval_filter_hidden_rows(0, &[]);
-    assert_eq!(num(&wb, "Sheet1", "C1"), 15.0, "empty push must restore the unfiltered total");
+    assert_eq!(
+        num(&wb, "Sheet1", "C1"),
+        15.0,
+        "empty push must restore the unfiltered total"
+    );
 }
 
 /// A filter push to a non-existent sheet index is a silent no-op — same
@@ -247,7 +271,11 @@ fn filter_push_to_out_of_range_sheet_is_a_no_op() {
     assert_eq!(num(&wb, "Sheet1", "C1"), 6.0);
 
     wb.set_eval_filter_hidden_rows(99, &[0, 1, 2]); // no such sheet
-    assert_eq!(num(&wb, "Sheet1", "C1"), 6.0, "unrelated sheet push must not affect Sheet1");
+    assert_eq!(
+        num(&wb, "Sheet1", "C1"),
+        6.0,
+        "unrelated sheet push must not affect Sheet1"
+    );
 }
 
 // ===================== split-epoch invalidation =====================
@@ -278,7 +306,11 @@ fn manual_push_does_not_dirty_a_1_to_11_formula() {
         "SUBTOTAL(9) holds no manual-hidden edge and must stay cached"
     );
 
-    assert_eq!(num(&wb, "Sheet1", "C1"), 15.0, "9 still includes the manually hidden row");
+    assert_eq!(
+        num(&wb, "Sheet1", "C1"),
+        15.0,
+        "9 still includes the manually hidden row"
+    );
     assert_eq!(num(&wb, "Sheet1", "C2"), 13.0, "109 excludes it");
     assert_eq!(
         wb.debug_formula_eval_count(0),
@@ -307,8 +339,16 @@ fn filter_push_dirties_both_layers_including_the_first_push() {
     // (empty) probe, or neither formula would ever learn about it.
     wb.set_eval_filter_hidden_rows(0, &[1]);
 
-    assert_eq!(num(&wb, "Sheet1", "C1"), 13.0, "9 must pick up the first filter push");
-    assert_eq!(num(&wb, "Sheet1", "C2"), 13.0, "109 must pick up the first filter push");
+    assert_eq!(
+        num(&wb, "Sheet1", "C1"),
+        13.0,
+        "9 must pick up the first filter push"
+    );
+    assert_eq!(
+        num(&wb, "Sheet1", "C2"),
+        13.0,
+        "109 must pick up the first filter push"
+    );
     // Both held the filter edge, so both re-derived exactly once — the mirror
     // image of `manual_push_does_not_dirty_a_1_to_11_formula`'s `+1`.
     assert_eq!(
@@ -329,10 +369,22 @@ fn unrelated_formulas_hold_no_hidden_edge() {
     assert_eq!(wb.debug_formula_cache_state(0, "C1"), "clean");
 
     wb.set_eval_filter_hidden_rows(0, &[0]);
-    assert_eq!(wb.debug_formula_cache_state(0, "C1"), "clean", "plain SUM holds no filter edge");
+    assert_eq!(
+        wb.debug_formula_cache_state(0, "C1"),
+        "clean",
+        "plain SUM holds no filter edge"
+    );
     wb.set_eval_hidden_rows(0, &[0]);
-    assert_eq!(wb.debug_formula_cache_state(0, "C1"), "clean", "plain SUM holds no manual edge");
-    assert_eq!(num(&wb, "Sheet1", "C1"), 6.0, "SUM never excludes hidden rows");
+    assert_eq!(
+        wb.debug_formula_cache_state(0, "C1"),
+        "clean",
+        "plain SUM holds no manual edge"
+    );
+    assert_eq!(
+        num(&wb, "Sheet1", "C1"),
+        6.0,
+        "SUM never excludes hidden rows"
+    );
 }
 
 // ===================== cross-sheet =====================
@@ -356,7 +408,11 @@ fn cross_sheet_args_read_the_referenced_sheets_filter_set() {
 
     // Filter-hide row 1 on Sheet1 ONLY.
     wb.set_eval_filter_hidden_rows(0, &[1]);
-    assert_eq!(num(&wb, "Sheet1", "C1"), 4.0, "same-sheet 9 drops Sheet1 row 1 (=2)");
+    assert_eq!(
+        num(&wb, "Sheet1", "C1"),
+        4.0,
+        "same-sheet 9 drops Sheet1 row 1 (=2)"
+    );
     assert_eq!(
         num(&wb, "Sheet1", "C2"),
         60.0,
@@ -366,7 +422,11 @@ fn cross_sheet_args_read_the_referenced_sheets_filter_set() {
     // Filter-hide row 1 on Sheet2 ONLY; manual-hide row 2 on Sheet2.
     wb.set_eval_filter_hidden_rows(1, &[1]);
     wb.set_eval_hidden_rows(1, &[2]);
-    assert_eq!(num(&wb, "Sheet1", "C1"), 4.0, "Sheet1 result unchanged by Sheet2 pushes");
+    assert_eq!(
+        num(&wb, "Sheet1", "C1"),
+        4.0,
+        "Sheet1 result unchanged by Sheet2 pushes"
+    );
     assert_eq!(
         num(&wb, "Sheet1", "C2"),
         40.0,
@@ -417,7 +477,11 @@ fn both_sets_apply_across_multiple_range_args() {
     wb.set_eval_filter_hidden_rows(0, &[0]);
     wb.set_eval_hidden_rows(0, &[4]);
     assert_eq!(num(&wb, "Sheet1", "C1"), 20.0, "9 drops only A1: 2+3+4+5+6");
-    assert_eq!(num(&wb, "Sheet1", "C2"), 15.0, "109 drops A1 and A5: 2+3+4+6");
+    assert_eq!(
+        num(&wb, "Sheet1", "C2"),
+        15.0,
+        "109 drops A1 and A5: 2+3+4+6"
+    );
 }
 
 // ===================== error propagation is unchanged =====================
@@ -445,8 +509,16 @@ fn error_propagation_semantics_are_preserved() {
 
     // Filter-hide the error row → both layers skip it and return numbers.
     wb.set_eval_filter_hidden_rows(0, &[3]);
-    assert_eq!(num(&wb, "Sheet1", "C1"), 6.0, "9 skips a filter-hidden error cell");
-    assert_eq!(num(&wb, "Sheet1", "C2"), 6.0, "109 skips a filter-hidden error cell");
+    assert_eq!(
+        num(&wb, "Sheet1", "C1"),
+        6.0,
+        "9 skips a filter-hidden error cell"
+    );
+    assert_eq!(
+        num(&wb, "Sheet1", "C2"),
+        6.0,
+        "109 skips a filter-hidden error cell"
+    );
 
     // Manual-hide it instead → 9 still sees the error, 109 does not.
     wb.set_eval_filter_hidden_rows(0, &[]);
@@ -455,5 +527,9 @@ fn error_propagation_semantics_are_preserved() {
         matches!(wb.get_cell("Sheet1", "C1"), Value::Error(_)),
         "9 must still propagate an error from a MANUALLY hidden row"
     );
-    assert_eq!(num(&wb, "Sheet1", "C2"), 6.0, "109 skips a manually hidden error cell");
+    assert_eq!(
+        num(&wb, "Sheet1", "C2"),
+        6.0,
+        "109 skips a manually hidden error cell"
+    );
 }

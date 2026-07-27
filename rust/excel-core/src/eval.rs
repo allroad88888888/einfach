@@ -20067,7 +20067,10 @@ fn fn_subtotal(args: &[Expr], provider: &dyn EvalProvider) -> Value {
     let (fn_norm, policy) = if (1..=11).contains(&fn_int) {
         (fn_int as u32, SubtotalHiddenPolicy::ExcludeFilter)
     } else if (101..=111).contains(&fn_int) {
-        ((fn_int - 100) as u32, SubtotalHiddenPolicy::ExcludeFilterAndManual)
+        (
+            (fn_int - 100) as u32,
+            SubtotalHiddenPolicy::ExcludeFilterAndManual,
+        )
     } else {
         return Value::Error(ValueError::InvalidValue);
     };

@@ -286,9 +286,7 @@ fn a_trailing_total_row_is_pinned_visible_even_when_no_rule_matches_it() {
     wb.set_cell(0, "A6", Value::Text("Total".into()));
     wb.set_cell(0, "B6", Value::Number(10.0));
 
-    let report = wb
-        .apply_filter(0, &[contains(0, "zzz")])
-        .expect("apply");
+    let report = wb.apply_filter(0, &[contains(0, "zzz")]).expect("apply");
 
     // Everything is rejected, yet row 5 survives: `isFilterSortSummaryRow`
     // pins the last scanned row when its column-0 label trims and
@@ -381,7 +379,11 @@ fn inserting_a_row_displaces_the_filter_set_without_re_running_the_predicate() {
         scans,
         "structural edits displace, never re-derive"
     );
-    assert_eq!(wb.filter_rules(0), vec![contains(0, "a")], "rules untouched");
+    assert_eq!(
+        wb.filter_rules(0),
+        vec![contains(0, "a")],
+        "rules untouched"
+    );
 
     // Deleting the band a hidden row sits in removes it entirely.
     wb.delete_rows(0, 5, 1);
@@ -691,7 +693,10 @@ fn clearing_a_filter_is_never_refused_for_being_too_large_to_scan() {
     wb.apply_filter(0, &[contains(0, "a")]).expect("apply");
     // Push the extent far past the budget, the way a real large sheet does.
     wb.set_cell(0, "A80000", Value::Text("far".into()));
-    assert!(wb.apply_filter(0, &[contains(0, "b")]).is_err(), "too large to APPLY");
+    assert!(
+        wb.apply_filter(0, &[contains(0, "b")]).is_err(),
+        "too large to APPLY"
+    );
 
     let report = wb.apply_filter(0, &[]).expect("clearing must still work");
     assert_eq!(report.scanned_rows, 0, "nothing was scanned, truthfully");
@@ -716,7 +721,10 @@ fn reapply_on_a_sheet_with_no_filter_is_a_scan_free_no_op() {
 #[test]
 fn the_entry_points_reject_an_unknown_sheet() {
     let mut wb = produce_sheet();
-    assert_eq!(wb.apply_filter(9, &[]).unwrap_err(), FilterError::InvalidSheet);
+    assert_eq!(
+        wb.apply_filter(9, &[]).unwrap_err(),
+        FilterError::InvalidSheet
+    );
     assert_eq!(wb.reapply_filter(9).unwrap_err(), FilterError::InvalidSheet);
     assert_eq!(wb.clear_filter(9).unwrap_err(), FilterError::InvalidSheet);
     assert!(wb.filter_rules(9).is_empty());
@@ -739,7 +747,11 @@ fn the_host_push_port_still_replaces_clears_and_feeds_subtotal() {
 
     wb.set_eval_filter_hidden_rows(0, &[1, 2]);
     assert_eq!(num(&wb, "C1"), 12.0);
-    assert_eq!(wb.filter_hidden_rows(0), vec![1, 2], "landed in owned state");
+    assert_eq!(
+        wb.filter_hidden_rows(0),
+        vec![1, 2],
+        "landed in owned state"
+    );
 
     // Whole-set REPLACE, not merge.
     wb.set_eval_filter_hidden_rows(0, &[4]);
@@ -782,7 +794,8 @@ fn filter_snapshot_round_trips_rules_and_the_rows_they_hid() {
     wb.set_cell(second, "A3", Value::Text("drop".into()));
 
     wb.apply_filter(0, &[contains(0, "a")]).expect("apply");
-    wb.apply_filter(second, &[contains(0, "keep")]).expect("apply");
+    wb.apply_filter(second, &[contains(0, "keep")])
+        .expect("apply");
     let before = wb.snapshot_filters();
     assert_eq!(before.len(), 2);
 
@@ -808,7 +821,11 @@ fn restoring_an_empty_snapshot_clears_every_sheet_rather_than_no_opping() {
     wb.apply_filter(0, &[contains(0, "a")]).expect("apply");
     assert_eq!(num(&wb, "D1"), 6.0);
 
-    assert_eq!(wb.restore_filters(FilterSnapshot::default()).expect("restore"), 0);
+    assert_eq!(
+        wb.restore_filters(FilterSnapshot::default())
+            .expect("restore"),
+        0
+    );
     assert!(wb.filter_rules(0).is_empty());
     assert_eq!(num(&wb, "D1"), 10.0, "REPLACE semantics released every row");
 }
@@ -843,7 +860,11 @@ fn a_sheet_move_carries_the_filter_and_re_keys_the_mirror() {
     for sheet in [0, second] {
         wb.set_cell(sheet, "A1", Value::Text("H".into()));
         for row in 0..3u32 {
-            wb.set_cell(sheet, &format!("A{}", row + 2), Value::Number((row + 1) as f64));
+            wb.set_cell(
+                sheet,
+                &format!("A{}", row + 2),
+                Value::Number((row + 1) as f64),
+            );
         }
     }
     assert!(wb.set_formula(second, "C1", "=SUBTOTAL(9,A2:A4)"));
@@ -868,7 +889,10 @@ fn a_sheet_move_carries_the_filter_and_re_keys_the_mirror() {
 
     assert!(wb.move_sheet(second, 0));
     assert_eq!(wb.filter_hidden_rows(0), vec![1, 2], "moved to index 0");
-    assert!(wb.filter_hidden_rows(1).is_empty(), "and left index 1 clean");
+    assert!(
+        wb.filter_hidden_rows(1).is_empty(),
+        "and left index 1 clean"
+    );
     assert_eq!(
         match wb.get_cell("Second", "C1") {
             Value::Number(n) => n,
@@ -886,7 +910,8 @@ fn removing_a_sheet_drops_its_filter_and_shifts_the_rest_down() {
     wb.set_cell(second, "A1", Value::Text("H".into()));
     wb.set_cell(second, "A2", Value::Text("keep".into()));
     wb.set_cell(second, "A3", Value::Text("drop".into()));
-    wb.apply_filter(second, &[contains(0, "keep")]).expect("apply");
+    wb.apply_filter(second, &[contains(0, "keep")])
+        .expect("apply");
     assert_eq!(wb.filter_hidden_rows(second), vec![2]);
 
     assert!(wb.remove_sheet(0).is_some());

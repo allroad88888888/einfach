@@ -901,7 +901,11 @@ fn canonical_custom_call_key(name: &str, args: &[Value]) -> String {
     fn write_value(out: &mut String, v: &Value) {
         match v {
             Value::Number(n) => {
-                let bits = if n.is_nan() { f64::NAN.to_bits() } else { n.to_bits() };
+                let bits = if n.is_nan() {
+                    f64::NAN.to_bits()
+                } else {
+                    n.to_bits()
+                };
                 let _ = write!(out, "N:{bits:016x}");
             }
             Value::Text(s) => {
@@ -1030,7 +1034,11 @@ fn remap_index_keyed_rows(
 /// `row_heights` on the same edit.
 pub(crate) fn shift_hidden_row(row: u32, at: u32, count: u32, insert: bool) -> Option<u32> {
     if insert {
-        return Some(if row >= at { row.saturating_add(count) } else { row });
+        return Some(if row >= at {
+            row.saturating_add(count)
+        } else {
+            row
+        });
     }
     if row >= at.saturating_add(count) {
         Some(row - count)
@@ -1282,7 +1290,10 @@ impl WorkbookAtomContext {
     ) -> Option<Rc<HashSet<u32>>> {
         self.depend_filter_hidden(args);
         let sheet_index = sheet_index?;
-        self.eval_filter_hidden_rows.borrow().get(&sheet_index).cloned()
+        self.eval_filter_hidden_rows
+            .borrow()
+            .get(&sheet_index)
+            .cloned()
     }
 
     /// Untracked MANUAL hidden-row lookup for the eager `WorkbookEvalProvider`
@@ -1299,7 +1310,10 @@ impl WorkbookAtomContext {
         &self,
         sheet_index: usize,
     ) -> Option<Rc<HashSet<u32>>> {
-        self.eval_filter_hidden_rows.borrow().get(&sheet_index).cloned()
+        self.eval_filter_hidden_rows
+            .borrow()
+            .get(&sheet_index)
+            .cloned()
     }
 
     /// Republish `Workbook`'s engine-owned MANUAL hidden set for
@@ -1481,7 +1495,13 @@ impl WorkbookAtomContext {
         if shift_rows_for_sheet(&self.eval_hidden_rows, sheet_index, at, count, insert) {
             self.bump_epoch(&self.manual_hidden_epoch, &self.manual_hidden_revision);
         }
-        if shift_rows_for_sheet(&self.eval_filter_hidden_rows, sheet_index, at, count, insert) {
+        if shift_rows_for_sheet(
+            &self.eval_filter_hidden_rows,
+            sheet_index,
+            at,
+            count,
+            insert,
+        ) {
             self.bump_epoch(&self.filter_hidden_epoch, &self.filter_hidden_revision);
         }
     }
@@ -2448,7 +2468,11 @@ impl Sheet {
     }
 
     pub fn clear_col_width(&mut self, col_index: u32) -> bool {
-        self.interior.col_widths.borrow_mut().remove(&col_index).is_some()
+        self.interior
+            .col_widths
+            .borrow_mut()
+            .remove(&col_index)
+            .is_some()
     }
 
     pub fn col_width(&self, col_index: u32) -> Option<u32> {

@@ -9,8 +9,8 @@
 //     type error — Excel-identical propagation, not a sort defect.
 
 use einfach_core::Value;
-use einfach_excel_core::range::CellRange;
 use einfach_excel_core::cell::CellAddress;
+use einfach_excel_core::range::CellRange;
 use einfach_excel_core::sort::{SortDirection, SortKey};
 use einfach_excel_core::workbook::Workbook;
 
@@ -21,7 +21,11 @@ fn rng(a: &str, b: &str) -> CellRange {
     CellRange::new(addr(a), addr(b))
 }
 fn asc(col: u32) -> SortKey {
-    SortKey { col, direction: SortDirection::Ascending, case_sensitive: false }
+    SortKey {
+        col,
+        direction: SortDirection::Ascending,
+        case_sensitive: false,
+    }
 }
 
 #[test]
@@ -59,7 +63,11 @@ fn physical_sort_relocates_cross_sheet_formula_and_reevaluates() {
         "relocated cross-sheet formula must re-evaluate to 13, not error",
     );
     // C2 (now the A=1 row) had no formula.
-    assert_eq!(wb.get_cell("Sheet1", "C2"), Value::Null, "C2 empty after move");
+    assert_eq!(
+        wb.get_cell("Sheet1", "C2"),
+        Value::Null,
+        "C2 empty after move"
+    );
 }
 
 // The vNext Worker demo's actual seed is a 3-hop chain where a FAR formula
@@ -89,7 +97,11 @@ fn physical_sort_moving_a_referenced_number_cell_propagates_type_error() {
     wb.set_cell(s0, "C4", Value::Text("source".into()));
 
     // Seed: 10 -> 11 -> 12 -> 13.
-    assert_eq!(wb.get_cell("Sheet1", "C2"), Value::Number(13.0), "seed chain = 13");
+    assert_eq!(
+        wb.get_cell("Sheet1", "C2"),
+        Value::Number(13.0),
+        "seed chain = 13"
+    );
 
     wb.sort_range(s0, rng("A2", "C4"), &[asc(0)], &[]).unwrap();
 
@@ -98,7 +110,11 @@ fn physical_sort_moving_a_referenced_number_cell_propagates_type_error() {
     // whole chain (Sheet2!C2, then the relocated formula at Sheet1!C4)
     // resolves to the same type error. This is correct — the sort moved the
     // number out of B4 and the absolute reference was not retargeted.
-    assert_eq!(wb.get_cell("Sheet1", "B4"), Value::Text("result".into()), "B4 now text");
+    assert_eq!(
+        wb.get_cell("Sheet1", "B4"),
+        Value::Text("result".into()),
+        "B4 now text"
+    );
     assert!(
         matches!(wb.get_cell("Sheet3", "C2"), Value::Error(_)),
         "Sheet3!C2 = text+1 is a type error, got {:?}",

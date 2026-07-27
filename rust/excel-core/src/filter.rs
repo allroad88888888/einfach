@@ -60,10 +60,7 @@ pub enum ColumnFilterRule {
     },
     /// Membership in an explicit value list. RAW string comparison — see
     /// the module note about the deliberate inconsistency with `Equals`.
-    List {
-        col_index: u32,
-        values: Vec<String>,
-    },
+    List { col_index: u32, values: Vec<String> },
 }
 
 impl ColumnFilterRule {
@@ -505,7 +502,11 @@ mod tests {
         assert_eq!(js_numeric_value("0x10"), Some(16.0));
         assert_eq!(js_numeric_value("0b101"), Some(5.0));
         assert_eq!(js_numeric_value("0o17"), Some(15.0));
-        assert_eq!(js_numeric_value("-0x10"), None, "a sign voids the radix form");
+        assert_eq!(
+            js_numeric_value("-0x10"),
+            None,
+            "a sign voids the radix form"
+        );
         assert_eq!(js_numeric_value("0x"), None);
         assert_eq!(js_numeric_value(".5"), Some(0.5));
         assert_eq!(js_numeric_value("5."), Some(5.0));

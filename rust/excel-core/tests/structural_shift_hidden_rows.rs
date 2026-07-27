@@ -41,7 +41,11 @@ use einfach_excel_core::Workbook;
 ///   D10 `=SUBTOTAL(9,   A1:A5)` — excludes FILTER-hidden only.
 fn seed(wb: &mut Workbook, sheet_idx: usize) {
     for i in 0..5 {
-        wb.set_cell(sheet_idx, &format!("A{}", i + 1), Value::Number((i + 1) as f64));
+        wb.set_cell(
+            sheet_idx,
+            &format!("A{}", i + 1),
+            Value::Number((i + 1) as f64),
+        );
     }
     assert!(wb.set_formula(sheet_idx, "C10", "=SUBTOTAL(109, A1:A5)"));
     assert!(wb.set_formula(sheet_idx, "D10", "=SUBTOTAL(9, A1:A5)"));
@@ -113,7 +117,11 @@ fn insert_below_the_hidden_row_leaves_the_set_alone() {
 
     wb.insert_rows(0, 5, 1);
 
-    assert_eq!(num(&wb, "Sheet1", "C11"), 13.0, "row 1 is above the insert point");
+    assert_eq!(
+        num(&wb, "Sheet1", "C11"),
+        13.0,
+        "row 1 is above the insert point"
+    );
 }
 
 /// A multi-row insert shifts by the full `count`, not by one.
@@ -189,7 +197,11 @@ fn delete_below_the_hidden_row_leaves_the_set_alone() {
 
     wb.delete_rows(0, 5, 1);
 
-    assert_eq!(num(&wb, "Sheet1", "C9"), 13.0, "row 1 is above the deleted band");
+    assert_eq!(
+        num(&wb, "Sheet1", "C9"),
+        13.0,
+        "row 1 is above the deleted band"
+    );
 }
 
 /// A multi-row delete band that COVERS one hidden row and sits above another:
@@ -221,7 +233,11 @@ fn manual_and_filter_sets_shift_independently() {
     let mut wb = one_sheet();
     wb.set_eval_hidden_rows(0, &[1]); // the 2, manual
     wb.set_eval_filter_hidden_rows(0, &[3]); // the 4, filter
-    assert_eq!(num(&wb, "Sheet1", "C10"), 9.0, "precondition 109: 15 - 2 - 4");
+    assert_eq!(
+        num(&wb, "Sheet1", "C10"),
+        9.0,
+        "precondition 109: 15 - 2 - 4"
+    );
     assert_eq!(num(&wb, "Sheet1", "D10"), 11.0, "precondition 9: 15 - 4");
 
     wb.insert_rows(0, 0, 1);
@@ -249,7 +265,11 @@ fn filter_set_shifts_with_no_manual_set_present() {
 
     wb.insert_rows(0, 0, 1);
 
-    assert_eq!(num(&wb, "Sheet1", "D11"), 11.0, "filter set must follow to 4");
+    assert_eq!(
+        num(&wb, "Sheet1", "D11"),
+        11.0,
+        "filter set must follow to 4"
+    );
 }
 
 // ===================== cross-sheet isolation =====================
@@ -267,7 +287,11 @@ fn structural_shift_on_one_sheet_leaves_another_sheets_set_alone() {
 
     wb.insert_rows(0, 0, 1);
 
-    assert_eq!(num(&wb, "Sheet1", "C11"), 11.0, "the edited sheet's set follows");
+    assert_eq!(
+        num(&wb, "Sheet1", "C11"),
+        11.0,
+        "the edited sheet's set follows"
+    );
     assert_eq!(
         num(&wb, "Sheet2", "C10"),
         11.0,
@@ -287,10 +311,18 @@ fn column_shifts_leave_the_row_sets_alone() {
 
     wb.insert_columns(0, 0, 2);
     // C10 rode two columns right to E10; A1:A5 followed to C1:C5.
-    assert_eq!(num(&wb, "Sheet1", "E10"), 9.0, "row sets are untouched by a column insert");
+    assert_eq!(
+        num(&wb, "Sheet1", "E10"),
+        9.0,
+        "row sets are untouched by a column insert"
+    );
 
     wb.delete_columns(0, 0, 2);
-    assert_eq!(num(&wb, "Sheet1", "C10"), 9.0, "row sets are untouched by a column delete");
+    assert_eq!(
+        num(&wb, "Sheet1", "C10"),
+        9.0,
+        "row sets are untouched by a column delete"
+    );
 }
 
 // ===================== clearing =====================
@@ -306,5 +338,9 @@ fn delete_covering_every_hidden_row_clears_the_set() {
     wb.delete_rows(0, 1, 2);
 
     // Rows are now 1,4,5; range A1:A3; C10 -> C8. Nothing hidden.
-    assert_eq!(num(&wb, "Sheet1", "C8"), 10.0, "both hidden rows were deleted; 1 + 4 + 5");
+    assert_eq!(
+        num(&wb, "Sheet1", "C8"),
+        10.0,
+        "both hidden rows were deleted; 1 + 4 + 5"
+    );
 }
