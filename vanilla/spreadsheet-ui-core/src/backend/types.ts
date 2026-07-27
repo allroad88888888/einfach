@@ -1,9 +1,17 @@
 import type { CellCoord, CellRange, SheetRef, SpreadsheetError } from '../shared'
 import type { ColumnFilterRule, SetFilterSortRequest, SortDirection } from '../filter-sort/types'
-import type { ReadPrintConfigRequest, ReadPrintConfigResult, SetPrintConfigRequest } from '../print/types'
+import type {
+  ReadPrintConfigRequest,
+  ReadPrintConfigResult,
+  SetPrintConfigRequest,
+} from '../print/types'
 import type { PresenceUpdate } from '../presence/types'
 import type { DisplayCellRichValue } from '../rich-types/types'
-import type { ValidationOutcome, SetValidationRuleRequest, ClearValidationRuleRequest } from '../data-validation/types'
+import type {
+  ValidationOutcome,
+  SetValidationRuleRequest,
+  ClearValidationRuleRequest,
+} from '../data-validation/types'
 import type {
   ConditionalFormatRulesResult,
   ListConditionalFormatRulesRequest,
@@ -202,12 +210,7 @@ export type SpreadsheetAlignment =
   | 'justify'
   | 'distributed'
 
-export type SpreadsheetVerticalAlignment =
-  | 'top'
-  | 'center'
-  | 'bottom'
-  | 'justify'
-  | 'distributed'
+export type SpreadsheetVerticalAlignment = 'top' | 'center' | 'bottom' | 'justify' | 'distributed'
 
 /**
  * Overflow strategy for a cell whose text exceeds its box.
@@ -224,12 +227,7 @@ export type SpreadsheetVerticalAlignment =
  * - `'shrink-to-fit'` — scale the rendered text down to fit. Mutually
  *   exclusive with `'wrap'` at the UI level; the editor decides precedence.
  */
-export type SpreadsheetOverflow =
-  | 'overflow'
-  | 'clip'
-  | 'ellipsis'
-  | 'wrap'
-  | 'shrink-to-fit'
+export type SpreadsheetOverflow = 'overflow' | 'clip' | 'ellipsis' | 'wrap' | 'shrink-to-fit'
 
 /**
  * Cell text rotation.
@@ -311,7 +309,14 @@ export type SpreadsheetNumberFormat =
 
 export type SpreadsheetBorderSide = 'top' | 'right' | 'bottom' | 'left'
 
-export type SpreadsheetBorderStyle = 'none' | 'thin' | 'medium' | 'thick' | 'dashed' | 'dotted' | 'double'
+export type SpreadsheetBorderStyle =
+  | 'none'
+  | 'thin'
+  | 'medium'
+  | 'thick'
+  | 'dashed'
+  | 'dotted'
+  | 'double'
 
 export interface SpreadsheetBorderSpec {
   style: SpreadsheetBorderStyle
@@ -503,9 +508,7 @@ export interface RangeTsvExportChunk {
   text: string
 }
 
-export type RangeTsvChunkConsumer = (
-  chunk: RangeTsvExportChunk,
-) => void | Promise<void>
+export type RangeTsvChunkConsumer = (chunk: RangeTsvExportChunk) => void | Promise<void>
 
 export interface RangeTsvChunkExportResult extends SheetRef {
   kind: 'range-tsv-chunks'
@@ -829,6 +832,35 @@ export interface BackendMutationResult extends SheetRef {
 }
 
 /**
+ * Exact ACK for the two compact auto-fill mutations.
+ *
+ * Unlike a generic mutation ACK, this discriminated union distinguishes a
+ * proven no-op from exactly one backend transaction. `not-undoable` still
+ * witnesses a transaction: UI core mirrors it into one positional history
+ * entry, and a later structured backend undo no-op resolves that entry through
+ * the history command's outcome-unknown path.
+ */
+export type AutoFillMutationResult =
+  | (Omit<BackendMutationResult, 'affectedRange' | 'structuralShift'> & {
+      /** No cell changed and no backend transaction was recorded. */
+      applied: false
+      historyTransactionCount: 0
+      historyDisposition: 'none'
+      affectedRange?: never
+      structuralShift?: never
+    })
+  | (Omit<BackendMutationResult, 'affectedRange' | 'revision' | 'structuralShift'> & {
+      /** The backend applied the fill to this exact range. */
+      applied: true
+      /** Compact auto-fill records exactly one positional transaction. */
+      historyTransactionCount: 1
+      historyDisposition: 'undoable' | 'not-undoable'
+      revision: ProjectionRevision
+      affectedRange: CellRange
+      structuralShift?: never
+    })
+
+/**
  * ACK for `setFilterSort`, carrying the visibility answer back to UI core
  * (`design-filter-hidden-rows` §4.2, slice S5).
  *
@@ -1056,7 +1088,7 @@ export interface SpreadsheetBackend {
   setFormatRange?(request: SetFormatRangeRequest): Promise<BackendMutationResult>
   setRowHeight?(request: SetRowHeightRequest): Promise<BackendMutationResult>
   setColumnWidth?(request: SetColumnWidthRequest): Promise<BackendMutationResult>
-  fillRange?(request: FillRangeRequest): Promise<BackendMutationResult>
+  fillRange?(request: FillRangeRequest): Promise<AutoFillMutationResult>
   resolveDataEdge?(request: ResolveDataEdgeRequest): Promise<ResolveDataEdgeResult>
   addSheet?(request: AddSheetRequest): Promise<SheetMutationResult>
   renameSheet?(request: RenameSheetRequest): Promise<SheetMutationResult>
@@ -1088,7 +1120,7 @@ export interface SpreadsheetBackend {
   // omits the port; UI core silently skips the push and SUBTOTAL 101-111
   // degrades to "does not exclude" without disturbing any other feature.
   setEvalHiddenRows?(request: SetEvalHiddenRowsRequest): Promise<void> | void
-  fillSeries?(request: FillSeriesRequest): Promise<BackendMutationResult>
+  fillSeries?(request: FillSeriesRequest): Promise<AutoFillMutationResult>
   // comments & notes
   setNote?(request: SetNoteRequest): Promise<BackendMutationResult>
   clearNote?(request: ClearNoteRequest): Promise<BackendMutationResult>
@@ -1099,9 +1131,15 @@ export interface SpreadsheetBackend {
   setValidationRule?(request: SetValidationRuleRequest): Promise<BackendMutationResult>
   clearValidationRule?(request: ClearValidationRuleRequest): Promise<BackendMutationResult>
   // conditional formatting
-  setConditionalFormatRule?(request: SetConditionalFormatRuleRequest): Promise<BackendMutationResult>
-  removeConditionalFormatRule?(request: RemoveConditionalFormatRuleRequest): Promise<BackendMutationResult>
-  listConditionalFormatRules?(request: ListConditionalFormatRulesRequest): Promise<ConditionalFormatRulesResult>
+  setConditionalFormatRule?(
+    request: SetConditionalFormatRuleRequest,
+  ): Promise<BackendMutationResult>
+  removeConditionalFormatRule?(
+    request: RemoveConditionalFormatRuleRequest,
+  ): Promise<BackendMutationResult>
+  listConditionalFormatRules?(
+    request: ListConditionalFormatRulesRequest,
+  ): Promise<ConditionalFormatRulesResult>
   // print config
   readPrintConfig?(request: ReadPrintConfigRequest): Promise<ReadPrintConfigResult>
   setPrintConfig?(request: SetPrintConfigRequest): Promise<BackendMutationResult>

@@ -140,6 +140,7 @@ describe('TS worker runtime — structured UNSUPPORTED instead of success-shaped
     await raw({ cmd: 'initWorkbook', sheets: ['Sheet1'] })
 
     const witness = {
+      autoFill: false,
       structuralEdits: false,
       formats: false,
       formatSnapshots: false,

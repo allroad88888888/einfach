@@ -25,6 +25,7 @@ import type {
   ViewportSizeProjectionResult,
 } from '@einfach/spreadsheet-ui-core'
 import {
+  BUILTIN_FILL_SERIES_WEEKDAY_NAMES,
   clipboardStateAtom,
   menuIntentAtom,
   menuStateAtom,
@@ -52,6 +53,7 @@ import {
   hideRowsAtom,
   viewportHiddenDiagnosticAtom,
   historyStackAtom,
+  getFillHandleWriteRange,
 } from '@einfach/spreadsheet-ui-core'
 import {
   createWorkerWorkbookSpreadsheetBackend,
@@ -76,6 +78,7 @@ function dispatchPointerEvent(
     clientY?: number
     ctrlKey?: boolean
     metaKey?: boolean
+    detail?: number
   },
 ) {
   target.dispatchEvent(
@@ -86,6 +89,7 @@ function dispatchPointerEvent(
       clientY: coordinates.clientY ?? 0,
       ctrlKey: coordinates.ctrlKey ?? false,
       metaKey: coordinates.metaKey ?? false,
+      detail: coordinates.detail ?? 0,
     }),
   )
 }
@@ -207,6 +211,7 @@ interface FillSeriesDragOptions {
 
 async function runFillSeriesDrag(options: FillSeriesDragOptions) {
   const store = createStore()
+  store.setter(setWorkspaceActiveSheetAtom, { sheetId: 'sheet-1' })
   const rangeRequests: RangeProjectionRequest[] = []
   const fillSeriesRequests: FillSeriesRequest[] = []
   const fillRangeRequests: FillRangeRequest[] = []
@@ -231,26 +236,53 @@ async function runFillSeriesDrag(options: FillSeriesDragOptions) {
   if (options.includeFillSeries !== false) {
     backend.fillSeries = async (request) => {
       fillSeriesRequests.push(request)
+      const affectedRange = getFillHandleWriteRange(
+        request.sourceRange,
+        request.targetRange,
+        request.direction,
+      )!
       return {
         sheetId: request.sheetId,
         requestId: request.requestId,
         revision: 18,
-        affectedRange: request.targetRange,
+        affectedRange,
+        applied: true,
+        historyTransactionCount: 1,
+        historyDisposition: 'undoable',
       }
     }
   }
   if (options.includeFillRange !== false) {
     backend.fillRange = async (request) => {
       fillRangeRequests.push(request)
+      const affectedRange = getFillHandleWriteRange(
+        request.sourceRange,
+        request.targetRange,
+        request.direction,
+      )!
       return {
         sheetId: request.sheetId,
-        affectedRange: request.targetRange,
+        revision: 18,
+        affectedRange,
+        applied: true,
+        historyTransactionCount: 1,
+        historyDisposition: 'undoable',
       }
     }
   }
   backend.setCellInput = async (request) => {
     setCellInputRequests.push(request)
-    return { sheetId: request.sheetId, requestId: request.requestId }
+    return {
+      sheetId: request.sheetId,
+      requestId: request.requestId,
+      revision: 18,
+      affectedRange: {
+        rowStart: request.row,
+        rowEnd: request.row,
+        colStart: request.col,
+        colEnd: request.col,
+      },
+    }
   }
 
   const viewport = {
@@ -877,6 +909,51 @@ describe('vNext SpreadsheetGrid', () => {
     })
   })
 
+  it('hosts one fill handle at the normalized bottom-right of a reverse selection', async () => {
+    const store = createStore()
+    const { backend } = createFakeBackend()
+    const viewport = {
+      scrollTop: 0,
+      scrollLeft: 0,
+      viewportHeight: 3,
+      viewportWidth: 3,
+      rowHeight: 1,
+      colWidth: 1,
+      rowCount: 6,
+      colCount: 6,
+      overscanRows: 0,
+      overscanCols: 0,
+    }
+
+    const { container, getByTestId, queryByTestId } = render(() => (
+      <SpreadsheetUiProvider backend={backend} store={store}>
+        <SpreadsheetGrid sheetId="sheet-1" viewport={viewport} />
+      </SpreadsheetUiProvider>
+    ))
+
+    await waitFor(() => {
+      expect(container.querySelectorAll('td.spreadsheet-grid-cell')).toHaveLength(9)
+    })
+
+    fireEvent.click(container.querySelector('[data-cell-addr="C3"] .spreadsheet-grid-cell-button')!)
+    fireEvent.click(
+      container.querySelector('[data-cell-addr="A1"] .spreadsheet-grid-cell-button')!,
+      { shiftKey: true },
+    )
+
+    await waitFor(() => {
+      expect(store.getter(selectionAtom)).toEqual({
+        kind: 'range',
+        sheetId: 'sheet-1',
+        anchor: { row: 2, col: 2 },
+        focus: { row: 0, col: 0 },
+      })
+      expect(container.querySelectorAll('.spreadsheet-grid-fill-handle')).toHaveLength(1)
+      expect(getByTestId('fill-handle-C3')).toBeTruthy()
+      expect(queryByTestId('fill-handle-A1')).toBeNull()
+    })
+  })
+
   it('renders Ctrl/Cmd-click disjoint cell selections from the core multi-range state', async () => {
     const store = createStore()
     const { backend } = createFakeBackend()
@@ -1245,13 +1322,23 @@ describe('vNext SpreadsheetGrid', () => {
 
   it('commits fill handle drag as a compact backend fillRange request', async () => {
     const store = createStore()
+    store.setter(setWorkspaceActiveSheetAtom, { sheetId: 'sheet-1' })
     const fillRangeRequests: FillRangeRequest[] = []
     const { backend } = createFakeBackend()
     backend.fillRange = async (request) => {
       fillRangeRequests.push(request)
+      const affectedRange = getFillHandleWriteRange(
+        request.sourceRange,
+        request.targetRange,
+        request.direction,
+      )!
       return {
         sheetId: request.sheetId,
-        affectedRange: request.targetRange,
+        revision: 18,
+        affectedRange,
+        applied: true,
+        historyTransactionCount: 1,
+        historyDisposition: 'undoable',
       }
     }
     const viewport = {
@@ -1312,6 +1399,148 @@ describe('vNext SpreadsheetGrid', () => {
     })
   })
 
+  it('double-clicks the fill handle once when both trusted pointer commits stay in the source', async () => {
+    const store = createStore()
+    store.setter(setWorkspaceActiveSheetAtom, { sheetId: 'sheet-1' })
+    const rangeRequests: RangeProjectionRequest[] = []
+    const resolveRequests: ResolveDataEdgeRequest[] = []
+    const fillRangeRequests: FillRangeRequest[] = []
+    const { backend, requests: visibleRequests } = createFakeBackend()
+    backend.readRangeProjection = async (request) => {
+      rangeRequests.push(request)
+      return {
+        kind: 'range',
+        sheetId: request.sheetId,
+        requestId: request.requestId,
+        revision: 17,
+        range: request.range,
+        cells: [
+          {
+            row: request.range.rowStart,
+            col: request.range.colStart,
+            displayValue: 'guide-1',
+          },
+          {
+            row: request.range.rowEnd,
+            col: request.range.colStart,
+            displayValue: 'guide-2',
+          },
+        ],
+      }
+    }
+    backend.resolveDataEdge = async (request) => {
+      resolveRequests.push(request)
+      return {
+        sheetId: request.sheetId,
+        requestId: request.requestId,
+        revision: request.revision,
+        target: { row: 2, col: request.from.col },
+      }
+    }
+    backend.fillRange = async (request) => {
+      fillRangeRequests.push(request)
+      return {
+        sheetId: request.sheetId,
+        revision: 18,
+        affectedRange: getFillHandleWriteRange(
+          request.sourceRange,
+          request.targetRange,
+          request.direction,
+        )!,
+        applied: true,
+        historyTransactionCount: 1,
+        historyDisposition: 'undoable',
+      }
+    }
+
+    const viewport = {
+      scrollTop: 0,
+      scrollLeft: 0,
+      viewportHeight: 3,
+      viewportWidth: 2,
+      rowHeight: 1,
+      colWidth: 1,
+      rowCount: 6,
+      colCount: 4,
+      overscanRows: 0,
+      overscanCols: 0,
+    }
+    const { container, getByTestId } = render(() => (
+      <SpreadsheetUiProvider backend={backend} store={store}>
+        <SpreadsheetGrid sheetId="sheet-1" viewport={viewport} />
+      </SpreadsheetUiProvider>
+    ))
+
+    await waitFor(() => {
+      expect(container.querySelectorAll('td.spreadsheet-grid-cell')).toHaveLength(6)
+    })
+    fireEvent.click(container.querySelector('[data-cell-addr="A1"] .spreadsheet-grid-cell-button')!)
+
+    const handle = getByTestId('fill-handle-A1')
+    const sourceCell = container.querySelector('[data-cell-addr="A1"]') as HTMLElement
+    const originalElementFromPoint = document.elementFromPoint
+    Object.defineProperty(document, 'elementFromPoint', {
+      configurable: true,
+      value: () => sourceCell,
+    })
+
+    try {
+      // Chromium reports detail=0 for both trusted pointerdown/pointerup pairs.
+      // Pointer movement that remains inside the selected source keeps each
+      // pointer commit directionless; only the following dblclick may fill.
+      dispatchPointerEvent(handle, 'pointerdown', { detail: 0, clientX: 1, clientY: 1 })
+      dispatchPointerEvent(window, 'pointermove', { detail: 0, clientX: 1, clientY: 1 })
+      dispatchPointerEvent(window, 'pointerup', { detail: 0, clientX: 1, clientY: 1 })
+      dispatchPointerEvent(handle, 'pointerdown', { detail: 0, clientX: 1, clientY: 1 })
+      dispatchPointerEvent(window, 'pointermove', { detail: 0, clientX: 1, clientY: 1 })
+      dispatchPointerEvent(window, 'pointerup', { detail: 0, clientX: 1, clientY: 1 })
+      fireEvent.dblClick(handle, { detail: 2 })
+    } finally {
+      Object.defineProperty(document, 'elementFromPoint', {
+        configurable: true,
+        value: originalElementFromPoint,
+      })
+    }
+
+    await waitFor(() => {
+      expect(fillRangeRequests).toHaveLength(1)
+    })
+    await waitFor(() => {
+      expect(visibleRequests.length).toBeGreaterThanOrEqual(2)
+    })
+    await flushMicrotasks()
+
+    expect(rangeRequests).toHaveLength(1)
+    expect(rangeRequests[0]).toMatchObject({
+      kind: 'range',
+      sheetId: 'sheet-1',
+      reason: 'fill-handle',
+      range: { rowStart: 0, rowEnd: 1, colStart: 1, colEnd: 1 },
+    })
+    expect(resolveRequests).toEqual([
+      {
+        kind: 'resolve-data-edge',
+        sheetId: 'sheet-1',
+        from: { row: 0, col: 1 },
+        direction: 'down',
+        bounds: { rowCount: 6, colCount: 4 },
+        requestId: rangeRequests[0].requestId,
+        revision: 17,
+      },
+    ])
+    expect(fillRangeRequests).toEqual([
+      {
+        kind: 'fill-range',
+        sheetId: 'sheet-1',
+        sourceRange: { rowStart: 0, rowEnd: 0, colStart: 0, colEnd: 0 },
+        targetRange: { rowStart: 0, rowEnd: 2, colStart: 0, colEnd: 0 },
+        direction: 'down',
+        requestId: rangeRequests[0].requestId,
+        revision: 17,
+      },
+    ])
+  })
+
   it('dispatches one numeric fillSeries mutation bound to the accepted projection witness', async () => {
     const sourceCells: DisplayCell[] = [
       { row: 0, col: 0, displayValue: '1', valueKind: 'number', numericValue: 1 },
@@ -1345,6 +1574,85 @@ describe('vNext SpreadsheetGrid', () => {
     expect(result.fillRangeRequests).toHaveLength(0)
     expect(result.setCellInputRequests).toHaveLength(0)
     expect(result.visibleRequests.length).toBeGreaterThanOrEqual(2)
+  })
+
+  it.each([
+    {
+      name: 'least-squares trend',
+      sourceCells: [
+        { row: 0, col: 0, displayValue: '1', valueKind: 'number' as const, numericValue: 1 },
+        { row: 1, col: 0, displayValue: '2', valueKind: 'number' as const, numericValue: 2 },
+        { row: 2, col: 0, displayValue: '4', valueKind: 'number' as const, numericValue: 4 },
+      ],
+      sourceEndAddr: 'A3',
+      expected: {
+        series: 'linear-trend',
+        step: 1.5,
+      },
+    },
+    {
+      name: 'single calendar date',
+      sourceCells: [
+        {
+          row: 0,
+          col: 0,
+          displayValue: '2024-01-01',
+          valueKind: 'number' as const,
+          numericValue: 45_292,
+          format: {
+            numberFormat: {
+              kind: 'date' as const,
+              pattern: 'yyyy-mm-dd',
+            },
+          },
+        },
+      ],
+      sourceEndAddr: 'A1',
+      expected: {
+        series: 'date-day',
+        step: 1,
+      },
+    },
+    {
+      name: 'single text-number seed',
+      sourceCells: [{ row: 0, col: 0, displayValue: 'Item009', valueKind: 'string' as const }],
+      sourceEndAddr: 'A1',
+      expected: {
+        series: 'text-number',
+        step: 1,
+        textPattern: { prefix: 'Item', suffix: '', width: 3 },
+      },
+    },
+    {
+      name: 'single built-in weekday seed',
+      sourceCells: [{ row: 0, col: 0, displayValue: 'Mon', valueKind: 'string' as const }],
+      sourceEndAddr: 'A1',
+      expected: {
+        series: 'weekday-name',
+        step: 1,
+        list: {
+          listName: 'builtin-weekday-short',
+          values: BUILTIN_FILL_SERIES_WEEKDAY_NAMES,
+        },
+      },
+    },
+  ])('dispatches $name through the compact fillSeries path', async (testCase) => {
+    const result = await runFillSeriesDrag({
+      sourceCells: testCase.sourceCells,
+      sourceEndAddr: testCase.sourceEndAddr,
+      expectedMutation: 'series',
+    })
+
+    expect(result.fillSeriesRequests).toHaveLength(1)
+    expect(result.fillSeriesRequests[0]).toMatchObject({
+      kind: 'fill-series',
+      sheetId: 'sheet-1',
+      targetRange: { rowStart: 0, rowEnd: 3, colStart: 0, colEnd: 0 },
+      direction: 'down',
+      ...testCase.expected,
+    })
+    expect(result.fillRangeRequests).toHaveLength(0)
+    expect(result.setCellInputRequests).toHaveLength(0)
   })
 
   it.each([
@@ -1402,6 +1710,15 @@ describe('vNext SpreadsheetGrid', () => {
     expect(result.fillSeriesRequests).toHaveLength(0)
     expect(result.fillRangeRequests).toHaveLength(1)
     expect(result.rangeRequests).toHaveLength(testCase.expectedRangeReads)
+    if (testCase.expectedRangeReads === 1) {
+      expect(result.fillRangeRequests[0]).toMatchObject({
+        requestId: result.rangeRequests[0].requestId,
+        revision: 17,
+      })
+    } else {
+      expect(result.fillRangeRequests[0]).not.toHaveProperty('requestId')
+      expect(result.fillRangeRequests[0]).not.toHaveProperty('revision')
+    }
   })
 
   it.each([
@@ -1474,6 +1791,8 @@ describe('vNext SpreadsheetGrid', () => {
     expect(result.rangeRequests).toHaveLength(1)
     expect(result.fillSeriesRequests).toHaveLength(0)
     expect(result.fillRangeRequests).toHaveLength(1)
+    expect(result.fillRangeRequests[0]).not.toHaveProperty('requestId')
+    expect(result.fillRangeRequests[0]).not.toHaveProperty('revision')
   })
 
   it('honors Ctrl copy-only and skips both projection detection and fillSeries', async () => {
@@ -1489,6 +1808,8 @@ describe('vNext SpreadsheetGrid', () => {
     expect(result.rangeRequests).toHaveLength(0)
     expect(result.fillSeriesRequests).toHaveLength(0)
     expect(result.fillRangeRequests).toHaveLength(1)
+    expect(result.fillRangeRequests[0]).not.toHaveProperty('requestId')
+    expect(result.fillRangeRequests[0]).not.toHaveProperty('revision')
   })
 
   it('uses fillRange without a range read when fillSeries capability is absent', async () => {
@@ -1503,6 +1824,8 @@ describe('vNext SpreadsheetGrid', () => {
 
     expect(result.rangeRequests).toHaveLength(0)
     expect(result.fillRangeRequests).toHaveLength(1)
+    expect(result.fillRangeRequests[0]).not.toHaveProperty('requestId')
+    expect(result.fillRangeRequests[0]).not.toHaveProperty('revision')
   })
 
   it('uses the existing per-cell fallback when fillSeries and fillRange are absent', async () => {
@@ -1525,6 +1848,7 @@ describe('vNext SpreadsheetGrid', () => {
 
   it('shifts fallback fill formulas from each repeated source coordinate', async () => {
     const store = createStore()
+    store.setter(setWorkspaceActiveSheetAtom, { sheetId: 'sheet-1' })
     const setCellInputRequests: SetCellInputRequest[] = []
     const sourceCells: DisplayCell[] = [
       {
@@ -1553,7 +1877,17 @@ describe('vNext SpreadsheetGrid', () => {
     })
     backend.setCellInput = async (request) => {
       setCellInputRequests.push(request)
-      return { sheetId: request.sheetId, requestId: request.requestId }
+      return {
+        sheetId: request.sheetId,
+        requestId: request.requestId,
+        revision: 18,
+        affectedRange: {
+          rowStart: request.row,
+          rowEnd: request.row,
+          colStart: request.col,
+          colEnd: request.col,
+        },
+      }
     }
     const viewport = {
       scrollTop: 0,

@@ -1,5 +1,5 @@
 import { atom, type Atom } from '@einfach/core'
-import type { CellCoord } from '../shared'
+import type { CellCoord, CellRange } from '../shared'
 import type {
   ClipboardIntent,
   ClipboardOperation,
@@ -19,6 +19,9 @@ export * from './types'
 
 export const CLIPBOARD_ORIGIN_MARKER_PREFIX = '# einfach-clipboard-origin: '
 export const DEFAULT_CLIPBOARD_TSV_PASTE_ROWS_PER_CHUNK = 1000
+
+const EXCEL_MAX_FORMULA_ROW_INDEX = 1_048_575
+const EXCEL_MAX_FORMULA_COL_INDEX = 16_383
 
 function copyRange(range: ClipboardTargetDescriptor['range']): ClipboardTargetDescriptor['range'] {
   return {
@@ -147,7 +150,10 @@ function indexToColumnLabel(col: number): string {
   return label
 }
 
-function parseFormulaRefCoord(letters: string, digits: string): { row: number; col: number } | null {
+function parseFormulaRefCoord(
+  letters: string,
+  digits: string,
+): { row: number; col: number } | null {
   const col = columnLabelToIndex(letters)
   const row = Number(digits) - 1
   if (col < 0 || !Number.isInteger(row) || row < 0) return null
@@ -160,6 +166,109 @@ function parseA1Coord(addr: string): CellCoord | null {
   return parseFormulaRefCoord(match[1], match[2])
 }
 
+const FORMULA_IDENTIFIER_CHAR_PATTERN = /[\p{L}\p{M}\p{N}\p{Pc}.\\$\u200C\u200D]/u
+
+function formulaCodePointAt(value: string, index: number): string | undefined {
+  const codePoint = value.codePointAt(index)
+  return codePoint === undefined ? undefined : String.fromCodePoint(codePoint)
+}
+
+function formulaCodePointBefore(value: string, index: number): string | undefined {
+  if (index <= 0) return undefined
+
+  const previous = value.charCodeAt(index - 1)
+  if (previous >= 0xdc00 && previous <= 0xdfff && index >= 2) {
+    const leading = value.charCodeAt(index - 2)
+    if (leading >= 0xd800 && leading <= 0xdbff) {
+      return value.slice(index - 2, index)
+    }
+  }
+  return value[index - 1]
+}
+
+function isFormulaIdentifierChar(char: string | undefined): boolean {
+  return char !== undefined && FORMULA_IDENTIFIER_CHAR_PATTERN.test(char)
+}
+
+function isFormulaFunctionCallHead(formula: string, tokenEnd: number): boolean {
+  let next = tokenEnd
+  while (next < formula.length && /\s/.test(formula[next])) next += 1
+  return formula[next] === '('
+}
+
+function scanFormulaQuotedSegment(formula: string, start: number, quote: '"' | "'"): number | null {
+  let index = start + 1
+  while (index < formula.length) {
+    if (formula[index] !== quote) {
+      index += 1
+      continue
+    }
+    if (formula[index + 1] === quote) {
+      index += 2
+      continue
+    }
+    return index + 1
+  }
+  return null
+}
+
+function isInExcelFormulaGrid(row: number, col: number): boolean {
+  return (
+    Number.isInteger(row) &&
+    Number.isInteger(col) &&
+    row >= 0 &&
+    col >= 0 &&
+    row <= EXCEL_MAX_FORMULA_ROW_INDEX &&
+    col <= EXCEL_MAX_FORMULA_COL_INDEX
+  )
+}
+
+interface FormulaRefScanToken {
+  readonly row: number
+  readonly col: number
+  readonly start: number
+  readonly end: number
+  readonly qualifier?: string
+  readonly qualifierSeparator?: number
+}
+
+interface FormulaRefMapResult {
+  readonly formula: string
+  readonly complete: boolean
+}
+
+interface FormulaRefScanVisitor {
+  readonly visitRef?: (token: FormulaRefScanToken) => void
+  readonly visitPunctuation?: (kind: ':' | '!', index: number) => void
+}
+
+interface FormulaRefQualifier {
+  readonly name: string
+  readonly separator: number
+}
+
+function findUnquotedFormulaRefQualifier(
+  formula: string,
+  referenceStart: number,
+): FormulaRefQualifier | undefined {
+  let separator = referenceStart - 1
+  while (separator >= 0 && /\s/.test(formula[separator])) separator -= 1
+  if (formula[separator] !== '!') return undefined
+
+  let qualifierStart = separator
+  while (qualifierStart > 0) {
+    const previous = formulaCodePointBefore(formula, qualifierStart)
+    if (!isFormulaIdentifierChar(previous)) break
+    qualifierStart -= previous?.length ?? 0
+  }
+  if (qualifierStart === separator) return undefined
+
+  return {
+    name: formula.slice(qualifierStart, separator),
+    separator,
+  }
+}
+
 function mapFormulaRefs(
   formula: string,
   mapRef: (
@@ -167,63 +276,211 @@ function mapFormulaRefs(
     col: number,
     anchors: { rowAbsolute: boolean; colAbsolute: boolean },
   ) => { row: number; col: number } | null,
-): string {
-  const rewriteSegment = (segment: string): string => {
-    const refPattern = /(?:([A-Za-z_][A-Za-z0-9_]*)!)?(\$?)([A-Za-z]+)(\$?)(\d+)/g
-    return segment.replace(
-      refPattern,
-      (full, sheetName, colAnchor, letters, rowAnchor, digits) => {
-        // name tokens (no trailing digits) bypass the rewriter
-        if (!digits || digits.length === 0) return full
-        const coord = parseFormulaRefCoord(letters, digits)
-        if (!coord) return full
-
-        const moved = mapRef(coord.row, coord.col, {
-          rowAbsolute: rowAnchor === '$',
-          colAbsolute: colAnchor === '$',
-        })
-        if (moved === null || moved.row < 0 || moved.col < 0) return '#REF!'
-
-        const nextAddr =
-          `${colAnchor}${indexToColumnLabel(moved.col)}${rowAnchor}${moved.row + 1}`
-        return sheetName ? `${sheetName}!${nextAddr}` : nextAddr
-      },
-    )
-  }
-
+  visitor: FormulaRefScanVisitor = {},
+): FormulaRefMapResult {
   let output = ''
-  let segment = ''
-  for (let index = 0; index < formula.length; index += 1) {
+  let index = 0
+  let pendingQualifier: FormulaRefQualifier | undefined
+  const a1RefPattern = /(\$?)([A-Za-z]+)(\$?)(\d+)/y
+  while (index < formula.length) {
     const char = formula[index]
-    if (char !== '"') {
-      segment += char
+
+    if (char === '[' || char === ']') return { formula, complete: false }
+
+    if (char === '"' || char === "'") {
+      const segmentEnd = scanFormulaQuotedSegment(formula, index, char)
+      if (segmentEnd === null) return { formula, complete: false }
+
+      if (char === "'") {
+        const qualifier = formula.slice(index, segmentEnd)
+        if (qualifier.includes('[') || qualifier.includes(']')) {
+          return { formula, complete: false }
+        }
+        if (formula[segmentEnd] !== '!') return { formula, complete: false }
+
+        const name = formula
+          .slice(index + 1, segmentEnd - 1)
+          .replace(/''/g, "'")
+        if (name.length === 0) return { formula, complete: false }
+        pendingQualifier = { name, separator: segmentEnd }
+        visitor.visitPunctuation?.('!', segmentEnd)
+        output += formula.slice(index, segmentEnd + 1)
+        index = segmentEnd + 1
+      } else {
+        if (pendingQualifier) return { formula, complete: false }
+        output += formula.slice(index, segmentEnd)
+        index = segmentEnd
+      }
       continue
     }
 
-    output += rewriteSegment(segment)
-    segment = ''
-    const start = index
-    index += 1
-    while (index < formula.length) {
-      if (formula[index] === '"') {
-        if (formula[index + 1] === '"') {
-          index += 2
-          continue
-        }
-        break
-      }
+    if (pendingQualifier && /\s/.test(char)) {
+      output += char
       index += 1
+      continue
     }
-    output += formula.slice(start, Math.min(index + 1, formula.length))
+
+    a1RefPattern.lastIndex = index
+    const match = a1RefPattern.exec(formula)
+    if (!match) {
+      if (pendingQualifier) return { formula, complete: false }
+      if (char === ':' || char === '!') {
+        visitor.visitPunctuation?.(char, index)
+      }
+      output += char
+      index += 1
+      continue
+    }
+
+    const [full, colAnchor, letters, rowAnchor, digits] = match
+    const tokenEnd = index + full.length
+    if (
+      isFormulaIdentifierChar(formulaCodePointBefore(formula, index)) ||
+      isFormulaIdentifierChar(formulaCodePointAt(formula, tokenEnd)) ||
+      isFormulaFunctionCallHead(formula, tokenEnd) ||
+      formula[tokenEnd] === '!'
+    ) {
+      if (pendingQualifier) return { formula, complete: false }
+      output += full
+      index = tokenEnd
+      continue
+    }
+
+    const coord = parseFormulaRefCoord(letters, digits)
+    if (!coord || !isInExcelFormulaGrid(coord.row, coord.col)) {
+      if (pendingQualifier) return { formula, complete: false }
+      output += full
+      index = tokenEnd
+      continue
+    }
+
+    const qualifier = pendingQualifier ?? findUnquotedFormulaRefQualifier(formula, index)
+    visitor.visitRef?.({
+      row: coord.row,
+      col: coord.col,
+      start: index,
+      end: tokenEnd,
+      ...(qualifier
+        ? {
+            qualifier: qualifier.name,
+            qualifierSeparator: qualifier.separator,
+          }
+        : {}),
+    })
+    pendingQualifier = undefined
+    const moved = mapRef(coord.row, coord.col, {
+      rowAbsolute: rowAnchor === '$',
+      colAbsolute: colAnchor === '$',
+    })
+    if (moved === null || !isInExcelFormulaGrid(moved.row, moved.col)) {
+      output += '#REF!'
+      index = tokenEnd
+      continue
+    }
+
+    output += `${colAnchor}${indexToColumnLabel(moved.col)}${rowAnchor}${moved.row + 1}`
+    index = tokenEnd
   }
-  return output + rewriteSegment(segment)
+  if (pendingQualifier) return { formula, complete: false }
+  return { formula: output, complete: true }
 }
 
 export function shiftFormulaRefs(formula: string, drow: number, dcol: number): string {
   return mapFormulaRefs(formula, (row, col, anchors) => ({
     row: anchors.rowAbsolute ? row : row + drow,
     col: anchors.colAbsolute ? col : col + dcol,
-  }))
+  })).formula
+}
+
+/**
+ * A lexically complete ordinary A1 reference. A missing qualifier means the
+ * reference is relative to the sheet containing the formula.
+ */
+export interface FormulaA1ReferenceRange extends CellRange {
+  readonly qualifier?: string
+}
+
+export type FormulaReferenceRangeScan = readonly FormulaA1ReferenceRange[] | null
+
+/**
+ * Collect ordinary A1 dependencies with the exact lexical boundaries used
+ * when shifting copied formulas. `null` means the scanner could not safely
+ * classify the whole expression; callers must not infer a partial dependency
+ * set.
+ */
+export function collectFormulaReferenceRanges(formula: string): FormulaReferenceRangeScan {
+  const tokens: FormulaRefScanToken[] = []
+  const colonPositions = new Set<number>()
+  const bangPositions = new Set<number>()
+  const scan = mapFormulaRefs(
+    formula,
+    (row, col) => ({ row, col }),
+    {
+      visitRef: (token) => tokens.push(token),
+      visitPunctuation: (kind, index) => {
+        if (kind === ':') colonPositions.add(index)
+        else bangPositions.add(index)
+      },
+    },
+  )
+  if (!scan.complete) return null
+
+  const references: FormulaA1ReferenceRange[] = []
+  const consumedColons = new Set<number>()
+  const consumedBangs = new Set<number>()
+  for (let index = 0; index < tokens.length; index += 1) {
+    const start = tokens[index]
+    const end = tokens[index + 1]
+    const separator = end ? formula.slice(start.end, end.start) : ''
+    if (end && /^\s*:\s*$/.test(separator)) {
+      if (!start.qualifier && end.qualifier) return null
+      if (
+        start.qualifier &&
+        end.qualifier &&
+        start.qualifier !== end.qualifier
+      ) {
+        return null
+      }
+
+      const colonPosition = start.end + separator.indexOf(':')
+      consumedColons.add(colonPosition)
+      if (start.qualifierSeparator !== undefined) {
+        consumedBangs.add(start.qualifierSeparator)
+      }
+      if (end.qualifierSeparator !== undefined) {
+        consumedBangs.add(end.qualifierSeparator)
+      }
+      references.push({
+        ...(start.qualifier ? { qualifier: start.qualifier } : {}),
+        rowStart: Math.min(start.row, end.row),
+        rowEnd: Math.max(start.row, end.row),
+        colStart: Math.min(start.col, end.col),
+        colEnd: Math.max(start.col, end.col),
+      })
+      index += 1
+      continue
+    }
+
+    if (start.qualifierSeparator !== undefined) {
+      consumedBangs.add(start.qualifierSeparator)
+    }
+    references.push({
+      ...(start.qualifier ? { qualifier: start.qualifier } : {}),
+      rowStart: start.row,
+      rowEnd: start.row,
+      colStart: start.col,
+      colEnd: start.col,
+    })
+  }
+
+  for (const position of colonPositions) {
+    if (!consumedColons.has(position)) return null
+  }
+  for (const position of bangPositions) {
+    if (!consumedBangs.has(position)) return null
+  }
+
+  return references
 }
 
 function normalizeRowsPerChunk(rowsPerChunk: number | undefined): number {

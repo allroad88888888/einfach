@@ -1935,7 +1935,10 @@ describe('vnext adapter', () => {
       sheetId: 'sheet-1',
       requestId: 11,
       revision: 6,
-      affectedRange: { rowStart: 0, rowEnd: 2, colStart: 0, colEnd: 1 },
+      affectedRange: { rowStart: 1, rowEnd: 2, colStart: 0, colEnd: 1 },
+      applied: true,
+      historyTransactionCount: 1,
+      historyDisposition: 'undoable',
     })
 
     const result = await backend.readRangeProjection(

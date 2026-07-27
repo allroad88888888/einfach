@@ -1,3 +1,4 @@
+pub mod auto_fill;
 pub mod bulk_import_trace;
 pub mod cell;
 pub mod csv;
@@ -12,6 +13,10 @@ pub mod sort;
 pub mod undo;
 pub mod workbook;
 
+pub use auto_fill::{
+    AutoFillDirection, AutoFillError, AutoFillListWitness, AutoFillReport, AutoFillRequest,
+    AutoFillSeries, AutoFillTextPattern,
+};
 pub use cell::CellAddress;
 pub use csv::{export_csv, import_csv, parse_csv, to_csv};
 pub use eval::{eval_expr, is_builtin_function_name, CustomFunctionRegistry, EvalProvider};

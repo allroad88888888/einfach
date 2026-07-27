@@ -70,6 +70,7 @@ export type MenuItemDispatch =
   | { kind: 'edit.copyAs' }
   | { kind: 'paste' }
   | { kind: 'edit.pasteSpecial' }
+  | { kind: 'fill-selection'; direction: 'down' | 'up' | 'right' | 'left' }
   | { kind: 'select-all' }
   | { kind: 'delete-cells' }
   | { kind: 'open-find-replace' }

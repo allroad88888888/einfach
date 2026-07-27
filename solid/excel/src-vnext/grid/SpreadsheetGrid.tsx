@@ -10,7 +10,6 @@ import {
   createClipboardTsvPastePlan,
   cutClipboardAtom,
   createFillHandlePreview,
-  detectFillSeries,
   dispatchKeyboardInputAtom,
   dismissFormulaSuggestionsAtom,
   editingDraftAtom,
@@ -25,8 +24,6 @@ import {
   getOutlineLeveledGroupsForSheet,
   getOutlineMaxLevelForSheet,
   getAdjacentSheetId,
-  getFillHandleSourceCoord,
-  getFillHandleWriteRange,
   getRichValueText,
   getViewportColumnWidth,
   getViewportRowHeight,
@@ -48,7 +45,7 @@ import {
   scrollToCellAtom,
   serializeClipboardTsv,
   setClipboardErrorAtom,
-  shiftFormulaRefs,
+  runAutoFillAtom,
   MAX_VIEWPORT_COL_WIDTH,
   MAX_VIEWPORT_ROW_HEIGHT,
   MIN_VIEWPORT_COL_WIDTH,
@@ -76,7 +73,6 @@ import {
   openGoToAtom,
   reapplyFilterAtom,
   filterSortStateAtom,
-  fillSeriesLocaleAtom,
   openFilterDropdownAtom,
   openFormatCellsAtom,
   notifyActiveSheetChangedAtom,
@@ -90,6 +86,7 @@ import {
   type CellCoord,
   type CellRange,
   type ClipboardTransferInput,
+  type AutoFillControllerPort,
   type DisplayCell,
   type DisplayCellRichValue,
   type FormatToggleField,
@@ -112,6 +109,7 @@ import {
   viewportShowGridlinesAtom,
   viewportShowHeadingsAtom,
   viewportSizeOverridesAtom,
+  setWorkspaceActiveSheetAtom,
   workspaceSessionAtom,
 } from '@einfach/spreadsheet-ui-core'
 import { createEffect, createSignal, For, onCleanup, onMount, Show } from 'solid-js'
@@ -496,28 +494,12 @@ function SpreadsheetCellDisplayValue(props: { cell: DisplayCell | undefined }) {
   )
 }
 
-function getRangeCellCount(range: CellRange): number {
-  return (range.rowEnd - range.rowStart + 1) * (range.colEnd - range.colStart + 1)
-}
-
 function isCoordInRange(row: number, col: number, range: CellRange): boolean {
   return (
     row >= range.rowStart && row <= range.rowEnd && col >= range.colStart && col <= range.colEnd
   )
 }
 
-function getCellInputForFill(
-  cell: DisplayCell | undefined,
-  source: CellCoord,
-  target: CellCoord,
-): string {
-  if (cell?.formula) {
-    return shiftFormulaRefs(cell.formula, target.row - source.row, target.col - source.col)
-  }
-  return cell?.displayValue ?? ''
-}
-
-const MAX_UI_FILL_FALLBACK_CELLS = 200
 const AUTO_FIT_CELL_PADDING_PX = 16
 const AUTO_FIT_ROW_PADDING_PX = 4
 const CLIPBOARD_CELL_LIMIT = 10_000
@@ -1208,6 +1190,17 @@ export function SpreadsheetGrid(props: SpreadsheetGridProps) {
         void loadProjection(requestProjection())
       }) ?? null
 
+    // No host (sheet-tabs, go-to, name-box) has claimed a workspace-active
+    // sheet yet. A mounted grid is visibly showing `props.sheetId`, so treat
+    // it as the active sheet by default — commands gated on workspace
+    // authority (e.g. auto-fill's active-sheet check) would otherwise stay
+    // permanently blocked for any host that renders a bare grid without
+    // separately wiring up multi-sheet workspace tracking. A host that DOES
+    // manage the active sheet itself always sets it before this point, so
+    // this is a no-op for it.
+    if (store.getter(workspaceSessionAtom).activeSheetId === null) {
+      store.setter(setWorkspaceActiveSheetAtom, { sheetId: props.sheetId })
+    }
     lastActiveSheetId = store.getter(workspaceSessionAtom).activeSheetId
     unsubscribeWorkspace = store.sub(workspaceSessionAtom, () => {
       const nextSheetId = store.getter(workspaceSessionAtom).activeSheetId
@@ -1658,6 +1651,20 @@ export function SpreadsheetGrid(props: SpreadsheetGridProps) {
     )
   }
 
+  function isFillHandleHost(row: number, col: number) {
+    const selection = selectionSnapshot()
+    return (
+      selection.selection.sheetId === props.sheetId &&
+      selection.range.rowEnd === row &&
+      selection.range.colEnd === col
+    )
+  }
+
+  function isSheetEditing() {
+    const editing = editingSession()
+    return editing.status === 'drafting' && editing.source?.sheetId === props.sheetId
+  }
+
   function isEditing(row: number, col: number) {
     const editing = editingSession()
     return (
@@ -1928,289 +1935,58 @@ export function SpreadsheetGrid(props: SpreadsheetGridProps) {
     return previewRange ? isCoordInRange(row, col, previewRange) : false
   }
 
-  async function fallbackFillHandle(intent: PointerFillHandleCommitIntent, writeRange: CellRange) {
-    if (getRangeCellCount(writeRange) > MAX_UI_FILL_FALLBACK_CELLS) {
-      return
+  function createAutoFillController(): AutoFillControllerPort {
+    return {
+      readRangeProjection: (sheetId, range) =>
+        readRangeProjection(sheetId, { ...range }, 'fill-handle'),
+      setCellInput: (request) => backend.setCellInput(request),
+      ...(backend.fillSeries ? { fillSeries: (request) => backend.fillSeries!(request) } : {}),
+      ...(backend.fillRange ? { fillRange: (request) => backend.fillRange!(request) } : {}),
+      ...(backend.importCells ? { importCells: (request) => backend.importCells!(request) } : {}),
+      ...(backend.resolveDataEdge
+        ? { resolveDataEdge: (request) => backend.resolveDataEdge!(request) }
+        : {}),
     }
-
-    const sourceProjection = await readRangeProjection(
-      intent.sheetId,
-      intent.sourceRange,
-      'fill-handle',
-    )
-    if (sourceProjection === null) return
-    const sourceCells = new Map<string, DisplayCell>()
-    for (const cell of sourceProjection.cells) {
-      sourceCells.set(makeCellKey(cell.row, cell.col), cell)
-    }
-
-    // Mutation gateway: pre-resolve every write cell (display→source remap
-    // plus protection gate); one unmappable or locked cell aborts the whole
-    // fill before the first transport (fail-closed).
-    const writes: Array<{ row: number; col: number; input: string }> = []
-    for (let row = writeRange.rowStart; row <= writeRange.rowEnd; row += 1) {
-      for (let col = writeRange.colStart; col <= writeRange.colEnd; col += 1) {
-        const resolution = store.setter(resolveContentMutationAtom, {
-          kind: 'fill-range',
-          sheetId: intent.sheetId,
-          cell: { row, col },
-        })
-        if (resolution.status === 'blocked' || resolution.cell === undefined) {
-          return
-        }
-        const sourceCoord = getFillHandleSourceCoord(intent.sourceRange, { row, col })
-        const sourceCell = sourceCells.get(makeCellKey(sourceCoord.row, sourceCoord.col))
-        writes.push({
-          row: resolution.cell.row,
-          col: resolution.cell.col,
-          input: getCellInputForFill(sourceCell, sourceCoord, { row, col }),
-        })
-      }
-    }
-
-    if (writes.length === 0) {
-      return
-    }
-
-    const affectedRange = writes.reduce(
-      (acc, write) => ({
-        rowStart: Math.min(acc.rowStart, write.row),
-        rowEnd: Math.max(acc.rowEnd, write.row),
-        colStart: Math.min(acc.colStart, write.col),
-        colEnd: Math.max(acc.colEnd, write.col),
-      }),
-      {
-        rowStart: writes[0].row,
-        rowEnd: writes[0].row,
-        colStart: writes[0].col,
-        colEnd: writes[0].col,
-      },
-    )
-
-    if (backend.importCells) {
-      // Batch port: ONE transport = ONE adapter transaction record = ONE
-      // UI history entry, so undoing the entry reverts the whole fill and
-      // the two undo stacks stay positionally aligned (same contract as
-      // the batch paste path).
-      const result = await backend.importCells({
-        kind: 'import-cells',
-        sheetId: intent.sheetId,
-        cells: writes,
-        range: affectedRange,
-      })
-      const revision =
-        typeof result?.revision === 'number' ? result.revision : Number(result?.revision ?? 0) || 0
-      store.setter(pushHistoryAtom, {
-        transactionId: nextHistoryTransactionId(),
-        kind: 'range.fill',
-        sheetId: intent.sheetId,
-        projectionRevision: revision,
-        affectedRange: result?.affectedRange ? { ...result.affectedRange } : affectedRange,
-      })
-      return
-    }
-
-    // Fallback host without the batch port: keep the per-cell transport but
-    // record one UI entry PER acknowledged write (N:N). Zero entries over N
-    // per-cell mutations would leave the adapter transaction stack N records
-    // deeper than the UI stack and bind later undos to the wrong snapshots.
-    for (const write of writes) {
-      const result = await backend.setCellInput({
-        kind: 'set-cell-input',
-        sheetId: intent.sheetId,
-        row: write.row,
-        col: write.col,
-        input: write.input,
-      })
-      const revision =
-        typeof result?.revision === 'number' ? result.revision : Number(result?.revision ?? 0) || 0
-      store.setter(pushHistoryAtom, {
-        transactionId: nextHistoryTransactionId(),
-        kind: 'cell.set-input',
-        sheetId: intent.sheetId,
-        projectionRevision: revision,
-        affectedRange: result?.affectedRange
-          ? { ...result.affectedRange }
-          : { rowStart: write.row, rowEnd: write.row, colStart: write.col, colEnd: write.col },
-      })
-    }
-  }
-
-  function isBoundedNumericSeriesSource(
-    sourceRange: CellRange,
-    direction: Exclude<PointerFillHandleCommitIntent['direction'], null>,
-  ): boolean {
-    if (sourceRange.rowStart > sourceRange.rowEnd || sourceRange.colStart > sourceRange.colEnd) {
-      return false
-    }
-
-    if (direction === 'down' || direction === 'up') {
-      return (
-        sourceRange.colStart === sourceRange.colEnd &&
-        sourceRange.rowEnd - sourceRange.rowStart + 1 >= 2
-      )
-    }
-
-    return (
-      sourceRange.rowStart === sourceRange.rowEnd &&
-      sourceRange.colEnd - sourceRange.colStart + 1 >= 2
-    )
-  }
-
-  function getOrderedSeriesSourceCells(
-    projection: RangeProjectionResult,
-    sourceRange: CellRange,
-    direction: Exclude<PointerFillHandleCommitIntent['direction'], null>,
-  ): DisplayCell[] | null {
-    const expectedCellCount =
-      direction === 'down' || direction === 'up'
-        ? sourceRange.rowEnd - sourceRange.rowStart + 1
-        : sourceRange.colEnd - sourceRange.colStart + 1
-    if (projection.truncated === true || projection.cells.length !== expectedCellCount) {
-      return null
-    }
-
-    const cellsByCoord = new Map<string, DisplayCell>()
-    for (const cell of projection.cells) {
-      if (
-        !Number.isSafeInteger(cell.row) ||
-        !Number.isSafeInteger(cell.col) ||
-        !isCoordInRange(cell.row, cell.col, sourceRange)
-      ) {
-        return null
-      }
-      const key = makeCellKey(cell.row, cell.col)
-      if (cellsByCoord.has(key)) return null
-      cellsByCoord.set(key, cell)
-    }
-
-    const ordered: DisplayCell[] = []
-    if (direction === 'down' || direction === 'up') {
-      for (let row = sourceRange.rowStart; row <= sourceRange.rowEnd; row += 1) {
-        const cell = cellsByCoord.get(makeCellKey(row, sourceRange.colStart))
-        if (!cell) return null
-        ordered.push(cell)
-      }
-    } else {
-      for (let col = sourceRange.colStart; col <= sourceRange.colEnd; col += 1) {
-        const cell = cellsByCoord.get(makeCellKey(sourceRange.rowStart, col))
-        if (!cell) return null
-        ordered.push(cell)
-      }
-    }
-
-    return ordered
-  }
-
-  async function tryNumericFillSeries(
-    intent: PointerFillHandleCommitIntent & {
-      direction: Exclude<PointerFillHandleCommitIntent['direction'], null>
-    },
-  ): Promise<boolean> {
-    if (
-      intent.copyOnly === true ||
-      !backend.fillSeries ||
-      !isBoundedNumericSeriesSource(intent.sourceRange, intent.direction)
-    ) {
-      return false
-    }
-
-    let sourceProjection: RangeProjectionResult | null
-    try {
-      sourceProjection = await readRangeProjection(
-        intent.sheetId,
-        intent.sourceRange,
-        'fill-handle',
-      )
-    } catch {
-      return false
-    }
-    if (sourceProjection === null || sourceProjection.revision === undefined) return false
-
-    const sourceCells = getOrderedSeriesSourceCells(
-      sourceProjection,
-      intent.sourceRange,
-      intent.direction,
-    )
-    if (sourceCells === null) return false
-
-    const detected = detectFillSeries(sourceCells, store.getter(fillSeriesLocaleAtom))
-    if (
-      (detected.kind !== 'integer-step' && detected.kind !== 'decimal-step') ||
-      typeof detected.step !== 'number' ||
-      !Number.isFinite(detected.step) ||
-      detected.step === 0
-    ) {
-      return false
-    }
-
-    await backend.fillSeries({
-      kind: 'fill-series',
-      sheetId: intent.sheetId,
-      sourceRange: intent.sourceRange,
-      targetRange: intent.targetRange,
-      direction: intent.direction,
-      series: detected.kind,
-      step: detected.step,
-      requestId: sourceProjection.requestId,
-      revision: sourceProjection.revision,
-    })
-    return true
   }
 
   async function executeFillHandle(intent: PointerFillHandleCommitIntent) {
-    if (intent.direction === null) {
-      return
-    }
-
-    const writeRange = getFillHandleWriteRange(
-      intent.sourceRange,
-      intent.targetRange,
-      intent.direction,
-    )
-    if (writeRange === null) {
-      return
-    }
-
-    // Mutation gateway: the write range must clear the protection gate
-    // before any transport (fail-closed). Copying FROM locked cells is
-    // allowed, so the fill source skips the lock gate and is only checked
-    // for coordinate validity.
-    const writeResolution = store.setter(resolveContentMutationAtom, {
-      kind: 'fill-range',
-      sheetId: intent.sheetId,
-      range: writeRange,
-    })
-    if (writeResolution.status === 'blocked') {
-      return
-    }
-    const sourceResolution = store.setter(resolveContentMutationAtom, {
-      kind: 'fill-range',
-      sheetId: intent.sheetId,
-      range: intent.sourceRange,
-      protectionGate: false,
-    })
-    if (sourceResolution.status === 'blocked') {
-      return
-    }
-
-    const filledSeries = await tryNumericFillSeries({ ...intent, direction: intent.direction })
-
-    if (filledSeries) {
-      // Numeric series is a single compact backend mutation.
-    } else if (backend.fillRange) {
-      await backend.fillRange({
-        kind: 'fill-range',
+    if (intent.direction === null) return
+    await store.setter(runAutoFillAtom, {
+      entrypoint: 'fill-handle',
+      intent: {
         sheetId: intent.sheetId,
-        sourceRange: intent.sourceRange,
-        targetRange: intent.targetRange,
+        sourceRange: { ...intent.sourceRange },
+        targetRange: { ...intent.targetRange },
         direction: intent.direction,
-      })
-    } else {
-      await fallbackFillHandle(intent, writeRange)
-    }
+        copyOnly: intent.copyOnly,
+      },
+      source: createAutoFillController(),
+      refreshProjection: async () => loadProjection(requestProjection()),
+    })
+    bumpRender()
+  }
 
-    await loadProjection(requestProjection())
+  async function executeFillHandleDoubleClick(event: MouseEvent) {
+    event.preventDefault()
+    event.stopPropagation()
+    activeFillCleanup?.()
+    store.setter(cancelPointerAtom)
+
+    const snapshot = selectionSnapshot()
+    if (snapshot.selection.sheetId !== props.sheetId) return
+    const metrics = viewportMetrics()
+    await store.setter(runAutoFillAtom, {
+      entrypoint: 'double-click',
+      sheetId: props.sheetId,
+      sourceRange: { ...snapshot.range },
+      bounds: {
+        rowCount: metrics.rowCount,
+        colCount: metrics.colCount,
+      },
+      source: createAutoFillController(),
+      refreshProjection: async () => loadProjection(requestProjection()),
+    })
+    bumpRender()
   }
 
   function selectRow(row: number, extend: boolean, append: boolean) {
@@ -4149,13 +3925,14 @@ export function SpreadsheetGrid(props: SpreadsheetGridProps) {
                                   }}
                                 />
                               </Show>
-                              <Show when={active() && !editing()}>
+                              <Show when={isFillHandleHost(row, col) && !isSheetEditing()}>
                                 <button
                                   type="button"
                                   class="spreadsheet-grid-fill-handle"
                                   data-testid={`fill-handle-${addr}`}
                                   aria-label={`Fill from ${addr}`}
                                   onPointerDown={startFillHandle}
+                                  onDblClick={executeFillHandleDoubleClick}
                                 />
                               </Show>
                             </td>

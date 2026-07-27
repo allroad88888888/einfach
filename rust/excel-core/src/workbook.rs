@@ -18,6 +18,8 @@ use crate::sheet::{
     WorkbookAtomContext,
 };
 
+type FormulaOverlay<'a> = HashMap<(usize, CellAddress), Option<&'a Expr>>;
+
 /// One entry in `Workbook::named_values`. Stores the user-supplied
 /// canonical-case name alongside the cached `Value` so the registry can
 /// report names back to UIs with the casing the user typed, while
@@ -1562,6 +1564,16 @@ impl Workbook {
     /// Store dependency edges yet. Runtime ownership and invalidation remain in
     /// the shared Store; this walk retains no second dependency graph.
     fn closes_workbook_cycle(&self, target_idx: usize, target: CellAddress, expr: &Expr) -> bool {
+        self.closes_workbook_cycle_with_overlay(target_idx, target, expr, &FormulaOverlay::new())
+    }
+
+    fn closes_workbook_cycle_with_overlay(
+        &self,
+        target_idx: usize,
+        target: CellAddress,
+        expr: &Expr,
+        overlay: &FormulaOverlay<'_>,
+    ) -> bool {
         let mut visited: HashSet<(usize, CellAddress)> = HashSet::new();
         let mut to_visit: Vec<(usize, CellAddress)> = Vec::new();
         self.cycle_ast_walk_count
@@ -1574,6 +1586,7 @@ impl Workbook {
             &mut to_visit,
             &mut visiting_names,
             false,
+            overlay,
         ) {
             return true;
         }
@@ -1585,23 +1598,41 @@ impl Workbook {
             if !visited.insert((idx, addr)) {
                 continue;
             }
-            let Some(next) = self
-                .sheets
-                .get(idx)
-                .and_then(|sheet| sheet.cycle_expr_for(addr))
-            else {
-                continue;
-            };
             let mut visiting_names = HashSet::new();
-            if self.collect_workbook_cycle_refs(
-                &next,
-                idx,
-                (target_idx, target),
-                &mut to_visit,
-                &mut visiting_names,
-                true,
-            ) {
-                return true;
+            if let Some(next) = overlay.get(&(idx, addr)) {
+                let Some(next) = *next else {
+                    continue;
+                };
+                if self.collect_workbook_cycle_refs(
+                    next,
+                    idx,
+                    (target_idx, target),
+                    &mut to_visit,
+                    &mut visiting_names,
+                    true,
+                    overlay,
+                ) {
+                    return true;
+                }
+            } else {
+                let Some(next) = self
+                    .sheets
+                    .get(idx)
+                    .and_then(|sheet| sheet.cycle_expr_for(addr))
+                else {
+                    continue;
+                };
+                if self.collect_workbook_cycle_refs(
+                    &next,
+                    idx,
+                    (target_idx, target),
+                    &mut to_visit,
+                    &mut visiting_names,
+                    true,
+                    overlay,
+                ) {
+                    return true;
+                }
             }
         }
         false
@@ -1615,6 +1646,7 @@ impl Workbook {
         out: &mut Vec<(usize, CellAddress)>,
         visiting_names: &mut HashSet<String>,
         detect_unbounded_target: bool,
+        overlay: &FormulaOverlay<'_>,
     ) -> bool {
         match expr {
             Expr::CellRef(addr, _) => {
@@ -1636,6 +1668,7 @@ impl Workbook {
                     target,
                     out,
                     detect_unbounded_target,
+                    overlay,
                 ) {
                     return true;
                 }
@@ -1663,6 +1696,7 @@ impl Workbook {
                         target,
                         out,
                         detect_unbounded_target,
+                        overlay,
                     ) {
                         return true;
                     }
@@ -1676,6 +1710,7 @@ impl Workbook {
                     out,
                     visiting_names,
                     detect_unbounded_target,
+                    overlay,
                 ) || self.collect_workbook_cycle_refs(
                     right,
                     current_idx,
@@ -1683,6 +1718,7 @@ impl Workbook {
                     out,
                     visiting_names,
                     detect_unbounded_target,
+                    overlay,
                 ) {
                     return true;
                 }
@@ -1695,6 +1731,7 @@ impl Workbook {
                     out,
                     visiting_names,
                     detect_unbounded_target,
+                    overlay,
                 ) {
                     return true;
                 }
@@ -1707,6 +1744,7 @@ impl Workbook {
                     out,
                     visiting_names,
                     detect_unbounded_target,
+                    overlay,
                 ) {
                     return true;
                 }
@@ -1718,6 +1756,7 @@ impl Workbook {
                         out,
                         visiting_names,
                         detect_unbounded_target,
+                        overlay,
                     ) {
                         return true;
                     }
@@ -1731,6 +1770,7 @@ impl Workbook {
                     out,
                     visiting_names,
                     detect_unbounded_target,
+                    overlay,
                 ) || self.collect_workbook_cycle_refs(
                     end,
                     current_idx,
@@ -1738,6 +1778,7 @@ impl Workbook {
                     out,
                     visiting_names,
                     detect_unbounded_target,
+                    overlay,
                 ) {
                     return true;
                 }
@@ -1750,6 +1791,7 @@ impl Workbook {
                     out,
                     visiting_names,
                     detect_unbounded_target,
+                    overlay,
                 ) {
                     return true;
                 }
@@ -1762,6 +1804,7 @@ impl Workbook {
                     out,
                     visiting_names,
                     detect_unbounded_target,
+                    overlay,
                 ) {
                     return true;
                 }
@@ -1773,6 +1816,7 @@ impl Workbook {
                         out,
                         visiting_names,
                         detect_unbounded_target,
+                        overlay,
                     ) {
                         return true;
                     }
@@ -1787,6 +1831,7 @@ impl Workbook {
                         out,
                         visiting_names,
                         detect_unbounded_target,
+                        overlay,
                     ) {
                         return true;
                     }
@@ -1810,6 +1855,7 @@ impl Workbook {
         target: (usize, CellAddress),
         out: &mut Vec<(usize, CellAddress)>,
         detect_unbounded_target: bool,
+        overlay: &FormulaOverlay<'_>,
     ) -> bool {
         let range = range.normalize();
         if sheet_idx == target.0
@@ -1819,12 +1865,18 @@ impl Workbook {
             return true;
         }
         if let Some(sheet) = self.sheets.get(sheet_idx) {
-            out.extend(
-                sheet
-                    .formula_addrs_in_range(range)
-                    .into_iter()
-                    .map(|addr| (sheet_idx, addr)),
-            );
+            let mut formula_addrs = sheet.formula_addrs_in_range(range);
+            for ((overlay_sheet_idx, addr), expr) in overlay {
+                if *overlay_sheet_idx != sheet_idx || !range.contains(*addr) {
+                    continue;
+                }
+                if expr.is_some() {
+                    formula_addrs.insert(*addr);
+                } else {
+                    formula_addrs.remove(addr);
+                }
+            }
+            out.extend(formula_addrs.into_iter().map(|addr| (sheet_idx, addr)));
         }
         false
     }
@@ -1837,6 +1889,7 @@ impl Workbook {
         out: &mut Vec<(usize, CellAddress)>,
         visiting_names: &mut HashSet<String>,
         detect_unbounded_target: bool,
+        overlay: &FormulaOverlay<'_>,
     ) -> bool {
         let key = name.to_ascii_uppercase();
         if !visiting_names.insert(key.clone()) {
@@ -1850,6 +1903,7 @@ impl Workbook {
                 out,
                 visiting_names,
                 detect_unbounded_target,
+                overlay,
             )
         });
         visiting_names.remove(&key);
@@ -1864,6 +1918,7 @@ impl Workbook {
         out: &mut Vec<(usize, CellAddress)>,
         visiting_names: &mut HashSet<String>,
         detect_unbounded_target: bool,
+        overlay: &FormulaOverlay<'_>,
     ) -> bool {
         let Value::Lambda(lambda) = value else {
             return false;
@@ -1878,6 +1933,7 @@ impl Workbook {
             out,
             visiting_names,
             detect_unbounded_target,
+            overlay,
         ) {
             return true;
         }
@@ -1889,6 +1945,7 @@ impl Workbook {
                 out,
                 visiting_names,
                 detect_unbounded_target,
+                overlay,
             )
         })
     }

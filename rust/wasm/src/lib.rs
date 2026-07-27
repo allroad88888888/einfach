@@ -8,6 +8,10 @@ use einfach_excel_core::{
     TableRegistrySnapshot, TotalsFunction, VerticalAlign, Workbook, WorkbookError,
     MAX_FILTER_PREDICATE_CELLS,
 };
+use einfach_excel_core::{
+    AutoFillDirection, AutoFillError, AutoFillListWitness, AutoFillReport, AutoFillRequest,
+    AutoFillSeries, AutoFillTextPattern,
+};
 use serde::{de, Deserialize, Serialize};
 use std::cell::Cell;
 use std::collections::{HashMap, HashSet};
@@ -15,6 +19,199 @@ use std::sync::{Arc, Mutex};
 use wasm_bindgen::prelude::*;
 #[cfg(target_arch = "wasm32")]
 use wasm_bindgen::JsCast;
+
+#[derive(Clone, Copy, Debug, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+enum AutoFillDirectionJSON {
+    Up,
+    Down,
+    Left,
+    Right,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+enum AutoFillSeriesJSON {
+    Copy,
+    IntegerStep,
+    DecimalStep,
+    LinearTrend,
+    DateDay,
+    DateWeek,
+    DateMonth,
+    TextNumber,
+    WeekdayName,
+    MonthName,
+    CustomList,
+}
+
+#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct AutoFillRangeJSON {
+    start_row: u32,
+    start_col: u32,
+    end_row: u32,
+    end_col: u32,
+}
+
+impl From<AutoFillRangeJSON> for CellRange {
+    fn from(value: AutoFillRangeJSON) -> Self {
+        CellRange::new(
+            CellAddress::new(value.start_row, value.start_col),
+            CellAddress::new(value.end_row, value.end_col),
+        )
+    }
+}
+
+impl From<CellRange> for AutoFillRangeJSON {
+    fn from(value: CellRange) -> Self {
+        Self {
+            start_row: value.start.row,
+            start_col: value.start.col,
+            end_row: value.end.row,
+            end_col: value.end.col,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct AutoFillTextPatternJSON {
+    prefix: String,
+    suffix: String,
+    width: u32,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct AutoFillListWitnessJSON {
+    list_name: String,
+    values: Vec<String>,
+    locale: String,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct AutoFillRequestJSON {
+    sheet: u32,
+    source_range: AutoFillRangeJSON,
+    target_range: AutoFillRangeJSON,
+    direction: AutoFillDirectionJSON,
+    series: AutoFillSeriesJSON,
+    #[serde(default)]
+    step: Option<f64>,
+    #[serde(default)]
+    text_pattern: Option<AutoFillTextPatternJSON>,
+    #[serde(default)]
+    list: Option<AutoFillListWitnessJSON>,
+}
+
+impl From<AutoFillRequestJSON> for AutoFillRequest {
+    fn from(value: AutoFillRequestJSON) -> Self {
+        Self {
+            sheet_idx: value.sheet as usize,
+            source_range: value.source_range.into(),
+            target_range: value.target_range.into(),
+            direction: match value.direction {
+                AutoFillDirectionJSON::Up => AutoFillDirection::Up,
+                AutoFillDirectionJSON::Down => AutoFillDirection::Down,
+                AutoFillDirectionJSON::Left => AutoFillDirection::Left,
+                AutoFillDirectionJSON::Right => AutoFillDirection::Right,
+            },
+            series: match value.series {
+                AutoFillSeriesJSON::Copy => AutoFillSeries::Copy,
+                AutoFillSeriesJSON::IntegerStep => AutoFillSeries::IntegerStep,
+                AutoFillSeriesJSON::DecimalStep => AutoFillSeries::DecimalStep,
+                AutoFillSeriesJSON::LinearTrend => AutoFillSeries::LinearTrend,
+                AutoFillSeriesJSON::DateDay => AutoFillSeries::DateDay,
+                AutoFillSeriesJSON::DateWeek => AutoFillSeries::DateWeek,
+                AutoFillSeriesJSON::DateMonth => AutoFillSeries::DateMonth,
+                AutoFillSeriesJSON::TextNumber => AutoFillSeries::TextNumber,
+                AutoFillSeriesJSON::WeekdayName => AutoFillSeries::WeekdayName,
+                AutoFillSeriesJSON::MonthName => AutoFillSeries::MonthName,
+                AutoFillSeriesJSON::CustomList => AutoFillSeries::CustomList,
+            },
+            step: value.step,
+            text_pattern: value.text_pattern.map(|pattern| AutoFillTextPattern {
+                prefix: pattern.prefix,
+                suffix: pattern.suffix,
+                width: pattern.width,
+            }),
+            list: value.list.map(|list| AutoFillListWitness {
+                list_name: list.list_name,
+                values: list.values,
+                locale: list.locale,
+            }),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct AutoFillReportJSON {
+    write_range: Option<AutoFillRangeJSON>,
+    written: usize,
+}
+
+#[cfg(target_arch = "wasm32")]
+const AUTO_FILL_REJECTION_ERROR_NAME: &str = "EinfachAutoFillRejected";
+/// Default wire code for a rejected `apply_auto_fill` call.
+const AUTO_FILL_REJECTION_ERROR_CODE: &str = "AUTO_FILL_REJECTED";
+/// Wire code for [`AutoFillError::TooLarge`] specifically — lets hosts tell
+/// "the target range exceeds the engine's size budget" apart from every
+/// other semantic rejection without parsing the message text. Mirrors
+/// `MAX_AUTO_FILL_CELLS` (`rust/excel-core/src/auto_fill.rs`) and the two TS
+/// adapter pre-flight checks (`worker-workbook-backend.ts`,
+/// `static-backend.ts`) that reject the same request before it ever reaches
+/// this wasm boundary.
+const AUTO_FILL_TOO_LARGE_ERROR_CODE: &str = "AUTO_FILL_TOO_LARGE";
+
+/// Selects the wire `code` for a rejected [`AutoFillError`]. Only
+/// `TooLarge` gets its own code; every other variant keeps the generic
+/// `AUTO_FILL_REJECTED` code the wire has always used.
+fn auto_fill_error_code(err: &AutoFillError) -> &'static str {
+    match err {
+        AutoFillError::TooLarge { .. } => AUTO_FILL_TOO_LARGE_ERROR_CODE,
+        _ => AUTO_FILL_REJECTION_ERROR_CODE,
+    }
+}
+
+fn auto_fill_rejection(code: &str, message: String) -> JsValue {
+    #[cfg(target_arch = "wasm32")]
+    {
+        let error = js_sys::Error::new(&message);
+        let error_value = error.as_ref();
+        let _ = js_sys::Reflect::set(
+            error_value,
+            &JsValue::from_str("name"),
+            &JsValue::from_str(AUTO_FILL_REJECTION_ERROR_NAME),
+        );
+        let _ = js_sys::Reflect::set(
+            error_value,
+            &JsValue::from_str("code"),
+            &JsValue::from_str(code),
+        );
+        return error.into();
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        // Native tests compile the wire helpers but never execute this
+        // wasm-bindgen boundary. Keep a native fallback so `cargo test` can
+        // type-check the exported implementation.
+        let _ = code;
+        JsValue::from_str(&message)
+    }
+}
+
+impl From<AutoFillReport> for AutoFillReportJSON {
+    fn from(value: AutoFillReport) -> Self {
+        Self {
+            write_range: value.write_range.map(Into::into),
+            written: value.written,
+        }
+    }
+}
 
 /// Wire format for `CellFormat` over wasm-bindgen. Mirrors `CellFormat` /
 /// `NumberFormat` / `Align` but tagged-by-string so the JS side can build
@@ -4061,6 +4258,30 @@ impl WasmWorkbook {
         self.workbook.clear_range(sheet_idx as usize, range) as u32
     }
 
+    /// Preflight and apply one native drag-fill atomically. The payload uses
+    /// zero-based inclusive ranges and carries every detector witness needed
+    /// to reject semantically inconsistent series requests.
+    pub fn apply_auto_fill(&mut self, payload: JsValue) -> Result<JsValue, JsValue> {
+        let request: AutoFillRequestJSON =
+            serde_wasm_bindgen::from_value(payload).map_err(|err| {
+                auto_fill_rejection(
+                    AUTO_FILL_REJECTION_ERROR_CODE,
+                    format!("invalid auto-fill request: {err}"),
+                )
+            })?;
+        let report = self
+            .workbook
+            .apply_auto_fill(&request.into())
+            .map_err(|err| {
+                auto_fill_rejection(
+                    auto_fill_error_code(&err),
+                    format!("auto-fill rejected: {err}"),
+                )
+            })?;
+        serde_wasm_bindgen::to_value(&AutoFillReportJSON::from(report))
+            .map_err(|err| JsValue::from_str(&format!("serialize auto-fill report: {err}")))
+    }
+
     /// Set a range format without materializing empty cells. The core stores
     /// a sparse range-format layer and only notifies addresses that are
     /// already subscribed.
@@ -5062,6 +5283,108 @@ mod tests {
             demote_busy_for_custom_return(ValueError::Spill),
             ValueError::Spill
         );
+    }
+
+    #[test]
+    fn auto_fill_wire_requires_list_locale() {
+        let payload = r#"{
+            "sheet": 0,
+            "sourceRange": {"startRow": 0, "startCol": 0, "endRow": 1, "endCol": 0},
+            "targetRange": {"startRow": 0, "startCol": 0, "endRow": 3, "endCol": 0},
+            "direction": "down",
+            "series": "weekday-name",
+            "list": {"listName": "weekday", "values": ["Mon", "Tue"]}
+        }"#;
+
+        let error = serde_json::from_str::<AutoFillRequestJSON>(payload)
+            .expect_err("the native wire requires an explicit locale");
+        assert!(error.to_string().contains("locale"));
+    }
+
+    #[test]
+    fn auto_fill_wire_preserves_canonical_locale_and_rejects_unknown_fields() {
+        let payload = r#"{
+            "sheet": 0,
+            "sourceRange": {"startRow": 0, "startCol": 0, "endRow": 1, "endCol": 0},
+            "targetRange": {"startRow": 0, "startCol": 0, "endRow": 3, "endCol": 0},
+            "direction": "down",
+            "series": "custom-list",
+            "list": {
+                "listName": "days",
+                "values": ["Pazartesi", "Salı"],
+                "locale": "tr-TR"
+            }
+        }"#;
+        let request: AutoFillRequestJSON =
+            serde_json::from_str(payload).expect("strict auto-fill payload");
+        let core: AutoFillRequest = request.into();
+        assert_eq!(
+            core.list.as_ref().map(|list| list.locale.as_str()),
+            Some("tr-TR")
+        );
+
+        let payload_with_unknown =
+            payload.replacen("\"sheet\": 0,", "\"sheet\": 0, \"unexpected\": true,", 1);
+        assert!(
+            serde_json::from_str::<AutoFillRequestJSON>(&payload_with_unknown).is_err(),
+            "unknown request fields must fail closed"
+        );
+    }
+
+    #[test]
+    fn auto_fill_error_code_maps_too_large_to_its_own_wire_code_and_everything_else_generic() {
+        // `AUTO_FILL_TOO_LARGE` lets hosts distinguish the size-budget
+        // rejection from every other semantic rejection without parsing the
+        // message text (parity with the `worker-workbook-backend.ts` /
+        // `static-backend.ts` pre-flight checks, which reject the same
+        // oversized request before ever reaching this wasm boundary).
+        assert_eq!(
+            auto_fill_error_code(&AutoFillError::TooLarge {
+                requested_cells: 2_000_000
+            }),
+            AUTO_FILL_TOO_LARGE_ERROR_CODE
+        );
+        for other in [
+            AutoFillError::SheetOutOfRange,
+            AutoFillError::MutationDuringCustomCall,
+            AutoFillError::InvalidGeometry("x"),
+            AutoFillError::InvalidStep("x"),
+            AutoFillError::InvalidSource("x"),
+            AutoFillError::InvalidWitness("x"),
+            AutoFillError::FormulaParse,
+            AutoFillError::UnsupportedFormula,
+            AutoFillError::UnsupportedSeries,
+        ] {
+            assert_eq!(auto_fill_error_code(&other), AUTO_FILL_REJECTION_ERROR_CODE);
+        }
+    }
+
+    #[test]
+    fn apply_auto_fill_engine_call_rejects_a_request_over_the_cell_budget() {
+        // Full end-to-end (minus the `JsValue` boundary, which needs a wasm32
+        // runtime): a target range over `MAX_AUTO_FILL_CELLS` is rejected by
+        // the engine itself, and the rejection maps to the too-large wire
+        // code — the same path `apply_auto_fill` (the `#[wasm_bindgen]`
+        // export) drives.
+        let mut wb = Workbook::new();
+        let request = AutoFillRequest {
+            sheet_idx: 0,
+            source_range: CellRange::new(CellAddress::new(0, 0), CellAddress::new(0, 1)),
+            target_range: CellRange::new(CellAddress::new(0, 0), CellAddress::new(1_048_575, 1)),
+            direction: AutoFillDirection::Down,
+            series: AutoFillSeries::Copy,
+            step: None,
+            text_pattern: None,
+            list: None,
+        };
+        let error = wb.apply_auto_fill(&request).unwrap_err();
+        assert_eq!(
+            error,
+            AutoFillError::TooLarge {
+                requested_cells: 2_097_152
+            }
+        );
+        assert_eq!(auto_fill_error_code(&error), AUTO_FILL_TOO_LARGE_ERROR_CODE);
     }
 
     // === Excel Table registry wire (#32 T3) ===

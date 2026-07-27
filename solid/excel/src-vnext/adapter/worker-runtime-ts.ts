@@ -113,6 +113,9 @@ export const TS_WORKER_RUNTIME_CAPABILITIES: WorkerRuntimeCapabilitiesWire = Obj
   formatSnapshots: false,
   tsvChunkExport: false,
   persistenceFormats: false,
+  // The TS core has no atomic auto-fill primitive. Withhold the backend
+  // ports and refuse direct RPCs instead of acknowledging an unperformed fill.
+  autoFill: false,
   // The TS core has no physical-sort primitive (no arbitrary-permutation
   // relocate + verbatim carry + spill gate). Declaring `false` withholds
   // the host sort port; a real implementation is the optional S7 slice.
@@ -1501,6 +1504,8 @@ export function createWorkerRuntimeTs(events?: WorkerRuntimeTsEvents): ExcelCore
       }
       case 'describeCapabilities':
         return { ...TS_WORKER_RUNTIME_CAPABILITIES }
+      case 'applyAutoFill':
+        return unsupported('applyAutoFill (native auto-fill)')
       case 'insertRows':
       case 'deleteRows':
       case 'insertColumns':

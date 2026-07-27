@@ -4,6 +4,8 @@ import init, { WasmWorkbook } from '../../wasm-pkg/einfach_wasm.js'
 import { createAsyncCustomPump, type AsyncCustomRequest } from './async-custom-pump'
 import { sparseRangeToTSV } from './range-tsv'
 import type {
+  AutoFillReportWire,
+  AutoFillRequestWire,
   CellFormatJSON,
   CellRefWire,
   CellSnapshotWire,
@@ -113,6 +115,7 @@ type WasmWorkbookRuntime = {
     endRow: number,
     endCol: number,
   ) => number
+  apply_auto_fill?: (request: AutoFillRequestWire) => AutoFillReportWire
   set_format_range?: (
     sheetIdx: number,
     startRow: number,
@@ -547,6 +550,46 @@ function postResponse(id: number, result: unknown) {
 function postError(id: number, error: RpcErrorWire) {
   const msg: RpcResponseWire = { id, ok: false, error }
   ctx.postMessage(msg)
+}
+
+const AUTO_FILL_REJECTION_ERROR_NAME = 'EinfachAutoFillRejected'
+const AUTO_FILL_REJECTION_ERROR_CODE = 'AUTO_FILL_REJECTED'
+
+/**
+ * Only the wasm boundary creates this Error shape, and it does so before the
+ * core mutates the workbook. Strings and plain objects deliberately do not
+ * qualify: serialization failures and unrelated worker exceptions must stay
+ * in the generic outcome-unknown lane at the host.
+ */
+function autoFillRejectionMessage(error: unknown): string | null {
+  if (
+    !(error instanceof Error) ||
+    error.name !== AUTO_FILL_REJECTION_ERROR_NAME ||
+    !Object.prototype.hasOwnProperty.call(error, 'code') ||
+    (error as Error & { code?: unknown }).code !== AUTO_FILL_REJECTION_ERROR_CODE
+  ) {
+    return null
+  }
+  return error.message
+}
+
+function dispatchAutoFill(id: number, run: () => AutoFillReportWire): void {
+  let result: AutoFillReportWire
+  try {
+    result = run()
+  } catch (error) {
+    const message = autoFillRejectionMessage(error)
+    if (message === null) throw error
+    postError(id, {
+      code: AUTO_FILL_REJECTION_ERROR_CODE,
+      message,
+    })
+    return
+  }
+  // Keep response serialization / transport outside the semantic-rejection
+  // catch. A failing post means the host cannot know whether the core commit
+  // happened and must never receive AUTO_FILL_REJECTED.
+  postResponse(id, result)
 }
 
 function postDirty(cells: CellRefWire[]) {
@@ -1336,8 +1379,16 @@ function snapshotRangeSparseChunk(
 
 function toRpcError(err: unknown): RpcErrorWire {
   if (err instanceof Error) {
+    const claimedCode = String((err as Error & { code?: string }).code ?? 'WORKER_ERROR')
     return {
-      code: String((err as Error & { code?: string }).code ?? 'WORKER_ERROR'),
+      // AUTO_FILL_REJECTED is a private typed boundary, not a generally
+      // claimable Error.code. The applyAutoFill dispatcher emits it only
+      // after checking the complete native Error witness; anything reaching
+      // this generic path (including a spoofed partial witness) stays generic.
+      code:
+        claimedCode === AUTO_FILL_REJECTION_ERROR_CODE
+          ? 'WORKER_ERROR'
+          : claimedCode,
       message: err.message,
     }
   }
@@ -1417,6 +1468,16 @@ export function installWorkerRuntime() {
         case 'sheetList':
           postResponse(msg.id, sheetList(wb))
           break
+        case 'describeCapabilities':
+          // AutoFill is deliberately stricter than the legacy capability
+          // families: advertise it only when this concrete wasm-pkg exposes
+          // the single native transaction entry point. The scoped witness
+          // keeps every older family on its existing legacy path.
+          postResponse(msg.id, {
+            scope: 'auto-fill',
+            autoFill: typeof wb.apply_auto_fill === 'function',
+          })
+          break
         case 'addSheet':
           postResponse(msg.id, wb.add_sheet(String(msg.name ?? 'Sheet')))
           break
@@ -1488,6 +1549,19 @@ export function installWorkerRuntime() {
                 range.endRow,
                 range.endCol,
               ),
+            )
+          }
+          break
+        case 'applyAutoFill':
+          {
+            const applyAutoFill = assertMethod(wb, 'apply_auto_fill')
+            dispatchAutoFill(
+              msg.id,
+              () =>
+                applyAutoFill.call(
+                  wb,
+                  msg.request as AutoFillRequestWire,
+                ) as AutoFillReportWire,
             )
           }
           break

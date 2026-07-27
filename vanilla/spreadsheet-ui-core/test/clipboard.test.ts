@@ -4,6 +4,7 @@ import {
   clipboardIntentAtom,
   clipboardStateAtom,
   clearClipboardAtom,
+  collectFormulaReferenceRanges,
   copyClipboardAtom,
   createClipboardPayloadDescriptor,
   createClipboardTsvPastePlan,
@@ -322,6 +323,97 @@ describe('clipboard core', () => {
     expect(shiftFormulaRefs('=Sheet1!A1+Revenue', 0, 1)).toBe('=Sheet1!B1+Revenue')
   })
 
+  test('shifts only standalone in-grid A1 refs, not functions, exponents, or identifiers', () => {
+    expect(shiftFormulaRefs('=LOG10(A1)+1E10+SUM(A1:B2)+Sheet1!A1+$A$1', 1, 1)).toBe(
+      '=LOG10(B2)+1E10+SUM(B2:C3)+Sheet1!B2+$A$1',
+    )
+    expect(shiftFormulaRefs('=LOG10 \t (A1)', 1, 1)).toBe('=LOG10 \t (B2)')
+    expect(shiftFormulaRefs('=_A1+A1_+1A1+A1.name+A1', 1, 1)).toBe('=_A1+A1_+1A1+A1.name+B2')
+    expect(shiftFormulaRefs('=XFE1+A1048577+XFD1048576', 0, 0)).toBe('=XFE1+A1048577+XFD1048576')
+    expect(shiftFormulaRefs('=XFD1048576', 1, 0)).toBe('=#REF!')
+    expect(shiftFormulaRefs('=XFD1048576', 0, 1)).toBe('=#REF!')
+  })
+
+  test('keeps quoted and escaped sheet qualifiers atomic while shifting their refs', () => {
+    expect(shiftFormulaRefs("='A1 Data'!B2+C3", 1, 0)).toBe(
+      "='A1 Data'!B3+C4",
+    )
+    expect(shiftFormulaRefs("='A1'' Q4'!$B2+A1", 1, 0)).toBe(
+      "='A1'' Q4'!$B3+A2",
+    )
+    expect(shiftFormulaRefs("='成本A1'!B2+A1", 1, 0)).toBe(
+      "='成本A1'!B3+A2",
+    )
+    expect(shiftFormulaRefs('=A1!B2+C3', 1, 0)).toBe('=A1!B3+C4')
+  })
+
+  test('does not reinterpret A1-shaped suffixes inside Unicode formula names', () => {
+    expect(shiftFormulaRefs('=成本A1+A1', 1, 0)).toBe('=成本A1+A2')
+    expect(shiftFormulaRefs('=A1成本+A1', 1, 0)).toBe('=A1成本+A2')
+    expect(shiftFormulaRefs('=𝒳A1+A1', 1, 0)).toBe('=𝒳A1+A2')
+    expect(shiftFormulaRefs('=CaféA1+A1', 1, 0)).toBe('=CaféA1+A2')
+  })
+
+  test('collects lexically safe ordinary A1 ranges with decoded sheet qualifiers', () => {
+    expect(
+      collectFormulaReferenceRanges(
+        '=SUM(A1:B2)+C3+"D4"+\'A1 Data\'!E5+成本F6+G7+Sheet1!H8+\'O\'\'Brien\'!I9',
+      ),
+    ).toEqual([
+      { rowStart: 0, rowEnd: 1, colStart: 0, colEnd: 1 },
+      { rowStart: 2, rowEnd: 2, colStart: 2, colEnd: 2 },
+      {
+        qualifier: 'A1 Data',
+        rowStart: 4,
+        rowEnd: 4,
+        colStart: 4,
+        colEnd: 4,
+      },
+      { rowStart: 6, rowEnd: 6, colStart: 6, colEnd: 6 },
+      {
+        qualifier: 'Sheet1',
+        rowStart: 7,
+        rowEnd: 7,
+        colStart: 7,
+        colEnd: 7,
+      },
+      {
+        qualifier: "O'Brien",
+        rowStart: 8,
+        rowEnd: 8,
+        colStart: 8,
+        colEnd: 8,
+      },
+    ])
+    expect(collectFormulaReferenceRanges('=Sheet1!A1:B2')).toEqual([
+      {
+        qualifier: 'Sheet1',
+        rowStart: 0,
+        rowEnd: 1,
+        colStart: 0,
+        colEnd: 1,
+      },
+    ])
+    expect(collectFormulaReferenceRanges('=A1+[Book.xlsx]Data!B2')).toBeNull()
+    expect(collectFormulaReferenceRanges('=A1+"unterminated B2')).toBeNull()
+  })
+
+  test('fails closed for unknown bracket syntax and malformed quoted segments', () => {
+    const unknownBracketFormula = '=A1+[Book.xlsx]Data!B2'
+    const unterminatedStringFormula = '=A1+"unterminated B2'
+    const unterminatedSheetFormula = "=A1+'unterminated B2"
+
+    expect(shiftFormulaRefs(unknownBracketFormula, 1, 0)).toBe(
+      unknownBracketFormula,
+    )
+    expect(shiftFormulaRefs(unterminatedStringFormula, 1, 0)).toBe(
+      unterminatedStringFormula,
+    )
+    expect(shiftFormulaRefs(unterminatedSheetFormula, 1, 0)).toBe(
+      unterminatedSheetFormula,
+    )
+  })
+
   test('plans TSV paste chunks from marker origin to target origin', () => {
     const text = '# einfach-clipboard-origin: B2\r\n=A1\tplain\n=SUM(B2:C3)\t'
     const plan = createClipboardTsvPastePlan({
@@ -363,6 +455,22 @@ describe('clipboard core', () => {
           { row: 5, col: 4, input: '' },
         ],
       },
+    ])
+  })
+
+  test('applies safe formula shifting through the clipboard paste plan', () => {
+    const text =
+      "# einfach-clipboard-origin: A1\n='A1'' Data'!B2+成本A1+A1\t" +
+      '=A1+[Book.xlsx]Data!B2'
+    const plan = createClipboardTsvPastePlan({
+      text,
+      fallbackOriginAddr: 'A1',
+      targetOrigin: { row: 1, col: 1 },
+    })
+
+    expect([...plan.chunks()][0].cells).toEqual([
+      { row: 1, col: 1, input: "='A1'' Data'!C3+成本A1+B2" },
+      { row: 1, col: 2, input: '=A1+[Book.xlsx]Data!B2' },
     ])
   })
 

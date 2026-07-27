@@ -2,6 +2,13 @@
 
 Planning doc for series-aware fill-handle drag in `@einfach/spreadsheet-ui-core`.
 
+> Historical design sketch. The authoritative contract is
+> `src/auto-fill/types.ts`, the implementation is `src/auto-fill/index.ts`, and the connected-path
+> status is documented in `src/auto-fill/README.md`. The shipped bounded Static path now supports
+> uniform numeric steps, least-squares trends, calendar dates, text-number patterns, built-in and
+> locale weekday/month names, and custom-list witnesses. The proposed preview/session architecture
+> and several type names below were not adopted and must not be treated as the current API.
+
 ## Goal
 
 Drag the fill handle over an adjacent range and have the UI core detect a

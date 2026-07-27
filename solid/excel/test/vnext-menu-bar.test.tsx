@@ -58,7 +58,9 @@ import {
   type CreateTableRequest,
   type CreateTableResult,
   type DisplayCell,
+  type FillRangeRequest,
   type HideColumnsRequest,
+  type ImportCellsRequest,
   type ListTablesResult,
   type SpreadsheetTableDescriptor,
   type HideRowsRequest,
@@ -392,6 +394,359 @@ describe('SpreadsheetMenuBar', () => {
     expect(state.cursor).toBe(1)
     expect(state.entries).toHaveLength(1)
     expect(state.inFlight).toBe(false)
+  })
+
+  it.each([
+    {
+      itemId: 'edit.fillDown',
+      direction: 'down' as const,
+      sourceRange: { rowStart: 2, rowEnd: 2, colStart: 3, colEnd: 5 },
+      affectedRange: { rowStart: 3, rowEnd: 4, colStart: 3, colEnd: 5 },
+    },
+    {
+      itemId: 'edit.fillUp',
+      direction: 'up' as const,
+      sourceRange: { rowStart: 4, rowEnd: 4, colStart: 3, colEnd: 5 },
+      affectedRange: { rowStart: 2, rowEnd: 3, colStart: 3, colEnd: 5 },
+    },
+    {
+      itemId: 'edit.fillRight',
+      direction: 'right' as const,
+      sourceRange: { rowStart: 2, rowEnd: 4, colStart: 3, colEnd: 3 },
+      affectedRange: { rowStart: 2, rowEnd: 4, colStart: 4, colEnd: 5 },
+    },
+    {
+      itemId: 'edit.fillLeft',
+      direction: 'left' as const,
+      sourceRange: { rowStart: 2, rowEnd: 4, colStart: 5, colEnd: 5 },
+      affectedRange: { rowStart: 2, rowEnd: 4, colStart: 3, colEnd: 4 },
+    },
+  ])(
+    'Edit > $itemId delegates one copy-only compact fill through the $direction source edge',
+    async ({ itemId, direction, sourceRange, affectedRange }) => {
+      const store = createStore()
+      const fillRequests: FillRangeRequest[] = []
+      const visibleRequests: VisibleProjectionRequest[] = []
+      let rangeReads = 0
+      let fallbackMutations = 0
+      const backend: SpreadsheetBackend = {
+        ...createBaseBackend(),
+        async readVisibleProjection(request) {
+          visibleRequests.push(request)
+          return {
+            kind: 'visible-window',
+            sheetId: request.sheetId,
+            window: { ...request.window },
+            requestId: request.requestId,
+            revision: 12,
+            cells: [],
+          }
+        },
+        async readRangeProjection() {
+          rangeReads += 1
+          throw new Error('compact fill-command must not read the source range')
+        },
+        async fillSeries() {
+          fallbackMutations += 1
+          throw new Error('copy-only fill-command must not detect or execute a series')
+        },
+        async fillRange(request) {
+          fillRequests.push(request)
+          return {
+            sheetId: request.sheetId,
+            revision: 11,
+            affectedRange: { ...affectedRange },
+            applied: true,
+            historyTransactionCount: 1,
+            historyDisposition: 'undoable',
+          }
+        },
+        async importCells() {
+          fallbackMutations += 1
+          throw new Error('compact fillRange must win over importCells')
+        },
+        async setCellInput() {
+          fallbackMutations += 1
+          throw new Error('compact fillRange must win over setCellInput')
+        },
+      }
+      const selectionRange = { rowStart: 2, rowEnd: 4, colStart: 3, colEnd: 5 }
+      const window = { rowStart: 0, rowEnd: 9, colStart: 0, colEnd: 9 }
+      store.setter(setWorkspaceActiveSheetAtom, { sheetId: 'sheet-1' })
+      store.setter(selectionAtom, {
+        kind: 'range',
+        sheetId: 'sheet-1',
+        anchor: { row: selectionRange.rowEnd, col: selectionRange.colEnd },
+        focus: { row: selectionRange.rowStart, col: selectionRange.colStart },
+      })
+      seedReadyVisibleProjection(store, {
+        status: 'ready',
+        request: {
+          kind: 'visible-window',
+          sheetId: 'sheet-1',
+          window,
+          requestId: 20,
+        },
+        result: {
+          kind: 'visible-window',
+          sheetId: 'sheet-1',
+          window,
+          requestId: 20,
+          revision: 10,
+          cells: [],
+        },
+      })
+
+      const { container } = render(() => (
+        <SpreadsheetUiProvider backend={backend} store={store}>
+          <SpreadsheetMenuBar />
+        </SpreadsheetUiProvider>
+      ))
+
+      fireEvent.click(container.querySelector('[data-testid="menu-bar-button-edit"]')!)
+      fireEvent.click(container.querySelector(`[data-testid="menu-bar-item-${itemId}"]`)!)
+
+      await waitFor(() => {
+        expect(fillRequests).toHaveLength(1)
+        expect(visibleRequests).toHaveLength(1)
+      })
+      expect(fillRequests).toEqual([
+        {
+          kind: 'fill-range',
+          sheetId: 'sheet-1',
+          sourceRange,
+          targetRange: selectionRange,
+          direction,
+        },
+      ])
+      expect(fillRequests[0]).not.toHaveProperty('copyOnly')
+      expect({ rangeReads, fallbackMutations }).toEqual({
+        rangeReads: 0,
+        fallbackMutations: 0,
+      })
+      expect(visibleRequests[0]).toMatchObject({
+        kind: 'visible-window',
+        sheetId: 'sheet-1',
+        window,
+        reason: 'toolbar',
+      })
+      expect(store.getter(historyStackAtom).entries).toHaveLength(1)
+      expect(store.getter(historyStackAtom).entries[0]).toMatchObject({
+        kind: 'range.fill',
+        sheetId: 'sheet-1',
+        affectedRange,
+      })
+      expect(store.getter(topMenuOpenAtom)).toEqual({ kind: 'idle' })
+    },
+  )
+
+  it('Edit > Fill Down uses the toolbar range lane and import fallback when fillRange is absent', async () => {
+    const store = createStore()
+    const rangeRequests: RangeProjectionRequest[] = []
+    const importRequests: ImportCellsRequest[] = []
+    const visibleRequests: VisibleProjectionRequest[] = []
+    const sourceRange = { rowStart: 2, rowEnd: 2, colStart: 3, colEnd: 3 }
+    const affectedRange = { rowStart: 3, rowEnd: 3, colStart: 3, colEnd: 3 }
+    const selectionRange = { rowStart: 2, rowEnd: 3, colStart: 3, colEnd: 3 }
+    const window = { rowStart: 0, rowEnd: 9, colStart: 0, colEnd: 9 }
+    const backend: SpreadsheetBackend = {
+      ...createBaseBackend(),
+      async readVisibleProjection(request) {
+        visibleRequests.push(request)
+        return {
+          kind: 'visible-window',
+          sheetId: request.sheetId,
+          window: { ...request.window },
+          requestId: request.requestId,
+          revision: 12,
+          cells: [],
+        }
+      },
+      async readRangeProjection(request) {
+        rangeRequests.push(request)
+        return {
+          kind: 'range',
+          sheetId: request.sheetId,
+          range: { ...request.range },
+          requestId: request.requestId,
+          revision: 10,
+          cells: [
+            {
+              row: sourceRange.rowStart,
+              col: sourceRange.colStart,
+              displayValue: 'seed',
+              valueKind: 'string',
+            },
+          ],
+        }
+      },
+      async importCells(request) {
+        importRequests.push(request)
+        return {
+          sheetId: request.sheetId,
+          revision: 11,
+          affectedRange: { ...affectedRange },
+        }
+      },
+      async setCellInput() {
+        throw new Error('importCells must win over setCellInput')
+      },
+    }
+    store.setter(setWorkspaceActiveSheetAtom, { sheetId: 'sheet-1' })
+    store.setter(selectionAtom, {
+      kind: 'range',
+      sheetId: 'sheet-1',
+      anchor: { row: selectionRange.rowEnd, col: selectionRange.colEnd },
+      focus: { row: selectionRange.rowStart, col: selectionRange.colStart },
+    })
+    seedReadyVisibleProjection(store, {
+      status: 'ready',
+      request: {
+        kind: 'visible-window',
+        sheetId: 'sheet-1',
+        window,
+        requestId: 20,
+      },
+      result: {
+        kind: 'visible-window',
+        sheetId: 'sheet-1',
+        window,
+        requestId: 20,
+        revision: 10,
+        cells: [],
+      },
+    })
+
+    const { container } = render(() => (
+      <SpreadsheetUiProvider backend={backend} store={store}>
+        <SpreadsheetMenuBar />
+      </SpreadsheetUiProvider>
+    ))
+
+    fireEvent.click(container.querySelector('[data-testid="menu-bar-button-edit"]')!)
+    fireEvent.click(container.querySelector('[data-testid="menu-bar-item-edit.fillDown"]')!)
+
+    await waitFor(() => {
+      expect(importRequests).toHaveLength(1)
+      expect(visibleRequests).toHaveLength(1)
+    })
+    expect(rangeRequests).toHaveLength(1)
+    expect(rangeRequests[0]).toMatchObject({
+      kind: 'range',
+      sheetId: 'sheet-1',
+      range: sourceRange,
+      reason: 'toolbar',
+    })
+    expect(importRequests).toEqual([
+      {
+        kind: 'import-cells',
+        sheetId: 'sheet-1',
+        range: affectedRange,
+        cells: [{ row: 3, col: 3, input: 'seed' }],
+      },
+    ])
+    expect(visibleRequests[0]).toMatchObject({
+      kind: 'visible-window',
+      sheetId: 'sheet-1',
+      window,
+      reason: 'toolbar',
+    })
+    expect(store.getter(historyStackAtom).entries).toHaveLength(1)
+    expect(store.getter(topMenuOpenAtom)).toEqual({ kind: 'idle' })
+  })
+
+  it('Edit > Fill Down is a no-op for a single-cell selection', async () => {
+    const store = createStore()
+    let rangeReads = 0
+    let visibleReads = 0
+    let mutations = 0
+    const backend: SpreadsheetBackend = {
+      ...createBaseBackend(),
+      async readVisibleProjection(request) {
+        visibleReads += 1
+        return {
+          kind: 'visible-window',
+          sheetId: request.sheetId,
+          window: { ...request.window },
+          requestId: request.requestId,
+          revision: 12,
+          cells: [],
+        }
+      },
+      async readRangeProjection(request) {
+        rangeReads += 1
+        return {
+          kind: 'range',
+          sheetId: request.sheetId,
+          range: { ...request.range },
+          requestId: request.requestId,
+          revision: 10,
+          cells: [],
+        }
+      },
+      async fillSeries() {
+        mutations += 1
+        throw new Error('single-cell fill-command must not mutate')
+      },
+      async fillRange() {
+        mutations += 1
+        throw new Error('single-cell fill-command must not mutate')
+      },
+      async importCells() {
+        mutations += 1
+        throw new Error('single-cell fill-command must not mutate')
+      },
+      async setCellInput() {
+        mutations += 1
+        throw new Error('single-cell fill-command must not mutate')
+      },
+    }
+    const cell = { row: 2, col: 3 }
+    const window = { rowStart: 0, rowEnd: 9, colStart: 0, colEnd: 9 }
+    store.setter(setWorkspaceActiveSheetAtom, { sheetId: 'sheet-1' })
+    store.setter(selectionAtom, {
+      kind: 'cell',
+      sheetId: 'sheet-1',
+      anchor: cell,
+      focus: cell,
+    })
+    seedReadyVisibleProjection(store, {
+      status: 'ready',
+      request: {
+        kind: 'visible-window',
+        sheetId: 'sheet-1',
+        window,
+        requestId: 20,
+      },
+      result: {
+        kind: 'visible-window',
+        sheetId: 'sheet-1',
+        window,
+        requestId: 20,
+        revision: 10,
+        cells: [],
+      },
+    })
+
+    const { container } = render(() => (
+      <SpreadsheetUiProvider backend={backend} store={store}>
+        <SpreadsheetMenuBar />
+      </SpreadsheetUiProvider>
+    ))
+
+    fireEvent.click(container.querySelector('[data-testid="menu-bar-button-edit"]')!)
+    fireEvent.click(container.querySelector('[data-testid="menu-bar-item-edit.fillDown"]')!)
+    await Promise.resolve()
+    await Promise.resolve()
+    await Promise.resolve()
+
+    expect({ mutations, rangeReads, visibleReads }).toEqual({
+      mutations: 0,
+      rangeReads: 0,
+      visibleReads: 0,
+    })
+    expect(store.getter(historyStackAtom).entries).toHaveLength(0)
+    expect(store.getter(topMenuOpenAtom)).toEqual({ kind: 'idle' })
   })
 
   it('Edit > Find opens the find/replace dialog', () => {
@@ -1379,6 +1734,7 @@ describe('SpreadsheetMenuBar', () => {
           sheetId: request.sheetId,
           requestId: request.requestId,
           revision: 2,
+          historyRecorded: false,
           hiddenRowIndices: [3],
         }
       },

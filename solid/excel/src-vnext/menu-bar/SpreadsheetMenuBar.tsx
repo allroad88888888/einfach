@@ -3,6 +3,7 @@ import { useAtomValue } from '@einfach/solid'
 import { useT } from '../../src/i18n'
 import {
   addSheetTabAtom,
+  beginProjectionAtom,
   closeFindReplaceAtom,
   closeHelpOverlayAtom,
   closeTopMenuAtom,
@@ -39,11 +40,14 @@ import {
   protectSheetAtom,
   reapplyFilterAtom,
   reapplyFilterDisabledReasonAtom,
+  rejectProjectionAtom,
   hideColumnsAtom,
   hideRowsAtom,
   reportCopyAsStatusAtom,
+  resolveProjectionAtom,
   retryFilterSortRefreshAtom,
   removeDuplicatesCapabilityAtom,
+  runAutoFillAtom,
   runCreateTableAtom,
   runToggleTableTotalsAtSelectionAtom,
   runPhysicalSortAtom,
@@ -69,9 +73,12 @@ import {
   viewportShowGridlinesAtom,
   viewportShowHeadingsAtom,
   workspaceSessionAtom,
+  type AutoFillControllerPort,
+  type CellRange,
   type MenuBarEntry,
   type MenuItemDescriptor,
   type MenuItemDispatch,
+  type RangeProjectionResult,
   type StructureOperationIntent,
   type TopMenuDescriptor,
   type TopMenuId,
@@ -303,6 +310,44 @@ export function SpreadsheetMenuBar(props: SpreadsheetMenuBarProps) {
     return ws.activeSheetId ?? null
   }
 
+  async function readAutoFillRangeProjection(
+    sheetId: string,
+    range: Readonly<CellRange>,
+  ): Promise<RangeProjectionResult | null> {
+    const begin = store.setter(beginProjectionAtom, {
+      kind: 'range',
+      sheetId,
+      range: { ...range },
+      reason: 'toolbar',
+    })
+    if (begin.status !== 'started' || begin.request.kind !== 'range') return null
+
+    const request = begin.request
+    try {
+      const result = await backend.readRangeProjection(request)
+      const outcome = store.setter(resolveProjectionAtom, { request, result })
+      return outcome.status === 'accepted' && outcome.result.kind === 'range'
+        ? outcome.result
+        : null
+    } catch (error) {
+      store.setter(rejectProjectionAtom, { request, error })
+      throw error
+    }
+  }
+
+  function createAutoFillController(): AutoFillControllerPort {
+    return {
+      readRangeProjection: readAutoFillRangeProjection,
+      setCellInput: (request) => backend.setCellInput(request),
+      ...(backend.fillSeries ? { fillSeries: (request) => backend.fillSeries!(request) } : {}),
+      ...(backend.fillRange ? { fillRange: (request) => backend.fillRange!(request) } : {}),
+      ...(backend.importCells ? { importCells: (request) => backend.importCells!(request) } : {}),
+      ...(backend.resolveDataEdge
+        ? { resolveDataEdge: (request) => backend.resolveDataEdge!(request) }
+        : {}),
+    }
+  }
+
   function routeDispatch(dispatch: MenuItemDispatch) {
     switch (dispatch.kind) {
       case 'undo':
@@ -337,6 +382,21 @@ export function SpreadsheetMenuBar(props: SpreadsheetMenuBarProps) {
         // projection if the worker is mid-restart).
         void dispatchCopyAs(store, backend, { sheetId, range: snap.range }).catch(() => {
           store.setter(reportCopyAsStatusAtom, { kind: 'failed' })
+        })
+        return
+      }
+      case 'fill-selection': {
+        const sheetId = store.getter(workspaceSessionAtom).activeSheetId
+        if (!sheetId) return
+        const snap = store.getter(selectionSnapshotAtom)
+        void store.setter(runAutoFillAtom, {
+          entrypoint: 'fill-command',
+          sheetId,
+          selectionRange: { ...snap.range },
+          direction: dispatch.direction,
+          source: createAutoFillController(),
+          refreshProjection: (target) =>
+            refreshVisibleProjection(store, backend, target, 'toolbar'),
         })
         return
       }

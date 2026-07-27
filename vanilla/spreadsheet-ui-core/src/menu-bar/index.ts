@@ -169,6 +169,31 @@ const EDIT_ITEMS: readonly MenuBarEntry[] = [
   },
   { kind: 'separator', id: 'edit.sep-2' },
   {
+    id: 'edit.fillDown',
+    label: 'menuBar.edit.fillDown',
+    dispatch: { kind: 'fill-selection', direction: 'down' },
+    isAvailable: 'always',
+  },
+  {
+    id: 'edit.fillUp',
+    label: 'menuBar.edit.fillUp',
+    dispatch: { kind: 'fill-selection', direction: 'up' },
+    isAvailable: 'always',
+  },
+  {
+    id: 'edit.fillRight',
+    label: 'menuBar.edit.fillRight',
+    dispatch: { kind: 'fill-selection', direction: 'right' },
+    isAvailable: 'always',
+  },
+  {
+    id: 'edit.fillLeft',
+    label: 'menuBar.edit.fillLeft',
+    dispatch: { kind: 'fill-selection', direction: 'left' },
+    isAvailable: 'always',
+  },
+  { kind: 'separator', id: 'edit.sep-fill' },
+  {
     id: 'edit.find',
     label: 'menuBar.edit.find',
     accessKey: 'F',

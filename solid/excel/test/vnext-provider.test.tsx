@@ -4,12 +4,14 @@ import { afterEach, describe, expect, it, jest } from '@jest/globals'
 import { atom, createStore } from '@einfach/core'
 import { useAtomValue, useSetAtom } from '@einfach/solid'
 import { render, cleanup, waitFor } from '@solidjs/testing-library'
-import { createEffect } from 'solid-js'
+import { createEffect, createSignal, type Setter } from 'solid-js'
 import {
+  fillSeriesLocaleAtom,
   namedRangeCapabilitiesAtom,
   namedRangeRegistryStateAtom,
   type NamedRangeBackendCapabilities,
 } from '@einfach/spreadsheet-ui-core'
+import { setLocale } from '../src/i18n'
 import {
   createStaticNamedRangeCapabilityPort,
   createStaticSpreadsheetBackend,
@@ -21,7 +23,10 @@ import {
   useSpreadsheetUiCoreContext,
 } from '../src-vnext/provider'
 
-afterEach(cleanup)
+afterEach(() => {
+  cleanup()
+  setLocale('zh')
+})
 
 const NAMED_RANGE_CAPABILITIES: NamedRangeBackendCapabilities = Object.freeze({
   runtime: 'static-session',
@@ -36,7 +41,159 @@ const NAMED_RANGE_CAPABILITIES: NamedRangeBackendCapabilities = Object.freeze({
   durability: 'session-local',
 })
 
+function unusedBackend() {
+  return {
+    async readVisibleProjection() {
+      throw new Error('not used')
+    },
+    async readRangeProjection() {
+      throw new Error('not used')
+    },
+    async setCellInput() {
+      throw new Error('not used')
+    },
+  }
+}
+
 describe('vNext SpreadsheetUiProvider', () => {
+  it('seeds localized fill-series facts before children read them and tracks language switches', async () => {
+    setLocale('zh')
+    const store = createStore()
+    const firstChildLocales: Array<string | undefined> = []
+
+    function Probe() {
+      const locale = useAtomValue(fillSeriesLocaleAtom)
+      firstChildLocales.push(locale().locale)
+      return <div data-testid="fill-locale">{locale().locale}</div>
+    }
+
+    const { getByTestId } = render(() => (
+      <SpreadsheetUiProvider
+        backend={unusedBackend()}
+        customFillSeriesLists={{ priority: ['低', '中', '高'] }}
+        store={store}
+      >
+        <Probe />
+      </SpreadsheetUiProvider>
+    ))
+
+    expect(firstChildLocales[0]).toBe('zh')
+    expect(getByTestId('fill-locale').textContent).toBe('zh')
+    const initial = store.getter(fillSeriesLocaleAtom)
+    expect(initial).toMatchObject({
+      locale: 'zh',
+      weekdayNames: ['星期一', '星期二', '星期三', '星期四', '星期五', '星期六', '星期日'],
+      customLists: { priority: ['低', '中', '高'] },
+    })
+    expect(initial.monthNames).toHaveLength(12)
+    expect(Object.isFrozen(initial)).toBe(true)
+    expect(Object.isFrozen(initial.customLists?.priority)).toBe(true)
+
+    setLocale('en')
+    await waitFor(() => {
+      expect(getByTestId('fill-locale').textContent).toBe('en')
+      expect(store.getter(fillSeriesLocaleAtom)).toMatchObject({
+        locale: 'en',
+        weekdayNames: [
+          'Monday',
+          'Tuesday',
+          'Wednesday',
+          'Thursday',
+          'Friday',
+          'Saturday',
+          'Sunday',
+        ],
+        customLists: { priority: ['低', '中', '高'] },
+      })
+    })
+    expect(store.getter(fillSeriesLocaleAtom).monthNames).toHaveLength(12)
+  })
+
+  it('keeps custom fill-series lists isolated between provider stores', () => {
+    setLocale('zh')
+    const firstStore = createStore()
+    const secondStore = createStore()
+
+    render(() => (
+      <>
+        <SpreadsheetUiProvider
+          backend={unusedBackend()}
+          customFillSeriesLists={{ priority: ['低', '中', '高'] }}
+          store={firstStore}
+        >
+          <div />
+        </SpreadsheetUiProvider>
+        <SpreadsheetUiProvider
+          backend={unusedBackend()}
+          customFillSeriesLists={{ temperature: ['冷', '温', '热'] }}
+          store={secondStore}
+        >
+          <div />
+        </SpreadsheetUiProvider>
+      </>
+    ))
+
+    const first = firstStore.getter(fillSeriesLocaleAtom)
+    const second = secondStore.getter(fillSeriesLocaleAtom)
+    expect(first.customLists).toEqual({ priority: ['低', '中', '高'] })
+    expect(second.customLists).toEqual({ temperature: ['冷', '温', '热'] })
+    expect(first.customLists).not.toBe(second.customLists)
+    expect(first.locale).toBe('zh')
+    expect(second.locale).toBe('zh')
+  })
+
+  it('clears removed lists and lets invalid lists fail closed without blocking locale updates', async () => {
+    setLocale('zh')
+    const store = createStore()
+    let setCustomLists!: Setter<Readonly<Record<string, readonly string[]>> | undefined>
+
+    render(() => {
+      const [customLists, setLists] = createSignal<
+        Readonly<Record<string, readonly string[]>> | undefined
+      >({
+        priority: ['低', '中', '高'],
+      })
+      setCustomLists = setLists
+
+      return (
+        <SpreadsheetUiProvider
+          backend={unusedBackend()}
+          customFillSeriesLists={customLists()}
+          store={store}
+        >
+          <div />
+        </SpreadsheetUiProvider>
+      )
+    })
+
+    expect(store.getter(fillSeriesLocaleAtom).customLists).toEqual({
+      priority: ['低', '中', '高'],
+    })
+
+    setCustomLists(undefined)
+    await waitFor(() => {
+      expect(store.getter(fillSeriesLocaleAtom).customLists).toEqual({})
+    })
+
+    setCustomLists({ priority: ['low', 'LOW'] })
+    setLocale('en')
+    await waitFor(() => {
+      expect(store.getter(fillSeriesLocaleAtom)).toMatchObject({
+        locale: 'en',
+        weekdayNames: [
+          'Monday',
+          'Tuesday',
+          'Wednesday',
+          'Thursday',
+          'Friday',
+          'Saturday',
+          'Sunday',
+        ],
+        customLists: {},
+      })
+    })
+  })
+
   it('creates an independent store per provider instance', async () => {
     const sharedAtom = atom(0)
     const seenStores: Array<ReturnType<typeof createStore>> = []

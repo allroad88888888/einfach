@@ -74,6 +74,49 @@ const COMMAND_READ_VALUES: readonly [
 ]
 
 describe('menu bar state boundary', () => {
+  test('registers directional Edit fill commands in their own post-paste group', () => {
+    const edit = MENU_BAR_ITEMS.find((menu) => menu.id === 'edit')
+    const ids = edit?.items.map((item) => item.id)
+    const pasteSpecialIndex = ids?.indexOf('edit.pasteSpecial') ?? -1
+
+    expect(ids?.slice(pasteSpecialIndex, pasteSpecialIndex + 8)).toEqual([
+      'edit.pasteSpecial',
+      'edit.sep-2',
+      'edit.fillDown',
+      'edit.fillUp',
+      'edit.fillRight',
+      'edit.fillLeft',
+      'edit.sep-fill',
+      'edit.find',
+    ])
+    expect(edit?.items.slice(pasteSpecialIndex + 2, pasteSpecialIndex + 6)).toEqual([
+      {
+        id: 'edit.fillDown',
+        label: 'menuBar.edit.fillDown',
+        dispatch: { kind: 'fill-selection', direction: 'down' },
+        isAvailable: 'always',
+      },
+      {
+        id: 'edit.fillUp',
+        label: 'menuBar.edit.fillUp',
+        dispatch: { kind: 'fill-selection', direction: 'up' },
+        isAvailable: 'always',
+      },
+      {
+        id: 'edit.fillRight',
+        label: 'menuBar.edit.fillRight',
+        dispatch: { kind: 'fill-selection', direction: 'right' },
+        isAvailable: 'always',
+      },
+      {
+        id: 'edit.fillLeft',
+        label: 'menuBar.edit.fillLeft',
+        dispatch: { kind: 'fill-selection', direction: 'left' },
+        isAvailable: 'always',
+      },
+    ])
+  })
+
   test('registers always-available Format unhide row and column commands', () => {
     const format = MENU_BAR_ITEMS.find((menu) => menu.id === 'format')
 

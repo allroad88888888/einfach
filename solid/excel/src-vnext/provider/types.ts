@@ -14,6 +14,8 @@ export interface SpreadsheetUiCore {
 
 export interface SpreadsheetUiProviderProps {
   backend: SpreadsheetBackend
+  /** Workbook-local custom sequences used by auto-fill detection and execution. */
+  customFillSeriesLists?: Readonly<Record<string, readonly string[]>>
   namedRangeCapabilityPort?: NamedRangeCapabilityPort
   store?: Store
   children: JSX.Element

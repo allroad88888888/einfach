@@ -103,6 +103,61 @@ export interface SparseRangeWire {
   endCol: number
 }
 
+export type AutoFillDirectionWire = 'up' | 'down' | 'left' | 'right'
+
+export type AutoFillSeriesWire =
+  | 'copy'
+  | 'integer-step'
+  | 'decimal-step'
+  | 'linear-trend'
+  | 'date-day'
+  | 'date-week'
+  | 'date-month'
+  | 'text-number'
+  | 'weekday-name'
+  | 'month-name'
+  | 'custom-list'
+
+export interface AutoFillRangeWire {
+  startRow: number
+  startCol: number
+  endRow: number
+  endCol: number
+}
+
+export interface AutoFillTextPatternWire {
+  prefix: string
+  suffix: string
+  width: number
+}
+
+/**
+ * Execution-boundary witness for locale-sensitive named lists. `locale` is
+ * required on the worker wire even though the public detector type keeps it
+ * optional for compatibility with older callers.
+ */
+export interface AutoFillListWitnessWire {
+  listName: string
+  values: readonly string[]
+  locale: string
+}
+
+export interface AutoFillRequestWire {
+  sheet: number
+  sourceRange: AutoFillRangeWire
+  targetRange: AutoFillRangeWire
+  direction: AutoFillDirectionWire
+  series: AutoFillSeriesWire
+  step?: number
+  textPattern?: AutoFillTextPatternWire
+  list?: AutoFillListWitnessWire
+}
+
+export interface AutoFillReportWire {
+  writeRange: AutoFillRangeWire | null
+  written: number
+}
+
 export interface SparseRangeSnapshotSessionWire {
   sessionId: number
   totalRows: number
@@ -439,14 +494,16 @@ export interface WorkbookPersistenceRestoreStatsWire {
  * command.
  *
  * Semantics:
- *  - A runtime that does not understand the command (the WASM runtime,
- *    which predates this handshake) answers `UNKNOWN_COMMAND`; the client
- *    maps that to `null` ("no claims") and the adapter keeps the legacy
- *    full-trust contract, so the WASM path is behaviorally unchanged.
- *  - A runtime that answers MUST tell the truth: any family declared
- *    `false` (or omitted — fail-closed) makes the adapter withhold the
- *    corresponding optional `SpreadsheetBackend` port, which hides the
- *    UI entry through the existing degradation contract.
+ *  - A runtime that does not understand the command answers
+ *    `UNKNOWN_COMMAND`; the client maps that to `null` ("no claims") and
+ *    the adapter keeps the legacy full-trust contract.
+ *  - A full witness MUST tell the truth: any family declared `false`
+ *    makes the adapter withhold the corresponding optional
+ *    `SpreadsheetBackend` port, which hides the UI entry through the
+ *    existing degradation contract.
+ *  - A scoped AutoFill witness gates only AutoFill. It deliberately leaves
+ *    every older family on the legacy contract instead of pretending that
+ *    an incomplete object is a full capability declaration.
  *  - Commands in a family declared `false` answer a structured
  *    `UNSUPPORTED` RPC error instead of a success-shaped fake ACK.
  */
@@ -461,6 +518,8 @@ export interface WorkerRuntimeCapabilitiesWire {
   tsvChunkExport: boolean
   /** persistence v1 snapshots round-trip the `formats` block. */
   persistenceFormats: boolean
+  /** applyAutoFill performs one native, preflighted value/formula/format transaction. */
+  autoFill: boolean
   /** sortRange physically reorders workbook data (engine physical sort). */
   sortRange: boolean
   /**
@@ -503,6 +562,20 @@ export interface WorkerRuntimeCapabilitiesWire {
   engineHiddenState: boolean
 }
 
+/**
+ * Narrow witness emitted by a runtime that only participates in the
+ * native AutoFill handshake. The discriminator keeps this from becoming
+ * an undocumented `Partial<WorkerRuntimeCapabilitiesWire>` contract.
+ */
+export interface WorkerAutoFillCapabilityWitnessWire
+  extends Pick<WorkerRuntimeCapabilitiesWire, 'autoFill'> {
+  scope: 'auto-fill'
+}
+
+export type WorkerRuntimeCapabilitiesResponseWire =
+  | WorkerRuntimeCapabilitiesWire
+  | WorkerAutoFillCapabilityWitnessWire
+
 export interface WorkerWorkbookSheetDebugCountersWire {
   idx: number
   name: string
@@ -538,11 +611,13 @@ export interface WorkerWorkbookClient {
    * Honest capability handshake. Resolves `null` when the runtime
    * predates the `describeCapabilities` command (`UNKNOWN_COMMAND`),
    * which the adapter treats as "no claims" — legacy full-trust
-   * behavior, keeping the WASM path unchanged. Optional so hand-rolled
+   * behavior. A runtime may instead return the explicitly-scoped
+   * AutoFill witness without changing older capability families.
+   * Optional so hand-rolled
    * client doubles (tests) keep compiling; the adapter reads it with
    * `client.describeCapabilities?.()`.
    */
-  describeCapabilities?(): Promise<WorkerRuntimeCapabilitiesWire | null>
+  describeCapabilities?(): Promise<WorkerRuntimeCapabilitiesResponseWire | null>
   sheetList(): Promise<WorkbookSheetMeta[]>
   addSheet(name: string): Promise<number>
   renameSheet(sheet: number, name: string): Promise<boolean>
@@ -557,6 +632,7 @@ export interface WorkerWorkbookClient {
   ): Promise<FormulaMutationResultWire>
   clearCell(sheet: number, addr: string): Promise<boolean>
   clearRange(range: SparseRangeWire): Promise<number>
+  applyAutoFill?(request: AutoFillRequestWire): Promise<AutoFillReportWire>
   insertRows(sheet: number, rowIndex: number, count: number): Promise<boolean>
   deleteRows(sheet: number, rowIndex: number, count: number): Promise<boolean>
   insertColumns(sheet: number, colIndex: number, count: number): Promise<boolean>
@@ -902,9 +978,9 @@ export function createWorkerWorkbook(opts: WorkerWorkbookOptions): WorkerWorkboo
     },
     async describeCapabilities() {
       try {
-        return await request<WorkerRuntimeCapabilitiesWire>('describeCapabilities')
+        return await request<WorkerRuntimeCapabilitiesResponseWire>('describeCapabilities')
       } catch (err) {
-        // Legacy runtimes (WASM) predate the handshake and answer
+        // Legacy runtimes may predate the handshake and answer
         // UNKNOWN_COMMAND — map to `null` ("no claims") so the adapter
         // keeps its legacy full-trust contract for them.
         if ((err as Error & { code?: string }).code === 'UNKNOWN_COMMAND') return null
@@ -944,6 +1020,9 @@ export function createWorkerWorkbook(opts: WorkerWorkbookOptions): WorkerWorkboo
     },
     clearRange(range) {
       return request<number>('clearRange', { range })
+    },
+    applyAutoFill(payload) {
+      return request<AutoFillReportWire>('applyAutoFill', { request: payload })
     },
     insertRows(sheet, rowIndex, count) {
       return request<boolean>('insertRows', { sheet, rowIndex, count })

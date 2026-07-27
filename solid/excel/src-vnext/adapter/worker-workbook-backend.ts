@@ -1,4 +1,5 @@
 import type {
+  AutoFillMutationResult,
   BackendMutationResult,
   CellRange,
   ClearRangeRequest,
@@ -11,6 +12,8 @@ import type {
   DeleteRowsRequest,
   DisplayCell,
   FilterSortState,
+  FillRangeRequest,
+  FillSeriesRequest,
   HistoryEntryKind,
   HistoryTransactionResult,
   ImportCellChunksRequest,
@@ -99,6 +102,11 @@ import {
   compareCellValue,
   conditionalRuleFormat,
   DEFAULT_WORKBOOK_LOCALE,
+  BUILTIN_FILL_SERIES_MONTH_LONG_NAMES,
+  BUILTIN_FILL_SERIES_MONTH_NAMES,
+  BUILTIN_FILL_SERIES_WEEKDAY_LONG_NAMES,
+  BUILTIN_FILL_SERIES_WEEKDAY_NAMES,
+  DEFAULT_FILL_SERIES_LOCALE,
   estimateUtf8Bytes,
   evaluateValidationLocal,
   filterSortHasEffect,
@@ -120,12 +128,19 @@ import {
   validationSeverityForMode,
   type RangeFormatLayer,
   getEffectiveFormat,
+  getFillHandleWriteRange,
+  normalizeCustomFillSeriesListWitness,
+  normalizeFillSeriesListWitness,
 } from '@einfach/spreadsheet-ui-core'
 
 import {
   createWorkerWorkbook,
+  type AutoFillRangeWire,
+  type AutoFillReportWire,
+  type AutoFillRequestWire,
   type CellFormatJSON,
   type CellFormatSnapshot,
+  type CellRefWire,
   type CellSnapshotWire,
   type CellWire,
   type FilterSnapshotWire,
@@ -603,6 +618,291 @@ function toSparseRange(sheet: number, range: CellRange): SparseRangeWire {
     startCol: range.colStart,
     endRow: range.rowEnd,
     endCol: range.colEnd,
+  }
+}
+
+const EXCEL_AUTO_FILL_MAX_ROW = 1_048_575
+const EXCEL_AUTO_FILL_MAX_COL = 16_383
+
+/**
+ * Fail-closed size budget for one drag-fill: one full Excel column
+ * (1,048,576 rows x 1 column). Host mirror of `MAX_AUTO_FILL_CELLS`
+ * (`rust/excel-core/src/auto_fill.rs`); crossing it rejects the request
+ * BEFORE any RPC, matching the pre-dispatch geometry convention of
+ * `MAX_SORT_SOURCE_CELLS` / `MAX_FILTER_SORT_PREDICATE_CELLS` above. The
+ * engine enforces the same cap independently (wire code
+ * `AUTO_FILL_TOO_LARGE`) — this is a fail-fast mirror, not the sole guard.
+ */
+export const MAX_AUTO_FILL_CELLS = 1_048_576
+const AUTO_FILL_DIRECTIONS = new Set(['up', 'down', 'left', 'right'])
+const AUTO_FILL_SERIES = new Set([
+  'copy',
+  'integer-step',
+  'decimal-step',
+  'linear-trend',
+  'date-day',
+  'date-week',
+  'date-month',
+  'text-number',
+  'weekday-name',
+  'month-name',
+  'custom-list',
+])
+
+function invalidAutoFill(message: string): never {
+  throw createBackendError('INVALID_AUTO_FILL', `invalid auto-fill request: ${message}`)
+}
+
+function isCanonicalAutoFillRange(range: CellRange): boolean {
+  return (
+    Number.isSafeInteger(range.rowStart) &&
+    Number.isSafeInteger(range.rowEnd) &&
+    Number.isSafeInteger(range.colStart) &&
+    Number.isSafeInteger(range.colEnd) &&
+    range.rowStart >= 0 &&
+    range.colStart >= 0 &&
+    range.rowStart <= range.rowEnd &&
+    range.colStart <= range.colEnd &&
+    range.rowEnd <= EXCEL_AUTO_FILL_MAX_ROW &&
+    range.colEnd <= EXCEL_AUTO_FILL_MAX_COL
+  )
+}
+
+function toAutoFillRangeWire(range: CellRange): AutoFillRangeWire {
+  return {
+    startRow: range.rowStart,
+    startCol: range.colStart,
+    endRow: range.rowEnd,
+    endCol: range.colEnd,
+  }
+}
+
+function validateAutoFillGeometry(
+  source: CellRange,
+  target: CellRange,
+  direction: FillRangeRequest['direction'],
+  series: FillSeriesRequest['series'] | 'copy',
+): void {
+  if (!isCanonicalAutoFillRange(source) || !isCanonicalAutoFillRange(target)) {
+    invalidAutoFill('ranges must be canonical and inside the Excel grid')
+  }
+  const targetCells = (target.rowEnd - target.rowStart + 1) * (target.colEnd - target.colStart + 1)
+  if (targetCells > MAX_AUTO_FILL_CELLS) {
+    invalidAutoFill(
+      `target spans ${targetCells} cells but the engine cap is ${MAX_AUTO_FILL_CELLS}`,
+    )
+  }
+
+  if (direction === 'up' || direction === 'down') {
+    if (target.colStart !== source.colStart || target.colEnd !== source.colEnd) {
+      invalidAutoFill('vertical target must keep the source columns')
+    }
+    if (series !== 'copy' && source.colStart !== source.colEnd) {
+      invalidAutoFill('vertical series require one source column')
+    }
+    const doesExtend =
+      direction === 'down'
+        ? target.rowStart === source.rowStart && target.rowEnd >= source.rowEnd
+        : target.rowEnd === source.rowEnd && target.rowStart <= source.rowStart
+    if (!doesExtend) {
+      invalidAutoFill('target does not extend the source in the requested direction')
+    }
+    return
+  }
+
+  if (target.rowStart !== source.rowStart || target.rowEnd !== source.rowEnd) {
+    invalidAutoFill('horizontal target must keep the source rows')
+  }
+  if (series !== 'copy' && source.rowStart !== source.rowEnd) {
+    invalidAutoFill('horizontal series require one source row')
+  }
+  const doesExtend =
+    direction === 'right'
+      ? target.colStart === source.colStart && target.colEnd >= source.colEnd
+      : target.colEnd === source.colEnd && target.colStart <= source.colStart
+  if (!doesExtend) {
+    invalidAutoFill('target does not extend the source in the requested direction')
+  }
+}
+
+function autoFillSourceCellCount(request: FillSeriesRequest): number {
+  return request.direction === 'up' || request.direction === 'down'
+    ? request.sourceRange.rowEnd - request.sourceRange.rowStart + 1
+    : request.sourceRange.colEnd - request.sourceRange.colStart + 1
+}
+
+function sameAutoFillList(
+  left: readonly string[],
+  right: readonly string[],
+): boolean {
+  return left.length === right.length && left.every((value, index) => value === right[index])
+}
+
+function normalizeAutoFillListWitness(
+  request: FillSeriesRequest,
+): AutoFillRequestWire['list'] {
+  const witness = normalizeFillSeriesListWitness(request.list)
+  if (!witness) {
+    invalidAutoFill('named series require a valid bounded list witness and canonical locale')
+  }
+  if (
+    request.series === 'custom-list' &&
+    normalizeCustomFillSeriesListWitness(witness) === null
+  ) {
+    invalidAutoFill('custom list witness may not use a reserved list name')
+  }
+
+  const builtinValues =
+    witness.listName === 'builtin-weekday-short'
+      ? BUILTIN_FILL_SERIES_WEEKDAY_NAMES
+      : witness.listName === 'builtin-weekday-long'
+        ? BUILTIN_FILL_SERIES_WEEKDAY_LONG_NAMES
+        : witness.listName === 'builtin-month-short'
+          ? BUILTIN_FILL_SERIES_MONTH_NAMES
+          : witness.listName === 'builtin-month-long'
+            ? BUILTIN_FILL_SERIES_MONTH_LONG_NAMES
+            : null
+  if (
+    witness.listName.startsWith('builtin-') &&
+    (witness.locale !== DEFAULT_FILL_SERIES_LOCALE ||
+      builtinValues === null ||
+      !sameAutoFillList(witness.values, builtinValues))
+  ) {
+    invalidAutoFill('built-in list witness does not match the canonical English list')
+  }
+  if (
+    (request.series === 'weekday-name' &&
+      !(
+        witness.listName.startsWith('builtin-weekday-') ||
+        witness.listName === 'locale-weekday'
+      )) ||
+    (request.series === 'month-name' &&
+      !(
+        witness.listName.startsWith('builtin-month-') ||
+        witness.listName === 'locale-month'
+      ))
+  ) {
+    invalidAutoFill('named series kind does not match its list witness')
+  }
+  return {
+    listName: witness.listName,
+    values: [...witness.values],
+    locale: witness.locale,
+  }
+}
+
+function prepareAutoFillWireRequest(
+  sheet: number,
+  request: FillRangeRequest | FillSeriesRequest,
+): { readonly wire: AutoFillRequestWire; readonly writeRange: CellRange | null } {
+  const runtimeRequest = request as {
+    readonly kind?: unknown
+    readonly direction?: unknown
+    readonly series?: unknown
+  }
+  const isSeries = runtimeRequest.kind === 'fill-series'
+  if (runtimeRequest.kind !== 'fill-range' && !isSeries) {
+    invalidAutoFill('request kind must be fill-range or fill-series')
+  }
+  if (
+    typeof runtimeRequest.direction !== 'string' ||
+    !AUTO_FILL_DIRECTIONS.has(runtimeRequest.direction)
+  ) {
+    invalidAutoFill('direction must be up, down, left, or right')
+  }
+
+  const direction = runtimeRequest.direction as FillRangeRequest['direction']
+  const series = isSeries ? runtimeRequest.series : 'copy'
+  if (typeof series !== 'string' || !AUTO_FILL_SERIES.has(series)) {
+    invalidAutoFill('series kind is unsupported')
+  }
+  validateAutoFillGeometry(
+    request.sourceRange,
+    request.targetRange,
+    direction,
+    series as FillSeriesRequest['series'],
+  )
+
+  let step: number | undefined
+  let textPattern: AutoFillRequestWire['textPattern']
+  let list: AutoFillRequestWire['list']
+  if (isSeries && series !== 'copy') {
+    const seriesRequest = request as FillSeriesRequest
+    if (
+      typeof seriesRequest.step !== 'number' ||
+      !Number.isFinite(seriesRequest.step) ||
+      seriesRequest.step === 0
+    ) {
+      invalidAutoFill('step must be finite and non-zero')
+    }
+    step = seriesRequest.step
+
+    const minimumSourceCells =
+      series === 'linear-trend'
+        ? 3
+        : series === 'integer-step' || series === 'decimal-step'
+          ? 2
+          : 1
+    if (autoFillSourceCellCount(seriesRequest) < minimumSourceCells) {
+      invalidAutoFill(`${series} requires at least ${minimumSourceCells} source cells`)
+    }
+
+    if (
+      (series === 'date-day' ||
+        series === 'date-week' ||
+        series === 'date-month' ||
+        series === 'text-number') &&
+      !Number.isSafeInteger(step)
+    ) {
+      invalidAutoFill('calendar and text-number steps must be safe integers')
+    }
+    if (
+      (series === 'weekday-name' || series === 'month-name' || series === 'custom-list') &&
+      step !== 1 &&
+      step !== -1
+    ) {
+      invalidAutoFill('named series step must be 1 or -1')
+    }
+    if (series === 'text-number') {
+      const pattern = seriesRequest.textPattern
+      if (
+        typeof pattern !== 'object' ||
+        pattern === null ||
+        typeof pattern.prefix !== 'string' ||
+        typeof pattern.suffix !== 'string' ||
+        !Number.isSafeInteger(pattern.width) ||
+        pattern.width < 0 ||
+        pattern.width > 0xffff_ffff
+      ) {
+        invalidAutoFill('text-number series require a valid text pattern witness')
+      }
+      textPattern = {
+        prefix: pattern.prefix,
+        suffix: pattern.suffix,
+        width: pattern.width,
+      }
+    }
+    if (series === 'weekday-name' || series === 'month-name' || series === 'custom-list') {
+      list = normalizeAutoFillListWitness(seriesRequest)
+    }
+  }
+
+  return {
+    wire: {
+      sheet,
+      sourceRange: toAutoFillRangeWire(request.sourceRange),
+      targetRange: toAutoFillRangeWire(request.targetRange),
+      direction,
+      series: series as AutoFillRequestWire['series'],
+      ...(step === undefined ? {} : { step }),
+      ...(textPattern === undefined ? {} : { textPattern }),
+      ...(list === undefined ? {} : { list }),
+    },
+    writeRange: getFillHandleWriteRange(
+      request.sourceRange,
+      request.targetRange,
+      direction,
+    ),
   }
 }
 
@@ -1270,6 +1570,8 @@ export function createWorkerWorkbookSpreadsheetBackend(
   const sheetInputs = normalizeSheetInputs(options.sheets)
   let lookup: SheetLookup = { sheets: [], byId: new Map() }
   let revision = options.revision ?? 0
+  let autoFillOpaqueRevisionNamespace: string | null = null
+  let autoFillOpaqueRevisionEpoch = 0n
   let disposed = false
   const client: WorkerWorkbookClient = resolvedClient
   // Adapter host-overlay metadata (data validation, conditional format, merge,
@@ -1334,11 +1636,13 @@ export function createWorkerWorkbookSpreadsheetBackend(
   const redoRecords: WorkerTransactionRecord[] = []
   let namedRanges: NamedRange[] = []
   let namedRangeMutationTail: Promise<void> = Promise.resolve()
+  let autoFillMutationTail: Promise<void> = Promise.resolve()
   /**
    * Fail-closed capability witness declared by the worker runtime itself
    * (see `WorkerRuntimeCapabilitiesWire`). `null` means the runtime made
-   * no claims — either it predates the `describeCapabilities` handshake
-   * (the WASM runtime answers UNKNOWN_COMMAND) or the client double does
+   * no full-family claims — either it predates the
+   * `describeCapabilities` handshake or it returned the scoped AutoFill
+   * witness, or the client double does
    * not implement the method — and the adapter keeps the legacy
    * full-trust contract so the WASM path is behaviorally unchanged.
    * Until the handshake resolves the value stays `null` (full trust);
@@ -1346,11 +1650,20 @@ export function createWorkerWorkbookSpreadsheetBackend(
    * declared witness.
    */
   let runtimeCapabilities: WorkerRuntimeCapabilitiesWire | null = null
+  let autoFillCapability = false
   const readyPromise = client
     .initWorkbook(sheetInputs.map((sheet) => sheet.name))
     .then(async (metas) => {
       lookup = buildSheetLookup(sheetInputs, metas)
-      runtimeCapabilities = (await client.describeCapabilities?.()) ?? null
+      const declared = (await client.describeCapabilities?.()) ?? null
+      // AutoFill never inherits the legacy `null => trust` convention. A
+      // concrete runtime must both advertise the native transaction and
+      // expose its RPC method. WASM sends a scoped AutoFill-only witness;
+      // full capability declarations (the TS runtime) continue to gate the
+      // older families exactly as before.
+      autoFillCapability = declared?.autoFill === true
+      runtimeCapabilities =
+        declared !== null && 'structuralEdits' in declared ? declared : null
       await options.afterInit?.(client, lookup.sheets)
       return lookup.sheets
     })
@@ -1371,9 +1684,31 @@ export function createWorkerWorkbookSpreadsheetBackend(
   const contentChangeHandlers = new Set<() => void>()
   let sheetIndexRemapDepth = 0
   let deferredContentChange = false
+  const autoFillNativeMutationRanges: SparseRangeWire[] = []
+  let deferredAutoFillContentChange = false
 
   function notifyContentChangeHandlers(): void {
     for (const handler of contentChangeHandlers) handler()
+  }
+
+  /**
+   * AutoFill-only notify. Scoped deliberately: every other mutation family
+   * calls the plain `notifyContentChangeHandlers` above and an observer
+   * exception propagates exactly as it did before AutoFill existed. AutoFill
+   * finalizes an already-decided outcome (a committed success ACK, a
+   * rejection that also carries an independent dirty event, or an
+   * outcome-unknown throw issued after a native call that may have already
+   * committed) synchronously with this notify, so a throwing observer must
+   * never replace that outcome with its own exception.
+   */
+  function notifyContentChangeHandlersForAutoFillOutcome(): void {
+    for (const handler of contentChangeHandlers) {
+      try {
+        handler()
+      } catch {
+        // Advisory observer; see comment above.
+      }
+    }
   }
 
   function beginSheetIndexRemap(): void {
@@ -1387,7 +1722,31 @@ export function createWorkerWorkbookSpreadsheetBackend(
     notifyContentChangeHandlers()
   }
 
-  const offDirty = client.onCellsDirty(() => {
+  function dirtyCellsBelongToActiveAutoFill(cells: readonly CellRefWire[]): boolean {
+    if (cells.length === 0 || autoFillNativeMutationRanges.length === 0) return false
+    return autoFillNativeMutationRanges.some((range) =>
+      cells.every((cell) => {
+        if (cell.sheet !== range.sheet) return false
+        const coord = parseA1(cell.addr)
+        return (
+          coord !== null &&
+          coord.row >= range.startRow &&
+          coord.row <= range.endRow &&
+          coord.col >= range.startCol &&
+          coord.col <= range.endCol
+        )
+      }),
+    )
+  }
+
+  const offDirty = client.onCellsDirty((cells) => {
+    if (dirtyCellsBelongToActiveAutoFill(cells)) {
+      deferredAutoFillContentChange = true
+      return
+    }
+    // An event outside the active write range is an independent mutation.
+    // Its refresh covers any earlier deferred in-range event as well.
+    deferredAutoFillContentChange = false
     bumpRevision()
     if (sheetIndexRemapDepth > 0) {
       deferredContentChange = true
@@ -1395,6 +1754,114 @@ export function createWorkerWorkbookSpreadsheetBackend(
     }
     notifyContentChangeHandlers()
   })
+
+  async function runAutoFillNativeMutation<T>(
+    range: SparseRangeWire,
+    mutation: () => Promise<T>,
+  ): Promise<T> {
+    autoFillNativeMutationRanges.push(range)
+    try {
+      return await mutation()
+    } finally {
+      const index = autoFillNativeMutationRanges.lastIndexOf(range)
+      if (index >= 0) autoFillNativeMutationRanges.splice(index, 1)
+    }
+  }
+
+  function discardDeferredAutoFillContentChange(): void {
+    deferredAutoFillContentChange = false
+  }
+
+  function flushDeferredAutoFillContentChange(): void {
+    if (autoFillNativeMutationRanges.length > 0 || !deferredAutoFillContentChange) return
+    deferredAutoFillContentChange = false
+    notifyContentChangeHandlersForAutoFillOutcome()
+  }
+
+  function flushRejectedAutoFillContentChange(): void {
+    if (autoFillNativeMutationRanges.length > 0 || !deferredAutoFillContentChange) return
+    // A semantic rejection proves that the native auto-fill did not mutate.
+    // Any deferred in-range dirty signal therefore belongs to an independent
+    // mutation and needs its own epoch instead of being discarded.
+    deferredAutoFillContentChange = false
+    bumpRevision()
+    if (sheetIndexRemapDepth > 0) {
+      deferredContentChange = true
+      return
+    }
+    notifyContentChangeHandlersForAutoFillOutcome()
+  }
+
+  function escapeAutoFillOpaqueRevisionWitness(value: ProjectionRevision): string {
+    const witness = String(value)
+    let escaped = ''
+    for (let index = 0; index < witness.length; index += 1) {
+      const codeUnit = witness.charCodeAt(index)
+      const isAsciiAlphaNumeric =
+        (codeUnit >= 48 && codeUnit <= 57) ||
+        (codeUnit >= 65 && codeUnit <= 90) ||
+        (codeUnit >= 97 && codeUnit <= 122)
+      if (
+        isAsciiAlphaNumeric ||
+        codeUnit === 45 ||
+        codeUnit === 46 ||
+        codeUnit === 95
+      ) {
+        escaped += witness[index]
+      } else {
+        // Encode UTF-16 code units directly. Unlike encodeURIComponent this
+        // is total for every legal JS string, including lone surrogates.
+        escaped += `~${codeUnit.toString(16).padStart(4, '0')}`
+      }
+    }
+    return escaped
+  }
+
+  function advanceAutoFillOpaqueRevision(): string {
+    if (autoFillOpaqueRevisionNamespace === null) {
+      autoFillOpaqueRevisionNamespace =
+        `worker-auto-fill:${escapeAutoFillOpaqueRevisionWitness(revision)}`
+    }
+    autoFillOpaqueRevisionEpoch += 1n
+    revision = `${autoFillOpaqueRevisionNamespace}:${autoFillOpaqueRevisionEpoch}`
+    return revision
+  }
+
+  /**
+   * AutoFill-only revision advance. Scoped deliberately: every other
+   * mutation family bumps through the plain `bumpRevision` below and never
+   * sees a BigInt or opaque-namespace value. AutoFill needs a bump that
+   * cannot silently fail to produce a fresh witness even at the two edges
+   * `bumpRevision` does not promise to handle — a host-supplied non-numeric
+   * revision (which `bumpRevision` intentionally leaves unchanged) and the
+   * `Number.MAX_SAFE_INTEGER` boundary (where a plain `+1` cannot be told
+   * apart from the previous value in IEEE754) — because AutoFill's
+   * outcome-unknown lane forces a notify after a native call that may have
+   * already committed, and a stuck revision there would mask that commit
+   * forever. Once this falls into the opaque namespace it keeps advancing
+   * on every subsequent call to THIS function (not `bumpRevision`) so a
+   * chain of outcome-unknown auto-fills stays distinguishable.
+   */
+  function advanceAutoFillEpochRevision(): ProjectionRevision {
+    if (autoFillOpaqueRevisionNamespace !== null) {
+      return advanceAutoFillOpaqueRevision()
+    }
+    if (typeof revision === 'number' && Number.isFinite(revision)) {
+      if (Number.isSafeInteger(revision) && revision === Number.MAX_SAFE_INTEGER) {
+        revision = (BigInt(revision) + BigInt(1)).toString()
+        return revision
+      }
+      const nextRevision = revision + 1
+      if (!Object.is(nextRevision, revision)) {
+        revision = nextRevision
+        return revision
+      }
+    } else if (typeof revision === 'string' && /^(?:0|[1-9]\d*)$/.test(revision)) {
+      revision = (BigInt(revision) + BigInt(1)).toString()
+      return revision
+    }
+    return advanceAutoFillOpaqueRevision()
+  }
 
   function bumpRevision(): ProjectionRevision {
     // The filter-hidden set is NOT dropped here. Its predecessor (the display
@@ -1991,7 +2458,23 @@ export function createWorkerWorkbookSpreadsheetBackend(
       const image = action === 'undo' ? record.before : record.after
       // Replay failures propagate as thrown errors: the workbook may be
       // half-restored, which is exactly the outcome-unknown lane.
-      await replayUndoImage(record, image)
+      if (record.kind === 'range.fill') {
+        if (record.clearRange === null) {
+          throw createBackendError(
+            'INVALID_HISTORY_RECORD',
+            'auto-fill history replay requires an exact clear range',
+          )
+        }
+        try {
+          await runAutoFillNativeMutation(record.clearRange, () =>
+            replayUndoImage(record, image),
+          )
+        } catch (error) {
+          throwAutoFillHistoryOutcomeUnknown(action, error)
+        }
+      } else {
+        await replayUndoImage(record, image)
+      }
     }
     if (record.mergeOverlay) {
       // #04 merge overlay: pure adapter-memory swap of the sheet's merge
@@ -2040,6 +2523,9 @@ export function createWorkerWorkbookSpreadsheetBackend(
     source.pop()
     target.push(record)
     const nextRevision = bumpRevision()
+    if (record.kind === 'range.fill') {
+      flushDeferredAutoFillContentChange()
+    }
     return {
       transactionId: request.transactionId,
       requestId: request.requestId,
@@ -2940,6 +3426,370 @@ export function createWorkerWorkbookSpreadsheetBackend(
   // in the `describeCapabilities` handshake makes the optional port read
   // as `undefined` — UI core then hides the matching entries (the same
   // fail-closed degradation the removeRowsExact witness uses).
+  function autoFillIsSupported(): boolean {
+    return autoFillCapability && typeof client.applyAutoFill === 'function'
+  }
+
+  function assertCurrentAutoFillRevision(
+    request: FillRangeRequest | FillSeriesRequest,
+  ): void {
+    if (request.revision !== undefined && !Object.is(request.revision, revision)) {
+      invalidAutoFill(
+        `stale revision ${String(request.revision)}; current revision is ${String(revision)}`,
+      )
+    }
+  }
+
+  function advanceAutoFillRevision(): ProjectionRevision {
+    return advanceAutoFillEpochRevision()
+  }
+
+  function advanceAutoFillUnknownRevision(): ProjectionRevision {
+    // `advanceAutoFillEpochRevision` crosses MAX_SAFE_INTEGER as a canonical
+    // decimal string and moves arbitrary opaque witnesses into a
+    // per-backend sequence. It therefore cannot fail after the
+    // native/history mutation may have run — unlike the plain
+    // `bumpRevision` every other mutation family uses.
+    return advanceAutoFillEpochRevision()
+  }
+
+  function assertUnchangedAutoFillEpoch(expected: ProjectionRevision): void {
+    if (!Object.is(revision, expected)) {
+      invalidAutoFill(
+        `workbook revision changed during auto-fill preflight; expected ${String(
+          expected,
+        )}, current revision is ${String(revision)}`,
+      )
+    }
+  }
+
+  function enqueueAutoFillMutation(
+    mutation: () => Promise<AutoFillMutationResult>,
+  ): Promise<AutoFillMutationResult> {
+    const result = autoFillMutationTail.then(mutation, mutation)
+    autoFillMutationTail = result.then(
+      () => undefined,
+      () => undefined,
+    )
+    return result
+  }
+
+  function sameAutoFillReportRange(
+    actual: AutoFillRangeWire | null | undefined,
+    expected: CellRange,
+  ): boolean {
+    return (
+      actual !== null &&
+      actual !== undefined &&
+      actual.startRow === expected.rowStart &&
+      actual.endRow === expected.rowEnd &&
+      actual.startCol === expected.colStart &&
+      actual.endCol === expected.colEnd
+    )
+  }
+
+  function autoFillRangeArea(range: CellRange): number {
+    return (
+      (range.rowEnd - range.rowStart + 1) *
+      (range.colEnd - range.colStart + 1)
+    )
+  }
+
+  function isExpectedAutoFillReport(
+    report: AutoFillReportWire | null | undefined,
+    writeRange: CellRange | null,
+  ): boolean {
+    if (writeRange === null) {
+      return report?.writeRange === null && report.written === 0
+    }
+    return (
+      report !== null &&
+      report !== undefined &&
+      sameAutoFillReportRange(report.writeRange, writeRange) &&
+      report.written === autoFillRangeArea(writeRange)
+    )
+  }
+
+  function comparableAutoFillImage(image: WorkerUndoImage): string {
+    const cells =
+      image.cells === null
+        ? null
+        : [...image.cells].sort(
+            (left, right) =>
+              left.sheet - right.sheet ||
+              left.row - right.row ||
+              left.col - right.col ||
+              left.kind.localeCompare(right.kind),
+          )
+    const format =
+      image.format === null
+        ? null
+        : {
+            ...image.format,
+            cellFormats: [...image.format.cellFormats].sort((left, right) =>
+              left.addr.localeCompare(right.addr),
+            ),
+            rangeFormats: [...image.format.rangeFormats].sort(
+              (left, right) =>
+                left.startRow - right.startRow ||
+                left.startCol - right.startCol ||
+                left.endRow - right.endRow ||
+                left.endCol - right.endCol,
+            ),
+          }
+    return JSON.stringify({ cells, format })
+  }
+
+  async function restoreAndVerifyAutoFillImage(
+    range: SparseRangeWire,
+    before: WorkerUndoImage,
+  ): Promise<boolean> {
+    if (before.cells === null || before.format === null) return false
+    await client.clearRange(range)
+    if (before.cells.length > 0) {
+      await client.restoreSparse(before.cells)
+    }
+    await client.restoreFormatSnapshot(before.format)
+    const restored = await captureUndoImage(range, { values: true, formats: true })
+    return comparableAutoFillImage(restored) === comparableAutoFillImage(before)
+  }
+
+  function throwAutoFillOutcomeUnknown(message: string): never {
+    dropTransactionRecords()
+    discardDeferredAutoFillContentChange()
+    const nextRevision = advanceAutoFillUnknownRevision()
+    // The native call may already have committed, so force every projection
+    // consumer to refresh even when the worker failed to emit cellsDirty.
+    notifyContentChangeHandlersForAutoFillOutcome()
+    throw Object.assign(createBackendError('AUTO_FILL_OUTCOME_UNKNOWN', message), {
+      outcome: 'unknown' as const,
+      revision: nextRevision,
+    })
+  }
+
+  function throwAutoFillHistoryOutcomeUnknown(
+    action: 'undo' | 'redo',
+    cause: unknown,
+  ): never {
+    const detail = cause instanceof Error ? cause.message : String(cause)
+    throwAutoFillOutcomeUnknown(
+      `auto-fill ${action} replay failed after dispatch; workbook history was cleared because the replay outcome is unknown: ${detail}`,
+    )
+  }
+
+  function autoFillRejectionMessage(error: unknown): string | null {
+    if (!(error instanceof Error)) return null
+    const code = (error as Error & { code?: unknown }).code
+    // `AUTO_FILL_TOO_LARGE` is a distinct wire code (parity with the
+    // `AUTO_FILL_REJECTED` catch-all) for the engine's own size-budget
+    // rejection — normally unreachable here because `prepareAutoFillWireRequest`
+    // mirrors the same `MAX_AUTO_FILL_CELLS` cap and rejects before any RPC,
+    // but it must still be treated as a legitimate semantic rejection
+    // (not an unknown-outcome failure) if the two caps ever drift.
+    return code === 'AUTO_FILL_REJECTED' || code === 'AUTO_FILL_TOO_LARGE' ? error.message : null
+  }
+
+  function autoFillNotApplied(
+    request: FillRangeRequest | FillSeriesRequest,
+    reason?: string,
+  ): AutoFillMutationResult {
+    const result = {
+      sheetId: request.sheetId,
+      requestId: request.requestId,
+      revision,
+      applied: false as const,
+      historyTransactionCount: 0 as const,
+      historyDisposition: 'none' as const,
+      ...(reason === undefined ? {} : { notAppliedReason: reason }),
+    }
+    return result
+  }
+
+  async function applyAutoFillThroughWorker(
+    request: FillRangeRequest | FillSeriesRequest,
+  ): Promise<AutoFillMutationResult> {
+    return enqueueAutoFillMutation(async () => {
+      const sheet = await resolveSheet(request.sheetId)
+      const { wire, writeRange } = prepareAutoFillWireRequest(sheet.idx, request)
+      assertCurrentAutoFillRevision(request)
+      const preflightRevision = revision
+      if (!autoFillIsSupported()) {
+        throw createBackendError(
+          'UNSUPPORTED',
+          'worker runtime does not advertise native auto-fill',
+        )
+      }
+      if (writeRange === null) {
+        // A copy whose source already equals its target is mechanically a
+        // no-op. A non-copy series still needs the engine planner to validate
+        // its seed values against the requested step/trend/list semantics.
+        if (wire.series !== 'copy') {
+          let report: AutoFillReportWire
+          // With no write range the engine is performing semantic validation
+          // only. Do not suppress dirty events here: any such event is an
+          // independent mutation and must advance the live revision.
+          try {
+            report = await client.applyAutoFill!(wire)
+          } catch (error) {
+            const rejection = autoFillRejectionMessage(error)
+            if (rejection !== null) {
+              return autoFillNotApplied(request, rejection)
+            }
+            throwAutoFillOutcomeUnknown(
+              'native no-write auto-fill validation failed without a semantic-rejection witness; outcome is unknown',
+            )
+          }
+          if (!isExpectedAutoFillReport(report, null)) {
+            throwAutoFillOutcomeUnknown(
+              'native auto-fill returned a malformed no-write validation result',
+            )
+          }
+        }
+        return autoFillNotApplied(request)
+      }
+
+      // Revision witnesses cross MAX_SAFE_INTEGER as decimal strings, so an
+      // unbounded number of independent dirty events cannot exhaust a fixed
+      // numeric reserve between native dispatch and the success ACK.
+      const sparseRange = toSparseRange(sheet.idx, writeRange)
+      const undoCountBefore = undoRecords.length
+      let before: WorkerUndoImage | null = null
+      let diagnostic = ''
+      try {
+        if (!runtimeSupports('formatSnapshots')) {
+          diagnostic =
+            'runtime does not implement format snapshots; auto-fill is not undoable'
+        } else {
+          before = await captureUndoImage(sparseRange, {
+            values: true,
+            formats: true,
+          })
+        }
+      } catch (error) {
+        diagnostic = `auto-fill undo before-image snapshot failed: ${
+          error instanceof Error ? error.message : String(error)
+        }`
+      }
+
+      // Snapshot RPCs are reads but cellsDirty may arrive while they are in
+      // flight. Never dispatch a plan computed against an older epoch.
+      assertUnchangedAutoFillEpoch(preflightRevision)
+
+      let report: AutoFillReportWire
+      try {
+        report = await runAutoFillNativeMutation(sparseRange, () =>
+          client.applyAutoFill!(wire),
+        )
+      } catch (error) {
+        const rejection = autoFillRejectionMessage(error)
+        if (rejection !== null) {
+          flushRejectedAutoFillContentChange()
+          return autoFillNotApplied(request, rejection)
+        }
+        throwAutoFillOutcomeUnknown(
+          'native auto-fill RPC failed after dispatch; commit outcome is unknown',
+        )
+      }
+
+      if (!isExpectedAutoFillReport(report, writeRange)) {
+        if (before !== null) {
+          try {
+            const rolledBack = await runAutoFillNativeMutation(sparseRange, () =>
+              restoreAndVerifyAutoFillImage(sparseRange, before!),
+            )
+            if (rolledBack) {
+              discardDeferredAutoFillContentChange()
+              throw createBackendError(
+                'INVALID_AUTO_FILL_REPORT',
+                'native auto-fill returned a result that does not match the preflighted range; the captured image was restored',
+              )
+            }
+          } catch (error) {
+            if (
+              error instanceof Error &&
+              (error as Error & { code?: string }).code === 'INVALID_AUTO_FILL_REPORT'
+            ) {
+              throw error
+            }
+          }
+        }
+        throwAutoFillOutcomeUnknown(
+          'native auto-fill may have committed but its result could not be verified or rolled back',
+        )
+      }
+
+      let after: WorkerUndoImage | null = null
+      try {
+        after = await captureUndoImage(sparseRange, {
+          values: true,
+          formats: true,
+        })
+      } catch (error) {
+        diagnostic = `auto-fill redo after-image snapshot failed: ${
+          error instanceof Error ? error.message : String(error)
+        }`
+      }
+      const autoFillRecord: WorkerTransactionRecord =
+        before !== null && after !== null
+          ? {
+              kind: 'range.fill',
+              sheetIdx: sheet.idx,
+              boundTransactionId: null,
+              affectedRange: { ...writeRange },
+              clearRange: sparseRange,
+              before,
+              after,
+            }
+          : notUndoableRecord(
+              'range.fill',
+              sheet.idx,
+              writeRange,
+              diagnostic || 'auto-fill snapshots were unavailable',
+            )
+      pushTransactionRecord(autoFillRecord)
+
+      const expectedUndoCount = Math.min(
+        undoCountBefore + 1,
+        WORKER_UNDO_STACK_CAP,
+      )
+      if (
+        undoRecords.length !== expectedUndoCount ||
+        undoRecords[undoRecords.length - 1] !== autoFillRecord
+      ) {
+        throwAutoFillOutcomeUnknown(
+          'native auto-fill committed without exactly one backend transaction',
+        )
+      }
+      const nextRevision = advanceAutoFillRevision()
+      flushDeferredAutoFillContentChange()
+      const historyDisposition =
+        autoFillRecord.before !== null && autoFillRecord.after !== null
+          ? 'undoable'
+          : 'not-undoable'
+      return {
+        sheetId: request.sheetId,
+        requestId: request.requestId,
+        revision: nextRevision,
+        applied: true,
+        historyTransactionCount: 1,
+        historyDisposition,
+        affectedRange: { ...writeRange },
+      }
+    })
+  }
+
+  function fillRangeThroughWorker(
+    request: FillRangeRequest,
+  ): Promise<AutoFillMutationResult> {
+    return applyAutoFillThroughWorker(request)
+  }
+
+  function fillSeriesThroughWorker(
+    request: FillSeriesRequest,
+  ): Promise<AutoFillMutationResult> {
+    return applyAutoFillThroughWorker(request)
+  }
+
   async function insertRowsThroughWorker(
     request: InsertRowsRequest,
   ): Promise<BackendMutationResult> {
@@ -3842,6 +4692,14 @@ export function createWorkerWorkbookSpreadsheetBackend(
           }
         },
       })
+    },
+
+    get fillRange() {
+      return autoFillIsSupported() ? fillRangeThroughWorker : undefined
+    },
+
+    get fillSeries() {
+      return autoFillIsSupported() ? fillSeriesThroughWorker : undefined
     },
 
     get insertRows() {

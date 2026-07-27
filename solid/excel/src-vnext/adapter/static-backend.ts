@@ -93,6 +93,12 @@ import type {
   ViewportFreezeConfig,
 } from '@einfach/spreadsheet-ui-core'
 import {
+  analyzeFillSeriesDates,
+  BUILTIN_FILL_SERIES_MONTH_LONG_NAMES,
+  BUILTIN_FILL_SERIES_MONTH_NAMES,
+  BUILTIN_FILL_SERIES_WEEKDAY_LONG_NAMES,
+  BUILTIN_FILL_SERIES_WEEKDAY_NAMES,
+  calculateFillSeriesLinearTrend,
   cloneCell,
   cloneConditionalFormatRule,
   cloneConditionalFormatRuleEntry,
@@ -103,13 +109,17 @@ import {
   cloneRichValue,
   compareCellValue,
   conditionalRuleFormat,
+  DEFAULT_FILL_SERIES_LOCALE,
   DEFAULT_WORKBOOK_LOCALE,
   estimateUtf8Bytes,
   FILL_SERIES_NUMBER_EPSILON,
   filterSortHasEffect,
+  foldFillSeriesText,
+  formatFillSeriesTextNumber,
   formatNumberValue,
   getFillHandleSourceCoord,
   getFillHandleWriteRange,
+  getFillSeriesDateValue,
   getRichValueText,
   isCoordInsideRange,
   isFillSeriesInteger,
@@ -117,11 +127,14 @@ import {
   nextConditionalFormatRuleId,
   namedRangeIdentity,
   normalizeCopyAsHiddenRows,
+  normalizeCustomFillSeriesListWitness,
   normalizeDimensionSize,
+  normalizeFillSeriesListWitness,
   normalizeFormat,
   normalizeNamedRangeName,
   normalizeRange,
   numericValue,
+  parseFillSeriesTextNumber,
   rangesIntersect,
   reorderSheetMetadata,
   shiftFormulaRefs,
@@ -788,7 +801,6 @@ function applyStateDelta(state: StaticBackendState, delta: StateDelta): StateDel
     inverse.namedRanges = state.namedRanges.map(cloneNamedRange)
     state.namedRanges = delta.namedRanges.map(cloneNamedRange)
   }
-
   for (const [sheetId, sheet] of delta.sheetDeltas) {
     const inverseSheet: SheetDelta = {}
 
@@ -2338,19 +2350,68 @@ function applyClearRange(state: StaticBackendState, request: ClearRangeRequest):
   return cleared
 }
 
-function applyFillRange(state: StaticBackendState, request: FillRangeRequest): number {
+interface StaticFillRangeCellPlan {
+  readonly row: number
+  readonly col: number
+  readonly key: string
+  readonly cell: DisplayCell | null
+  readonly format?: SpreadsheetCellFormat
+}
+
+type StaticFillRangePlan =
+  | { readonly status: 'noop' }
+  | {
+      readonly status: 'ready'
+      readonly writeRange: CellRange
+      readonly cells: readonly StaticFillRangeCellPlan[]
+      readonly nextRevision: ProjectionRevision
+    }
+
+/**
+ * Fail-closed size budget for one drag-fill: one full Excel column
+ * (1,048,576 rows x 1 column). Mirrors `MAX_AUTO_FILL_CELLS`
+ * (`rust/excel-core/src/auto_fill.rs`) and the pre-flight check in
+ * `worker-workbook-backend.ts` (`prepareAutoFillWireRequest`) so every
+ * backend rejects an oversized target range before doing any work.
+ */
+const MAX_AUTO_FILL_CELLS = 1_048_576
+
+function assertAutoFillWithinCellBudget(target: CellRange): void {
+  const targetCells = (target.rowEnd - target.rowStart + 1) * (target.colEnd - target.colStart + 1)
+  if (targetCells > MAX_AUTO_FILL_CELLS) {
+    throw new Error(
+      `auto-fill target spans ${targetCells} cells but the engine cap is ${MAX_AUTO_FILL_CELLS}`,
+    )
+  }
+}
+
+function preflightFillRange(
+  state: StaticBackendState,
+  request: FillRangeRequest,
+): StaticFillRangePlan {
+  if (request.revision !== undefined && request.revision !== state.revision) {
+    throw new Error(
+      `fill range revision conflict: expected ${String(request.revision)}, current ${String(
+        state.revision,
+      )}`,
+    )
+  }
+  assertAutoFillWithinCellBudget(request.targetRange)
+
   const writeRange = getFillHandleWriteRange(
     request.sourceRange,
     request.targetRange,
     request.direction,
   )
   if (writeRange === null) {
-    return 0
+    return { status: 'noop' }
   }
 
-  const sheetCells = getOrCreateSheetCells(state, request.sheetId)
-  const cellFormats = getOrCreateCellFormats(state, request.sheetId)
-  const rangeFormats = getOrCreateRangeFormats(state, request.sheetId)
+  const nextRevision = nextRevisionOrThrow(state.revision)
+  const sheetCells = state.cellsBySheet.get(request.sheetId) ?? new Map<string, DisplayCell>()
+  const cellFormats =
+    state.cellFormatsBySheetId.get(request.sheetId) ?? new Map<string, SpreadsheetCellFormat>()
+  const rangeFormats = state.rangeFormatsBySheetId.get(request.sheetId) ?? []
   const sourceCells = new Map<string, DisplayCell>()
   for (const cell of sheetCells.values()) {
     if (isCellInsideRange(cell, request.sourceRange)) {
@@ -2358,57 +2419,81 @@ function applyFillRange(state: StaticBackendState, request: FillRangeRequest): n
     }
   }
 
-  let changed = 0
+  const cells: StaticFillRangeCellPlan[] = []
   for (let row = writeRange.rowStart; row <= writeRange.rowEnd; row += 1) {
     for (let col = writeRange.colStart; col <= writeRange.colEnd; col += 1) {
       const sourceCoord = getFillHandleSourceCoord(request.sourceRange, { row, col })
-      const sourceKey = keyFor(sourceCoord.row, sourceCoord.col)
-      const sourceCell = sourceCells.get(sourceKey)
-      const targetKey = keyFor(row, col)
-      recordCellBefore(state, request.sheetId, targetKey)
-      recordCellFormatBefore(state, request.sheetId, targetKey)
-
+      const sourceCell = sourceCells.get(keyFor(sourceCoord.row, sourceCoord.col))
+      const key = keyFor(row, col)
+      let cell: DisplayCell | null = null
       if (sourceCell) {
-        const nextCell = cloneCell(sourceCell)
-        if (nextCell.formula) {
-          nextCell.formula = shiftFormulaRefs(
-            nextCell.formula,
+        cell = cloneCell(sourceCell)
+        if (cell.formula) {
+          cell.formula = shiftFormulaRefs(
+            cell.formula,
             row - sourceCoord.row,
             col - sourceCoord.col,
           )
         }
-        sheetCells.set(targetKey, {
-          ...nextCell,
-          row,
-          col,
-        })
-      } else {
-        sheetCells.delete(targetKey)
+        cell.row = row
+        cell.col = col
       }
 
-      const sourceFormat = getEffectiveFormat(
-        sourceCoord.row,
-        sourceCoord.col,
-        cellFormats,
-        rangeFormats,
-      )
-      if (sourceFormat) {
-        cellFormats.set(targetKey, sourceFormat)
-      } else {
-        cellFormats.delete(targetKey)
-      }
-
-      changed += 1
+      const format = getEffectiveFormat(sourceCoord.row, sourceCoord.col, cellFormats, rangeFormats)
+      cells.push({ row, col, key, cell, ...(format ? { format } : {}) })
     }
   }
 
-  return changed
+  // Excel parity (was an SCC-based dependency-cycle rejection): a fill
+  // whose formulas would close a dependency cycle now ALWAYS lands. Each
+  // written formula cell is evaluated exactly like any other stored
+  // formula — `evaluateFormula`'s own runtime `stack` cycle guard
+  // (`static-formula-eval.ts`) returns '#CYCLE!' for whichever cell(s)
+  // close the loop when the projection is next read; every other written
+  // cell in the same batch computes normally.
+
+  return {
+    status: 'ready',
+    writeRange: cloneRange(writeRange),
+    cells,
+    nextRevision,
+  }
+}
+
+function applyFillRangePlan(
+  state: StaticBackendState,
+  request: FillRangeRequest,
+  plan: Extract<StaticFillRangePlan, { status: 'ready' }>,
+): void {
+  const sheetCells = getOrCreateSheetCells(state, request.sheetId)
+  const cellFormats = getOrCreateCellFormats(state, request.sheetId)
+  const rangeFormats = getOrCreateRangeFormats(state, request.sheetId)
+
+  recordCellFormatsBeforeInRange(state, request.sheetId, plan.writeRange)
+  recordRangeFormatsBefore(state, request.sheetId)
+  clearRangeFormats(cellFormats, rangeFormats, plan.writeRange)
+
+  for (const cellPlan of plan.cells) {
+    recordCellBefore(state, request.sheetId, cellPlan.key)
+    recordCellFormatBefore(state, request.sheetId, cellPlan.key)
+    if (cellPlan.cell) {
+      sheetCells.set(cellPlan.key, cloneCell(cellPlan.cell))
+    } else {
+      sheetCells.delete(cellPlan.key)
+    }
+    if (cellPlan.format) {
+      cellFormats.set(cellPlan.key, cloneFormat(cellPlan.format))
+    } else {
+      cellFormats.delete(cellPlan.key)
+    }
+  }
 }
 
 interface StaticFillSeriesCellPlan {
   readonly row: number
   readonly col: number
-  readonly value: number
+  readonly value: number | string
+  readonly valueKind: 'number' | 'string'
   readonly format?: SpreadsheetCellFormat
 }
 
@@ -2463,8 +2548,8 @@ function validateFillSeriesGeometry(request: FillSeriesRequest): void {
   }
 
   if (request.direction === 'down' || request.direction === 'up') {
-    if (source.colStart !== source.colEnd || source.rowEnd - source.rowStart + 1 < 2) {
-      invalidFillSeries('vertical series require at least two source cells in one column')
+    if (source.colStart !== source.colEnd) {
+      invalidFillSeries('vertical series require source cells in one column')
     }
     if (target.colStart !== source.colStart || target.colEnd !== source.colEnd) {
       invalidFillSeries('vertical target must stay in the source column')
@@ -2479,8 +2564,8 @@ function validateFillSeriesGeometry(request: FillSeriesRequest): void {
     return
   }
 
-  if (source.rowStart !== source.rowEnd || source.colEnd - source.colStart + 1 < 2) {
-    invalidFillSeries('horizontal series require at least two source cells in one row')
+  if (source.rowStart !== source.rowEnd) {
+    invalidFillSeries('horizontal series require source cells in one row')
   }
   if (target.rowStart !== source.rowStart || target.rowEnd !== source.rowEnd) {
     invalidFillSeries('horizontal target must stay in the source row')
@@ -2510,6 +2595,101 @@ function readCanonicalFillSeriesValue(cell: DisplayCell | undefined): number {
   return value
 }
 
+function readCanonicalFillSeriesText(cell: DisplayCell | undefined): string {
+  if (
+    !cell ||
+    cell.formula !== undefined ||
+    (cell.valueKind !== undefined && cell.valueKind !== 'string')
+  ) {
+    invalidFillSeries('source cells must be canonical non-formula strings')
+  }
+  return cell.displayValue
+}
+
+function getFillSeriesSourceCellCount(request: FillSeriesRequest): number {
+  return request.direction === 'down' || request.direction === 'up'
+    ? request.sourceRange.rowEnd - request.sourceRange.rowStart + 1
+    : request.sourceRange.colEnd - request.sourceRange.colStart + 1
+}
+
+function getOrderedStaticFillSeriesSourceCells(
+  sheetCells: Map<string, DisplayCell>,
+  cellFormats: Map<string, SpreadsheetCellFormat>,
+  rangeFormats: readonly RangeFormatLayer[],
+  request: FillSeriesRequest,
+): Array<DisplayCell | undefined> {
+  const cells: Array<DisplayCell | undefined> = []
+  const append = (row: number, col: number) => {
+    const stored = sheetCells.get(keyFor(row, col))
+    if (!stored) {
+      cells.push(undefined)
+      return
+    }
+    const format = getEffectiveFormat(row, col, cellFormats, rangeFormats)
+    cells.push(format ? { ...stored, format } : stored)
+  }
+
+  if (request.direction === 'down' || request.direction === 'up') {
+    for (let row = request.sourceRange.rowStart; row <= request.sourceRange.rowEnd; row += 1) {
+      append(row, request.sourceRange.colStart)
+    }
+  } else {
+    for (let col = request.sourceRange.colStart; col <= request.sourceRange.colEnd; col += 1) {
+      append(request.sourceRange.rowStart, col)
+    }
+  }
+  return cells
+}
+
+function fillSeriesSourceRelativeIndex(
+  request: FillSeriesRequest,
+  row: number,
+  col: number,
+): number {
+  return request.direction === 'down' || request.direction === 'up'
+    ? row - request.sourceRange.rowStart
+    : col - request.sourceRange.colStart
+}
+
+function normalizeRuntimeTextPattern(
+  value: FillSeriesRequest['textPattern'],
+): NonNullable<FillSeriesRequest['textPattern']> {
+  if (
+    !isObject(value) ||
+    typeof value.prefix !== 'string' ||
+    typeof value.suffix !== 'string' ||
+    !Number.isSafeInteger(value.width) ||
+    value.width < 0
+  ) {
+    invalidFillSeries('text-number series require a valid text pattern witness')
+  }
+  return {
+    prefix: value.prefix,
+    suffix: value.suffix,
+    width: value.width,
+  }
+}
+
+function normalizeRuntimeListWitness(value: FillSeriesRequest['list']): {
+  readonly listName: string
+  readonly values: readonly string[]
+  readonly locale: string
+} {
+  const witness = normalizeFillSeriesListWitness(value)
+  if (!witness) {
+    invalidFillSeries('named series require a valid bounded list witness')
+  }
+  return witness
+}
+
+function modulo(value: number, divisor: number): number {
+  return ((value % divisor) + divisor) % divisor
+}
+
+type StaticGeneratedFillSeriesValue =
+  | { readonly valueKind: 'number'; readonly value: number }
+  | { readonly valueKind: 'string'; readonly value: string }
+
 function preflightFillSeries(
   state: StaticBackendState,
   request: FillSeriesRequest,
@@ -2530,48 +2710,217 @@ function preflightFillSeries(
     )
   }
   validateFillSeriesGeometry(request)
+  assertAutoFillWithinCellBudget(request.targetRange)
 
-  if (request.series !== 'integer-step' && request.series !== 'decimal-step') {
-    invalidFillSeries('static backend only accepts numeric step series')
-  }
   if (typeof request.step !== 'number' || !Number.isFinite(request.step) || request.step === 0) {
     invalidFillSeries('step must be finite and non-zero')
+  }
+  const requestedStep = request.step
+  const sourceCellCount = getFillSeriesSourceCellCount(request)
+  const minimumSourceCellCount =
+    request.series === 'linear-trend'
+      ? 3
+      : request.series === 'integer-step' || request.series === 'decimal-step'
+        ? 2
+        : 1
+  if (sourceCellCount < minimumSourceCellCount) {
+    invalidFillSeries(`${request.series} requires at least ${minimumSourceCellCount} source cells`)
   }
 
   const sheetCells = state.cellsBySheet.get(request.sheetId)
   if (!sheetCells) invalidFillSeries('source sheet has no canonical cell store')
+  const cellFormats = state.cellFormatsBySheetId.get(request.sheetId) ?? new Map()
+  const rangeFormats = state.rangeFormatsBySheetId.get(request.sheetId) ?? []
+  const sourceCells = getOrderedStaticFillSeriesSourceCells(
+    sheetCells,
+    cellFormats,
+    rangeFormats,
+    request,
+  )
+  let generateValue: (sourceRelativeIndex: number) => StaticGeneratedFillSeriesValue | null
 
-  const sourceValues: number[] = []
-  if (request.direction === 'down' || request.direction === 'up') {
-    for (let row = request.sourceRange.rowStart; row <= request.sourceRange.rowEnd; row += 1) {
-      sourceValues.push(
-        readCanonicalFillSeriesValue(sheetCells.get(keyFor(row, request.sourceRange.colStart))),
-      )
+  if (request.series === 'integer-step' || request.series === 'decimal-step') {
+    const sourceValues = sourceCells.map(readCanonicalFillSeriesValue)
+    for (let index = 1; index < sourceValues.length; index += 1) {
+      const delta = sourceValues[index] - sourceValues[index - 1]
+      if (!fillSeriesStepsMatch(delta, requestedStep)) {
+        invalidFillSeries('source values do not match the requested step')
+      }
     }
-  } else {
-    for (let col = request.sourceRange.colStart; col <= request.sourceRange.colEnd; col += 1) {
-      sourceValues.push(
-        readCanonicalFillSeriesValue(sheetCells.get(keyFor(request.sourceRange.rowStart, col))),
-      )
-    }
-  }
 
-  for (let index = 1; index < sourceValues.length; index += 1) {
-    const delta = sourceValues[index] - sourceValues[index - 1]
-    if (!fillSeriesStepsMatch(delta, request.step)) {
-      invalidFillSeries('source values do not match the requested step')
+    const isIntegerSeries =
+      Math.abs(requestedStep) >= FILL_SERIES_NUMBER_EPSILON &&
+      isFillSeriesInteger(requestedStep) &&
+      sourceValues.every(isFillSeriesInteger)
+    if (
+      (request.series === 'integer-step' && !isIntegerSeries) ||
+      (request.series === 'decimal-step' && isIntegerSeries)
+    ) {
+      invalidFillSeries('series kind does not match the canonical source values')
     }
-  }
-
-  const isIntegerSeries =
-    Math.abs(request.step) >= FILL_SERIES_NUMBER_EPSILON &&
-    isFillSeriesInteger(request.step) &&
-    sourceValues.every(isFillSeriesInteger)
-  if (
-    (request.series === 'integer-step' && !isIntegerSeries) ||
-    (request.series === 'decimal-step' && isIntegerSeries)
+    const firstValue = sourceValues[0]
+    generateValue = (sourceRelativeIndex) => {
+      const value = firstValue + requestedStep * sourceRelativeIndex
+      return Number.isFinite(value) ? { valueKind: 'number', value } : null
+    }
+  } else if (request.series === 'linear-trend') {
+    const sourceValues = sourceCells.map(readCanonicalFillSeriesValue)
+    const trend = calculateFillSeriesLinearTrend(sourceValues)
+    if (
+      !trend ||
+      Math.abs(trend.slope) < FILL_SERIES_NUMBER_EPSILON ||
+      !fillSeriesStepsMatch(trend.slope, requestedStep)
+    ) {
+      invalidFillSeries('canonical source values do not match the requested linear trend')
+    }
+    generateValue = (sourceRelativeIndex) => {
+      const value = trend.intercept + trend.slope * sourceRelativeIndex
+      return Number.isFinite(value) ? { valueKind: 'number', value } : null
+    }
+  } else if (
+    request.series === 'date-day' ||
+    request.series === 'date-week' ||
+    request.series === 'date-month'
   ) {
-    invalidFillSeries('series kind does not match the canonical source values')
+    if (!Number.isSafeInteger(requestedStep)) {
+      invalidFillSeries('calendar series step must be a non-zero safe integer')
+    }
+    // Excel parity: dates are plain serial numbers, and fill arithmetic
+    // runs on the serial regardless of number format — format affects
+    // display only. A date-kind series is not gated on the source cell
+    // having an effective date format; only the value-type requirement
+    // (`readCanonicalFillSeriesValue`: canonical, non-formula numbers)
+    // still applies.
+    const sourceValues = sourceCells.map((cell) => readCanonicalFillSeriesValue(cell))
+    const analysis = analyzeFillSeriesDates(sourceValues)
+    if (
+      !analysis ||
+      analysis.kind !== request.series ||
+      !fillSeriesStepsMatch(analysis.step, requestedStep)
+    ) {
+      invalidFillSeries('canonical source dates do not match the requested calendar series')
+    }
+    const preserveEndOfMonth =
+      request.series === 'date-month' && analysis.kind === 'date-month'
+        ? analysis.preserveEndOfMonth
+        : false
+    const anchor = sourceValues[0]
+    generateValue = (sourceRelativeIndex) => {
+      const value = getFillSeriesDateValue(
+        anchor,
+        request.series as 'date-day' | 'date-week' | 'date-month',
+        requestedStep,
+        sourceRelativeIndex,
+        preserveEndOfMonth,
+      )
+      return value === null ? null : { valueKind: 'number', value }
+    }
+  } else if (request.series === 'text-number') {
+    if (!Number.isSafeInteger(requestedStep)) {
+      invalidFillSeries('text-number series step must be a non-zero safe integer')
+    }
+    const pattern = normalizeRuntimeTextPattern(request.textPattern)
+    const parsed = sourceCells.map((cell) =>
+      parseFillSeriesTextNumber(readCanonicalFillSeriesText(cell)),
+    )
+    if (parsed.some((value) => value === null)) {
+      invalidFillSeries('source strings do not contain a safe trailing number')
+    }
+    const sourceValues = parsed as Array<NonNullable<(typeof parsed)[number]>>
+    const first = sourceValues[0]
+    const establishedWidth = sourceValues.every((value) => value.width === first.width)
+      ? first.width
+      : 0
+    if (
+      pattern.prefix !== first.prefix ||
+      pattern.suffix !== first.suffix ||
+      pattern.width !== establishedWidth
+    ) {
+      invalidFillSeries('text pattern witness does not match the canonical source strings')
+    }
+    for (let index = 0; index < sourceValues.length; index += 1) {
+      const expected = first.value + requestedStep * index
+      if (
+        !Number.isSafeInteger(expected) ||
+        sourceValues[index].prefix !== first.prefix ||
+        sourceValues[index].suffix !== first.suffix ||
+        sourceValues[index].value !== expected
+      ) {
+        invalidFillSeries('source strings do not match the requested text-number step')
+      }
+    }
+    generateValue = (sourceRelativeIndex) => {
+      const numericPart = first.value + requestedStep * sourceRelativeIndex
+      const value = formatFillSeriesTextNumber(pattern, numericPart)
+      return value === null ? null : { valueKind: 'string', value }
+    }
+  } else if (
+    request.series === 'weekday-name' ||
+    request.series === 'month-name' ||
+    request.series === 'custom-list'
+  ) {
+    if (requestedStep !== 1 && requestedStep !== -1) {
+      invalidFillSeries('named series step must be 1 or -1')
+    }
+    const witness = normalizeRuntimeListWitness(request.list)
+    if (
+      request.series === 'custom-list' &&
+      normalizeCustomFillSeriesListWitness(witness) === null
+    ) {
+      invalidFillSeries('custom list witness may not use a reserved list name')
+    }
+    const canonicalBuiltinList =
+      witness.listName === 'builtin-weekday-short'
+        ? BUILTIN_FILL_SERIES_WEEKDAY_NAMES
+        : witness.listName === 'builtin-weekday-long'
+          ? BUILTIN_FILL_SERIES_WEEKDAY_LONG_NAMES
+          : witness.listName === 'builtin-month-short'
+            ? BUILTIN_FILL_SERIES_MONTH_NAMES
+            : witness.listName === 'builtin-month-long'
+              ? BUILTIN_FILL_SERIES_MONTH_LONG_NAMES
+              : null
+    if (
+      witness.listName.startsWith('builtin-') &&
+      (witness.locale !== DEFAULT_FILL_SERIES_LOCALE ||
+        canonicalBuiltinList === null ||
+        canonicalBuiltinList.length !== witness.values.length ||
+        !canonicalBuiltinList.every((value, index) => value === witness.values[index]))
+    ) {
+      invalidFillSeries('built-in list witness does not match the canonical list')
+    }
+    if (
+      (request.series === 'weekday-name' &&
+        !(
+          witness.listName.startsWith('builtin-weekday-') || witness.listName === 'locale-weekday'
+        )) ||
+      (request.series === 'month-name' &&
+        !(witness.listName.startsWith('builtin-month-') || witness.listName === 'locale-month'))
+    ) {
+      invalidFillSeries('named series kind does not match its list witness')
+    }
+    const normalizedList = witness.values.map((value) => foldFillSeriesText(value, witness.locale))
+    const sourceValues = sourceCells.map(readCanonicalFillSeriesText)
+    const indices = sourceValues.map((value) =>
+      normalizedList.indexOf(foldFillSeriesText(value, witness.locale)),
+    )
+    if (indices.some((index) => index < 0)) {
+      invalidFillSeries('source strings do not belong to the requested named list')
+    }
+    for (let index = 0; index < indices.length; index += 1) {
+      if (indices[index] !== modulo(indices[0] + requestedStep * index, witness.values.length)) {
+        invalidFillSeries('source strings do not match the requested named-list step')
+      }
+    }
+    const firstIndex = indices[0]
+    generateValue = (sourceRelativeIndex) => ({
+      valueKind: 'string',
+      value:
+        witness.values[
+          modulo(firstIndex + requestedStep * sourceRelativeIndex, witness.values.length)
+        ],
+    })
+  } else {
+    invalidFillSeries('unsupported series kind')
   }
 
   const writeRange = getFillHandleWriteRange(
@@ -2581,25 +2930,12 @@ function preflightFillSeries(
   )
   if (writeRange === null) return { status: 'noop' }
 
-  const cellFormats = state.cellFormatsBySheetId.get(request.sheetId) ?? new Map()
-  const rangeFormats = state.rangeFormatsBySheetId.get(request.sheetId) ?? []
-  const firstValue = sourceValues[0]
-  const lastValue = sourceValues[sourceValues.length - 1]
   const cells: StaticFillSeriesCellPlan[] = []
 
   for (let row = writeRange.rowStart; row <= writeRange.rowEnd; row += 1) {
     for (let col = writeRange.colStart; col <= writeRange.colEnd; col += 1) {
-      let value: number
-      if (request.direction === 'down') {
-        value = lastValue + request.step * (row - request.sourceRange.rowEnd)
-      } else if (request.direction === 'up') {
-        value = firstValue - request.step * (request.sourceRange.rowStart - row)
-      } else if (request.direction === 'right') {
-        value = lastValue + request.step * (col - request.sourceRange.colEnd)
-      } else {
-        value = firstValue - request.step * (request.sourceRange.colStart - col)
-      }
-      if (!Number.isFinite(value)) {
+      const generated = generateValue(fillSeriesSourceRelativeIndex(request, row, col))
+      if (generated === null) {
         invalidFillSeries('generated series contains a non-finite value')
       }
 
@@ -2608,7 +2944,8 @@ function preflightFillSeries(
       cells.push({
         row,
         col,
-        value,
+        value: generated.value,
+        valueKind: generated.valueKind,
         ...(format ? { format: cloneFormat(format) } : {}),
       })
     }
@@ -2629,17 +2966,31 @@ function applyFillSeriesPlan(
   beginUndoableMutation(state)
   const sheetCells = state.cellsBySheet.get(sheetId)!
   const cellFormats = getOrCreateCellFormats(state, sheetId)
+  const rangeFormats = getOrCreateRangeFormats(state, sheetId)
+  recordCellFormatsBeforeInRange(state, sheetId, plan.writeRange)
+  recordRangeFormatsBefore(state, sheetId)
+  clearRangeFormats(cellFormats, rangeFormats, plan.writeRange)
   for (const cellPlan of plan.cells) {
     const key = keyFor(cellPlan.row, cellPlan.col)
     recordCellBefore(state, sheetId, key)
     recordCellFormatBefore(state, sheetId, key)
-    sheetCells.set(key, {
-      row: cellPlan.row,
-      col: cellPlan.col,
-      displayValue: String(cellPlan.value),
-      valueKind: 'number',
-      numericValue: cellPlan.value,
-    })
+    sheetCells.set(
+      key,
+      cellPlan.valueKind === 'number'
+        ? {
+            row: cellPlan.row,
+            col: cellPlan.col,
+            displayValue: String(cellPlan.value),
+            valueKind: 'number',
+            numericValue: cellPlan.value as number,
+          }
+        : {
+            row: cellPlan.row,
+            col: cellPlan.col,
+            displayValue: cellPlan.value as string,
+            valueKind: 'string',
+          },
+    )
     if (cellPlan.format) {
       cellFormats.set(key, cloneFormat(cellPlan.format))
     } else {
@@ -4589,9 +4940,7 @@ export function createStaticSpreadsheetBackend(
      * this backend, like the WASM engine, has nothing authoritative to say about
      * hidden columns (§8), which stay UI-core canonical.
      */
-    async readSheetHiddenState(
-      request: SheetHiddenStateRequest,
-    ): Promise<SheetHiddenStateResult> {
+    async readSheetHiddenState(request: SheetHiddenStateRequest): Promise<SheetHiddenStateResult> {
       const manualRows = [...(state.hiddenRowsBySheetId.get(request.sheetId) ?? [])].sort(
         (left, right) => left - right,
       )
@@ -4953,10 +5302,7 @@ export function createStaticSpreadsheetBackend(
           filterHiddenRows: filterHiddenRowsForSheet(state, request.sheetId),
         }
         const displayRows = buildFilterSortDisplayRows(sheetCells, lookup, next)
-        const hidden = filterHiddenRowsFromDisplayRows(
-          displayRows,
-          getMaxSourceRow(sheetCells) + 1,
-        )
+        const hidden = filterHiddenRowsFromDisplayRows(displayRows, getMaxSourceRow(sheetCells) + 1)
         hiddenRowIndices = hidden
         if (hidden.length > 0) {
           state.filterHiddenRowsBySheetId.set(request.sheetId, new Set(hidden))
@@ -5178,20 +5524,30 @@ export function createStaticSpreadsheetBackend(
       }
     },
     async fillRange(request) {
+      const plan = preflightFillRange(state, request)
+      if (plan.status === 'noop') {
+        return {
+          sheetId: request.sheetId,
+          requestId: request.requestId,
+          revision: state.revision,
+          applied: false,
+          historyTransactionCount: 0,
+          historyDisposition: 'none',
+        }
+      }
+
       beginUndoableMutation(state)
-      applyFillRange(state, request)
-      state.revision = bumpRevision(state.revision)
+      applyFillRangePlan(state, request, plan)
+      state.revision = plan.nextRevision
 
       return {
         sheetId: request.sheetId,
         requestId: request.requestId,
-        revision: request.revision ?? state.revision,
-        affectedRange: {
-          rowStart: request.targetRange.rowStart,
-          rowEnd: request.targetRange.rowEnd,
-          colStart: request.targetRange.colStart,
-          colEnd: request.targetRange.colEnd,
-        },
+        revision: state.revision,
+        affectedRange: cloneRange(plan.writeRange),
+        applied: true,
+        historyTransactionCount: 1,
+        historyDisposition: 'undoable',
       }
     },
     async fillSeries(request) {
@@ -5201,6 +5557,9 @@ export function createStaticSpreadsheetBackend(
           sheetId: request.sheetId,
           requestId: request.requestId,
           revision: state.revision,
+          applied: false,
+          historyTransactionCount: 0,
+          historyDisposition: 'none',
         }
       }
 
@@ -5210,6 +5569,9 @@ export function createStaticSpreadsheetBackend(
         requestId: request.requestId,
         revision: state.revision,
         affectedRange: cloneRange(plan.writeRange),
+        applied: true,
+        historyTransactionCount: 1,
+        historyDisposition: 'undoable',
       }
     },
     async resolveDataEdge(request) {
