@@ -42,3 +42,9 @@ playwright/.cache/
 
 # ad-hoc sanity screenshots dropped at repo root (e.g. w5-*.png, w7-*.png)
 /*.png
+
+# CodeGraph local index (machine-local, rebuilt by `codegraph sync`)
+.codegraph/
+
+# agent-harness conversation archives (never commit)
+.agent-archive/
