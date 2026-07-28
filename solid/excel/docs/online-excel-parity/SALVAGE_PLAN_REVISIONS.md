@@ -188,7 +188,36 @@ test('SpreadsheetCellFormat accepts rotation, verticalAlign, overflow, shrinkToF
 总错误 **185 → 39**（余下主体是 `no-unused-vars`，与 D 链同批债）。
 比"整个关掉 max-len"保留了规则价值，比"不清"消除了噪音。
 
----
+### 测试空间收尾（2026-07-28）：全仓 src + test 双双归零
+
+承 C-later（见 §三）。测试目录按同一"真问题改代码、规则不适配改配置"的分法清完：
+
+- **配置**：测试 override 加 `naming-convention: off` —— 夹具名映射领域数据
+  （`financial.test.ts` 的 `jan1_2020` / `apr1_2020` 日期锚点改 camelCase 反而更难读）；
+  `**/*.bench.ts` 单列 override 关 `no-redeclare` + `no-loop-func` ——
+  `let WasmModule: WasmModule` 是合法 TS（类型与值分属不同命名空间），
+  按尺寸循环内声明函数是同步基准测试的常态；
+- **自动修**：18 个测试文件的前导分号，全部紧跟 `beforeAll(async () => {`
+  （以 `{` 结尾，`(` 开头的语句无可拼接对象，删除安全）；
+- **手工**：25 处 inline `import()` → 顶层 `import type`（主体是 `jest.mock`
+  工厂里的 `require('node:fs') as typeof import('node:fs')` 样板）、17 处
+  内层变量改名、17 处折行、6 处占位参数加 `_` 前缀、3 处
+  `no-loss-of-precision` 保留夹具原值 + 定向豁免。
+
+**唯一改了求值结构的两处**（`filter-sort.test.ts` / `format-cells.test.ts`）：
+`source` ↔ `acknowledgement` 的 Proxy 重入、以及自引用的 `reentrantPorts`
+是真循环闭包，改为先 `let` 前置声明再单次赋值，并对随之而来的 `prefer-const`
+加带理由的定向豁免。**未重构测试、未放宽任何断言。**
+
+**当前状态**：`vanilla/*` + `react/*` + `solid/*` 的 src 与 test **全部 0 错误**，
+`npx tsc -b` EXIT=0，`npm test` 5772 passed（与清理前逐个相同，无缩水）。
+金 parity 套件按最小改动规矩只受到类型导入样板与一处签名折行的影响，断言与
+夹具常量零变化。
+
+**下一步（未做，需决策）**：现在才具备把 lint 加进 pre-commit 的前提。两个障碍：
+①`npm run eslint` 是全仓 `--fix`，门禁需要一个新的 check-only script，而
+`package.json` 由并行 agent 持有；②加上后会同时门禁对方的提交。建议等其工作
+并回后再上，并注意 glob 排除 `apps/`。
 
 ## 五、D 链（tsc 零错误）：目标不变，路径要重排
 
