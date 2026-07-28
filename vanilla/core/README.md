@@ -94,10 +94,60 @@ const userAtom = atom(async (get) => {
 | `atomWithRefresh(readFn)` | 创建可刷新的 atom |
 | `atomWithLazyRefresh(readFn)` | 创建懒加载可刷新 atom |
 | `createAsyncParamsAtom(asyncFn)` | 创建接收参数的异步 atom |
-| `createUndoRedo(atom)` | 创建撤销/重做系统 |
+| `createHistory(store, options?)` | 创建事务日志式撤销/重做系统 |
+| `isSourceAtom(atom)` | 判断是否为 `atom(initialValue)` 造出的源子 atom |
 | `incrementAtom(atom, derivations)` | 创建带派生计算的 atom |
 | `createCacheStom(atomFn, options?)` | 创建 LRU 缓存 atom 工厂 |
 | `memo(weakKey, fn)` | 基于 WeakKey 缓存值 |
+
+## 撤销 / 重做
+
+`createHistory` 是**事务日志**，不是状态快照：历史里存的是「字符串 key → before/after」，每条 entry 自带完整逆操作。由此可有界截断（默认 cap 100）、可 JSON 序列化落 IndexedDB、一次 undo 的代价是 O(本条改动数) 而非 O(历史长度)。
+
+```ts
+const history = createHistory(store, { cap: 100 })
+
+// 注册「怎么还原」。scope 用于 family atom，单例 atom 可省略
+history.registerAtomApplier('count', () => countAtom)
+history.registerAtomApplier('row', (scope) => getRowAtom(scope!))
+
+// 一次事务 = 一步 undo，哪怕改了多个 atom
+history.transaction('输入', () => {
+  const before = store.getter(countAtom)
+  store.setter(countAtom, 7)
+  history.record({ key: 'count', before, after: 7 })
+})
+
+history.undo()   // → true
+store.getter(history.canRedoAtom)   // → true
+```
+
+要点：
+
+- **不自动捕获**。变更由 `record()` 显式声明 —— 自动捕获需要给每个被追踪的 atom 常驻订阅与基线值，成本 O(被追踪 atom 数)，在 family 场景下不成立。
+- **事务内抛异常**会把已记录的 op 逆序回退到事务开始状态，不留 entry，异常原样上抛。嵌套事务各自持有基线，内层失败被外层捕获时只退内层。
+- **`registerAtomApplier` 只接受源子 atom**。派生 atom（真相在上游）和命令 atom（write 是动作不是赋值）会被 `isSourceAtom` 挡掉。
+- **持久化**通过 `HistoryPersistPort`（`append` / `dropOldest` / `dropAfter` / `setCursor` / `load`）增量落盘，全部 fire-and-forget：IO 失败只经 `onError` 上报，不回滚内存状态。落盘的 `before`/`after` 必须可结构化克隆。
+
+### 接 IndexedDB
+
+core 不含浏览器实现，从外面传一个端口进去即可：
+
+```ts
+const history = createHistory(store, { cap: 100, persist: idbPort, onError: log })
+
+// 阻塞式启动:恢复完再放行编辑
+await history.restore()
+```
+
+适配器有两条硬约束：
+
+1. **内部必须排队。** 一次提交最多发四个调用（`dropAfter` → `append` → `dropOldest` → `setCursor`），core 不 await 也不串行化。IndexedDB 每个事务独立，乱序执行会写坏镜像。
+2. **端口是位置语义的镜像。** `dropOldest(n)` / `dropAfter(cursor)` 给的是当前数组下标而非 txId；按收到的顺序执行即可与内存逐位对齐。
+
+完整的 IndexedDB 参考实现见 [docs/HISTORY_INDEXEDDB.md](./docs/HISTORY_INDEXEDDB.md)。
+
+`hydrate()` 只在空栈上合法 —— 栈非空说明本会话已产生过历史，覆盖会静默吃掉用户的编辑，此时返回 `false` 并经 `onError` 上报。有意换一份历史（切文档）请先 `clear()`。
 
 ## 许可证
 
