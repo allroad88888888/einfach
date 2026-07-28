@@ -203,6 +203,32 @@ B 链与 auto-fill 的可见面**全部通过**：
 全绿；UI smoke 复验菜单栏路径不再抹格式。
 **工作量**：半天（含共享选择器上提与三条回归）。
 
+### 5 的执行结果（`dba9162`，2026-07-28）
+
+共享选择器落在 `vanilla/spreadsheet-ui-core/src/projection/index.ts` 的
+`activeCellFormatAtom`（debugLabel `spreadsheet.projection.activeCellFormat`，
+已在 projection README 归类为派生原子）。菜单栏与 Ctrl+1 两处补
+`initialFormat: store.getter(activeCellFormatAtom)`；**工具栏源码未动** ——
+它的局部 `cloneFormat` 签名带 `| undefined`、且被 `currentHAlign` 等多个消费方
+共用，去重的收益不值破坏反应式读取的风险（正确优先于去重）。
+
+一处与计划前提的偏差（已核实、结论正确）：`isVisibleProjectionResult` 并非
+ui-core 导出，而是 `provider/atoms.ts:50` 的私有 helper，故在原子里内联了
+等价判据 `result?.kind !== 'visible-window'`。另核实
+`spreadsheetProjectionSnapshotAtom` 只是 `provider/atoms.ts:44` 对 ui-core
+`projectionSnapshotAtom` 的别名再导出，**新原子与工具栏读的是同一个原子**，
+不存在「测试绿、真机空转」的风险。
+
+验证：`npx tsc -b` EXIT=0；两套 vnext 套件 3581 passed（+9，无缩水）；
+回归用例经「回退修复两行 → 用例转红」确认真能抓到缺陷。**真 UI 三入口复验**
+（Wave 5 demo，B2 设 3 位小数）：
+
+| 入口 | 重开时类别 / 小数位 | 空改动点确定 |
+|---|---|---|
+| 菜单栏（修复前） | 常规 / 输入框不渲染 | `120.000` → **`120` 格式被抹** |
+| 菜单栏（修复后） | 数字 / 3 | `120.000` 保持 ✅ |
+| Ctrl+1（修复后） | 数字 / 3 | `120.000` 保持 ✅ |
+
 ---
 
 ## 顺序
