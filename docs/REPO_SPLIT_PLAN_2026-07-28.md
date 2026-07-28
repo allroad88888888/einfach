@@ -25,13 +25,25 @@
 
 ### 迁往 einfach-excel（878 个受控文件）
 
-| 路径 | 包名 | 文件数 | 备注 |
-|---|---|---|---|
-| `vanilla/spreadsheet-ui-core` | `@einfach/spreadsheet-ui-core` v0.1.0 | 250 | 已发布包 |
-| `vanilla/excel-core-ts` | `@einfach/excel-core-ts` v0.0.0 | 73 | private |
-| `solid/excel` | `@einfach/solid-excel` v0.1.0 | 403 | 含 e2e / playwright |
-| `rust/excel-core` + `rust/wasm` | `einfach-excel-core` / `einfach-wasm` | 144 | 不在 pnpm workspace 内 |
-| `apps/excel-showcase` | `@einfach/excel-showcase` v0.1.0 | 8 | private |
+迁移同时做目录合并（决策见 §7），新仓路径见「迁往」列。
+
+| 现路径 | 迁往 | 包名 / crate | 文件数 | 备注 |
+|---|---|---|---|---|
+| `vanilla/spreadsheet-ui-core` | `excel/spreadsheet-ui-core` | `@einfach/spreadsheet-ui-core` v0.1.0 | 250 | 已发布包 |
+| `vanilla/excel-core-ts` | `excel/excel-core-ts` | `@einfach/excel-core-ts` v0.0.0 | 73 | private |
+| `solid/excel` | `excel/solid-excel` | `@einfach/solid-excel` v0.1.0 | 403 | 含 e2e / playwright |
+| `apps/excel-showcase` | `excel/showcase` | `@einfach/excel-showcase` v0.1.0 | 8 | private |
+| `rust/core` | `excel/rust/core` | `einfach-core`（Rust） | 10 | **见下** |
+| `rust/excel-core` | `excel/rust/excel-core` | `einfach-excel-core` | 105 | |
+| `rust/wasm` | `excel/rust/wasm` | `einfach-wasm` | 5 | |
+| `rust/docs` | `excel/rust/docs` | — | 24 | |
+
+**`rust/core` 的归属（2026-07-28 决策：跟 excel 走）**：它是 `einfach-core` —— 1790 行 Rust 版 atom store
+（`atom.rs` 369 / `store.rs` 1297 / `family.rs` 117），带 twin 测试（`store_twin.rs` / `family_twin.rs`，
+每个用例是 `vanilla/core` jest 测试的逐条移植，钉 INV-1 与 TS 实现同构）。
+身份上属 core，但消费方只有 `rust/excel-core` 与 `rust/wasm` 两个 crate，二者都以 `path = "../core"` 相对路径引用。
+跟 excel 一起走 ⟹ **Rust 侧零跨仓依赖**，相对路径关系原样成立；留在原仓则必须改成 crates.io 发布或 git 依赖。
+代价：Rust 与 TS 两版 atom store 分居两仓，twin 测试的对照物变成跨仓引用（仅文档引用，非代码依赖）。
 
 ### 留在 einfach（209 个受控文件）
 
@@ -54,6 +66,7 @@ excel 侧对留守侧的全部引用只有两个包，且只用到最稳定的�
 - excel 侧对 `@einfach/utils`、`@einfach/react*` **零引用**；对 `createHistory` / `createUndoRedo` **零引用**。
 - `vanilla/spreadsheet-ui-core` 对 `@einfach/solid` 和 `solid-js` **零引用**（三层分层约束成立，可整体搬走）。
 - 留守侧对 excel 侧的引用只存在于 `jest.config.mjs`、根 `package.json`、`rollup.config.mjs` 三个配置文件，源码零耦合。
+- **Rust 侧无跨仓接缝**：`rust/core` 跟 excel 一起走（§6），三个 crate 的 `path = "../…"` 相对依赖原样成立，不需要 crates.io 或 git 依赖。
 
 ---
 
@@ -115,10 +128,37 @@ excel 侧对留守侧的全部引用只有两个包，且只用到最稳定的�
 
 ### P2 内容拆分（在新仓工作副本内进行，不改原仓）
 
-- **历史策略（待定）**：`git filter-repo --path …` 保留 excel 相关提交历史（本机 `git-filter-repo` 未安装，需 `brew install git-filter-repo`）；
-  或 squash 成单个 initial commit。二选一。
-- **路径保持不变**（`vanilla/spreadsheet-ui-core`、`solid/excel`、`rust/*`、`apps/excel-showcase`），
-  以最小化改动量并让历史映射成立。
+- **历史策略（待定）**：`git filter-repo` 保留 excel 相关提交历史（本机 `git-filter-repo` 未安装，需 `brew install git-filter-repo`）；
+  或 squash 成单个 initial commit + `git mv`。二选一。
+- **路径合并在切分同一步完成**（决策见 §7），用 `--path-rename` 而非事后 `git mv`：
+
+  ```
+  git filter-repo \
+    --path vanilla/spreadsheet-ui-core --path-rename vanilla/spreadsheet-ui-core:excel/spreadsheet-ui-core \
+    --path vanilla/excel-core-ts       --path-rename vanilla/excel-core-ts:excel/excel-core-ts \
+    --path solid/excel                 --path-rename solid/excel:excel/solid-excel \
+    --path apps/excel-showcase         --path-rename apps/excel-showcase:excel/showcase \
+    --path rust                        --path-rename rust/:excel/rust/
+  ```
+
+  叶子目录名保持不变（`spreadsheet-ui-core` 等），使其为纯移动。
+
+- **移动后必须改的配置**（已逐条核实；源码基本不动，因为 import 走 `@einfach/*` 包名）：
+
+  | 位置 | 内容 |
+  |---|---|
+  | `pnpm-workspace.yaml` | glob 改为 `excel/*` |
+  | `jest.config.mjs:44` | `modulePathIgnorePatterns` 里的 `<rootDir>/solid/excel/wasm-pkg/` |
+  | `jest.config.mjs:51-53` | 三个 excel 包的 `moduleNameMapper` 路径 |
+  | 根 `package.json:21` | `ensureWasm` 里的 `solid/excel/wasm-pkg/…` |
+  | `solid/excel/package.json:34` | `build:wasm` 的 `--out-dir ../../solid/excel/wasm-pkg ../../rust/wasm` |
+  | `.gitignore:36` | `solid/excel/wasm-pkg/` |
+  | `tsconfig*.json` | project references 路径 |
+  | `rollup.config.mjs` | 包路径 |
+  | `CLAUDE.md` | monorepo 结构表与各处路径引用 |
+
+  **不用改**：`rust/*/Cargo.toml` 里的 `path = "../core"` / `"../excel-core"`（`rust/` 整体移动，相对关系不变）；
+  测试里的 `path.join(__dirname, '..', 'wasm-pkg', …)`（相对 `__dirname`）。
 - 根配置各留改造版：
   - `pnpm-workspace.yaml` — 收窄 glob
   - `jest.config.mjs` — 删除 `@einfach/core` / `@einfach/solid` 的 `moduleNameMapper`，让其走 node_modules
@@ -175,7 +215,19 @@ npm run e2e -w @einfach/solid-excel
 
 ---
 
-## 6. 待定项
+## 6. 已定决策（2026-07-28）
+
+| 决策 | 结论 | 理由 |
+|---|---|---|
+| `solid/solid` + `solid/form` 归属 | **留原仓**，只有 `solid/excel` 走 | 用户拍板 |
+| `rust/core` 归属 | **跟 excel 走** | 消费方只有 excel 侧两个 crate；一起走则 Cargo 相对路径依赖零改动，Rust 侧无跨仓依赖 |
+| excel 目录合并时机 | **并进拆仓那一步**，用 `filter-repo --path-rename` | 84 个本地分支碰过这五个目录，先在旧仓 `git mv` 等于白付这些分支的重命名合并税；切分时映射零额外成本 |
+| 推送范围 | 只推 `main` | 用户拍板 |
+| 旧仓 | 保留，不归档不删 | 用户拍板 |
+
+---
+
+## 7. 待定项
 
 1. **历史策略**：`git filter-repo` 保留 excel 历史，还是 squash 起步。
 2. **P1 的 core 版本号**：changeset 已按 `minor` → `0.3.0` 落地（`2cb4ce1`），**待你确认**；
