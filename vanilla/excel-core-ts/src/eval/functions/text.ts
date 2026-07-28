@@ -133,7 +133,12 @@ function splitDbcsAtByteBoundary(s: string, byteOffset: number): [string, string
   return [s, '']
 }
 
-function replaceDbcsBytes(s: string, startByte: number, byteCount: number, replacement: string): string {
+function replaceDbcsBytes(
+  s: string,
+  startByte: number,
+  byteCount: number,
+  replacement: string,
+): string {
   const start = Math.max(0, startByte - 1)
   const total = dbcsByteLength(s)
   if (start >= total) return s + replacement
@@ -331,7 +336,9 @@ function formatGridToText(rows: readonly Value[][], strict: boolean): string {
   return strict ? `{${inner}}` : inner
 }
 
-function readStrictFormat(args: Value[]): { ok: true; value: boolean } | { ok: false; error: Value } {
+function readStrictFormat(
+  args: Value[],
+): { ok: true; value: boolean } | { ok: false; error: Value } {
   if (args.length < 2) return { ok: true, value: false }
   const r = readInteger(args[1])
   if (!r.ok) return r
@@ -811,7 +818,11 @@ const TRIM: FunctionImpl = (args) => {
  * Out of scope:
  *   - Locale semantics, rendered colors, and full custom formats.
  */
-function formatTextNumber(n: number, format: string, separators: NumberSeparators): string | undefined {
+function formatTextNumber(
+  n: number,
+  format: string,
+  separators: NumberSeparators,
+): string | undefined {
   if (format.length === 0) return undefined
 
   const sections = splitTextNumberSections(format)
@@ -2654,7 +2665,10 @@ const TEXTAFTER: FunctionImpl = (args) => textBeforeAfter(args, false)
 // REGEXTEST / REGEXEXTRACT / REGEXREPLACE
 // =============================================================================
 
-function readRegexCase(args: Value[], index: number): { ok: true; value: boolean } | { ok: false; error: Value } {
+function readRegexCase(
+  args: Value[],
+  index: number,
+): { ok: true; value: boolean } | { ok: false; error: Value } {
   if (args.length <= index) return { ok: true, value: false }
   const r = readInteger(args[index])
   if (!r.ok) return r
@@ -3008,7 +3022,8 @@ const ARABIC: FunctionImpl = (args) => {
 const VALUETOTEXT: FunctionImpl = (args) => {
   if (args.length < 1 || args.length > 2)
     return errValue('#VALUE!', 'VALUETOTEXT takes 1 or 2 arguments')
-  const err = findNestedError(args[0]) ?? (args.length === 2 ? propagateError([args[1]]) : undefined)
+  const err =
+    findNestedError(args[0]) ?? (args.length === 2 ? propagateError([args[1]]) : undefined)
   if (err) return err
   const formatR = readStrictFormat(args)
   if (!formatR.ok) return formatR.error
@@ -3018,7 +3033,8 @@ const VALUETOTEXT: FunctionImpl = (args) => {
 const ARRAYTOTEXT: FunctionImpl = (args) => {
   if (args.length < 1 || args.length > 2)
     return errValue('#VALUE!', 'ARRAYTOTEXT takes 1 or 2 arguments')
-  const err = findNestedError(args[0]) ?? (args.length === 2 ? propagateError([args[1]]) : undefined)
+  const err =
+    findNestedError(args[0]) ?? (args.length === 2 ? propagateError([args[1]]) : undefined)
   if (err) return err
   const formatR = readStrictFormat(args)
   if (!formatR.ok) return formatR.error

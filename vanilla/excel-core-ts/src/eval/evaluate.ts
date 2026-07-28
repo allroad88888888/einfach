@@ -1822,7 +1822,13 @@ function runtimeRefFromIndexArgs(
     colEndOffset: number,
   ): { readonly ok: true; readonly ref: RuntimeRef } => {
     const materialized = source.ref.materialized
-      ? sliceMaterialized(source.ref.materialized, rowStartOffset, rowEndOffset, colStartOffset, colEndOffset)
+      ? sliceMaterialized(
+          source.ref.materialized,
+          rowStartOffset,
+          rowEndOffset,
+          colStartOffset,
+          colEndOffset,
+        )
       : undefined
     return {
       ok: true,
@@ -2102,7 +2108,12 @@ function inverseRelativeCoord(
 ): CellCoord | undefined {
   const row = source.rowStart + (coord.row - target.rowStart)
   const col = source.colStart + (coord.col - target.colStart)
-  if (row < source.rowStart || row > source.rowEnd || col < source.colStart || col > source.colEnd) {
+  if (
+    row < source.rowStart ||
+    row > source.rowEnd ||
+    col < source.colStart ||
+    col > source.colEnd
+  ) {
     return undefined
   }
   return { row, col }
@@ -2182,7 +2193,11 @@ function sparseCriteriaPairs(args: ReadonlyArray<Expr>, ctx: EvalContext): Spars
 function countIfsCandidateCoords(
   pairs: ReadonlyArray<SparseCriterionPair>,
   ctx: EvalContext,
-): { readonly ok: true; readonly coords: ReadonlyArray<CellCoord>; readonly implicitCount: number } | {
+): {
+  readonly ok: true;
+  readonly coords: ReadonlyArray<CellCoord>;
+  readonly implicitCount: number
+} | {
   readonly ok: false
   readonly error: Value
 } {
@@ -2278,7 +2293,8 @@ function matchesAllCriteria(
   coord: CellCoord,
   pairs: ReadonlyArray<SparseCriterionPair>,
   ctx: EvalContext,
-): { readonly ok: true; readonly matches: boolean } | { readonly ok: false; readonly error: Value } {
+): { readonly ok: true; readonly matches: boolean }
+  | { readonly ok: false; readonly error: Value } {
   const base = pairs[0].ref.range
   for (const pair of pairs) {
     const cell = valueAtRelativeCoord(base, pair.ref, coord, ctx)
@@ -2453,7 +2469,8 @@ function combinedRuntimeRefSheet(
   start: RuntimeRef,
   end: RuntimeRef,
   ctx: EvalContext,
-): { readonly ok: true; readonly sheetName?: string } | { readonly ok: false; readonly error: Value } {
+): { readonly ok: true; readonly sheetName?: string }
+  | { readonly ok: false; readonly error: Value } {
   const lhs = start.sheetName ?? ctx.currentSheetName
   const rhs = end.sheetName ?? ctx.currentSheetName
   if (lhs !== undefined && rhs !== undefined && lhs !== rhs) {
@@ -2664,7 +2681,9 @@ function resolveR1C1Axis(
   return resolved > max ? undefined : resolved
 }
 
-function readQuotedSheetName(text: string): { readonly name: string; readonly next: number } | undefined {
+function readQuotedSheetName(
+  text: string,
+): { readonly name: string; readonly next: number } | undefined {
   let i = 1
   let name = ''
   while (i < text.length) {
@@ -3342,7 +3361,11 @@ function evaluateArrayIfError(
   return arrayResult(out, 'IFERROR result')
 }
 
-function evaluateArrayChoose(indexValue: Value, args: ReadonlyArray<Expr>, ctx: EvalContext): Value {
+function evaluateArrayChoose(
+  indexValue: Value,
+  args: ReadonlyArray<Expr>,
+  ctx: EvalContext,
+): Value {
   const indexGrid = valueToGrid(indexValue)
   if (indexGrid.error) return indexGrid.error
   const rows = indexGrid.grid.rows
@@ -3804,7 +3827,10 @@ function resolveXLookupResultAsLambda(
   }
 }
 
-function resolveLetResultAsLambda(args: ReadonlyArray<Expr>, ctx: EvalContext): LambdaResolveResult {
+function resolveLetResultAsLambda(
+  args: ReadonlyArray<Expr>,
+  ctx: EvalContext,
+): LambdaResolveResult {
   if (args.length < 3 || args.length % 2 === 0) {
     return { error: ERR('#VALUE!', 'LET expects name/value pairs plus a result expression') }
   }
@@ -3919,7 +3945,11 @@ function bindLambdaSelf(name: string, lambda: LambdaBinding): LambdaBinding {
   return recursive
 }
 
-function applyLambda(lambda: LambdaBinding, args: ReadonlyArray<LambdaArgument>, ctx: EvalContext): Value {
+function applyLambda(
+  lambda: LambdaBinding,
+  args: ReadonlyArray<LambdaArgument>,
+  ctx: EvalContext,
+): Value {
   const prepared = prepareLambdaContext(lambda, args, ctx)
   if (!prepared.ok) return prepared.error
   prepared.depth.count += 1

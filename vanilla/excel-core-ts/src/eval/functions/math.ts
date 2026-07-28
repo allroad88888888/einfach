@@ -1523,7 +1523,9 @@ function runSubtotalFunction(
       if (fnNum === 19 && (k < 1 || k > 3)) return ERR('#VALUE!')
       const sorted = nums.slice().sort((a, b) => a - b)
       const fraction = k / 4
-      return fnNum === 17 ? percentileInclusive(sorted, fraction) : percentileExclusive(sorted, fraction)
+      return fnNum === 17
+        ? percentileInclusive(sorted, fraction)
+        : percentileExclusive(sorted, fraction)
     }
     default:
       return ERR('#VALUE!')

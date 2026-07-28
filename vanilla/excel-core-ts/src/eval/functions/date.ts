@@ -701,7 +701,9 @@ function mondayIndexedDow(serial: number): number {
   return (weekdaySun0Mon1(serial) + 6) % 7
 }
 
-function parseWeekendArg(value: Value): { ok: true; mask: WeekendMask } | { ok: false; error: Value } {
+function parseWeekendArg(
+  value: Value,
+): { ok: true; mask: WeekendMask } | { ok: false; error: Value } {
   if (value.kind === 'string') {
     const chars = [...value.value]
     if (chars.length !== 7) return { ok: false, error: { kind: 'error', code: '#VALUE!' } }
@@ -751,7 +753,9 @@ function parseWeekendArg(value: Value): { ok: true; mask: WeekendMask } | { ok: 
   return { ok: false, error: { kind: 'error', code: '#VALUE!' } }
 }
 
-function collectHolidaySerials(value: Value | undefined): { ok: true; holidays: Set<number> } | { ok: false; error: Value } {
+function collectHolidaySerials(
+  value: Value | undefined,
+): { ok: true; holidays: Set<number> } | { ok: false; error: Value } {
   const holidays = new Set<number>()
   if (!value) return { ok: true, holidays }
   if (value.kind === 'error') return { ok: false, error: value }
@@ -768,7 +772,12 @@ function collectHolidaySerials(value: Value | undefined): { ok: true; holidays: 
   return { ok: true, holidays }
 }
 
-function countWorkdays(start: number, end: number, weekend: WeekendMask, holidays: Set<number>): number {
+function countWorkdays(
+  start: number,
+  end: number,
+  weekend: WeekendMask,
+  holidays: Set<number>,
+): number {
   const lo = Math.min(start, end)
   const hi = Math.max(start, end)
   const sign = start <= end ? 1 : -1
@@ -781,7 +790,12 @@ function countWorkdays(start: number, end: number, weekend: WeekendMask, holiday
   return sign * count
 }
 
-function advanceWorkdays(start: number, days: number, weekend: WeekendMask, holidays: Set<number>): number {
+function advanceWorkdays(
+  start: number,
+  days: number,
+  weekend: WeekendMask,
+  holidays: Set<number>,
+): number {
   if (days === 0) return start
   const step = days > 0 ? 1 : -1
   let serial = start
@@ -905,7 +919,9 @@ function days360(start: number, end: number, european: boolean, applyFebEom = fa
     if (d1 === 31) d1 = 30
     if (d1 === 30 && d2 === 31) d2 = 30
   }
-  return (endParts.year - startParts.year) * 360 + (endParts.month - startParts.month) * 30 + (d2 - d1)
+  return (endParts.year - startParts.year) * 360 +
+    (endParts.month - startParts.month) * 30 +
+    (d2 - d1)
 }
 
 function isLastDayOfFeb(parts: { year: number; month: number; day: number }): boolean {

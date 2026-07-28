@@ -282,7 +282,14 @@ export const NPER: FunctionImpl = (args) => {
  * Residual of the annuity identity, with `rate` as the unknown.
  * `f(rate) = 0` at the correct rate.
  */
-function rateResidual(rate: number, nper: number, pmt: number, pv: number, fv: number, type: number): number {
+function rateResidual(
+  rate: number,
+  nper: number,
+  pmt: number,
+  pv: number,
+  fv: number,
+  type: number,
+): number {
   if (rate === 0) {
     return pv + pmt * nper + fv
   }
@@ -304,7 +311,14 @@ function rateResidual(rate: number, nper: number, pmt: number, pv: number, fv: n
  * TODO(F1): if convergence becomes a performance concern, swap in the
  * analytical derivative — it's about 2× faster per step.
  */
-function rateDerivative(rate: number, nper: number, pmt: number, pv: number, fv: number, type: number): number {
+function rateDerivative(
+  rate: number,
+  nper: number,
+  pmt: number,
+  pv: number,
+  fv: number,
+  type: number,
+): number {
   const eps = Math.max(1e-8, Math.abs(rate) * 1e-6)
   const left = rateResidual(rate - eps, nper, pmt, pv, fv, type)
   const right = rateResidual(rate + eps, nper, pmt, pv, fv, type)
@@ -532,7 +546,14 @@ export const IRR: FunctionImpl = (args) => {
  * period `per` equals the FV after `per - 1` periods of the original
  * loan (held the payment for `per - 1` periods).
  */
-function interestForPeriod(rate: number, per: number, nper: number, pv: number, fv: number, type: number): number {
+function interestForPeriod(
+  rate: number,
+  per: number,
+  nper: number,
+  pv: number,
+  fv: number,
+  type: number,
+): number {
   const pmt = periodicPayment(rate, nper, pv, fv, type)
   if (type === 1 && per === 1) return 0
   if (rate === 0) return 0
@@ -731,7 +752,13 @@ export const DB: FunctionImpl = (args) => {
   return NUM(lastDep)
 }
 
-function ddbPeriod(cost: number, salvage: number, life: number, period: number, factor: number): number {
+function ddbPeriod(
+  cost: number,
+  salvage: number,
+  life: number,
+  period: number,
+  factor: number,
+): number {
   const rate = factor / life
   let prior = 0
   const pInt = Math.floor(period)
@@ -936,7 +963,10 @@ export const AMORLINC: FunctionImpl = (args) => {
 
   const firstFrac = yearFracBasis(purchased.n, firstPeriod.n, basis.basis)
   const annual = cost.n * rate.n
-  const firstDep = Math.max(Math.min(Math.round(cost.n * rate.n * firstFrac), cost.n - salvage.n), 0)
+  const firstDep = Math.max(
+    Math.min(Math.round(cost.n * rate.n * firstFrac), cost.n - salvage.n),
+    0,
+  )
   if (p === 0) return finiteNumber(firstDep)
 
   let book = cost.n - firstDep

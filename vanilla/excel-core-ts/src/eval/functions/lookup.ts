@@ -932,7 +932,13 @@ export const XMATCH: FunctionImpl = (args, _ctx) => {
 
   const searchMode = pullNumber(args[3], 1)
   if (searchMode === null) return ERR_VALUE
-  if (searchMode !== -2 && searchMode !== -1 && searchMode !== 1 && searchMode !== 2) return ERR_VALUE
+  if (
+    searchMode !== -2 &&
+    searchMode !== -1 &&
+    searchMode !== 1 &&
+    searchMode !== 2
+  )
+    return ERR_VALUE
   if (matchMode === 2 && (searchMode === 2 || searchMode === -2)) return ERR_VALUE
 
   const grid = asArray(args[1])

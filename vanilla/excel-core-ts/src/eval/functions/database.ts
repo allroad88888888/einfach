@@ -307,7 +307,10 @@ function scalarEquals(left: Value, right: Value): boolean {
   return false
 }
 
-function matchingRows(database: DatabaseRange, criteria: Matrix): ValueResult<ReadonlyArray<number>> {
+function matchingRows(
+  database: DatabaseRange,
+  criteria: Matrix,
+): ValueResult<ReadonlyArray<number>> {
   if (criteria.length < 2) return { ok: true, value: [] }
 
   const columns = resolveCriteriaColumns(database, criteria)
@@ -394,7 +397,8 @@ function numericAggregate(
 const DSUM: FunctionImpl = (args, _ctx) =>
   numericAggregate(args, (numbers) => NUM(numbers.reduce((sum, value) => sum + value, 0)))
 
-const DCOUNT: FunctionImpl = (args, _ctx) => numericAggregate(args, (numbers) => NUM(numbers.length))
+const DCOUNT: FunctionImpl = (args, _ctx) =>
+  numericAggregate(args, (numbers) => NUM(numbers.length))
 
 const DCOUNTA: FunctionImpl = (args, _ctx) => {
   const values = collectMatchedFieldValues(args)

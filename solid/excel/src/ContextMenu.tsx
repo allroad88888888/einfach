@@ -119,7 +119,8 @@ export function ContextMenu(props: ContextMenuProps) {
       e.preventDefault()
       const cur = highlight()
       const curPos = focusable.indexOf(cur)
-      const nextPos = curPos < 0 ? focusable.length - 1 : (curPos - 1 + focusable.length) % focusable.length
+      const nextPos =
+        curPos < 0 ? focusable.length - 1 : (curPos - 1 + focusable.length) % focusable.length
       setHighlight(focusable[nextPos])
     } else if (e.key === 'Enter') {
       const cur = highlight()

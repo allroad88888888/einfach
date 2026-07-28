@@ -281,7 +281,14 @@ export function DemoMillion() {
               )}
             </Show>
           </div>
-          <Table store={workbook().activeStore()} rows={ROWS} cols={COLS} virtualize formulaBar toolbar />
+          <Table
+            store={workbook().activeStore()}
+            rows={ROWS}
+            cols={COLS}
+            virtualize
+            formulaBar
+            toolbar
+          />
         </div>
       )}
     </Show>

@@ -440,7 +440,9 @@ function booleanArg(value: Value): BooleanArg {
  * ignore non-numeric; scalars coerce). Returns numbers as a flat array,
  * or the first error encountered.
  */
-function collectNumbers(args: ReadonlyArray<Value>): { ok: true; values: number[] } | { ok: false; err: Value } {
+function collectNumbers(
+  args: ReadonlyArray<Value>,
+): { ok: true; values: number[] } | { ok: false; err: Value } {
   const out: number[] = []
   for (const arg of args) {
     if (arg.kind === 'error') return { ok: false, err: arg }
@@ -1046,7 +1048,9 @@ const AVEDEV: FunctionImpl = (args) => {
   if (!r.ok) return r.err
   if (r.values.length === 0) return ERR_VAL('#DIV/0!')
   const mean = meanOf(r.values)
-  return finiteNumber(r.values.reduce((sum, value) => sum + Math.abs(value - mean), 0) / r.values.length)
+  return finiteNumber(
+    r.values.reduce((sum, value) => sum + Math.abs(value - mean), 0) / r.values.length,
+  )
 }
 
 /** DEVSQ — sum of squared deviations from the mean. */
@@ -1062,14 +1066,18 @@ const MAXA: FunctionImpl = (args) => {
   const r = collectNumbersA(args)
   if (!r.ok) return r.err
   if (r.values.length === 0) return NUM(0)
-  return finiteNumber(r.values.reduce((best, value) => Math.max(best, value), Number.NEGATIVE_INFINITY))
+  return finiteNumber(
+    r.values.reduce((best, value) => Math.max(best, value), Number.NEGATIVE_INFINITY),
+  )
 }
 
 const MINA: FunctionImpl = (args) => {
   const r = collectNumbersA(args)
   if (!r.ok) return r.err
   if (r.values.length === 0) return NUM(0)
-  return finiteNumber(r.values.reduce((best, value) => Math.min(best, value), Number.POSITIVE_INFINITY))
+  return finiteNumber(
+    r.values.reduce((best, value) => Math.min(best, value), Number.POSITIVE_INFINITY),
+  )
 }
 
 function varianceA(args: ReadonlyArray<Value>, sample: boolean, sqrt: boolean): Value {
@@ -1279,9 +1287,15 @@ function percentRank(args: Value[], exclusive: boolean): Value {
     else break
   }
   const exact = sorted[lowerIndex] === x.value
-  const fraction = exact ? 0 : (x.value - sorted[lowerIndex]) / (sorted[lowerIndex + 1] - sorted[lowerIndex])
+  const fraction = exact
+    ? 0
+    : (x.value - sorted[lowerIndex]) / (sorted[lowerIndex + 1] - sorted[lowerIndex])
   const position = lowerIndex + fraction
-  const rank = exclusive ? (position + 1) / (sorted.length + 1) : sorted.length === 1 ? 1 : position / last
+  const rank = exclusive
+    ? (position + 1) / (sorted.length + 1)
+    : sorted.length === 1
+      ? 1
+      : position / last
   return finiteNumber(truncateDigits(rank, significance))
 }
 
@@ -1727,7 +1741,9 @@ const EXPON_DIST: FunctionImpl = (args) => {
   if (!cumulative.ok) return cumulative.err
   if (x.value < 0 || lambda.value <= 0) return ERR_VAL('#NUM!')
   return finiteNumber(
-    cumulative.value ? -Math.expm1(-lambda.value * x.value) : lambda.value * Math.exp(-lambda.value * x.value),
+    cumulative.value
+      ? -Math.expm1(-lambda.value * x.value)
+      : lambda.value * Math.exp(-lambda.value * x.value),
   )
 }
 
@@ -2113,10 +2129,18 @@ const BETA_INV: FunctionImpl = (args) => {
   if (!lower.ok) return lower.err
   const upper = args.length === 5 ? numberArg(args[4]) : { ok: true, value: 1 } as const
   if (!upper.ok) return upper.err
-  if (p.value < 0 || p.value > 1 || alpha.value <= 0 || beta.value <= 0 || upper.value <= lower.value) {
+  if (
+    p.value < 0 ||
+    p.value > 1 ||
+    alpha.value <= 0 ||
+    beta.value <= 0 ||
+    upper.value <= lower.value
+  ) {
     return ERR_VAL('#NUM!')
   }
-  return finiteNumber(lower.value + betaInvUnit(p.value, alpha.value, beta.value) * (upper.value - lower.value))
+  return finiteNumber(
+    lower.value + betaInvUnit(p.value, alpha.value, beta.value) * (upper.value - lower.value),
+  )
 }
 
 const GAMMA_DIST: FunctionImpl = (args) => {
@@ -2185,7 +2209,14 @@ const BINOM_INV: FunctionImpl = (args) => {
   const alpha = numberArg(args[2])
   if (!alpha.ok) return alpha.err
   const n = integerValue(trials.value)
-  if (n === undefined || n < 0 || p.value <= 0 || p.value >= 1 || alpha.value <= 0 || alpha.value >= 1) {
+  if (
+    n === undefined ||
+    n < 0 ||
+    p.value <= 0 ||
+    p.value >= 1 ||
+    alpha.value <= 0 ||
+    alpha.value >= 1
+  ) {
     return ERR_VAL('#NUM!')
   }
   for (let k = 0; k <= n; k++) {
@@ -2223,7 +2254,9 @@ const CHISQ_DIST: FunctionImpl = (args) => {
   const cumulative = booleanArg(args[2])
   if (!cumulative.ok) return cumulative.err
   if (x.value < 0 || df.value <= 0) return ERR_VAL('#NUM!')
-  return probability(cumulative.value ? chiSquareCdf(x.value, df.value) : chiSquarePdf(x.value, df.value))
+  return probability(
+    cumulative.value ? chiSquareCdf(x.value, df.value) : chiSquarePdf(x.value, df.value),
+  )
 }
 
 const CHISQ_DIST_RT: FunctionImpl = (args) => {
@@ -2267,7 +2300,9 @@ const F_DIST: FunctionImpl = (args) => {
   const cumulative = booleanArg(args[3])
   if (!cumulative.ok) return cumulative.err
   if (x.value < 0 || df1.value <= 0 || df2.value <= 0) return ERR_VAL('#NUM!')
-  return probability(cumulative.value ? fCdf(x.value, df1.value, df2.value) : fPdf(x.value, df1.value, df2.value))
+  return probability(
+    cumulative.value ? fCdf(x.value, df1.value, df2.value) : fPdf(x.value, df1.value, df2.value),
+  )
 }
 
 const F_DIST_RT: FunctionImpl = (args) => {
@@ -2349,7 +2384,9 @@ const T_DIST: FunctionImpl = (args) => {
   const cumulative = booleanArg(args[2])
   if (!cumulative.ok) return cumulative.err
   if (df.value <= 0) return ERR_VAL('#NUM!')
-  return probability(cumulative.value ? studentTCdf(x.value, df.value) : studentTPdf(x.value, df.value))
+  return probability(
+    cumulative.value ? studentTCdf(x.value, df.value) : studentTPdf(x.value, df.value),
+  )
 }
 
 const T_DIST_RT: FunctionImpl = (args) => {
@@ -2503,7 +2540,8 @@ const CHISQ_TEST: FunctionImpl = (args) => {
     }
   }
   if (pairs < 2) return ERR_VAL('#DIV/0!')
-  const df = actual.rows === 1 || actual.cols === 1 ? pairs - 1 : (actual.rows - 1) * (actual.cols - 1)
+  const df =
+    actual.rows === 1 || actual.cols === 1 ? pairs - 1 : (actual.rows - 1) * (actual.cols - 1)
   if (df <= 0) return ERR_VAL('#DIV/0!')
   return probability(regularizedGammaQ(df / 2, chi2 / 2))
 }
@@ -2529,7 +2567,13 @@ const T_TEST: FunctionImpl = (args) => {
   if (!typeRaw.ok) return typeRaw.err
   const tails = integerValue(tailsRaw.value)
   const testType = integerValue(typeRaw.value)
-  if (tails === undefined || testType === undefined || (tails !== 1 && tails !== 2) || testType < 1 || testType > 3) {
+  if (
+    tails === undefined ||
+    testType === undefined ||
+    (tails !== 1 && tails !== 2) ||
+    testType < 1 ||
+    testType > 3
+  ) {
     return ERR_VAL('#NUM!')
   }
 
@@ -2646,7 +2690,9 @@ function transposeMatrix(matrix: ReadonlyArray<ReadonlyArray<number>>): number[]
   return out
 }
 
-function extractKnownY(value: Value): { ok: true; values: number[]; vertical: boolean } | MatrixErrorResult {
+function extractKnownY(
+  value: Value,
+): { ok: true; values: number[]; vertical: boolean } | MatrixErrorResult {
   const matrix = matrixArg(value)
   if (!matrix.ok) return matrix
   const rows = matrix.rows.length
@@ -2792,7 +2838,9 @@ function linregCore(
     const variance = inverse[index][index] * mse
     return variance > 0 ? Math.sqrt(variance) : 0
   })
-  const seIntercept = withIntercept && df > 0 ? Math.sqrt(Math.max(inverse[pEff - 1][pEff - 1] * mse, 0)) : 0
+  const seIntercept = withIntercept && df > 0
+    ? Math.sqrt(Math.max(inverse[pEff - 1][pEff - 1] * mse, 0))
+    : 0
   return {
     ok: true,
     fit: {
@@ -2830,13 +2878,18 @@ function linestArray(fit: LinRegFit, stats: boolean, expCoefs: boolean): Value {
   rows.push([NUM(r2), NUM(seY), ...Array.from({ length: Math.max(0, cols - 2) }, () => ERR_VAL('#N/A'))])
 
   const ssReg = Math.max(fit.ssTot - fit.ssRes, 0)
-  const fStat = fit.kVars > 0 && fit.df > 0 && fit.ssRes > 0 ? (ssReg / fit.kVars) / (fit.ssRes / fit.df) : 0
+  const fStat = fit.kVars > 0 && fit.df > 0 && fit.ssRes > 0
+    ? (ssReg / fit.kVars) / (fit.ssRes / fit.df)
+    : 0
   rows.push([NUM(fStat), NUM(fit.df), ...Array.from({ length: Math.max(0, cols - 2) }, () => ERR_VAL('#N/A'))])
   rows.push([NUM(ssReg), NUM(fit.ssRes), ...Array.from({ length: Math.max(0, cols - 2) }, () => ERR_VAL('#N/A'))])
   return { kind: 'array', value: rows }
 }
 
-function linestFlags(args: Value[], offset: number): { ok: true; withIntercept: boolean; stats: boolean } | MatrixErrorResult {
+function linestFlags(
+  args: Value[],
+  offset: number,
+): { ok: true; withIntercept: boolean; stats: boolean } | MatrixErrorResult {
   let withIntercept = true
   let stats = false
   if (args.length > offset) {
@@ -2906,7 +2959,8 @@ function trendGrowth(args: Value[], logY: boolean): Value {
     } else if (rows === k) {
       newXs = transposeMatrix(matrix.rows)
     } else if (k === 1 && (rows === 1 || cols === 1)) {
-      newXs = rows === 1 ? matrix.rows[0].map((value) => [value]) : matrix.rows.map((row) => [row[0]])
+      newXs =
+        rows === 1 ? matrix.rows[0].map((value) => [value]) : matrix.rows.map((row) => [row[0]])
     } else {
       return ERR_VAL('#N/A')
     }
