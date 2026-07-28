@@ -1,5 +1,6 @@
 import {
   activateSheetTabAtom,
+  activeCellFormatAtom,
   CLIPBOARD_ORIGIN_MARKER_PREFIX,
   beginProjectionAtom,
   cancelPointerAtom,
@@ -2527,6 +2528,7 @@ export function SpreadsheetGrid(props: SpreadsheetGridProps) {
         store.setter(openFormatCellsAtom, {
           sheetId,
           range: snapshot.range,
+          initialFormat: store.getter(activeCellFormatAtom),
         })
       }
       return

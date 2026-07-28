@@ -70,6 +70,7 @@ import {
   type RangeProjectionResult,
   type RemoveDuplicatesControllerPort,
   type SetFilterSortRequest,
+  type SetFormatRangeRequest,
   type SetSheetProtectionRequest,
   type SetTableTotalsRowRequest,
   type TableMutationResult,
@@ -82,6 +83,7 @@ import {
 } from '@einfach/spreadsheet-ui-core'
 import { SpreadsheetUiProvider } from '../src-vnext/provider'
 import { SpreadsheetMenuBar } from '../src-vnext/menu-bar'
+import { SpreadsheetFormatCellsDialog } from '../src-vnext/format-cells'
 import { createWorkerWorkbookSpreadsheetBackend } from '../src-vnext/adapter'
 import type { WorkerLike } from '../src-vnext/adapter'
 import { installWorkerRuntimeTs, type WorkerContext } from '../src-vnext/adapter/worker-runtime-ts'
@@ -1286,6 +1288,82 @@ describe('SpreadsheetMenuBar', () => {
     fireEvent.click(container.querySelector('[data-testid="menu-bar-button-format"]')!)
     fireEvent.click(container.querySelector('[data-testid="menu-bar-item-format.validation"]')!)
     expect(store.getter(validationRuleEditorAtom).status).toBe('editing')
+  })
+
+  // Regression for the format-wiping defect: the menu bar's "格式 -> 设置单元格
+  // 格式..." entry used to open the dialog with no `initialFormat` seed, so
+  // the category detector fell back to 'general' and a no-op save silently
+  // overwrote the selection's real number format.
+  it('regression: Format > Cells seeds the dialog with the active cell format and preserves it on an unedited save', async () => {
+    const store = createStore()
+    const setFormatRangeRequests: SetFormatRangeRequest[] = []
+    const backend = {
+      ...createBaseBackend(),
+      async setFormatRange(request: SetFormatRangeRequest) {
+        setFormatRangeRequests.push(request)
+        return {
+          sheetId: request.sheetId,
+          requestId: request.requestId,
+          revision: 2,
+          affectedRange: request.range,
+        }
+      },
+    }
+    setupSelection(store)
+    const window = { rowStart: 0, rowEnd: 9, colStart: 0, colEnd: 9 }
+    seedReadyVisibleProjection(store, {
+      status: 'ready',
+      request: { kind: 'visible-window', sheetId: 'sheet-1', window, requestId: 1 },
+      result: {
+        kind: 'visible-window',
+        sheetId: 'sheet-1',
+        window,
+        requestId: 1,
+        cells: [
+          {
+            row: 0,
+            col: 0,
+            displayValue: '120.000',
+            valueKind: 'number',
+            numericValue: 120,
+            format: { numberFormat: { kind: 'decimal', digits: 3 } },
+          },
+        ],
+      },
+    })
+
+    const { container } = render(() => (
+      <SpreadsheetUiProvider backend={backend} store={store}>
+        <SpreadsheetMenuBar />
+        <SpreadsheetFormatCellsDialog />
+      </SpreadsheetUiProvider>
+    ))
+
+    await activateFormatMenuItem(container, 'format.cells')
+
+    // The dialog's category radio must reflect the cell's real category
+    // ('decimal' -> 'number'), never fall back to 'general'.
+    await waitFor(() => {
+      expect(
+        (
+          document.body.querySelector(
+            '[data-testid="format-cells-category-number"]',
+          ) as HTMLInputElement | null
+        )?.checked,
+      ).toBe(true)
+    })
+    expect(
+      (
+        document.body.querySelector(
+          '[data-testid="format-cells-category-general"]',
+        ) as HTMLInputElement | null
+      )?.checked,
+    ).toBe(false)
+
+    fireEvent.click(document.body.querySelector('[data-testid="format-cells-save"]')!)
+
+    await waitFor(() => expect(setFormatRangeRequests).toHaveLength(1))
+    expect(setFormatRangeRequests[0].format?.numberFormat).toEqual({ kind: 'decimal', digits: 3 })
   })
 
   it('Format > Hide Row commits the local canonical state and mirrors the delta', async () => {

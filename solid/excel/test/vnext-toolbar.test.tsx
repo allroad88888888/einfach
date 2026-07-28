@@ -28,7 +28,7 @@ import {
   setSheetProtectionAtom,
 } from '@einfach/spreadsheet-ui-core'
 import { setLocale } from '../src/i18n'
-import { numberFormatDialogAtom } from '../src-vnext/format-cells'
+import { SpreadsheetFormatCellsDialog, numberFormatDialogAtom } from '../src-vnext/format-cells'
 import { SpreadsheetUiProvider, spreadsheetProjectionSnapshotAtom } from '../src-vnext/provider'
 import { SpreadsheetToolbar } from '../src-vnext/toolbar'
 
@@ -882,6 +882,110 @@ describe('vNext SpreadsheetToolbar', () => {
     // The lightweight per-kind dialog must NOT open along the new path.
     const lightweight = store.getter(numberFormatDialogAtom)
     expect(lightweight.status).toBe('closed')
+  })
+
+  // Regression for the format-wiping defect: opening Format Cells with no
+  // edits and saving must not erase the active cell's existing number
+  // format. The toolbar entry point already passed `initialFormat` before
+  // this fix (unlike the menu bar and grid Ctrl+1 entry points), so this
+  // test locks in the toolbar's correct behavior against the shared
+  // `activeCellFormatAtom` selector introduced to fix the other two.
+  it('regression: Custom number-format row preserves the active cell format on an unedited save', async () => {
+    const store = createStore()
+    const setFormatRangeCalls: SetFormatRangeRequest[] = []
+    const backend: SpreadsheetBackend = {
+      async readVisibleProjection(request) {
+        return {
+          kind: 'visible-window',
+          sheetId: request.sheetId,
+          requestId: request.requestId,
+          window: { ...request.window },
+          cells: [
+            {
+              row: 0,
+              col: 0,
+              displayValue: '120.000',
+              valueKind: 'number',
+              numericValue: 120,
+              format: { numberFormat: { kind: 'decimal', digits: 3 } },
+            },
+          ],
+        }
+      },
+      async readRangeProjection() {
+        throw new Error('not used')
+      },
+      async setCellInput() {
+        throw new Error('not used')
+      },
+      async setFormatRange(request) {
+        setFormatRangeCalls.push(request)
+        return {
+          kind: request.kind,
+          sheetId: request.sheetId,
+          requestId: request.requestId,
+          revision: 2,
+          affectedRange: { ...request.range },
+        }
+      },
+    }
+
+    store.setter(setWorkspaceActiveSheetAtom, { sheetId: 'sheet-1' })
+    store.setter(selectCellAtom, { sheetId: 'sheet-1', coord: { row: 0, col: 0 } })
+    seedVisibleProjection(store, {
+      kind: 'visible-window',
+      sheetId: 'sheet-1',
+      requestId: 1,
+      window: { rowStart: 0, rowEnd: 9, colStart: 0, colEnd: 9 },
+      cells: [
+        {
+          row: 0,
+          col: 0,
+          displayValue: '120.000',
+          valueKind: 'number',
+          numericValue: 120,
+          format: { numberFormat: { kind: 'decimal', digits: 3 } },
+        },
+      ],
+    })
+
+    const { container } = render(() => (
+      <SpreadsheetUiProvider backend={backend} store={store}>
+        <SpreadsheetToolbar />
+        <SpreadsheetFormatCellsDialog />
+      </SpreadsheetUiProvider>
+    ))
+
+    fireEvent.click(getButtons(container).numberFormat)
+    const custom = document.body.querySelector(
+      '[data-testid="number-format-item-Custom"]',
+    ) as HTMLButtonElement | null
+    expect(custom).not.toBeNull()
+    fireEvent.click(custom!)
+
+    // The dialog's category radio must reflect the cell's real category
+    // ('decimal' -> 'number'), not fall back to 'general'.
+    await waitFor(() => {
+      expect(
+        (
+          document.body.querySelector(
+            '[data-testid="format-cells-category-number"]',
+          ) as HTMLInputElement | null
+        )?.checked,
+      ).toBe(true)
+    })
+    expect(
+      (
+        document.body.querySelector(
+          '[data-testid="format-cells-category-general"]',
+        ) as HTMLInputElement | null
+      )?.checked,
+    ).toBe(false)
+
+    fireEvent.click(document.body.querySelector('[data-testid="format-cells-save"]')!)
+
+    await waitFor(() => expect(setFormatRangeCalls).toHaveLength(1))
+    expect(setFormatRangeCalls[0].format?.numberFormat).toEqual({ kind: 'decimal', digits: 3 })
   })
 
   it('calls backend merge and unmerge ports for the current selection range', async () => {

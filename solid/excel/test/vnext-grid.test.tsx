@@ -61,6 +61,7 @@ import {
 } from '../src-vnext/adapter'
 import { SpreadsheetGrid } from '../src-vnext/grid'
 import { SpreadsheetUiProvider } from '../src-vnext/provider'
+import { SpreadsheetFormatCellsDialog } from '../src-vnext/format-cells'
 
 afterEach(cleanup)
 
@@ -3239,6 +3240,97 @@ describe('vNext SpreadsheetGrid', () => {
     fireEvent.keyDown(container.querySelector('[data-testid="grid"]')!, { key: 'f', ctrlKey: true })
 
     expect(store.getter(findReplaceOpenAtom)).toBe(true)
+  })
+
+  // Regression for the format-wiping defect: Ctrl+1 used to open Format
+  // Cells with no `initialFormat` seed, so the category detector fell back
+  // to 'general' and a no-op save silently overwrote the active cell's real
+  // number format.
+  it('regression: Ctrl+1 seeds Format Cells with the active cell format and preserves it on an unedited save', async () => {
+    const store = createStore()
+    const setFormatRangeRequests: SetFormatRangeRequest[] = []
+    const { backend } = createFakeBackend({
+      cells: (window) => {
+        const cells: DisplayCell[] = []
+        for (let row = window.rowStart; row <= window.rowEnd; row += 1) {
+          for (let col = window.colStart; col <= window.colEnd; col += 1) {
+            if (row === 0 && col === 0) {
+              cells.push({
+                row,
+                col,
+                displayValue: '120.000',
+                valueKind: 'number',
+                numericValue: 120,
+                format: { numberFormat: { kind: 'decimal', digits: 3 } },
+              })
+              continue
+            }
+            cells.push({ row, col, displayValue: `${row},${col}` })
+          }
+        }
+        return cells
+      },
+    })
+    backend.setFormatRange = async (request) => {
+      setFormatRangeRequests.push(request)
+      return { sheetId: request.sheetId, revision: 2, affectedRange: request.range }
+    }
+
+    const viewport = {
+      scrollTop: 0,
+      scrollLeft: 0,
+      viewportHeight: 2,
+      viewportWidth: 2,
+      rowHeight: 1,
+      colWidth: 1,
+      rowCount: 4,
+      colCount: 4,
+      overscanRows: 0,
+      overscanCols: 0,
+    }
+
+    const { container } = render(() => (
+      <SpreadsheetUiProvider backend={backend} store={store}>
+        <SpreadsheetGrid sheetId="sheet-1" viewport={viewport} data-testid="grid" />
+        <SpreadsheetFormatCellsDialog />
+      </SpreadsheetUiProvider>
+    ))
+
+    await waitFor(() => {
+      expect(container.querySelectorAll('td.spreadsheet-grid-cell')).toHaveLength(4)
+    })
+
+    fireEvent.click(
+      container.querySelector('[data-cell-addr="A1"] .spreadsheet-grid-cell-button')!,
+    )
+    fireEvent.keyDown(container.querySelector('[data-testid="grid"]')!, {
+      key: '1',
+      ctrlKey: true,
+    })
+
+    // The dialog's category radio must reflect the cell's real category
+    // ('decimal' -> 'number'), never fall back to 'general'.
+    await waitFor(() => {
+      expect(
+        (
+          document.body.querySelector(
+            '[data-testid="format-cells-category-number"]',
+          ) as HTMLInputElement | null
+        )?.checked,
+      ).toBe(true)
+    })
+    expect(
+      (
+        document.body.querySelector(
+          '[data-testid="format-cells-category-general"]',
+        ) as HTMLInputElement | null
+      )?.checked,
+    ).toBe(false)
+
+    fireEvent.click(document.body.querySelector('[data-testid="format-cells-save"]')!)
+
+    await waitFor(() => expect(setFormatRangeRequests).toHaveLength(1))
+    expect(setFormatRangeRequests[0].format?.numberFormat).toEqual({ kind: 'decimal', digits: 3 })
   })
 
   it('filter chevron renders when column has an active filter rule and opens dropdown on click', async () => {

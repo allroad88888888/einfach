@@ -1,6 +1,7 @@
 import { createStore, type Store } from '@einfach/core'
 import { describe, expect, test } from '@jest/globals'
 import {
+  activeCellFormatAtom,
   beginProjectionAtom,
   issueProjectionRequestIdAtom,
   nextProjectionRequestId,
@@ -9,6 +10,7 @@ import {
   rejectProjectionAtom,
   resetProjectionAtom,
   resolveProjectionAtom,
+  selectCellAtom,
   type RangeProjectionRequest,
   type VisibleProjectionRequest,
 } from '../src'
@@ -605,5 +607,123 @@ describe('projection lifecycle', () => {
       result: { cells: [{ displayValue: 'retried' }] },
       error: undefined,
     })
+  })
+})
+
+// Regression coverage for the format-wiping defect: every "open Format
+// Cells for the active selection" entry point (toolbar, menu bar, grid
+// Ctrl+1) seeds its dialog draft from this atom. An unseeded draft makes
+// the dialog's category detector fall back to 'general', and a no-op save
+// then overwrites the selection's real format.
+describe('activeCellFormatAtom', () => {
+  test('returns the active cell format from a ready visible-window projection', () => {
+    const store = createStore()
+    store.setter(selectCellAtom, { sheetId: 'sheet-1', coord: { row: 1, col: 1 } })
+    const request = beginVisible(store)
+    store.setter(resolveProjectionAtom, {
+      request,
+      result: {
+        kind: 'visible-window',
+        sheetId: 'sheet-1',
+        window: request.window,
+        requestId: request.requestId,
+        cells: [
+          {
+            row: 1,
+            col: 1,
+            displayValue: '120.000',
+            format: { numberFormat: { kind: 'decimal', digits: 3 } },
+          },
+        ],
+      },
+    })
+
+    expect(store.getter(activeCellFormatAtom)).toEqual({
+      numberFormat: { kind: 'decimal', digits: 3 },
+    })
+  })
+
+  test('returns {} before any projection has resolved', () => {
+    const store = createStore()
+    store.setter(selectCellAtom, { sheetId: 'sheet-1', coord: { row: 0, col: 0 } })
+    expect(store.getter(activeCellFormatAtom)).toEqual({})
+  })
+
+  test('returns {} when the ready projection is for a different sheet', () => {
+    const store = createStore()
+    store.setter(selectCellAtom, { sheetId: 'sheet-2', coord: { row: 1, col: 1 } })
+    const request = beginVisible(store)
+    store.setter(resolveProjectionAtom, {
+      request,
+      result: {
+        kind: 'visible-window',
+        sheetId: 'sheet-1',
+        window: request.window,
+        requestId: request.requestId,
+        cells: [{ row: 1, col: 1, displayValue: 'x', format: { bold: true } }],
+      },
+    })
+
+    expect(store.getter(activeCellFormatAtom)).toEqual({})
+  })
+
+  test('returns {} for a range-only projection even when the sheet matches', () => {
+    const store = createStore()
+    store.setter(selectCellAtom, { sheetId: 'sheet-1', coord: { row: 4, col: 6 } })
+    const request = beginRange(store)
+    store.setter(resolveProjectionAtom, {
+      request,
+      result: {
+        kind: 'range',
+        sheetId: 'sheet-1',
+        range: request.range,
+        requestId: request.requestId,
+        cells: [{ row: 4, col: 6, displayValue: 'x', format: { bold: true } }],
+      },
+    })
+
+    expect(store.getter(activeCellFormatAtom)).toEqual({})
+  })
+
+  test('returns {} when the active cell has no format overrides', () => {
+    const store = createStore()
+    store.setter(selectCellAtom, { sheetId: 'sheet-1', coord: { row: 0, col: 0 } })
+    const request = beginVisible(store)
+    store.setter(resolveProjectionAtom, {
+      request,
+      result: {
+        kind: 'visible-window',
+        sheetId: 'sheet-1',
+        window: request.window,
+        requestId: request.requestId,
+        cells: [{ row: 0, col: 0, displayValue: 'plain' }],
+      },
+    })
+
+    expect(store.getter(activeCellFormatAtom)).toEqual({})
+  })
+
+  test('returns a clone: mutating the read does not mutate the projection result', () => {
+    const store = createStore()
+    store.setter(selectCellAtom, { sheetId: 'sheet-1', coord: { row: 0, col: 0 } })
+    const request = beginVisible(store)
+    const format = { numberFormat: { kind: 'decimal' as const, digits: 3 } }
+    store.setter(resolveProjectionAtom, {
+      request,
+      result: {
+        kind: 'visible-window',
+        sheetId: 'sheet-1',
+        window: request.window,
+        requestId: request.requestId,
+        cells: [{ row: 0, col: 0, displayValue: 'x', format }],
+      },
+    })
+
+    const read = store.getter(activeCellFormatAtom)
+    if (read.numberFormat?.kind === 'decimal') {
+      read.numberFormat.digits = 999
+    }
+
+    expect(format.numberFormat.digits).toBe(3)
   })
 })

@@ -1,4 +1,5 @@
 import { atom, type Atom } from '@einfach/core'
+import { cloneFormat } from '../backend'
 import type {
   DisplayCell,
   ProjectionCancelToken,
@@ -7,9 +8,11 @@ import type {
   ProjectionRevision,
   RangeProjectionRequest,
   RangeProjectionResult,
+  SpreadsheetCellFormat,
   VisibleProjectionRequest,
   VisibleProjectionResult,
 } from '../backend'
+import { selectionSnapshotAtom } from '../selection'
 import type { CellRange, SheetRef, SpreadsheetError } from '../shared'
 import type {
   BeginProjectionInput,
@@ -777,3 +780,30 @@ export function createEmptyRangeProjectionResult(
     cells: [],
   }
 }
+
+/**
+ * Derived: the active cell's cell-level format, looked up in the current
+ * visible-window projection result. Returns `{}` when the projection isn't
+ * showing the selected sheet (no result yet, an error, or a range-only
+ * projection) or when the active cell carries no format overrides.
+ *
+ * Every "open Format Cells for the active selection" entry point (toolbar
+ * number-format dropdown, menu bar, grid Ctrl+1) must seed the dialog's
+ * `initialFormat` with this value. Without a seed the dialog's category
+ * detector falls back to `'general'`, and saving with no edits silently
+ * overwrites the selection's real format with `{ kind: 'general' }`.
+ */
+export const activeCellFormatAtom: Atom<SpreadsheetCellFormat> = atom((get) => {
+  const selection = get(selectionSnapshotAtom)
+  const result = get(projectionSnapshotAtom).result
+  if (result?.kind !== 'visible-window' || result.sheetId !== selection.selection.sheetId) {
+    return {}
+  }
+
+  const cell = result.cells.find(
+    (candidate) =>
+      candidate.row === selection.activeCell.row && candidate.col === selection.activeCell.col,
+  )
+  return cell?.format ? cloneFormat(cell.format) : {}
+})
+activeCellFormatAtom.debugLabel = 'spreadsheet.projection.activeCellFormat'

@@ -2,6 +2,7 @@ import { For, Show, createEffect, createMemo, onCleanup, onMount } from 'solid-j
 import { useAtomValue } from '@einfach/solid'
 import { useT } from '../../src/i18n'
 import {
+  activeCellFormatAtom,
   addSheetTabAtom,
   beginProjectionAtom,
   closeFindReplaceAtom,
@@ -486,6 +487,7 @@ export function SpreadsheetMenuBar(props: SpreadsheetMenuBarProps) {
         store.setter(openFormatCellsAtom, {
           sheetId,
           range: snap.range,
+          initialFormat: store.getter(activeCellFormatAtom),
         })
         return
       }
