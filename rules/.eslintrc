@@ -299,7 +299,7 @@
           "error",
           {
             "functions": false,
-            "classes": true,
+            "classes": false,
             "variables": false
           }
         ],

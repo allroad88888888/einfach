@@ -502,9 +502,9 @@ export function createSheetStore(sheet: ISheet) {
     }
   }
 
-  function restoreFormatSnapshot(snapshot: FormatRangeSnapshot): Promise<void> | void {
+  function restoreFormatSnapshot(formatSnapshot: FormatRangeSnapshot): Promise<void> | void {
     if (!sheet.restore_format_snapshot) return
-    return Promise.resolve(sheet.restore_format_snapshot(snapshot)).then(() => {})
+    return Promise.resolve(sheet.restore_format_snapshot(formatSnapshot)).then(() => {})
   }
 
   function currentSelectionRange(): NormalizedCellRange {
