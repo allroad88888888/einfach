@@ -1177,7 +1177,7 @@ function determinant(matrix: number[][]): number {
     }
     if (Math.abs(m[pivot][i]) < 1e-12) return 0
     if (pivot !== i) {
-      ;[m[pivot], m[i]] = [m[i], m[pivot]]
+      [m[pivot], m[i]] = [m[i], m[pivot]]
       det *= -1
     }
     const pv = m[i][i]
@@ -1218,7 +1218,7 @@ export const MINVERSE: FunctionImpl = (args) => {
     }
     if (Math.abs(aug[pivot][c]) < 1e-12) return ERR('#NUM!')
     if (pivot !== c) {
-      ;[aug[pivot], aug[c]] = [aug[c], aug[pivot]]
+      [aug[pivot], aug[c]] = [aug[c], aug[pivot]]
     }
     const pv = aug[c][c]
     for (let j = 0; j < 2 * n; j += 1) aug[c][j] /= pv
@@ -1250,7 +1250,7 @@ export const GCD: FunctionImpl = (args) => {
   if (nums.length === 0) return NUM(0)
   const gcd2 = (a: number, b: number): number => {
     while (b !== 0) {
-      ;[a, b] = [b, a % b]
+      [a, b] = [b, a % b]
     }
     return a
   }
@@ -1276,7 +1276,7 @@ export const LCM: FunctionImpl = (args) => {
   if (nums.some((n) => n === 0)) return NUM(0)
   const gcd2 = (a: number, b: number): number => {
     while (b !== 0) {
-      ;[a, b] = [b, a % b]
+      [a, b] = [b, a % b]
     }
     return a
   }

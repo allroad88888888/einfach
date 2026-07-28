@@ -35,7 +35,7 @@ export function createGetFamilyAtomById<T2, T extends Atom<unknown> = AtomEntity
       return createAtom ? createAtom(tid, params) : atom(defaultState)
     },
     debuggerKey: debuggerKey || 'family',
-    getCacheKey(tid, params) {
+    getCacheKey(tid, _params) {
       return tid
     },
   }) as GetFamilyAtomByIdWithOverride<T2, T>

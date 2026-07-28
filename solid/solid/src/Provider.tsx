@@ -1,8 +1,9 @@
 /** @jsxImportSource solid-js */
-import { getDefaultStore, Store } from '@einfach/core'
+import type { Store } from '@einfach/core';
+import { getDefaultStore } from '@einfach/core'
 import { createContext, mergeProps, useContext } from 'solid-js'
-import { JSX } from 'solid-js/jsx-runtime'
-import { StoreContextValue } from './type'
+import type { JSX } from 'solid-js/jsx-runtime'
+import type { StoreContextValue } from './type'
 
 export const defaultStore = getDefaultStore()
 

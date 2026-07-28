@@ -4181,7 +4181,7 @@ export function createWorkerWorkbookSpreadsheetBackend(
         // A no-op sort (movedRows 0) writes nothing and pushes no undo
         // record — UI-core pushes no history entry for it either, so
         // recording here would skew the host↔worker stack (design §7).
-        shouldRecord: (report) => report.movedRows > 0,
+        shouldRecord: (sortReport) => sortReport.movedRows > 0,
         execute: async () => {
           const result = await client.sortRange(sheet.idx, payload)
           appliedRevision = bumpRevision()
@@ -5340,10 +5340,10 @@ export function createWorkerWorkbookSpreadsheetBackend(
     async registerCustomFormula(
       name: string,
       source: string,
-      options?: { isAsync?: boolean },
+      registration?: { isAsync?: boolean },
     ): Promise<void> {
       await readyPromise
-      await client.registerCustomFormula(name, source, options)
+      await client.registerCustomFormula(name, source, registration)
     },
 
     async unregisterCustomFormula(name: string): Promise<void> {

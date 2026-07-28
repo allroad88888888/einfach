@@ -225,7 +225,10 @@ type WasmWorkbookRuntime = {
    * a wasm-pkg predating the exports and test mocks keep compiling —
    * `assertMethod` guards the call at dispatch time.
    */
-  applyFilter?: (sheetIdx: number, payload: { rules: ColumnFilterRuleWire[] }) => FilterApplyResultWire
+  applyFilter?: (
+    sheetIdx: number,
+    payload: { rules: ColumnFilterRuleWire[] },
+  ) => FilterApplyResultWire
   reapplyFilter?: (sheetIdx: number) => FilterApplyResultWire
   clearFilter?: (sheetIdx: number) => FilterApplyResultWire
   getFilter?: (sheetIdx: number) => SheetFilterStateWire

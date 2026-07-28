@@ -1169,7 +1169,7 @@ async function runStructureOperation(
         'refresh-failed',
         ticket,
         acknowledgement.revision,
-        `Structure operation was acknowledged, ` +
+        'Structure operation was acknowledged, ' +
         `but refresh failed: ${structureOperationErrorMessage(error)}`,
       ),
     )
@@ -1410,7 +1410,7 @@ export const retryStructureOperationRefreshAtom = atom(
           'refresh-failed',
           ticket,
           acknowledgedRevision,
-          `Structure operation was acknowledged, ` +
+          'Structure operation was acknowledged, ' +
         `but refresh failed: ${structureOperationErrorMessage(error)}`,
         ),
       )

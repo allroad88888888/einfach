@@ -1,7 +1,7 @@
 # Structural Undo
 
 How `insertRow` / `deleteRow` / `insertCol` / `deleteCol` are made undoable in
-`sheet-store.ts`. Companion to `vanilla/core/src/utils/createUndoRedo.ts`,
+`sheet-store.ts`. Companion to `vanilla/core/src/utils/createHistory.ts`,
 which is the same idea applied at the atom layer.
 
 ## Background

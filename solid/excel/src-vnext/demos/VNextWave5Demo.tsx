@@ -157,7 +157,7 @@ function VNextWave5Workbook() {
   }
 
   onMount(() => {
-    const activeSheetId =
+    const mountSheetId =
       store.getter(workspaceSessionAtom).activeSheetId ?? sheets[0].id
     if (!store.getter(workspaceSessionAtom).activeSheetId) {
       store.setter(setWorkspaceActiveSheetAtom, { sheetId: sheets[0].id })
@@ -168,7 +168,7 @@ function VNextWave5Workbook() {
     // "untouched" signal we wire the cell selection against.
     if (!store.getter(selectionAtom).sheetId) {
       store.setter(selectCellAtom, {
-        sheetId: activeSheetId,
+        sheetId: mountSheetId,
         coord: { row: 0, col: 0 },
       })
     }

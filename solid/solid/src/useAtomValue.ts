@@ -1,6 +1,6 @@
-import { Atom, AtomState, StatesWithPromise } from '@einfach/core'
+import type { Atom, AtomState, StatesWithPromise } from '@einfach/core'
 import { createSignal, onCleanup } from 'solid-js'
-import { HookOption } from './type'
+import type { HookOption } from './type'
 import { useStore } from './useStore'
 import { useAsyncAtomValue } from './useAsyncAtomValue'
 
@@ -20,7 +20,7 @@ export function useAtomValue<AtomType extends Atom<unknown>>(
 ): () => AtomState<AtomType>
 export function useAtomValue<State>(
   atom: Atom<State>,
-  options: HookOption = {}
+  options: HookOption = {},
 ) {
   const store = useStore(options)
 

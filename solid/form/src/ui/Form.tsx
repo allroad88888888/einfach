@@ -1,8 +1,8 @@
 /** @jsxImportSource solid-js */
 
 import { FormContext } from '../core/context'
-import { JSX } from 'solid-js'
-import { FormInstance } from '../core/type'
+import type { JSX } from 'solid-js'
+import type { FormInstance } from '../core/type'
 
 interface FormProps {
   children: JSX.Element

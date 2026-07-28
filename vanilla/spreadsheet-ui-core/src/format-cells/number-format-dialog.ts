@@ -514,7 +514,7 @@ interface SaveLaunch {
   readonly sensitive: boolean
 }
 
-interface SaveController<State extends SaveOpenState | { readonly status: 'closed' }> {
+interface SaveController {
   readonly runAtom: ReturnType<
     typeof atom<null, [RunFormatCellsSaveInput?], Promise<FormatCellsSaveResult>>
   >
@@ -845,7 +845,7 @@ export function createFormatCellsSaveController<
   dialog: FormatCellsDialogId,
   sourceAtom: AtomEntity<State>,
   formatForOpenState: (state: Extract<State, SaveOpenState>) => SpreadsheetCellFormat,
-): SaveController<State> {
+): SaveController {
   const ledgerSourceAtom = atom<readonly FormatCellsSaveAttempt[]>(Object.freeze([]))
   const requestSequenceAtom = atom(0)
   const launchAtom = atom<SaveLaunch | null>(null)

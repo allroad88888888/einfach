@@ -22,6 +22,17 @@
  * OCT=30 bits, HEX=40 bits.
  */
 
+/*
+ * The erf / Bessel coefficient tables and the CONVERT unit factors below are
+ * transcribed from published references (Cephes / SLATEC / glibc, and the SI
+ * definitions) at their full published precision, which is more digits than a
+ * double can hold exactly. Rounding them to what a double represents would
+ * hide where each number came from and invite transcription errors on the next
+ * edit, so the loss-of-precision rule — whose premise is "this literal is
+ * probably a typo" — does not apply to this file.
+ */
+/* eslint-disable @typescript-eslint/no-loss-of-precision */
+
 import type { FunctionImpl, Value } from '../../types'
 import { propagateError, toNumber, toString } from '../coerce'
 

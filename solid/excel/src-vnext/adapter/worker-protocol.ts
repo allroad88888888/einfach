@@ -735,7 +735,10 @@ export interface WorkerWorkbookClient {
    * `snapshot*`/`restore*` are the whole-workbook undo primitives (REPLACE
    * semantics: an empty payload CLEARS).
    */
-  applyFilter?(sheet: number, rules: readonly ColumnFilterRuleWire[]): Promise<FilterApplyResultWire>
+  applyFilter?(
+    sheet: number,
+    rules: readonly ColumnFilterRuleWire[],
+  ): Promise<FilterApplyResultWire>
   reapplyFilter?(sheet: number): Promise<FilterApplyResultWire>
   clearFilter?(sheet: number): Promise<FilterApplyResultWire>
   getFilter?(sheet: number): Promise<SheetFilterStateWire>

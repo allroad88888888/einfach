@@ -129,7 +129,28 @@ describe('runBoundedOperation', () => {
     const result = await promise
     jest.useRealTimers()
 
-    expect(result).toEqual({ kind: 'timeout' })
+    // The label rides along so the caller can name the stalled transport.
+    expect(result).toEqual({ kind: 'timeout', label: 'test' })
+  })
+
+  test('a payload shaped like the timeout marker is still reported fulfilled', async () => {
+    // The deadline is a private symbol, so a T that mimics the timeout shape
+    // cannot be mistaken for a stall.
+    const decoy = { kind: 'timeout' as const, label: 'not-a-timeout' }
+    const result = await runBoundedOperation(() => Promise.resolve(decoy), 1000, 'test')
+    expect(result).toEqual({ kind: 'fulfilled', value: decoy })
+  })
+
+  test('clears the deadline timer once the operation settles', async () => {
+    jest.useFakeTimers()
+    try {
+      await runBoundedOperation(() => Promise.resolve(1), 10_000, 'test')
+      // A live timer here would keep the process (and a Jest worker) busy for
+      // the rest of timeoutMs after the work is already done.
+      expect(jest.getTimerCount()).toBe(0)
+    } finally {
+      jest.useRealTimers()
+    }
   })
 
   test('non-timeout result wins when both settle simultaneously (sync resolve)', async () => {

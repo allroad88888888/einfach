@@ -114,6 +114,56 @@ for i in 1 2 3; do npm test 2>&1 | grep -E '^Tests:'; done   # 全量默认并�
   （max-len / use-before-define / max-lines-per-function）在
   `rules/.eslintignore` 或 overrides 里显式豁免存量、对新文件生效，分期还债。
 
+### C-later 执行结果（2026-07-28）：目标面归零
+
+`solid/excel/src-vnext` + `vanilla/spreadsheet-ui-core/src` 的 lint 错误
+**168 → 0**；`vanilla/core` / `vanilla/utils` / `react/*` / `solid/solid` /
+`solid/form` 一并归零。全量 `npm test` 5772 passed，`npx tsc -b` EXIT=0。
+
+**关键结论：存量里"真问题"只占约 1/8，其余是规则不适配本仓架构。** 分开处置：
+
+真问题（改代码）：
+- `ack-hardening.ts` 的 `runBoundedOperation` 收了 `debugLabel` 却**从不使用**，
+  文档承诺的"超时可追溯"是空的；同时 `setTimeout` 从不 `clearTimeout`
+  （快路径后仍悬挂 15s，jest 里是 open handle），且靠结构嗅探判定超时
+  （`T` 恰好形如 `{kind:'timeout'}` 即误判）。改为私有 Symbol 哨兵 +
+  `finally` 清理 + 超时结果带 `label`，补 2 条回归；
+- 3 处变量遮蔽、1 个从未使用的泛型参数（`SaveController<State>`）、
+  `createCacheStom` 的泛型参数 `AtomEntity` 遮蔽同名导入类型（改 `TAtom`）；
+- 10 条可折断的超长代码行手工折行；quotes / no-extra-semi / prefer-const /
+  consistent-type-imports / comma-dangle 走定向 `--fix`。
+
+规则不适配（改配置，各带理由）：
+- `no-use-before-define`(46)：**全部**是延迟闭包——command atom 的回调引用下方
+  定义的 backing atom、事件 handler 与其 cleanup 互相引用（`const` 箭头函数下
+  两种顺序都会报，唯一代码解法是全改 `function` 声明，即在拖拽逻辑里 churn 46
+  处、零行为收益）。已核实其余包**零命中**，故仅对 vnext 两包 `variables:false`；
+- `max-lines-per-function`(23)：全是闭包模块工厂（`createWorkerWorkbookSpreadsheetBackend`
+  2814 行、`createStaticSpreadsheetBackend` 1252 行——方法共享捕获状态）与 Solid
+  组件体。规则会在每个主文件报警即噪音，对 vnext 两包关闭（与测试目录既有先例一致）；
+- **核心 `max-len` 已 `off`**：它被 ESLint 官方弃用并迁入 `@stylistic`，仓库两条
+  同时开着导致每处双报且选项漂移（`@stylistic` 版本一直带 `ignoreStrings` /
+  `ignoreComments`，核心版没有——这就是"严格"的那一半从何而来）。统一由
+  `@stylistic/max-len` 管，测试与 vnext 两处冗余覆盖随之删除；
+- `react-hooks/rules-of-hooks` 对 `solid/**` 关闭：`useAtomValue.ts:34` 的"条件调用
+  hook"是 React 规则误判 Solid——Solid 的 `createSignal` 按组件实例化一次而非每次
+  渲染，条件调用合法；
+- `no-unused-vars` 加 `^_` 三类 ignorePattern：代码里 4 处刻意的 `_` 占位参数是
+  既有写法，配置没跟上；`naming-convention` 的 function 选择器加
+  `leadingUnderscore:"allowDouble"`（`__setImportLimitsForTest` 等测试钩子，
+  且 `no-underscore-dangle` 本就已关，意图明确）；
+- `lines-between-class-members` 加 `exceptAfterSingleLine`：`OverlayRenderer`
+  的 14 行单行字段块被要求插 12 个空行，只会更难读；
+- `engineering.ts` 的 `no-loss-of-precision`(38)：Cephes/SLATEC/glibc 的 `erf`
+  系数与 CONVERT 物理常量，按已发布全精度转写是**正确**做法（编译器就近舍入到
+  double 即所需），截断只会掩盖出处并招致抄录错误。文件级豁免 + 理由。
+
+**残余（不在本批次，另行排期）**：`vanilla/excel-core-ts` ~70 条、
+legacy `solid/excel/src` ~9 条，绝大多数是 `@stylistic/max-len`。前者是 Rust
+引擎的 TS 镜像，后者按 CLAUDE.md 仅为 parity 测试保留——两者都不是本批次目标面。
+另注：全仓有 56 个文件偏离 `.prettierrc.mjs`，属仓库级既有漂移，重排应独立立项，
+不要混进功能 commit。
+
 ---
 
 ## 四、H 链（测试 lint 155 条）：**改判——不是"不清"，是"精确豁免"**

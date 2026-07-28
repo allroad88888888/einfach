@@ -1,6 +1,6 @@
-import { Store } from '@einfach/core'
+import type { Store } from '@einfach/core'
 import { defaultStore, useStoreContext } from './Provider'
-import { HookOption } from './type'
+import type { HookOption } from './type'
 
 /**
  * 获取 store 实例的 hook

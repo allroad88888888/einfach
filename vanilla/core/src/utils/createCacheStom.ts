@@ -4,10 +4,10 @@ import { LRUCache } from './LRUCache'
 
 export interface CreateCacheStomOptions<
   Args extends unknown[],
-  AtomEntity extends Atom<unknown> | WritableAtom<unknown, any, any>,
+  TAtom extends Atom<unknown> | WritableAtom<unknown, any, any>,
   CacheKey = string,
 > {
-  createAtom: (...args: Args) => AtomEntity
+  createAtom: (...args: Args) => TAtom
   /**
    * 自定义缓存键生成函数
    * @param args - 传入的参数
@@ -25,13 +25,13 @@ export interface CreateCacheStomOptions<
 
 export function createCacheStom<
   Args extends unknown[],
-  AtomEntity extends Atom<unknown> | WritableAtom<unknown, any, any>,
+  TAtom extends Atom<unknown> | WritableAtom<unknown, any, any>,
   CacheKey = string,
->(options: CreateCacheStomOptions<Args, AtomEntity, CacheKey>): (...args: Args) => AtomEntity {
+>(options: CreateCacheStomOptions<Args, TAtom, CacheKey>): (...args: Args) => TAtom {
   const getCacheKey = (options?.getCacheKey ?? ((...args: Args) => JSON.stringify(args))) as (
     ...args: Args
   ) => CacheKey
-  const cache = new LRUCache<CacheKey, AtomEntity>(options.maxSize)
+  const cache = new LRUCache<CacheKey, TAtom>(options.maxSize)
 
   return (...args: Args) => {
     const cacheKey = getCacheKey(...args)
@@ -43,7 +43,7 @@ export function createCacheStom<
     if (process.env.NODE_ENV === 'development') {
       newAtom.debugLabel = `${options?.debuggerKey}-${JSON.stringify(cacheKey)}`
     }
-    return newAtom as AtomEntity
+    return newAtom as TAtom
   }
 }
 
@@ -79,25 +79,25 @@ export function createCacheStomById<T>(options: {
   debuggerKey: string
   maxSize?: number
 }): (id: string) => AtomEntity<T>
-export function createCacheStomById<AtomEntity extends Atom<unknown>>(options: {
-  createAtom: (id: string) => AtomEntity
+export function createCacheStomById<TAtom extends Atom<unknown>>(options: {
+  createAtom: (id: string) => TAtom
   debuggerKey: string
   maxSize?: number
-}): (id: string) => AtomEntity
-export function createCacheStomById<T, AtomEntity extends Atom<unknown>>({
+}): (id: string) => TAtom
+export function createCacheStomById<T, TAtom extends Atom<unknown>>({
   createAtom,
   defaultState,
   debuggerKey,
   maxSize,
 }: {
-  createAtom?: (id: string) => AtomEntity
+  createAtom?: (id: string) => TAtom
   defaultState?: T
   debuggerKey: string
   maxSize?: number
 }) {
-  const atomCreator = createAtom || ((id: string) => atom(defaultState) as unknown as AtomEntity)
+  const atomCreator = createAtom || ((_id: string) => atom(defaultState) as unknown as TAtom)
 
-  return createCacheStom<[id: string], AtomEntity, string>({
+  return createCacheStom<[id: string], TAtom, string>({
     createAtom: atomCreator,
     getCacheKey: (id: string) => id,
     debuggerKey,

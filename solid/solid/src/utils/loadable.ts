@@ -1,4 +1,5 @@
-import { Atom, atom, AtomAsyncState, StatesWithPromise } from '@einfach/core'
+import type { Atom, AtomAsyncState, StatesWithPromise } from '@einfach/core';
+import { atom } from '@einfach/core'
 import { useAtomValue } from '../useAtomValue'
 
 export type LoadableStatus = 'loading' | 'hasData' | 'hasError'
@@ -93,7 +94,7 @@ export function loadable<AtomType extends Atom<Promise<unknown>>>(asyncAtom: Ato
  * @returns loadable 值
  */
 export function useLoadable<T>(
-  loadableAtom: Atom<LoadableValue<T>>
+  loadableAtom: Atom<LoadableValue<T>>,
 ) {
   const rawValue = useAtomValue(loadableAtom)
   return rawValue as () => LoadableValue<T>

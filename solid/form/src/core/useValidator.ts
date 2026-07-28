@@ -18,7 +18,9 @@ export function useValidator(name: NamePath, { formInstance, rules = [], label }
   const nameStr = namePathToStr(name)
 
   // 创建选择器atom获取消息
-  const message = useEasySelectAtomValue(_messageMappingAtom, nameStr, Object.is, { store: _store }) as () => (Message | undefined)
+  const message = useEasySelectAtomValue(_messageMappingAtom, nameStr, Object.is, {
+    store: _store,
+  }) as () => Message | undefined
 
   // 设置字段选项
   createEffect(() => {

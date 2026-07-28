@@ -122,7 +122,7 @@ export function useForm<Values extends Obj>(props: FormProps<Values>): FormInsta
     const results = await Promise.all(
       nameList.map(async (nameStr) => {
         return validateField(nameStr)
-      })
+      }),
     )
 
     return results.every(Boolean)

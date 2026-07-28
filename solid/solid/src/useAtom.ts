@@ -1,5 +1,5 @@
-import { AtomEntity } from '@einfach/core'
-import { HookOption } from './type'
+import type { AtomEntity } from '@einfach/core'
+import type { HookOption } from './type'
 import { useAtomValue } from './useAtomValue'
 import { useSetAtom } from './useSetAtom'
 
@@ -11,7 +11,7 @@ import { useSetAtom } from './useSetAtom'
  */
 export function useAtom<Value>(
   atom: AtomEntity<Value>,
-  options: HookOption = {}
+  options: HookOption = {},
 ) {
   const rawValue = useAtomValue<Value>(atom, options)
   const setValue = useSetAtom(atom, options)

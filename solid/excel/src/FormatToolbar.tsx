@@ -52,7 +52,7 @@ function numberFormatId(nf: NumberFormatJSON | undefined): string {
   if (nf.kind === 'decimal' || nf.kind === 'number') return `decimal-${nf.digits ?? 2}`
   if (nf.kind === 'percent' || nf.kind === 'percentage') return `percent-${nf.digits ?? 0}`
   if (nf.kind === 'currency') return `currency-${nf.digits ?? 2}`
-  if (nf.kind === 'date') return `date-iso`
+  if (nf.kind === 'date') return 'date-iso'
   return 'general'
 }
 

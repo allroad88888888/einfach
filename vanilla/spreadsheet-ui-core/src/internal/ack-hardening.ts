@@ -107,38 +107,42 @@ function isNotAppliedAck(
 export type BoundedOperationResult<T> =
   | { readonly kind: 'fulfilled'; readonly value: T }
   | { readonly kind: 'rejected'; readonly error: unknown }
-  | { readonly kind: 'timeout' }
+  | { readonly kind: 'timeout'; readonly label: string }
+
+/** Race marker for the deadline branch. Unforgeable by any `T`. */
+const TIMED_OUT = Symbol('ack-hardening.timeout')
 
 /**
  * Run `operation` with a deadline.  If the returned promise settles before
  * `timeoutMs` the outcome is `fulfilled` / `rejected`; otherwise the outcome
- * is `timeout`.
+ * is `timeout` carrying `debugLabel`, so a caller surfacing the timeout can
+ * name the transport that stalled (`"editing-commit"`, `"history-undo"`, …).
  *
- * The caller is responsible for providing a meaningful `debugLabel` so
- * timeout messages are traceable (`"editing-commit"`, `"history-undo"`, …).
+ * The deadline is identified by a private symbol rather than by sniffing the
+ * settled value's shape: a `T` that happens to look like `{ kind: 'timeout' }`
+ * would otherwise be misreported as a stall. The timer is always cleared, so a
+ * fast operation leaves nothing pending for the rest of `timeoutMs`.
  */
 export async function runBoundedOperation<T>(
   operation: () => Promise<T>,
   timeoutMs: number,
   debugLabel: string,
 ): Promise<BoundedOperationResult<T>> {
-  const timeoutPromise = new Promise<BoundedOperationResult<T>>((resolve) => {
-    setTimeout(() => resolve({ kind: 'timeout' }), timeoutMs)
-  })
+  let timer: ReturnType<typeof setTimeout> | undefined
 
   try {
-    const result = await Promise.race([operation(), timeoutPromise])
-    if (
-      result !== null &&
-      typeof result === 'object' &&
-      'kind' in result &&
-      (result as BoundedOperationResult<T>).kind === 'timeout'
-    ) {
-      return result as BoundedOperationResult<T>
-    }
-    return { kind: 'fulfilled', value: result as T }
+    const settled = await Promise.race([
+      operation(),
+      new Promise<typeof TIMED_OUT>((resolve) => {
+        timer = setTimeout(() => resolve(TIMED_OUT), timeoutMs)
+      }),
+    ])
+    if (settled === TIMED_OUT) return { kind: 'timeout', label: debugLabel }
+    return { kind: 'fulfilled', value: settled }
   } catch (error: unknown) {
     return { kind: 'rejected', error }
+  } finally {
+    if (timer !== undefined) clearTimeout(timer)
   }
 }
 

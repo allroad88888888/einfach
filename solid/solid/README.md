@@ -45,7 +45,7 @@ function Counter() {
 
 ### 工具函数
 
-- `createUndoRedo(atom, options?)` - 为 atom 创建撤销/重做功能
+- `createHistory(options?)` - 事务日志式撤销/重做（由 `@einfach/core` 导出）
 - `createSelector(atom, selectorFn)` - 创建一个选择器 atom
 - `useSelector(atom, selectorFn)` - 从 atom 中选择部分状态
 - `loadable(asyncFn)` - 从异步函数创建 loadable atom

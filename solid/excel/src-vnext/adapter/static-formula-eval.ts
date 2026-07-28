@@ -187,7 +187,10 @@ const BARE_LITERALS: Record<string, number> = {
   FALSE: 0,
 }
 
-/** Error literal tokens — 13 Excel error codes aligned with rust/wasm error_token_to_value_error. */
+/**
+ * Error literal tokens — 13 Excel error codes aligned with
+ * `rust/wasm` `error_token_to_value_error`.
+ */
 const ERROR_LITERAL_RE = /^#(NULL!|DIV\/0!|N\/A|REF!|VALUE!|NAME\?|NUM!|CYCLE!|TYPE!|ARGS!|SPILL!|CALC!|BUSY!)/
 
 /**
@@ -402,6 +405,7 @@ function isTruthy(v: Value): boolean {
 
 class Parser {
   private pos = 0
+
   constructor(
     private readonly tokens: Token[],
     private readonly resolve: (row: number, col: number) => Value,
@@ -711,7 +715,7 @@ function applyBooleanReduce(
   resolve: (row: number, col: number) => Value,
   isAnd: boolean,
 ): Value {
-  let result = isAnd
+  const result = isAnd
   let sawAny = false
   for (const arg of args) {
     if (typeof arg === 'object') {

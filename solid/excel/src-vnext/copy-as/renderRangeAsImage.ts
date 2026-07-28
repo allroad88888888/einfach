@@ -210,7 +210,11 @@ function sumMap(values: Iterable<number>): number {
  * render. The fallback path (no size map) is the PoC default grid of
  * uniform 96×24 cells.
  */
-export function buildRangeSvg(input: RenderRangeAsImageInput, width: number, height: number): string {
+export function buildRangeSvg(
+  input: RenderRangeAsImageInput,
+  width: number,
+  height: number,
+): string {
   const colWidths = resolveColumnWidths(input)
   const rowHeights = resolveRowHeights(input)
   const tableHtml = encodeSelectionAsHtml({
@@ -231,12 +235,12 @@ export function buildRangeSvg(input: RenderRangeAsImageInput, width: number, hei
 
   return [
     `<svg xmlns="http://www.w3.org/2000/svg" width="${width}" height="${height}">`,
-    `  <foreignObject width="100%" height="100%">`,
-    `    <div xmlns="http://www.w3.org/1999/xhtml" style="font: 12px system-ui, sans-serif; color: #000; background: #fff;">`,
+    '  <foreignObject width="100%" height="100%">',
+    '    <div xmlns="http://www.w3.org/1999/xhtml" style="font: 12px system-ui, sans-serif; color: #000; background: #fff;">',
     tableHtml,
-    `    </div>`,
-    `  </foreignObject>`,
-    `</svg>`,
+    '    </div>',
+    '  </foreignObject>',
+    '</svg>',
   ].join('\n')
 }
 

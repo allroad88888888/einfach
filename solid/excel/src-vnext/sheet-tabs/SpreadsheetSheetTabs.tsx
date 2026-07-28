@@ -109,7 +109,7 @@ export function SpreadsheetSheetTabs(props: SpreadsheetSheetTabsProps) {
     reorderCleanup?.()
     closeContextMenu('sheet-changed')
     try {
-      ;(event.currentTarget as HTMLElement).setPointerCapture?.(event.pointerId)
+      (event.currentTarget as HTMLElement).setPointerCapture?.(event.pointerId)
     } catch {
       // Synthetic pointer events may not have an active capture session.
     }
@@ -159,7 +159,7 @@ export function SpreadsheetSheetTabs(props: SpreadsheetSheetTabsProps) {
     event.preventDefault()
     event.stopPropagation()
     try {
-      ;(event.currentTarget as HTMLElement).releasePointerCapture?.(event.pointerId)
+      (event.currentTarget as HTMLElement).releasePointerCapture?.(event.pointerId)
     } catch {
       // See the matching setPointerCapture guard.
     }

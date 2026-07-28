@@ -78,23 +78,23 @@ function seed(store: SheetStore) {
 
   const statRow = lastRow + 1
   store.setText(`A${statRow}`, 'Class Avg')
-  store.setFormula(`B${statRow}`, `=AVERAGE(B2,B3,B4,B5,B6,B7,B8,B9)`)
-  store.setFormula(`C${statRow}`, `=AVERAGE(C2,C3,C4,C5,C6,C7,C8,C9)`)
-  store.setFormula(`D${statRow}`, `=AVERAGE(D2,D3,D4,D5,D6,D7,D8,D9)`)
+  store.setFormula(`B${statRow}`, '=AVERAGE(B2,B3,B4,B5,B6,B7,B8,B9)')
+  store.setFormula(`C${statRow}`, '=AVERAGE(C2,C3,C4,C5,C6,C7,C8,C9)')
+  store.setFormula(`D${statRow}`, '=AVERAGE(D2,D3,D4,D5,D6,D7,D8,D9)')
 
   const maxRow = statRow + 1
   store.setText(`A${maxRow}`, 'Highest')
-  store.setFormula(`B${maxRow}`, `=MAX(B2,B3,B4,B5,B6,B7,B8,B9)`)
-  store.setFormula(`C${maxRow}`, `=MAX(C2,C3,C4,C5,C6,C7,C8,C9)`)
-  store.setFormula(`D${maxRow}`, `=MAX(D2,D3,D4,D5,D6,D7,D8,D9)`)
+  store.setFormula(`B${maxRow}`, '=MAX(B2,B3,B4,B5,B6,B7,B8,B9)')
+  store.setFormula(`C${maxRow}`, '=MAX(C2,C3,C4,C5,C6,C7,C8,C9)')
+  store.setFormula(`D${maxRow}`, '=MAX(D2,D3,D4,D5,D6,D7,D8,D9)')
 
   const minRow = maxRow + 1
   store.setText(`A${minRow}`, 'Lowest')
-  store.setFormula(`B${minRow}`, `=MIN(B2,B3,B4,B5,B6,B7,B8,B9)`)
-  store.setFormula(`C${minRow}`, `=MIN(C2,C3,C4,C5,C6,C7,C8,C9)`)
-  store.setFormula(`D${minRow}`, `=MIN(D2,D3,D4,D5,D6,D7,D8,D9)`)
+  store.setFormula(`B${minRow}`, '=MIN(B2,B3,B4,B5,B6,B7,B8,B9)')
+  store.setFormula(`C${minRow}`, '=MIN(C2,C3,C4,C5,C6,C7,C8,C9)')
+  store.setFormula(`D${minRow}`, '=MIN(D2,D3,D4,D5,D6,D7,D8,D9)')
 
   const countRow = minRow + 1
   store.setText(`A${countRow}`, 'Count')
-  store.setFormula(`B${countRow}`, `=COUNT(B2,B3,B4,B5,B6,B7,B8,B9)`)
+  store.setFormula(`B${countRow}`, '=COUNT(B2,B3,B4,B5,B6,B7,B8,B9)')
 }

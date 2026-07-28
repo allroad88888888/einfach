@@ -1,6 +1,6 @@
-import { Atom } from '@einfach/core'
+import type { Atom } from '@einfach/core'
 import { createResource } from 'solid-js'
-import { HookOption } from './type'
+import type { HookOption } from './type'
 import { useStore } from './useStore'
 
 /**
@@ -12,13 +12,13 @@ import { useStore } from './useStore'
  */
 export function useAsyncAtomValue<State>(
     atom: Atom<State>,
-    options: HookOption = {}
+    options: HookOption = {},
 ) {
     const store = useStore(options)
     // 获取atom的当前值
     const fetchAtomValue = async () => {
         const value = store.getter(atom)
-        return await value
+        return value
     }
 
     return createResource(fetchAtomValue)

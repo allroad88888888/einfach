@@ -156,7 +156,7 @@ function reduceArrayBoolean(
   isAnd: boolean,
 ): (Value & { kind: 'error' }) | { kind: 'ok'; sawAny: boolean; result: boolean } {
   let sawAny = false
-  let result = isAnd
+  const result = isAnd
   for (const row of cells) {
     for (const cell of row) {
       if (cell.kind === 'error') return cell

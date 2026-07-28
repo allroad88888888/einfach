@@ -80,7 +80,7 @@
       "error",
       "always",
       {
-        "exceptAfterSingleLine": false
+        "exceptAfterSingleLine": true
       }
     ],
     "@stylistic/no-extra-parens": [
@@ -133,7 +133,8 @@
         "format": [
           "camelCase",
           "PascalCase"
-        ]
+        ],
+        "leadingUnderscore": "allowDouble"
       },
       {
         "selector": "typeLike",
@@ -182,7 +183,10 @@
       {
         "vars": "all",
         "args": "after-used",
-        "ignoreRestSiblings": true
+        "ignoreRestSiblings": true,
+        "argsIgnorePattern": "^_",
+        "varsIgnorePattern": "^_",
+        "caughtErrorsIgnorePattern": "^_"
       }
     ],
     "@typescript-eslint/no-use-before-define": [
@@ -219,12 +223,7 @@
       "error",
       "never"
     ],
-    "max-len": [
-      "error",
-      {
-        "code": 100
-      }
-    ],
+    "max-len": "off",
     "react-hooks/rules-of-hooks": "error",
     "react-hooks/exhaustive-deps": "warn",
     "max-lines-per-function": [
@@ -268,15 +267,7 @@
       ],
       "rules": {
         "max-lines-per-function": "off",
-        "no-console": "off",
-        "max-len": [
-          "error",
-          {
-            "code": 100,
-            "ignoreStrings": true,
-            "ignoreTemplateLiterals": true
-          }
-        ]
+        "no-console": "off"
       }
     },
     {
@@ -285,6 +276,32 @@
       ],
       "rules": {
         "no-console": "off"
+      }
+    },
+    {
+      "files": [
+        "solid/**"
+      ],
+      "rules": {
+        "react-hooks/rules-of-hooks": "off",
+        "react-hooks/exhaustive-deps": "off"
+      }
+    },
+    {
+      "files": [
+        "solid/excel/src-vnext/**",
+        "vanilla/spreadsheet-ui-core/src/**"
+      ],
+      "rules": {
+        "@typescript-eslint/no-use-before-define": [
+          "error",
+          {
+            "functions": false,
+            "classes": true,
+            "variables": false
+          }
+        ],
+        "max-lines-per-function": "off"
       }
     }
   ]

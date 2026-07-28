@@ -1,7 +1,8 @@
 import { selectAtom } from '@einfach/core'
 
 import type { AtomEntity } from '@einfach/core'
-import { HookOption, useAtomValue } from '@einfach/solid'
+import type { HookOption } from '@einfach/solid';
+import { useAtomValue } from '@einfach/solid'
 import { easyGet, easyEqual } from '@einfach/utils'
 import type { NamePath } from '@einfach/utils'
 

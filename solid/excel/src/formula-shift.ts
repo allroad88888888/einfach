@@ -40,7 +40,7 @@ export function shiftFormulaForRowInsert(
   count: number,
 ): string {
   return mapFormulaRefs(formula, (row, col) =>
-    row >= at ? { row: row + count, col } : { row, col }
+    row >= at ? { row: row + count, col } : { row, col },
   )
 }
 
@@ -66,7 +66,7 @@ export function shiftFormulaForColInsert(
   count: number,
 ): string {
   return mapFormulaRefs(formula, (row, col) =>
-    col >= at ? { row, col: col + count } : { row, col }
+    col >= at ? { row, col: col + count } : { row, col },
   )
 }
 

@@ -207,7 +207,9 @@ function newSheetId(idx: number): string {
   return `sheet-${idx + 1}`
 }
 
-function makeWorkbookFor(sheetNames: ReadonlyArray<string>): { wb: Workbook; sheets: SheetEntry[] } {
+function makeWorkbookFor(
+  sheetNames: ReadonlyArray<string>,
+): { wb: Workbook; sheets: SheetEntry[] } {
   const names = sheetNames.length > 0 ? sheetNames : DEFAULT_INITIAL_SHEETS
   const seeds = names.map((name, idx) => ({ id: newSheetId(idx), name }))
   const wb = createWorkbook(seeds)
@@ -453,7 +455,13 @@ function listSheetMeta(state: RuntimeState): WorkbookSheetMeta[] {
   return state.sheets.map((sheet) => ({ idx: sheet.idx, name: sheet.name }))
 }
 
-function applyCellInput(state: RuntimeState, sheet: SheetEntry, row: number, col: number, input: string) {
+function applyCellInput(
+  state: RuntimeState,
+  sheet: SheetEntry,
+  row: number,
+  col: number,
+  input: string,
+) {
   state.workbook.setCell(sheet.id, row, col, input)
 }
 
@@ -592,7 +600,12 @@ function collectCellsInBounds(
     const sep = key.indexOf(':')
     const row = Number(key.slice(0, sep))
     const col = Number(key.slice(sep + 1))
-    if (row < bounds.rowStart || row > bounds.rowEnd || col < bounds.colStart || col > bounds.colEnd) {
+    if (
+      row < bounds.rowStart ||
+      row > bounds.rowEnd ||
+      col < bounds.colStart ||
+      col > bounds.colEnd
+    ) {
       continue
     }
     out.push({ key, row, col, cell })
@@ -1098,7 +1111,9 @@ function wrapCustomResult(result: unknown): Value {
   }
   if (Array.isArray(result)) {
     // 2-D array marshalling.
-    const rows: Value[][] = result.map((row) => (Array.isArray(row) ? row.map(wrapCustomResult) : [wrapCustomResult(row)]))
+    const rows: Value[][] = result.map((row) =>
+      Array.isArray(row) ? row.map(wrapCustomResult) : [wrapCustomResult(row)],
+    )
     return { kind: 'array', value: rows }
   }
   if (typeof result === 'object' && 'error' in (result as Record<string, unknown>)) {
@@ -1331,7 +1346,12 @@ function restorePersistenceSizes(
 
 export interface ExcelCoreTsWorkerRuntime {
   /** Handle one decoded RPC request. Exported for jest tests. */
-  handle(msg: RequestMessage): Promise<{ id: number; ok: true; result: unknown } | { id: number; ok: false; error: RpcErrorWire }>
+  handle(
+    msg: RequestMessage,
+  ): Promise<
+    | { id: number; ok: true; result: unknown }
+    | { id: number; ok: false; error: RpcErrorWire }
+  >
   /** Resets to a fresh empty workbook (mostly for tests). */
   reset(): void
   /** Current state, for tests that need to introspect. */
@@ -1811,7 +1831,11 @@ export function createWorkerRuntimeTs(events?: WorkerRuntimeTsEvents): ExcelCore
           })
           importCells(state, importable)
           restorePersistenceSizes(state, snapshot)
-          return { restored_cells: importable.length, restored_formats: 0, sheets: state.sheets.length }
+          return {
+            restored_cells: importable.length,
+            restored_formats: 0,
+            sheets: state.sheets.length,
+          }
         }
       case 'subscribeCells':
         // No fine-grained sub propagation in Phase 4 — just acknowledge.

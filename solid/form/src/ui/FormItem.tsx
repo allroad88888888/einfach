@@ -1,5 +1,6 @@
 /** @jsxImportSource solid-js */
-import { JSX, Show, children as solidChildren, splitProps } from 'solid-js'
+import type { JSX } from 'solid-js';
+import { Show, children as solidChildren, splitProps } from 'solid-js'
 import { useValidator } from '../core/useValidator'
 import type { NamePath, Rule, FormInstance } from '../core/type'
 import { useField } from '../core'

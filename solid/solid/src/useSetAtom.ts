@@ -1,5 +1,5 @@
-import { AtomSetParameters, AtomSetResult, WritableAtom } from '@einfach/core'
-import { HookOption } from './type'
+import type { AtomSetParameters, AtomSetResult, WritableAtom } from '@einfach/core'
+import type { HookOption } from './type'
 import { useStore } from './useStore'
 
 /**
@@ -9,8 +9,11 @@ import { useStore } from './useStore'
  * @returns 设置 atom 值的函数
  */
 export function useSetAtom<
-  AtomType extends WritableAtom<unknown, any, unknown>
->(atom: AtomType, options: HookOption = {}): (...args: AtomSetParameters<AtomType>) => AtomSetResult<AtomType> {
+  AtomType extends WritableAtom<unknown, any, unknown>,
+>(
+  atom: AtomType,
+  options: HookOption = {},
+): (...args: AtomSetParameters<AtomType>) => AtomSetResult<AtomType> {
   const store = useStore(options)
 
   return (...args: AtomSetParameters<AtomType>) => {

@@ -827,7 +827,7 @@ const WORKDAY: FunctionImpl = (args) => {
   if (!sa.ok) return sa.error
   const dc = coerceNumber(args[1])
   if (!dc.ok) return dc.error
-  let days = Math.trunc(dc.value)
+  const days = Math.trunc(dc.value)
   let serial = Math.floor(sa.value)
   const holidays = new Set<number>()
   if (args.length === 3) {
