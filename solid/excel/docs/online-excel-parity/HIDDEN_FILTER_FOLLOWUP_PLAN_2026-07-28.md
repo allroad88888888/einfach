@@ -14,6 +14,18 @@ worker 谓词在 Rust 内求值，static 保留 TS 谓词（`filter-predicate.ts
 
 遗留的活只有下面两件 + 若干备案。
 
+> ## 执行状态（2026-07-28 收口）
+>
+> **1 与 2 均已落地并验收通过。** 五条验收全绿，详见 §1 的「执行结果」。
+>
+> **计划的一处事实错误（已核实并更正）**：§1 解决方案第 1 步说 wire 层需要新增
+> `hide-rows` / `unhide-rows` 消息——**不成立，wire 早就在 HEAD 里**：
+> `worker-protocol.ts:742-743` 声明了 `hideRows?` / `unhideRows?`，客户端实现在
+> `:1103-1107`，两个 runtime 也都有分发（`worker-runtime.ts:1845-1856`、
+> `worker-runtime-ts.ts:1564`），WASM 绑定同样齐备（`rust/wasm/src/lib.rs:3013/3020`）。
+> as-built 修正 6 说的是「**适配器**从未暴露」，本计划把它读成了「wire 也没有」。
+> 实际工作量因此只有 adapter + atom 两层，远小于 1-2 天的估计。
+
 ---
 
 ## 1. P1：worker 暴露 `hideRows` / `unhideRows` ACK 端口——「零推送」终局
@@ -68,6 +80,42 @@ worker 谓词在 Rust 内求值，static 保留 TS 谓词（`filter-predicate.ts
 
 **工作量**：1–2 天（wire + adapter + atom 三层；引擎方法已在，无 Rust 新语义）。
 
+### 1 的执行结果（2026-07-28）
+
+落地形状（wire 层无需改动，见开头的事实更正）：
+
+- **adapter**：`worker-workbook-backend.ts` 新增 `hideRowsThroughWorker` /
+  `unhideRowsThroughWorker`，挂 `engineHiddenState` 门禁（与
+  `readSheetHiddenState` 同一 witness），RPC 后 `bumpRevision()` 并回标准
+  `BackendMutationResult`；
+- **UI-core**：`feedAndReconcileHiddenRows` 改三层派发 —— Tier 1 双 ACK 端口发
+  增量、Tier 2 `setEvalHiddenRows` 整集回落、Tier 3 无引擎 feed 时 fire-and-forget
+  镜像。**无条件 `readSheetHiddenState` 对账在三层之上保留**；
+- 撤销路径无需特殊处理：local-replay applier 已把整集恢复换算成相对当前态的
+  增量（`hidden.ts` 的 `applyViewportHiddenReplaySnapshot`），Tier 1 直接可用，
+  **未新增第二条恢复路径**（守住 §10.2-7 双恢复禁令）。
+
+验收对照：
+
+| 验收项 | 结果 |
+|---|---|
+| 双后端端口 parity | `vnext-table-totals-static-wasm-parity` 的端口哨兵**由「worker 必须没有」翻为「双方都有」**（含 `unhideRows`）；该套件全部 SUBTOTAL 数值钉随之首次真正执行并通过 |
+| SUBTOTAL 101-111 实时性 | UI smoke（vNext Worker，真 WASM）：D1:D3 = 100/20/5，隐藏第 2 行 → `SUBTOTAL(109)` **125 → 105**、`SUBTOTAL(9)` 保持 **125**。这个不等式就是修正 6 的信号 |
+| #27 结构位移 e2e | `vnext-filter-structural-shift-real-backend` 2 passed |
+| `setEvalHiddenRows` 仅剩回落 | 是——`hidden.ts` 里只出现在类型声明、文档与 Tier 2 分支 |
+| 撤销/重做 | UI smoke：Ctrl+Z 后第 2 行恢复、`SUBTOTAL(109)` 回到 125 |
+| 两套 vnext 套件 | 3582 passed（+1，新增 Tier 1 用例） |
+
+新增/更新的测试：`hidden-rows-reconcile.test.ts` 加
+「tier 1: both ACK ports present sends only the delta and still reconciles」
+（断言只发增量、整集 lane 保持关闭、且仍对账到引擎权威集）；
+`hidden-rows-columns.test.ts` 的 hide-delta 用例改为 Tier 1 口径（payload 带
+`requestId`）。两条均以「临时关闭 Tier 1 → 转红」确认过能抓回归。
+
+**接手说明**：本项由另一 agent 起手（adapter + atom + 注释），交接时
+`npx tsc -b` EXIT=2（`HideRowsRequest` / `UnhideRowsRequest` 未导入，
+连带两处隐式 any），且未跑任何验收。补齐导入与上述验收后收口。
+
 ## 2. P2：`filter-predicate.ts` 头部注释过期
 
 **现状**（E9 收敛第 2 条）：E4 落地时 worker 仍用它故取中性名；E5 后 worker
@@ -79,6 +127,10 @@ worker 谓词在 Rust 内求值，static 保留 TS 谓词（`filter-predicate.ts
 （历史提交与设计稿引用均用现名）。
 
 **验收**：注释与现实一致。**工作量**：15 分钟，可搭任何顺风 commit。
+
+**已完成**（2026-07-28）：头注释改为「static 后端专用的第二引擎谓词；worker 谓词
+在 `rust/excel-core/src/filter.rs` 经 `applyFilter` 求值；两者由 parity 套件钉住」，
+文件未改名。
 
 ---
 

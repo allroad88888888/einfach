@@ -184,13 +184,17 @@ viewportHiddenDiagnosticAtom.debugLabel = 'spreadsheet.viewport.hiddenDiagnostic
  * Optional persistence / engine hook. Absence of any method never degrades the
  * feature.
  *
- * The engine feed for manually hidden ROWS is `setEvalHiddenRows` — a WHOLE-SET
- * replace of the engine's owned set (the port both real backends actually
- * expose for it: the worker engine owns it there, the static engine folds it
- * into its own hidden map). `readSheetHiddenState` is the reconcile read-back:
- * with it the row commands are optimistic-then-reconciled; without it (static)
- * the feed alone keeps the engine in step. A backend exposing neither — only
- * `hideRows` / `unhideRows` — degrades to a fire-and-forget delta mirror.
+ * Manually hidden ROWS reach the engine, which owns the set, through whichever
+ * of three feeds the backend supports — see `feedAndReconcileHiddenRows` for
+ * the dispatch. `hideRows` / `unhideRows` send only the delta and are the
+ * preferred pair; `setEvalHiddenRows` whole-set-replaces and stands in for
+ * backends predating those ports; a backend with none of the three degrades to
+ * a fire-and-forget mirror with no engine round-trip.
+ *
+ * `readSheetHiddenState` is the reconcile read-back and is orthogonal to which
+ * feed ran: with it the row commands are optimistic-then-reconciled and the
+ * engine's answer always wins, without it the feed alone keeps the engine in
+ * step.
  */
 export interface ViewportHiddenPersistencePort {
   readViewportSizeProjection?: (
@@ -356,18 +360,26 @@ function persistHiddenMutation(
 
 /**
  * Feed the engine's owned manual hidden-ROW set and reconcile the projection
- * (design-engine-hidden-rows §4.2/§4.3).
+ * (design-engine-hidden-rows §4.2/§4.3, followup P1 three-tier upgrade).
  *
- * The feed is a WHOLE-SET `setEvalHiddenRows` push of the current set — the port
- * both real backends expose for manual rows (the worker never exposed
- * `hideRows`; the static engine folds the push into its own hidden map). When
- * the backend also exposes `readSheetHiddenState` (the worker) the pushed set is
- * re-read and the projection is overwritten UNCONDITIONALLY with the engine's
- * answer; a stale answer (a newer write advanced the generation) is dropped
- * rather than rolled back — the engine self-corrects through the same write path
- * on the next ACK. Backends that expose neither `setEvalHiddenRows` nor
- * `readSheetHiddenState` fall back to a fire-and-forget `hideRows` / `unhideRows`
- * delta mirror.
+ * Three-tier dispatch, tried in order:
+ *
+ * 1. **Incremental ACK** — when the backend exposes `hideRows` / `unhideRows`
+ *    (both backends after followup P1), only the delta rows are sent.
+ *    `readSheetHiddenState` is still called unconditionally to reconcile the
+ *    engine's authoritative set into the UI-core projection.
+ *
+ * 2. **Whole-set push** — fallback when only `setEvalHiddenRows` is available
+ *    (the pre-P1 worker had this but not `hideRows`). The entire set is
+ *    pushed, then reconciled through `readSheetHiddenState` when present.
+ *
+ * 3. **Fire-and-forget mirror** — backends that expose neither engine feed
+ *    (`hideRows` / `unhideRows` nor `setEvalHiddenRows`) degrade to a
+ *    fire-and-forget delta mirror with no engine round-trip.
+ *
+ * A stale reconcile answer (a newer write advanced the generation) is dropped
+ * rather than rolled back — the engine self-corrects through the same write
+ * path on the next ACK.
  */
 function feedAndReconcileHiddenRows(
   get: Getter,
@@ -381,14 +393,6 @@ function feedAndReconcileHiddenRows(
 ) {
   if (typeof source !== 'object' || source === null) return
   const port = source as ViewportHiddenPersistencePort
-  if (typeof port.setEvalHiddenRows !== 'function') {
-    // Persistence-mirror fallback: no engine feed, just mirror the delta.
-    persistHiddenMutation(set, port, sheetId, 'hide-rows', added)
-    persistHiddenMutation(set, port, sheetId, 'unhide-rows', removed)
-    return
-  }
-  const pushEval = port.setEvalHiddenRows
-  const readback = port.readSheetHiddenState
   const recordFailure = (error: unknown) => {
     set(viewportHiddenDiagnosticBackingAtom, {
       kind: 'persist-failed',
@@ -396,6 +400,55 @@ function feedAndReconcileHiddenRows(
       message: hiddenErrorMessage(error),
     })
   }
+
+  // Tier 1: incremental ACK write through hideRows / unhideRows ports
+  // (the "zero push" endgame — design-engine-hidden-rows followup P1).
+  // When both backends expose these, the engine receives only the delta
+  // rows instead of a whole-set replacement; the unconditional reconcile
+  // through readSheetHiddenState is STILL run to guarantee agreement.
+  if (typeof port.hideRows === 'function' && typeof port.unhideRows === 'function') {
+    void (async () => {
+      try {
+        if (added.length > 0) {
+          await port.hideRows!({ kind: 'hide-rows', sheetId, rowIndices: [...added], requestId: gen })
+        }
+        if (removed.length > 0) {
+          await port.unhideRows!({ kind: 'unhide-rows', sheetId, rowIndices: [...removed], requestId: gen })
+        }
+        if (typeof port.readSheetHiddenState !== 'function') return
+        const result = await port.readSheetHiddenState({
+          kind: 'sheet-hidden-state',
+          sheetId,
+          requestId: gen,
+        })
+        if (currentRowReconcileGen(get, sheetId) !== gen) return
+        if (
+          typeof result !== 'object' ||
+          result === null ||
+          result.sheetId !== sheetId ||
+          !Array.isArray(result.manualRows)
+        ) {
+          return
+        }
+        writeSheetRowsReconcile(get, set, sheetId, sanitizeIndices(result.manualRows))
+      } catch (error) {
+        recordFailure(error)
+      }
+    })()
+    return
+  }
+
+  // Tier 2: whole-set push via setEvalHiddenRows (fallback when the
+  // incremental ACK ports above are not available — e.g. a pre-P1 backend
+  // that has the eval input but not the owning hideRows/unhideRows ports).
+  if (typeof port.setEvalHiddenRows !== 'function') {
+    // Tier 3: fire-and-forget delta mirror — no engine feed at all.
+    persistHiddenMutation(set, port, sheetId, 'hide-rows', added)
+    persistHiddenMutation(set, port, sheetId, 'unhide-rows', removed)
+    return
+  }
+  const pushEval = port.setEvalHiddenRows
+  const readback = port.readSheetHiddenState
   void (async () => {
     try {
       await pushEval.call(port, { kind: 'set-eval-hidden-rows', sheetId, rows: [...wholeSet] })

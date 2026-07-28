@@ -14,6 +14,7 @@ import type {
   FilterSortState,
   FillRangeRequest,
   FillSeriesRequest,
+  HideRowsRequest,
   HistoryEntryKind,
   HistoryTransactionResult,
   ImportCellChunksRequest,
@@ -26,6 +27,7 @@ import type {
   ListConditionalFormatRulesRequest,
   ListNamedRangesRequest,
   MergeRangeRequest,
+  UnhideRowsRequest,
   UnmergeRangeRequest,
   NamedRange,
   NamedRangeListResult,
@@ -4224,6 +4226,46 @@ export function createWorkerWorkbookSpreadsheetBackend(
     await client.setEvalHiddenRows(sheet.idx, rows)
   }
 
+  /**
+   * Engine-owned manual hidden rows — `hideRows` (design-engine-hidden-rows
+   * E2, add rows to the manual set). Capability-gated by `engineHiddenState`
+   * (same witness as `readSheetHiddenState`) so the TS worker's `false`
+   * declaration withholds the port and UI-core falls back to the
+   * `setEvalHiddenRows` whole-set push + `readSheetHiddenState` reconcile
+   * path. The worker RPC resolves the engine-side `boolean` (whether anything
+   * changed), then the adapter bumps the host revision and returns the
+   * standard `BackendMutationResult` ACK so UI-core's strict acknowledgement
+   * chain completes.
+   */
+  async function hideRowsThroughWorker(request: HideRowsRequest): Promise<BackendMutationResult> {
+    const sheet = await resolveSheet(request.sheetId)
+    const rows = request.rowIndices.filter((v) => Number.isSafeInteger(v) && v >= 0)
+    await client.hideRows!(sheet.idx, rows)
+    return {
+      sheetId: request.sheetId,
+      requestId: request.requestId ?? 0,
+      revision: bumpRevision(),
+    }
+  }
+
+  /**
+   * Engine-owned manual hidden rows — `unhideRows`. Symmetric twin of
+   * `hideRowsThroughWorker`; see that function's doc for the capability
+   * gate and ACK convention.
+   */
+  async function unhideRowsThroughWorker(
+    request: UnhideRowsRequest,
+  ): Promise<BackendMutationResult> {
+    const sheet = await resolveSheet(request.sheetId)
+    const rows = request.rowIndices.filter((v) => Number.isSafeInteger(v) && v >= 0)
+    await client.unhideRows!(sheet.idx, rows)
+    return {
+      sheetId: request.sheetId,
+      requestId: request.requestId ?? 0,
+      revision: bumpRevision(),
+    }
+  }
+
   // --- Excel Table CRUD (design-excel-table.md §10, parity #32) ---------
   //
   // The engine registry is canonical (CANONICAL_OWNERSHIP §3 #32): these
@@ -5173,6 +5215,21 @@ export function createWorkerWorkbookSpreadsheetBackend(
      */
     get readSheetHiddenState() {
       return runtimeSupports('engineHiddenState') ? readSheetHiddenStateThroughWorker : undefined
+    },
+
+    /**
+     * Engine-owned manual hidden rows (design-engine-hidden-rows E2/E5).
+     * Incremental ACK ports — the "zero push" endgame (followup P1). Once
+     * both backends expose these, UI-core feeds the manual set through
+     * `hideRows`/`unhideRows` and the `setEvalHiddenRows` whole-set push
+     * degrades to a fallback path. Capability-gated by `engineHiddenState`
+     * (same witness as `readSheetHiddenState` / `setFilterSort`).
+     */
+    get hideRows() {
+      return runtimeSupports('engineHiddenState') ? hideRowsThroughWorker : undefined
+    },
+    get unhideRows() {
+      return runtimeSupports('engineHiddenState') ? unhideRowsThroughWorker : undefined
     },
 
     /**

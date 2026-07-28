@@ -201,6 +201,58 @@ describe('manual hidden-row reconcile (design-engine-hidden-rows §4.3)', () => 
     expect(engine.evalPushes[engine.evalPushes.length - 1]).toEqual([])
   })
 
+  test('tier 1: both ACK ports present sends only the delta and still reconciles', async () => {
+    // The "zero push" endgame (followup P1): a backend owning hideRows AND
+    // unhideRows receives the delta rows, never a whole-set replace, and the
+    // unconditional readSheetHiddenState reconcile still decides the answer.
+    const store = createStore()
+    const hidden = new Set<number>([9])
+    const hideCalls: number[][] = []
+    const unhideCalls: number[][] = []
+    const evalPushes: number[][] = []
+    const port: ViewportHiddenPersistencePort = {
+      async hideRows(request) {
+        hideCalls.push([...request.rowIndices])
+        for (const row of request.rowIndices) hidden.add(row)
+        return { sheetId: request.sheetId, requestId: request.requestId }
+      },
+      async unhideRows(request) {
+        unhideCalls.push([...request.rowIndices])
+        for (const row of request.rowIndices) hidden.delete(row)
+        return { sheetId: request.sheetId, requestId: request.requestId }
+      },
+      async setEvalHiddenRows(request: SetEvalHiddenRowsRequest) {
+        evalPushes.push([...request.rows])
+      },
+      async readSheetHiddenState(request): Promise<SheetHiddenStateResult> {
+        return {
+          kind: 'sheet-hidden-state',
+          sheetId: request.sheetId,
+          requestId: request.requestId,
+          manualRows: [...hidden].sort((a, b) => a - b),
+          filterRows: [],
+          filterRules: [],
+        }
+      },
+    }
+
+    store.setter(hideRowsAtom, { sheetId: 'A', indices: [2], source: port })
+    await flushMicrotasks()
+    // Only the delta crossed the boundary — and the whole-set lane stayed shut
+    // even though this backend also exposes it.
+    expect(hideCalls).toEqual([[2]])
+    expect(evalPushes).toEqual([])
+    // Reconciled to the engine's authoritative set, which carries the row 9
+    // this host never knew about.
+    expect(store.getter(sheetHiddenRowsAtom)['A']).toEqual([2, 9])
+
+    store.setter(unhideRowsAtom, { sheetId: 'A', indices: [2], source: port })
+    await flushMicrotasks()
+    expect(unhideCalls).toEqual([[2]])
+    expect(evalPushes).toEqual([])
+    expect(store.getter(sheetHiddenRowsAtom)['A']).toEqual([9])
+  })
+
   test('a backend with only hideRows (no engine feed) degrades to a delta mirror', async () => {
     const store = createStore()
     const hideRows: number[][] = []

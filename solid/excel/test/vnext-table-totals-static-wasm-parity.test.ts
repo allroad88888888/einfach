@@ -744,13 +744,18 @@ describe('static ⇄ WASM Table totals + structured-reference parity', () => {
     // static host is precisely the divergence this script was added to catch.
     expect(value('port.setEvalHiddenRows')).toBe('true')
 
-    // The view lane is asymmetric BY DESIGN and is therefore asserted per
-    // backend rather than diffed: the engine models no hidden state at all
-    // (design §2.2), so the WASM backend exposes no `hideRows` — hidden rows
-    // reach it only as the pushed eval input. The static backend doubles as
-    // its own view host, so it does own that port.
-    expect(typeof (wasm as unknown as TableBackend).hideRows).toBe('undefined')
+    // The view lane used to be asymmetric: the WASM backend exposed no
+    // `hideRows`, so manual hidden rows reached the engine only as the pushed
+    // whole-set eval input. Followup P1 closed that gap — the engine has owned
+    // the manual set since E2, and the worker adapter now exposes the
+    // incremental ACK ports it always had on the wire. Both backends therefore
+    // own the view lane, and this sentinel pins the symmetry rather than the
+    // old asymmetry: a regression that withholds either port would silently
+    // demote UI core back to the whole-set push.
+    expect(typeof (wasm as unknown as TableBackend).hideRows).toBe('function')
     expect(typeof (staticBackend as unknown as TableBackend).hideRows).toBe('function')
+    expect(typeof (wasm as unknown as TableBackend).unhideRows).toBe('function')
+    expect(typeof (staticBackend as unknown as TableBackend).unhideRows).toBe('function')
 
     // Baseline: nothing hidden, so 9 and 109 agree. Q1 = 120 + 80 + 200.
     expect(value('baseline =SUBTOTAL(9,Table1[Q1])')).toBe('400')

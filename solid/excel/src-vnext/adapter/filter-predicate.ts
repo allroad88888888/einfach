@@ -20,13 +20,13 @@
  *
  * SCOPE (as-built after E5)
  *
- * Now static-only: E5 deleted the worker adapter's
- * `computeFilterSortDisplayRows` layer (`worker-workbook-backend.ts` no longer
- * imports this module — the worker feeds the engine's `applyFilter` instead),
- * so `static-backend.ts` is the sole importer. The design's slice table calls
- * for renaming this to `static-filter-predicate.ts`; that rename is deferred
- * (it would touch the one importer plus tests for zero behavioural gain) and
- * tracked as available cleanup, not done here.
+ * Static-only second-engine predicate. The worker engine evaluates its own
+ * predicate in Rust (`rust/excel-core/src/filter.rs` —
+ * `filter_rule_matches_value`), fed through `applyFilter`. This module serves
+ * `static-backend.ts` exclusively — the static host is itself a second engine
+ * (it carries its own `evaluateFormula`) and legitimately keeps a TS predicate.
+ * The two engines' predicate behaviour is pinned by the parity suite
+ * (`vnext-filter-static-wasm-parity.test.ts`).
  *
  * This file is a VERBATIM move out of
  * `vanilla/spreadsheet-ui-core/src/backend/projection-helpers.ts` — matching

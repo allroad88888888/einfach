@@ -198,15 +198,17 @@ describe('viewportHiddenAtom (UI-core canonical)', () => {
 })
 
 describe('hidden persistence hook', () => {
-  test('mirrors a committed hide delta fire-and-forget', async () => {
+  test('mirrors a committed hide delta through the incremental ACK ports', async () => {
     const store = createStore()
     const persistence = createPersistencePort()
     store.setter(hideRowsAtom, { sheetId: 'A', indices: [2, 3], source: persistence.port })
-    // Local commit is synchronous even though the mirror is async.
+    // Local commit is synchronous even though the engine feed is async.
     expect(store.getter(viewportHiddenAtom).rowsBySheet['A']).toEqual([2, 3])
     await flushMicrotasks()
+    // This port owns hideRows/unhideRows, so the feed takes tier 1 and carries
+    // a requestId — the reconcile generation, so a late ACK can be dropped.
     expect(persistence.hideRows).toEqual([
-      { kind: 'hide-rows', sheetId: 'A', rowIndices: [2, 3] },
+      { kind: 'hide-rows', sheetId: 'A', rowIndices: [2, 3], requestId: expect.any(Number) },
     ])
     expect(store.getter(viewportHiddenDiagnosticAtom)).toBeNull()
   })
