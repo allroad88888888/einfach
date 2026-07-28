@@ -300,7 +300,7 @@ describe('easyHas - 复杂场景测试', () => {
     it('应该处理 Proxy 对象', () => {
       const target = { a: 1, b: 2 }
       const proxy = new Proxy(target, {
-        has(target, prop) {
+        has(_proxyTarget, prop) {
           return prop === 'a' || prop === 'c' // 'c' 实际不存在，但 Proxy 说存在
         },
       })

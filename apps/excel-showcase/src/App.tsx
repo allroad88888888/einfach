@@ -7,7 +7,6 @@ import {
   openNameManagerAtom,
   openValidationRuleEditorAtom,
   selectCellAtom,
-  selectionAtom,
   scrollToCellAtom,
   setSelectionAtom,
   setWorkspaceActiveSheetAtom,

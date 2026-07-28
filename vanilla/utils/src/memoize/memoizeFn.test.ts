@@ -52,7 +52,7 @@ describe('memoize', () => {
     const arrayB = [4, 5, 6]
     let callCount = 0
 
-    function sumArrays(arr1: Param[], arr2: number[]) {
+    function sumArrays(arr1: Param[], _arr2: number[]) {
       callCount += 1
       if (arr1.length > 1) {
         return 4

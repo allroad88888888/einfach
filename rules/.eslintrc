@@ -10,7 +10,8 @@
       "./tsconfig.json",
       "./react/*/tsconfig.json",
       "./vanilla/*/tsconfig.json",
-      "./solid/*/tsconfig.json"
+      "./solid/*/tsconfig.json",
+      "./apps/*/tsconfig.json"
     ]
   },
   "plugins": [
