@@ -1,7 +1,7 @@
 # 仓库拆分计划：einfach → einfach + einfach-excel
 
 **日期**：2026-07-28
-**状态**：待执行（P0 未开始）
+**状态**：P0 已消解、P1 合并部分已完成（`43abddd` + `2cb4ce1`），待发布 `@einfach/core@0.3.0`；P2 起未开始
 **决策**：`vanilla/core` + `utils` + `react/*` + `solid/solid` + `solid/form` 留在原仓
 `allroad88888888/einfach`；excel 相关全部迁往 `git@github.com:allroad88888888/einfach-excel.git`。
 原仓保留，不归档、不删除。
@@ -57,7 +57,7 @@ excel 侧对留守侧的全部引用只有两个包，且只用到最稳定的�
 
 ---
 
-## 3. P0（阻塞项）：core 已双向分叉
+## 3. P0（阻塞项）：core 已双向分叉 —— **已解决 2026-07-28**
 
 | 事实 | 值 |
 |---|---|
@@ -73,28 +73,45 @@ excel 侧对留守侧的全部引用只有两个包，且只用到最稳定的�
 **反向好消息**：`solid/solid/src` 的未发布改动逐行核实为纯格式（`import type` 转换、尾逗号、`return await value` → `return value`），
 **零行为变更** → npm `@einfach/solid@0.2.18` 与 HEAD 功能等价，**不需要为拆仓重发 solid**。
 
+### 解决结论（2026-07-28）
+
+两条线是**同一问题的两次独立实现**，相隔 3 天：`d995942`（07-11，本分支，`READ_RECURSION_BUDGET = 256` + FAULT 哨兵帧循环，587 行）
+与 `8e46430`（07-14，main，`MAX_SYNC_EVALUATION_DEPTH = 250` + 缺失依赖异常 + 显式栈，473 行）。技术路线一致。
+
+判定依据：把 main 的 `deepNesting.test.ts` 原样打在本分支引擎上，**19 个用例全绿**（含 249/250/251/500 临界深度切换）
+→ 本分支引擎行为上覆盖 `8e46430`，且多 791 行深链护栏测试。
+
+处置（`43abddd`）：合并 `origin/main`，冲突面仅 2 个文件，均取本分支实现 ——
+`vanilla/core/src/store.ts`（已证明为超集）、`react/react/test/asyncWith.test.tsx`（本分支已改写为 `waitFor` + 10s，
+超集于 main 的 `timeout: 3000`）。main 的 `deepNesting.test.ts` 并入长期保留，作为跨实现回归钉。
+同时带入 7 个包的版本号 / CHANGELOG 与 `publish.yml` 的 `NODE_AUTH_TOKEN` 修复。
+
+副作用：`8e46430`、`a558de1`、`4e33a33` 现已是 HEAD 祖先，**原 P0 的 GC 风险自动消解**，无需再打 backup 分支。
+
 ---
 
 ## 4. 分阶段
 
-### P0 保命（本地，先做）
+### ~~P0 保命~~ —— 已由 P1 的合并消解
 
-`origin/main` 上的 `8e46430`、`a558de1`、`4e33a33` 只活在 remote-tracking ref 里，本地无任何分支指向；
-拆仓过程必然 fetch/prune，会让它们变成不可达对象并最终被 GC。
+原风险：`8e46430`、`a558de1`、`4e33a33` 只活在 remote-tracking ref 里，fetch/prune 后会被 GC。
+`43abddd` 合并 `origin/main` 后三者均为 HEAD 祖先，风险不存在。
 
-```
-git branch backup/origin-main origin/main
-```
+### P1 收口 core 分叉并发版（原仓内完成）—— 合并已完成，发版待做
 
-另：当前分支 `claude/rust-core-state-plan-Auzcj` 有 34 个提交未推往任何远端，工作区还有 5 个已暂存的修改。
+1. ~~把 HEAD 的 `store.ts` 重写与 `8e46430` 的深度受限递归 + 显式栈迭代合并~~ → `43abddd`，见 §3 解决结论。
+2. ~~跑深链护栏全套~~ → `npx jest vanilla/core react/react` 30 套 225 passed / 3 skipped；
+   下游 `npx jest vanilla/spreadsheet-ui-core solid vanilla/utils react` 205 套 3727 passed / 6 skipped。
+3. ~~写 changeset~~ → `2cb4ce1`，`@einfach/core: minor` → 0.3.0。
+   用 `minor` 而非 `major`：包在 0.x，changesets 不对 0.x 特殊处理，`major` 会跳到 1.0.0。
+4. **待做**：发布 `@einfach/core@0.3.0`。需本分支合入 `main` 后由 `publish.yml` 执行 —— 受「arc 收口前不推远端」约束。
+   `@einfach/solid` 无需重发（见 §3）。
 
-### P1 收口 core 分叉并发版（原仓内完成）
+**第 4 步不完成，新仓没有可依赖的 core。**
 
-1. 把 HEAD 的 `store.ts` 重写与 `8e46430` 的深度受限递归 + 显式栈迭代合并。
-2. 跑全套 `deepChain.test.ts` / `deepChainBoundary.test.ts` / `deepChainPerf.test.ts` + `store.test.ts`。
-3. 发 `@einfach/core`（breaking 走 `0.3.0`）。`@einfach/solid` 无需重发。
-
-**这一步不完成，新仓没有可依赖的 core。**
+发布面变化（相对已发布 0.2.19）：移除 `createUndoRedo` / `openUndoRedoAtom`（全仓零代码引用，仅
+`solid/excel/docs/STRUCTURAL_UNDO.md` 两处概念性提及），新增 `createHistory` 全套 + `isSourceAtom` / `SYNTHESIZED_WRITE`，
+引擎换实现。`vanilla/utils/src` 与 `solid/solid/src` 的净变更分别只是测试文件和纯格式，均不需要发版。
 
 ### P2 内容拆分（在新仓工作副本内进行，不改原仓）
 
@@ -149,8 +166,8 @@ npm run e2e -w @einfach/solid-excel
 
 | 风险 | 处置 |
 |---|---|
-| `8e46430` 等 3 个提交只在 remote-tracking ref | P0 打 backup 分支锚住 |
-| core 双向分叉 590 行 | P1 阻塞项，先合并再发版 |
+| ~~`8e46430` 等 3 个提交只在 remote-tracking ref~~ | 已消解：`43abddd` 合并后三者均为 HEAD 祖先 |
+| ~~core 双向分叉 590 行~~ | 已收敛：`43abddd` 取本分支实现，main 的测试全绿回归；剩发布未做 |
 | solid-js 单实例不变式跨仓 | 新仓根 `pnpm.overrides` 必须带 `solid-js: 1.9.12`；lockfile 中只能有一条 `solid-js@` 解析 |
 | `provider-remount` 契约测试对被拆开 | `solid/solid/test/provider-remount.test.tsx` 留守、`solid/excel/test/provider-remount-1912.test.tsx` 迁出；迁出侧改为验证 npm 版 `@einfach/solid`，两侧都要保留 |
 | 首推即触发 publish | P4 规避方案二选一 |
@@ -161,5 +178,6 @@ npm run e2e -w @einfach/solid-excel
 ## 6. 待定项
 
 1. **历史策略**：`git filter-repo` 保留 excel 历史，还是 squash 起步。
-2. **P1 的 core 版本号**：`createHistory` 是 breaking，确认走 `0.3.0`。
-3. **执行时机**：当前 arc（`claude/rust-core-state-plan-Auzcj`，34 个未推提交）收口后再启动 P1。
+2. **P1 的 core 版本号**：changeset 已按 `minor` → `0.3.0` 落地（`2cb4ce1`），**待你确认**；
+   若要走 `1.0.0`，把该 changeset 的 `minor` 改成 `major` 即可。
+3. **执行时机**：P1 的合并与 changeset 已在当前分支完成；发布与 P2 之后仍需等 arc 收口。
