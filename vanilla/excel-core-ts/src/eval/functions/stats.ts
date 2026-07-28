@@ -2685,8 +2685,8 @@ function invertMatrix(input: ReadonlyArray<ReadonlyArray<number>>): number[][] |
   const n = input.length
   if (n === 0 || input.some((row) => row.length !== n)) return undefined
   const a = input.map((row) => row.slice())
-  const inv: number[][] = Array.from({ length: n }, (_, r) =>
-    Array.from({ length: n }, (_, c) => (r === c ? 1 : 0)),
+  const inv: number[][] = Array.from({ length: n }, (_row, r) =>
+    Array.from({ length: n }, (_col, c) => (r === c ? 1 : 0)),
   )
   for (let i = 0; i < n; i++) {
     let pivot = i

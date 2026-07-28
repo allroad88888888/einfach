@@ -780,8 +780,8 @@ export function createWorkbook(
       if (removed) requestRecalc()
       return removed
     },
-    registerCustomFormula(name, fn, options) {
-      customFormulas.set(name.toUpperCase(), { fn, isAsync: options?.isAsync === true })
+    registerCustomFormula(name, fn, registration) {
+      customFormulas.set(name.toUpperCase(), { fn, isAsync: registration?.isAsync === true })
       // Any registry change invalidates the async memo wholesale and
       // strands in-flight settles (generation bump) — Rust parity.
       resetAsyncCustomState()

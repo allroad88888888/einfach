@@ -1,3 +1,5 @@
+import type { SpreadsheetNumberFormat } from '@einfach/spreadsheet-ui-core'
+
 /**
  * Interface matching the WasmSheet API from einfach-wasm.
  *
@@ -220,8 +222,7 @@ export interface CellFormatJSON {
  * `SpreadsheetNumberFormat` discriminated union from `@einfach/spreadsheet-ui-core`.
  * The alias is kept so existing call sites continue to compile.
  */
-export type NumberFormatJSON =
-  import('@einfach/spreadsheet-ui-core').SpreadsheetNumberFormat
+export type NumberFormatJSON = SpreadsheetNumberFormat
 
 /** Empty format → equivalent to the default (no styling, General number). */
 export const EMPTY_FORMAT: CellFormatJSON = {}

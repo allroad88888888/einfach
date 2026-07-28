@@ -290,7 +290,9 @@
     {
       "files": [
         "solid/excel/src-vnext/**",
-        "vanilla/spreadsheet-ui-core/src/**"
+        "solid/excel/src/**",
+        "vanilla/spreadsheet-ui-core/src/**",
+        "vanilla/excel-core-ts/src/**"
       ],
       "rules": {
         "@typescript-eslint/no-use-before-define": [

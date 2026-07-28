@@ -4056,7 +4056,7 @@ function makeMatrix(rows: number, cols: number): Value[][] {
 function evaluateInForeignSheet(
   inner: Expr,
   parent: EvalContext,
-  foreignCells: ReadonlyMap<CellKey, import('../types').Cell>,
+  foreignCells: ReadonlyMap<CellKey, Cell>,
   sheetName?: string,
 ): Value {
   const sheetIndex = sheetName === undefined ? undefined : parent.sheetIndexOf?.(sheetName)
@@ -4135,7 +4135,7 @@ function rangeTooLargeMessage(rowCount: number, colCount: number, totalCells: nu
  */
 export function refLookupGeneric(
   a1: string,
-  cells: ReadonlyMap<CellKey, import('../types').Cell>,
+  cells: ReadonlyMap<CellKey, Cell>,
   ctx: EvalContext,
 ): Value {
   const coord = parseRefToKey(a1)
@@ -4156,7 +4156,7 @@ export function refLookupGeneric(
 export function rangeLookupGeneric(
   start: string,
   end: string,
-  cells: ReadonlyMap<CellKey, import('../types').Cell>,
+  cells: ReadonlyMap<CellKey, Cell>,
   ctx: EvalContext,
 ): Value[][] {
   const range = parseRange(start, end)
@@ -4207,7 +4207,7 @@ export function rangeLookupGeneric(
  */
 const cellsMapTags = new WeakMap<object, string>()
 let cellsMapTagCounter = 0
-function tagFor(cells: ReadonlyMap<CellKey, import('../types').Cell>): string {
+function tagFor(cells: ReadonlyMap<CellKey, Cell>): string {
   const existing = cellsMapTags.get(cells)
   if (existing !== undefined) return existing
   cellsMapTagCounter += 1
@@ -4223,7 +4223,7 @@ function tagFor(cells: ReadonlyMap<CellKey, import('../types').Cell>): string {
  * would otherwise re-enter unguarded).
  */
 export function cycleGuardKey(
-  cells: ReadonlyMap<CellKey, import('../types').Cell>,
+  cells: ReadonlyMap<CellKey, Cell>,
   key: CellKey,
 ): CellKey {
   return `${tagFor(cells)}:${key}`
@@ -4252,7 +4252,7 @@ export function cycleGuardKey(
  */
 function resolveCell(
   key: CellKey,
-  cells: ReadonlyMap<CellKey, import('../types').Cell>,
+  cells: ReadonlyMap<CellKey, Cell>,
   ctx: EvalContext,
 ): Value {
   const tag = tagFor(cells)

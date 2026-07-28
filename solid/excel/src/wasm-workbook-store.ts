@@ -395,6 +395,9 @@ function createWorkbookSheetAdapter(
     const value = read()
     const after = workbook.debug_formula_cache_state(sheetIdx, addr)
     if (before !== 'clean' && after === 'clean') {
+      // The log IS this probe's product — it exists so the lazy-evaluation
+      // demo can show that Sheet2!C5 recomputed exactly once, on first read.
+      // eslint-disable-next-line no-console
       console.log('[lazy-demo] computed Sheet2!C5', { before, after, value })
     }
     return value
