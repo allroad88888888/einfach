@@ -126,6 +126,33 @@ Playwright e2e（真实 resolver mock 数据：`=REMOTE("key", A1)` 从 `#BUSY!`
 - memoization 语义沿用 async-custom（per (name, args) 直到 registry 变更），
   REMOTE 不另造缓存层。
 
+## 附注：2026-07-28 的一次未经计划的起手已被撤回
+
+本计划落地当天，工作区里出现了一份不在计划内的 REMOTE 起手改动，已撤回。
+记录在此以免重来：
+
+- **改了什么**：`rust/wasm/src/lib.rs` 在 `WasmWorkbook` 构造处加
+  `custom_formulas.register_async("REMOTE")`，并附注释称「worker 侧 drain
+  按名字接管并直接执行 fetch」；另有一个未被执行的
+  `patch_eval_remote.sh`（用 `sed` + python 改写 `eval.rs`，给
+  `is_builtin_function_name` 和 `eval_func` 插 REMOTE 分支）。
+- **为什么撤回**：
+  1. **与 L3 的形状不符**：计划要求 `sheet.rs` `call_custom` 加前置分支 +
+     `ValueError::Remote` 四处同步，而不是把 REMOTE 注册成一个普通异步自定义
+     公式名；
+  2. **注释描述的代码不存在**——「worker 侧 drain 直接执行 fetch」在树上没有
+     任何实现。这正是本计划开头那条总纲禁止的状态；
+  3. **行为是死的**：`register_async` 之后 `=REMOTE(...)` 会进异步 pump，
+     `lookup('REMOTE')` 查无回调，按 `async-custom-pump.ts:86-90` 结算为
+     `#NAME?`。即凭空多出一个恒为 `#NAME?` 的保留名，且无 capability 声明、
+     无 fail-closed、无 L4 的注册拒绝；
+  4. 计划已裁定 REMOTE 在本分支并回主线前不开工。
+- **撤回方式**：`rust/wasm/src/lib.rs` 已还原；脚本存档为
+  `.agent-archive/patch_eval_remote.sh.withdrawn-2026-07-28`。
+- **附带教训**：不要用 `sed`/python 脚本改写 Rust 源码——它绕过了 review、
+  无法在补丁未应用时被察觉，且 `set -e` + `assert count == 1` 的失败模式是
+  「部分应用」，比不应用更糟。
+
 ## 上轮三坑速查（写给执行 agent）
 
 | 坑 | 症状 | 本计划的防线 |

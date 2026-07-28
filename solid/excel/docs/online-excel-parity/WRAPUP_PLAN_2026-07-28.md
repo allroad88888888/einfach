@@ -11,6 +11,20 @@ salvage 批次（A–H）已于 2026-07-28 收口：`85760be`（parity normalize
 完成第 1 项后，`SALVAGE_PLAN_REVISIONS.md` §0.3 的「一律 `--no-verify`」体制
 即告终结。
 
+> ## 执行状态（2026-07-28 收口）
+>
+> **1 / 2 / 3 已全部落地**：`f8dfa46`（仓库卫生）+ `db8828a`（build 修复、
+> no-console、kind 支持矩阵）。`npm run build` **EXIT=0**，`db8828a` 是第一个
+> 走**真实 pre-commit 钩子**的提交（build + 5748 测试全绿）——**§0.3 的
+> `--no-verify` 体制到此终结**，后续提交一律走正常钩子。
+>
+> **4（UI smoke）已执行**，四步全绿，但**发现一个既有破坏性缺陷**，见 §5。
+>
+> **另**：本轮开工前工作区里有一份未经计划的 REMOTE 起手改动
+> （`rust/wasm` 注册 `REMOTE` 为异步自定义公式 + 一个 sed/python 改写
+> `eval.rs` 的脚本）。已撤回，理由见 `REMOTE_RESTART_PLAN_2026-07-28.md`
+> 附注；脚本存档在 `.agent-archive/patch_eval_remote.sh.withdrawn-2026-07-28`。
+
 **全程红线**（沿用 SALVAGE_PLAN_REVISIONS §九）：`package.json` /
 `pnpm-workspace.yaml` / `pnpm-lock.yaml` / `apps/` 由另一 AI 持有未提交，
 禁改；提交只用显式文件清单；禁跑 `npm run eslint`（全仓 `--fix`）。
@@ -136,10 +150,65 @@ solid/excel/src-vnext/**` 的 no-console 计数归零；async-custom-pump 套件
 **验收**：四步无异常，截图留档到 `.agent-archive/`；发现异常回写本文档。
 **工作量**：30 分钟。
 
+### 4 的执行结果（2026-07-28，vNext Worker + Wave 5 两个 demo）
+
+B 链与 auto-fill 的可见面**全部通过**：
+
+| 步骤 | 结果 |
+|---|---|
+| 工具栏增加小数位 ×2（A1=1234.5，worker 后端） | `1234.50` —— **这是 B 链的关键证据**：第二次点击必须认出从 WASM 回读的规范名 `number` 才会 1→2 位；若回读失败会反复 promote 成 1 位、停在 `1234.5` |
+| 减少小数位 ×1 | `1234.5`（2→1 位） |
+| 百分比格式（E1=0.25） | `25%` |
+| auto-fill 拖填柄（G1=10、G2=20 选中下拉至 G5） | `30 / 40 / 50`，等差序列延续正确 |
+| Format Cells 对话框（Wave 5 demo，B2 设 3 位小数） | `120.000` |
+
+两处顺带印证：对话框类别列表把 会计/时间/分数/科学记数/文本/特殊 显式标为
+「即将推出」，与 §2a 写进类型文档的引擎支持矩阵**逐项吻合**；
+`toolbar-btn-number-format` 是下拉开关而非直接套用，点开不选行时单元格不变，
+属正确行为（曾一度误判为回读缺陷，已排除）。
+
+## 5. 【UI smoke 新发现】P1：菜单栏 / Ctrl+1 打开 Format Cells 会静默抹掉已有格式
+
+**与本批无关，是 HEAD 既有缺陷**，但性质是数据损失，优先级高于隐藏/筛选下沉。
+
+**现状证据（真 UI 实测）**：B2 已是 3 位小数（显示 `120.000`）→ 菜单栏
+「格式 → 设置单元格格式…」打开对话框 → 类别单选停在**「常规」**（而非「数字」）
+→ 什么都不改直接点「确定」→ B2 变回 `120`，**3 位小数格式被清除**。
+
+**根因**：三个入口传参不一致，`openFormatCellsAtom` 的 `initialFormat` 只有
+工具栏传了。
+
+| 入口 | 代码位置 | 是否传 `initialFormat` |
+|---|---|---|
+| 工具栏 | `toolbar/SpreadsheetToolbar.tsx:588` | ✅ `activeCellFormat()` |
+| 菜单栏 | `menu-bar/SpreadsheetMenuBar.tsx:486` | ❌ 只传 `sheetId` / `range` |
+| Ctrl+1（网格） | `grid/SpreadsheetGrid.tsx:2527` | ❌ 同上 |
+
+草稿因此为 `null`，`detectCategory(null)` 归为 `'general'`（该函数本身对
+`number`/`decimal` 双名处理是**正确**的，不是 B 链问题），保存即把
+`{kind:'general'}` 写回整个选区。三个入口有两个会毁格式。
+
+**解决方案**：
+
+1. 把 `SpreadsheetToolbar.tsx:614` 的私有 `activeCellFormat()`（读
+   `selectionSnapshot()` + `projectionSnapshot()`，`cloneFormat` 已是共享的
+   `backend/projection-helpers.ts:19`）上提为共享选择器——建议放
+   `spreadsheet-ui-core` 作为 `readActiveCellFormat(get)` 派生读取，
+   避免第四个入口再抄一遍；
+2. 三个调用点统一传 `initialFormat`（工具栏改为调用共享版，行为不变）；
+3. 回归用例：**每个入口**各一条——「单元格已有格式 → 该入口打开 → 直接确定
+   → 格式不变」；再加一条「菜单栏打开时类别单选落在单元格的真实类别上」。
+
+**验收**：三入口行为一致；`npx jest solid/excel vanilla/spreadsheet-ui-core`
+全绿；UI smoke 复验菜单栏路径不再抹格式。
+**工作量**：半天（含共享选择器上提与三条回归）。
+
 ---
 
 ## 顺序
 
-1（build 修复，解锁门禁）→ 2、3 可并行 → 4（要 dev server）。
-全部完成后：`--no-verify` 体制终结，salvage 批次彻底关闭；后续大方向见
-`HIDDEN_FILTER_FOLLOWUP_PLAN_2026-07-28.md` 与 `REMOTE_RESTART_PLAN_2026-07-28.md`。
+~~1（build 修复，解锁门禁）→ 2、3 可并行 → 4（要 dev server）~~ **已全部完成**。
+
+**下一步**：§5（格式抹除，数据损失，优先）→ 之后才是
+`HIDDEN_FILTER_FOLLOWUP_PLAN_2026-07-28.md`；
+`REMOTE_RESTART_PLAN_2026-07-28.md` 维持并回主线后再排期。
