@@ -90,7 +90,7 @@ const inProcessWorker: WorkerLike = {
 let createWasmBackend: (() => WorkerWorkbookSpreadsheetBackend) | undefined
 
 beforeAll(async () => {
-  ;(globalThis as Record<string, unknown>).self = {
+  (globalThis as Record<string, unknown>).self = {
     postMessage(msg: unknown) {
       for (const listener of [...toClient]) listener({ data: msg } as MessageEvent)
     },

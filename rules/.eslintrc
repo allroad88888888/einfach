@@ -267,7 +267,20 @@
       ],
       "rules": {
         "max-lines-per-function": "off",
-        "no-console": "off"
+        "no-console": "off",
+        "@typescript-eslint/naming-convention": "off"
+      }
+    },
+    {
+      "files": [
+        "**/*.bench.ts"
+      ],
+      "rules": {
+        "max-lines-per-function": "off",
+        "no-console": "off",
+        "@typescript-eslint/naming-convention": "off",
+        "@typescript-eslint/no-redeclare": "off",
+        "@typescript-eslint/no-loop-func": "off"
       }
     },
     {

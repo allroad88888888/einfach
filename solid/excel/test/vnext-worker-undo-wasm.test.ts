@@ -90,7 +90,7 @@ let createBackendImpl:
 beforeAll(async () => {
   // Worker context the wasm dispatcher installs onto — must exist BEFORE
   // worker-runtime.ts is imported (its module scope reads `self`).
-  ;(globalThis as Record<string, unknown>).self = {
+  (globalThis as Record<string, unknown>).self = {
     postMessage(msg: unknown) {
       for (const listener of [...toClient]) listener({ data: msg } as MessageEvent)
     },

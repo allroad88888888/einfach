@@ -1881,7 +1881,7 @@ function chainSection(): string[] {
   out.push('- **setup**: create the workbook + seed `A1=1`.')
   out.push('- **bulkWrite**: install all `n-1` formulas via `bulkApply` / `bulk_import_cells`.')
   out.push('- **firstRecalc**: read `An` once. Forces full chain evaluation.')
-  out.push("- **mutateThenRecalc**: set `A1` to a new value, then read `An`.")
+  out.push('- **mutateThenRecalc**: set `A1` to a new value, then read `An`.')
   out.push('  Repeated 5×, median taken. THIS is the chain-workload diagnostic.')
   out.push('- **steadyState**: read `An` again without mutating. Cache-hit check.')
   out.push('')

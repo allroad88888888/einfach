@@ -169,7 +169,7 @@ function rssMb(): number {
 describePerf('Rust bulk_import_cells Ultra single-call bench (EINFACH_PERF=1)', () => {
   beforeAll(async () => {
     if (!existsSync(WASM_PKG_JS) || !existsSync(WASM_PKG_BIN)) {
-      wasmSkipReason = `wasm-pkg missing — run \`npm --prefix solid/excel run build:wasm\``
+      wasmSkipReason = 'wasm-pkg missing — run `npm --prefix solid/excel run build:wasm`'
       return
     }
     try {
@@ -312,7 +312,7 @@ function writeReport() {
   if (!PERF_ENABLED) return
   const reportPath = path.join(__dirname, 'perf-rust-bulk-import-ultra-report.md')
   const lines: string[] = []
-  lines.push(`# Rust bulk_import_cells — Ultra single-call bench`)
+  lines.push('# Rust bulk_import_cells — Ultra single-call bench')
   lines.push('')
   lines.push(`*Last run: ${new Date().toISOString()}*`)
   lines.push('')

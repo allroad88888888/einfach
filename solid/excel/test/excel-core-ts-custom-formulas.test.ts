@@ -400,7 +400,7 @@ describe('worker-runtime-ts custom formulas — wave 8.2 async', () => {
   })
 
   test('same-args calls memoize: callback executes once for two cells', async () => {
-    ;(globalThis as Record<string, unknown>).__tsAsyncCallCount = 0
+    (globalThis as Record<string, unknown>).__tsAsyncCallCount = 0
     try {
       const runtime = createWorkerRuntimeTs()
       const { rpc, sheetIdx } = await initSheet(runtime)

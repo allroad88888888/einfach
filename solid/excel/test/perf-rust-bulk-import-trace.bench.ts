@@ -325,7 +325,7 @@ function medianPhases(snaps: PhaseSnapshot[]): PhaseSnapshot {
 describePerf('Rust bulk-import phase-decomp bench (EINFACH_PERF=1)', () => {
   beforeAll(async () => {
     if (!existsSync(WASM_PKG_JS) || !existsSync(WASM_PKG_BIN)) {
-      wasmSkipReason = `wasm-pkg missing — run \`npm --prefix solid/excel run build:wasm\``
+      wasmSkipReason = 'wasm-pkg missing — run `npm --prefix solid/excel run build:wasm`'
       return
     }
     try {
@@ -352,7 +352,7 @@ describePerf('Rust bulk-import phase-decomp bench (EINFACH_PERF=1)', () => {
   // No phase breakdown for this tier (the production path is
   // deliberately uninstrumented) — only the dep-graph counts.
   it(
-    `Mega dep-stats only — 500k seeds + 500k formulas via production path`,
+    'Mega dep-stats only — 500k seeds + 500k formulas via production path',
     async () => {
       if (!wasmAvailable) {
         // eslint-disable-next-line no-console
@@ -384,7 +384,7 @@ describePerf('Rust bulk-import phase-decomp bench (EINFACH_PERF=1)', () => {
       } catch (err) {
         // eslint-disable-next-line no-console
         console.error(
-          `[bench] Mega dep-stats import failed:`,
+          '[bench] Mega dep-stats import failed:',
           err instanceof Error ? err.message : String(err),
         )
       }
@@ -522,7 +522,7 @@ function writeReport() {
   if (!PERF_ENABLED) return
   const reportPath = path.join(__dirname, 'perf-rust-bulk-import-trace-report.md')
   const lines: string[] = []
-  lines.push(`# Rust bulk-import phase-decomposition`)
+  lines.push('# Rust bulk-import phase-decomposition')
   lines.push('')
   lines.push(`*Last run: ${new Date().toISOString()}*`)
   lines.push('')

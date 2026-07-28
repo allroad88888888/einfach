@@ -108,7 +108,7 @@ describe('createSheetStore — observeCell retain/release', () => {
     createRoot((rootDispose) => {
       const store = createSheetStore(createJSSheet())
       const observers = Array.from({ length: 100 }, (_, i) =>
-        store.observeCell(`A${i + 1}`)
+        store.observeCell(`A${i + 1}`),
       )
       expect(store.activeSubscriptionCount()).toBe(100)
       for (let i = 0; i < 99; i++) observers[i].dispose()

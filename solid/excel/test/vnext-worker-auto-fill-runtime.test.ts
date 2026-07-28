@@ -31,7 +31,7 @@ const posted: WorkerResponse[] = []
 let successPostFailure: Error | null = null
 
 beforeAll(async () => {
-  ;(globalThis as Record<string, unknown>).self = {
+  (globalThis as Record<string, unknown>).self = {
     addEventListener(_type: string, listener: WorkerListener) {
       workerListeners.push(listener)
     },

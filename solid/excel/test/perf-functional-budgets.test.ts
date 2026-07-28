@@ -131,7 +131,7 @@ let FORMULA_CAP = 0
 let TOTALS_CAP = 0
 
 beforeAll(async () => {
-  ;(globalThis as Record<string, unknown>).self = {
+  (globalThis as Record<string, unknown>).self = {
     postMessage(msg: unknown) {
       const envelope = msg as { id?: unknown; result?: unknown }
       if (typeof envelope.id === 'number' && Array.isArray(envelope.result)) {
@@ -744,7 +744,7 @@ describe('perf budget · Table-definition mutations image only what they touch (
         `rename image scaling: 113-cell workbook → raw sweep ${small.raw} cells ` +
           `(${small.ms.toFixed(1)} ms) · 1813-cell workbook → raw sweep ${large.raw} cells ` +
           `(${large.ms.toFixed(1)} ms) · STORED image = 1 formula cell in BOTH, and both ` +
-          `undos applied`,
+          'undos applied',
       )
 
       // The RAW sweep still scales with the workbook (it must — a rewrite
@@ -915,7 +915,7 @@ describe('perf budget · Table-definition mutations image only what they touch (
       log(
         `REGRESSION #26 · ${rows}×${cols} sheet = ${workbookCells} cells (over the retired ` +
           `2000 cap): createTable ${createMs.toFixed(1)} ms with ${createSweep} workbook ` +
-          `sweeps; create / totals / rename undo ALL applied`,
+          'sweeps; create / totals / rename undo ALL applied',
       )
 
       expect(createMs).toBeLessThan(SCALE ? 15_000 : 5_000)
