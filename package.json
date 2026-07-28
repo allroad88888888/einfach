@@ -14,6 +14,8 @@
   },
   "scripts": {
     "eslint": "npx eslint --config rules/.eslintrc --ext=.tsx,.ts --ignore-path ./rules/.eslintignore ./ --fix ",
+    "lint:check": "npx eslint --config rules/.eslintrc --ext=.ts,.tsx --ignore-path ./rules/.eslintignore apps/*/src vanilla/*/src vanilla/*/test react/*/src react/*/test solid/*/src solid/*/test solid/excel/src-vnext",
+    "typecheck:apps": "npx tsc --noEmit -p apps/excel-showcase/tsconfig.json",
     "test": "jest --collect-coverage",
     "clearTypes": "node clean.js",
     "ensureWasm": "test -f solid/excel/wasm-pkg/einfach_wasm.js || npm run build:wasm -w @einfach/solid-excel",

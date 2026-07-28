@@ -3,3 +3,8 @@ es
 @types
 dist
 coverage
+cjs
+esm
+wasm-pkg
+.agent-archive
+.codex-artifacts
