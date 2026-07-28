@@ -2,3 +2,4 @@ packages:
   - 'vanilla/**'
   - 'react/**'
   - 'solid/**'
+  - 'apps/*'

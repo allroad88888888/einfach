@@ -1,0 +1,26 @@
+{
+  "name": "@einfach/excel-showcase",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Independent online Excel showcase for Einfach",
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "vite build",
+    "preview": "vite preview"
+  },
+  "dependencies": {
+    "@einfach/core": "workspace:*",
+    "@einfach/solid": "workspace:*",
+    "@einfach/solid-excel": "workspace:*",
+    "@einfach/spreadsheet-ui-core": "workspace:*",
+    "@lingui/core": "6.0.1",
+    "solid-js": "^1.9.12"
+  },
+  "devDependencies": {
+    "@types/node": "^20.17.30",
+    "typescript": "^5.7.2",
+    "vite": "^5.4.21",
+    "vite-plugin-solid": "^2.8.0"
+  }
+}

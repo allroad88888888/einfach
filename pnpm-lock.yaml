@@ -127,6 +127,40 @@ importers:
         specifier: 1.9.12
         version: 1.9.12
 
+  apps/excel-showcase:
+    dependencies:
+      '@einfach/core':
+        specifier: workspace:*
+        version: link:../../vanilla/core
+      '@einfach/solid':
+        specifier: workspace:*
+        version: link:../../solid/solid
+      '@einfach/solid-excel':
+        specifier: workspace:*
+        version: link:../../solid/excel
+      '@einfach/spreadsheet-ui-core':
+        specifier: workspace:*
+        version: link:../../vanilla/spreadsheet-ui-core
+      '@lingui/core':
+        specifier: 6.0.1
+        version: 6.0.1
+      solid-js:
+        specifier: 1.9.12
+        version: 1.9.12
+    devDependencies:
+      '@types/node':
+        specifier: ^20.17.30
+        version: 20.17.30
+      typescript:
+        specifier: ^5.7.2
+        version: 5.8.3
+      vite:
+        specifier: ^5.4.21
+        version: 5.4.21(@types/node@20.17.30)(terser@5.39.0)
+      vite-plugin-solid:
+        specifier: ^2.8.0
+        version: 2.11.11(@testing-library/jest-dom@6.6.3)(solid-js@1.9.12)(vite@5.4.21(@types/node@20.17.30)(terser@5.39.0))
+
   react/form:
     dependencies:
       '@einfach/core':

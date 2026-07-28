@@ -26,7 +26,8 @@
   "workspaces": [
     "react/*",
     "solid/*",
-    "vanilla/*"
+    "vanilla/*",
+    "apps/*"
   ],
   "pnpm": {
     "overrides": {
