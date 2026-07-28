@@ -371,6 +371,8 @@ const asyncCustomPump = createAsyncCustomPump<WasmWorkbookRuntime>({
     const entry = customFormulas.get(name)
     return entry?.isAsync ? entry.fn : undefined
   },
+  // eslint-disable-next-line no-console -- worker devtools diagnostic is established contract
+  warn: console.warn,
 })
 let nextExportId = 1
 let nextSnapshotId = 1

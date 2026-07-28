@@ -266,6 +266,25 @@ export type SpreadsheetNumberFormatFractionDenominator =
  * Wave 6.3 widens this type. The historical `'decimal'` variant is retained
  * as a deprecated alias for `'number'`; the projection layer treats them as
  * identical for one wave.
+ *
+ * ── Engine support matrix ──
+ *
+ * **WASM (Rust wire):** Only **6 kinds** are implemented:
+ *   `general` | `number` (and deprecated `decimal`) |
+ *   `percent` (and synonym `percentage`) | `currency` | `date` | `custom`.
+ *
+ * The remaining kinds – `accounting`, `time`, `fraction`, `scientific`,
+ * `text`, `special` – are **silently downgraded to `general`** by the wire
+ * layer (`into_number_format`).  The `negative` field on `number` /
+ * `currency` / `percent` is also silently discarded (no corresponding wire
+ * field).
+ *
+ * **Static backend:** All declared variants are accepted and echoed back
+ * verbatim (no wire round-trip).
+ *
+ * Support for the missing categories requires new variants on the engine
+ * `NumberFormat` enum; that work is tracked separately and is not part of
+ * the salvage / wrap-up batch.
  */
 export type SpreadsheetNumberFormat =
   | { kind: 'general' }

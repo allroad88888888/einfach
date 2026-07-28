@@ -1386,6 +1386,8 @@ export function createWorkerRuntimeTs(events?: WorkerRuntimeTsEvents): ExcelCore
       const entry = state.customFormulas.get(name.toUpperCase())
       return entry?.isAsync ? entry.callable : undefined
     },
+    // eslint-disable-next-line no-console -- worker devtools diagnostic is established contract
+    warn: console.warn,
   })
 
   async function handle(msg: RequestMessage) {

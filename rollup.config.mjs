@@ -9,7 +9,7 @@ import yaml from 'js-yaml'
 import { babel } from '@rollup/plugin-babel'
 
 const workspaceConfig = yaml.load(readFileSync('./pnpm-workspace.yaml', 'utf8'))
-const topLevelDirs = workspaceConfig.packages.map((pattern) => pattern.replace('/**', ''))
+const topLevelDirs = workspaceConfig.packages.map((p) => p.replace(/\/\*+$/, ''))
 
 // 获取所有子目录
 const products = topLevelDirs.reduce((acc, dir) => {

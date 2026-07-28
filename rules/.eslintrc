@@ -278,6 +278,14 @@
           }
         ]
       }
+    },
+    {
+      "files": [
+        "solid/excel/src-vnext/demos/**"
+      ],
+      "rules": {
+        "no-console": "off"
+      }
     }
   ]
 }

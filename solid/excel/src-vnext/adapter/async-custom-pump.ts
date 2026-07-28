@@ -39,6 +39,12 @@ export type AsyncCustomPumpHooks<TEngine> = {
   resolve(engine: TEngine, callId: number, value: unknown): boolean
   /** The worker-local compiled callback for an async name, if any. */
   lookup(name: string): AsyncCustomCallable | undefined
+  /**
+   * Optional diagnostic warning hook.
+   * Workers inject `console.warn` here so pump warnings reach worker
+   * devtools without the pump itself importing `console`.
+   */
+  warn?(message: string, detail?: unknown): void
 }
 
 /**
@@ -89,7 +95,7 @@ export function createAsyncCustomPump<TEngine>(
             // Throw and Promise-reject map to #VALUE!, same as a sync
             // callback throw. The message survives via console for
             // devtools; the cell only carries the token.
-            console.warn(
+            hooks.warn?.(
               `[einfach custom formula] async ${request.name} failed:`,
               err,
             )
@@ -101,7 +107,7 @@ export function createAsyncCustomPump<TEngine>(
       )
       if (!anySettled) return
     }
-    console.warn(
+    hooks.warn?.(
       `[einfach custom formula] async pump exceeded ${MAX_ASYNC_PUMP_ROUNDS} rounds; abandoning cascade`,
     )
   }
@@ -121,7 +127,7 @@ export function createAsyncCustomPump<TEngine>(
         // drain/resolve throwing is an engine-contract violation, not a
         // user-callback failure (those are caught per-request in run).
         // Swallow so the worker doesn't die on an unhandled rejection.
-        console.warn('[einfach custom formula] async pump crashed:', err)
+        hooks.warn?.('[einfach custom formula] async pump crashed:', err)
       } finally {
         // Clear synchronously at the end of the async body (not via
         // .finally) so there is no microtask gap in which a pump()
