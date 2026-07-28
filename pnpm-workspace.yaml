@@ -1,5 +1,3 @@
 packages:
-  - 'vanilla/**'
-  - 'react/**'
-  - 'solid/**'
-  - 'apps/*'
+  - 'core/*'
+  - 'excel/*'

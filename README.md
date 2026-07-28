@@ -18,8 +18,8 @@
 
 | 包 | 版本 | 说明 |
 |---|---|---|
-| [@einfach/core](./vanilla/core) | ![npm](https://img.shields.io/npm/v/@einfach/core) | 核心 atom 引擎（框架无关） |
-| [@einfach/utils](./vanilla/utils) | ![npm](https://img.shields.io/npm/v/@einfach/utils) | 工具函数（深拷贝、路径操作、记忆化） |
+| [@einfach/core](./core/core) | ![npm](https://img.shields.io/npm/v/@einfach/core) | 核心 atom 引擎（框架无关） |
+| [@einfach/utils](./core/utils) | ![npm](https://img.shields.io/npm/v/@einfach/utils) | 工具函数（深拷贝、路径操作、记忆化） |
 | [@einfach/react](./react/react) | ![npm](https://img.shields.io/npm/v/@einfach/react) | React hooks 绑定 |
 | [@einfach/react-utils](./react/utils) | ![npm](https://img.shields.io/npm/v/@einfach/react-utils) | React 工具 hooks |
 | [@einfach/react-form](./react/form) | ![npm](https://img.shields.io/npm/v/@einfach/react-form) | React 表单处理 |

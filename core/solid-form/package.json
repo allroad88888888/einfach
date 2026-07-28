@@ -1,0 +1,60 @@
+{
+  "name": "@einfach/solid-form",
+  "version": "0.2.21",
+  "description": "Atom-based form handling for Solid.js with Einfach",
+  "type": "module",
+  "main": "./cjs/index.cjs",
+  "module": "./esm/index.mjs",
+  "typings": "./@types/index.d.ts",
+  "license": "MIT",
+  "author": "dol",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/allroad88888888/einfach.git",
+    "directory": "core/solid-form"
+  },
+  "homepage": "https://github.com/allroad88888888/einfach/tree/main/core/solid-form",
+  "bugs": {
+    "url": "https://github.com/allroad88888888/einfach/issues"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "files": [
+    "esm",
+    "cjs",
+    "@types",
+    "README.md"
+  ],
+  "scripts": {
+    "build": "tsc"
+  },
+  "sideEffects": false,
+  "engines": {
+    "node": ">=14.18.0"
+  },
+  "keywords": [
+    "einfach",
+    "solid",
+    "solidjs",
+    "form",
+    "atom",
+    "antd-form-api"
+  ],
+  "dependencies": {
+    "@einfach/core": "workspace:*",
+    "@einfach/solid": "workspace:*",
+    "@einfach/utils": "workspace:*"
+  },
+  "peerDependencies": {
+    "solid-js": "^1.9.0"
+  },
+  "peerDependenciesMeta": {
+    "solid-js": {
+      "optional": false
+    }
+  },
+  "devDependencies": {
+    "@types/node": "^20.11.30"
+  }
+}

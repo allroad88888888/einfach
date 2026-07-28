@@ -42,38 +42,38 @@
     "node_modules",
     "**/node_modules",
     "**/@types/",
-    "./solid/excel/**"
+    "./excel/solid-excel/**"
   ],
   "references": [
     {
-      "path": "./vanilla/core/tsconfig.json"
+      "path": "./core/core/tsconfig.json"
     },
     {
-      "path": "./vanilla/utils/tsconfig.json"
+      "path": "./core/utils/tsconfig.json"
     },
     {
-      "path": "./vanilla/spreadsheet-ui-core/tsconfig.json"
+      "path": "./core/react/tsconfig.json"
     },
     {
-      "path": "./vanilla/excel-core-ts/tsconfig.json"
+      "path": "./core/react-utils/tsconfig.json"
     },
     {
-      "path": "./react/react/tsconfig.json"
+      "path": "./core/react-form/tsconfig.json"
     },
     {
-      "path": "./react/form/tsconfig.json"
+      "path": "./core/solid/tsconfig.json"
     },
     {
-      "path": "./react/utils/tsconfig.json"
+      "path": "./core/solid-form/tsconfig.json"
     },
     {
-      "path": "./solid/solid/tsconfig.json"
+      "path": "./excel/spreadsheet-ui-core/tsconfig.json"
     },
     {
-      "path": "./solid/form/tsconfig.json"
+      "path": "./excel/excel-core-ts/tsconfig.json"
     },
     {
-      "path": "./solid/excel/tsconfig.json"
+      "path": "./excel/solid-excel/tsconfig.json"
     },
   ]
 }

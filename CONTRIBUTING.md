@@ -26,13 +26,13 @@ pnpm install
 ## 项目结构
 
 ```
-vanilla/core/     → @einfach/core         # 核心 atom 引擎（框架无关）
-vanilla/utils/    → @einfach/utils         # 工具函数
-react/react/      → @einfach/react         # React hooks 绑定
-react/utils/      → @einfach/react-utils   # React 工具 hooks
-react/form/       → @einfach/react-form    # React 表单处理
-solid/solid/      → @einfach/solid         # Solid.js 绑定
-solid/form/       → @einfach/solid-form    # Solid.js 表单处理
+core/core/     → @einfach/core         # 核心 atom 引擎（框架无关）
+core/utils/    → @einfach/utils         # 工具函数
+core/react/      → @einfach/react         # React hooks 绑定
+core/react-utils/      → @einfach/react-utils   # React 工具 hooks
+core/react-form/       → @einfach/react-form    # React 表单处理
+core/solid/      → @einfach/solid         # Solid.js 绑定
+core/solid-form/       → @einfach/solid-form    # Solid.js 表单处理
 ```
 
 ## 代码风格

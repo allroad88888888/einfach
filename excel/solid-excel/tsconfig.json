@@ -1,0 +1,24 @@
+{
+  "extends": "../../tsconfig.base.json",
+  "compilerOptions": {
+    "outDir": "./@types",
+    "jsx": "preserve",
+    "jsxImportSource": "solid-js",
+    "moduleResolution": "Bundler"
+  },
+  "include": ["src/**/*", "src-vnext/**/*", "test/**/*"],
+  "references": [
+    {
+      "path": "../../core/core"
+    },
+    {
+      "path": "../../core/solid"
+    },
+    {
+      "path": "../../excel/spreadsheet-ui-core"
+    },
+    {
+      "path": "../../excel/excel-core-ts"
+    }
+  ]
+}

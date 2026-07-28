@@ -1,6 +1,6 @@
 # 帧循环深读（超预算路径）
 
-`vanilla/core/src/store.ts` 中 `readDep` / `runReadFn` / `readAtomInternal` 三者的协作。仅在嵌套深度超过 `READ_RECURSION_BUDGET`（256）时进入。
+`core/core/src/store.ts` 中 `readDep` / `runReadFn` / `readAtomInternal` 三者的协作。仅在嵌套深度超过 `READ_RECURSION_BUDGET`（256）时进入。
 
 引入于 `d995942 feat(core): iterative deep-chain readAtom/dependenciesChange in vanilla store`，护栏补于 `7226093`。
 

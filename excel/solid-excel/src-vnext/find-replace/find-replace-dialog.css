@@ -1,0 +1,328 @@
+/* Find & Replace dialog — Univer / Excel parity restyle.
+ *
+ * Scoping rule: every rule is namespaced under .find-replace-dialog (the root
+ * data-testid'd shell). The shared dialog skin in excel/solid-excel/src/styles.css
+ * still applies the centered card + backdrop, but everything below repaints
+ * the interior so the dialog looks like Univer's 查找和替换 modal:
+ *
+ *   ┌──────────────────────────────────────────────┐
+ *   │ 查找和替换                              ×    │  header
+ *   ├──────────────────────────────────────────────┤
+ *   │ 查找   替换                                  │  tab strip
+ *   ├──────────────────────────────────────────────┤
+ *   │ 查找内容  [_______________]   ↑  ↓           │
+ *   │ 替换为    [_______________]                  │  body
+ *   │ □ 区分大小写  □ 单元格匹配  □ 公式  □ 正则   │
+ *   ├──────────────────────────────────────────────┤
+ *   │              全部替换  替换  关闭            │  footer
+ *   └──────────────────────────────────────────────┘
+ *
+ * The shared skin in styles.css applies "padding: 12px 16px" to every direct
+ * child of [role=dialog]; we override that per-section below so the header,
+ * tab strip, and footer can carry their own bottom border / background. */
+
+.find-replace-dialog {
+  /* Reshape the shared dialog card to Univer's tighter footprint. */
+  width: 480px;
+  min-width: 480px !important;
+  max-width: 480px !important;
+  min-height: 280px;
+  border-radius: 6px !important;
+  box-shadow: 0 10px 30px rgba(0, 0, 0, 0.18) !important;
+  padding: 0 !important;
+}
+
+/* Reset the universal "all direct children get 12px 16px" rule from styles.css
+ * — the new sections own their own padding. The selector below is more
+ * specific because it goes through .find-replace-dialog, so it wins. */
+.vnext-demo .find-replace-dialog > *,
+.demo-page .find-replace-dialog > *,
+.find-replace-dialog > * {
+  padding: 0;
+}
+
+/* === Header ============================================================ */
+
+.find-replace-dialog .fr-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  height: 40px;
+  padding: 0 14px !important;
+  border-bottom: 1px solid var(--border, #e5e5e5);
+  background: #ffffff;
+}
+
+.find-replace-dialog .fr-title {
+  font-size: 14px;
+  font-weight: 600;
+  color: var(--text-default, #1a1a1a);
+  user-select: none;
+}
+
+/* The shared .dialog-close-x already absolutely-positions itself in the
+ * top-right corner. We re-tune it for this dialog: pull it slightly inset so
+ * it sits inside the header band rather than above it. */
+.find-replace-dialog .dialog-close-x {
+  position: absolute;
+  top: 8px;
+  right: 10px;
+  width: 24px;
+  height: 24px;
+  border: none;
+  background: transparent;
+  color: var(--text-muted, #6a6a6a);
+  font-size: 18px;
+  line-height: 1;
+  border-radius: 4px;
+  cursor: pointer;
+}
+.find-replace-dialog .dialog-close-x:hover {
+  background: var(--hover, #f0f0f0);
+  color: var(--text-default, #1a1a1a);
+}
+
+/* === Tab strip ========================================================= */
+
+.find-replace-dialog .fr-tabs {
+  display: flex;
+  gap: 24px;
+  padding: 0 16px !important;
+  border-bottom: 1px solid var(--border, #e5e5e5);
+  background: #ffffff;
+}
+
+.find-replace-dialog .fr-tab {
+  position: relative;
+  height: 36px;
+  padding: 0 2px;
+  border: none;
+  background: transparent;
+  color: var(--text-muted, #6a6a6a);
+  font: inherit;
+  font-size: 13px;
+  cursor: pointer;
+  transition: color 100ms ease-out;
+}
+
+.find-replace-dialog .fr-tab:hover {
+  color: var(--text-default, #1a1a1a);
+}
+
+.find-replace-dialog .fr-tab[aria-selected='true'] {
+  color: var(--office-blue, #0078d4);
+  font-weight: 600;
+}
+
+.find-replace-dialog .fr-tab[aria-selected='true']::after {
+  content: '';
+  position: absolute;
+  left: 0;
+  right: 0;
+  bottom: -1px;
+  height: 2px;
+  background: var(--office-blue, #0078d4);
+  border-radius: 1px;
+}
+
+/* === Body grid ========================================================= */
+
+.find-replace-dialog .fr-body {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  padding: 16px !important;
+  background: #ffffff;
+}
+
+.find-replace-dialog .fr-field {
+  display: grid;
+  grid-template-columns: 72px 1fr auto;
+  align-items: center;
+  gap: 10px;
+}
+
+.find-replace-dialog .fr-field-label {
+  font-size: 13px;
+  color: var(--text-default, #1a1a1a);
+  text-align: right;
+  white-space: nowrap;
+}
+
+.find-replace-dialog .fr-input {
+  height: 28px;
+  padding: 0 8px;
+  border: 1px solid var(--border, #d4d4d4);
+  border-radius: 4px;
+  background: #ffffff;
+  font: inherit;
+  color: var(--text-default, #1a1a1a);
+  transition: border-color 100ms ease-out, box-shadow 100ms ease-out;
+}
+
+.find-replace-dialog .fr-input:focus {
+  outline: none;
+  border-color: var(--office-blue, #0078d4);
+  box-shadow: 0 0 0 2px rgba(0, 120, 212, 0.18);
+}
+
+/* Inline step buttons (↑ / ↓) that sit at the end of the 查找内容 row. */
+.find-replace-dialog .fr-step-group {
+  display: inline-flex;
+  gap: 4px;
+}
+
+.find-replace-dialog .fr-step-btn {
+  width: 28px;
+  height: 28px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  border: 1px solid var(--border, #d4d4d4);
+  border-radius: 4px;
+  background: #ffffff;
+  color: var(--text-default, #1a1a1a);
+  font: inherit;
+  font-size: 14px;
+  line-height: 1;
+  cursor: pointer;
+  transition: background 100ms ease-out, border-color 100ms ease-out;
+}
+
+.find-replace-dialog .fr-step-btn:hover:not(:disabled) {
+  background: var(--hover, #f0f0f0);
+  border-color: var(--border-strong, #b0b0b0);
+}
+
+/* The replacement row spans the input full-width — no step buttons there. */
+.find-replace-dialog .fr-field.fr-field-replace {
+  grid-template-columns: 72px 1fr;
+}
+
+/* Toggle row (区分大小写 / 单元格匹配 / 公式 / 正则). */
+.find-replace-dialog .fr-options {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 14px 18px;
+  padding-left: 82px; /* align with the inputs above (72px label + 10px gap) */
+}
+
+.find-replace-dialog .fr-option {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 12px;
+  color: var(--text-default, #1a1a1a);
+  cursor: pointer;
+  user-select: none;
+}
+
+.find-replace-dialog .fr-option input[type='checkbox'] {
+  width: 14px;
+  height: 14px;
+  margin: 0;
+  accent-color: var(--office-blue, #0078d4);
+  cursor: pointer;
+}
+
+/* Scope row sits below the toggles, same alignment. */
+.find-replace-dialog .fr-scope {
+  display: grid;
+  grid-template-columns: 72px 1fr;
+  align-items: center;
+  gap: 10px;
+}
+
+.find-replace-dialog .fr-select {
+  height: 28px;
+  padding: 0 8px;
+  border: 1px solid var(--border, #d4d4d4);
+  border-radius: 4px;
+  background: #ffffff;
+  font: inherit;
+  color: var(--text-default, #1a1a1a);
+  cursor: pointer;
+}
+
+.find-replace-dialog .fr-select:focus {
+  outline: none;
+  border-color: var(--office-blue, #0078d4);
+  box-shadow: 0 0 0 2px rgba(0, 120, 212, 0.18);
+}
+
+/* === Status / error ==================================================== */
+
+.find-replace-dialog .fr-status {
+  min-height: 16px;
+  padding: 0 16px 8px !important;
+  font-size: 12px;
+  color: var(--text-muted, #6a6a6a);
+  background: #ffffff;
+}
+
+.find-replace-dialog .fr-error {
+  padding: 0 16px 8px !important;
+  font-size: 12px;
+  color: #c0392b;
+  background: #ffffff;
+}
+
+/* Replace-all hit the 500-match page cap (audit D-12). */
+.find-replace-dialog .fr-capped {
+  padding: 0 16px 8px !important;
+  font-size: 12px;
+  color: #8a6d1a;
+  background: #ffffff;
+}
+
+/* === Footer ============================================================ */
+
+.find-replace-dialog .fr-footer {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 8px;
+  height: 48px;
+  padding: 0 16px !important;
+  border-top: 1px solid var(--border, #e5e5e5);
+  background: var(--bg-chrome-light, #fafafa);
+}
+
+.find-replace-dialog .fr-btn {
+  height: 28px;
+  min-width: 64px;
+  padding: 0 14px;
+  border: 1px solid var(--border, #d4d4d4);
+  border-radius: 4px;
+  background: #ffffff;
+  color: var(--text-default, #1a1a1a);
+  font: inherit;
+  font-size: 13px;
+  cursor: pointer;
+  transition: background 100ms ease-out, border-color 100ms ease-out;
+}
+
+.find-replace-dialog .fr-btn:hover:not(:disabled) {
+  background: var(--hover, #f0f0f0);
+  border-color: var(--border-strong, #b0b0b0);
+}
+
+.find-replace-dialog .fr-btn-primary {
+  background: var(--office-blue, #0078d4);
+  border-color: var(--office-blue, #0078d4);
+  color: #ffffff;
+}
+
+.find-replace-dialog .fr-btn-primary:hover:not(:disabled) {
+  background: #006cbe;
+  border-color: #006cbe;
+}
+
+/* === Tab-driven visibility ============================================ *
+ * Elements that only belong to the 替换 tab carry data-replace-only="true".
+ * When the active tab is "find" we hide them via display:none — but they
+ * stay in the DOM so existing tests (which query by data-testid) keep
+ * passing. */
+.find-replace-dialog[data-active-tab='find'] [data-replace-only='true'] {
+  display: none !important;
+}

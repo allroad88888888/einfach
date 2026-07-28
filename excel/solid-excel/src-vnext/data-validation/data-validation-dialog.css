@@ -1,0 +1,272 @@
+/* Data Validation dialog — Univer-style restyle.
+ *
+ * Layered on top of the global vnext dialog skin in excel/solid-excel/src/styles.css.
+ * Scoped via [role='dialog'].validation-dialog to win over the generic dialog
+ * rules without raising !important. */
+
+[role='dialog'].validation-dialog {
+  width: 520px;
+  max-width: 520px;
+  min-width: 520px;
+  height: 420px;
+  max-height: 420px;
+  padding: 0;
+  background: #ffffff;
+  border: 1px solid #d9dde2;
+  border-radius: 6px;
+  box-shadow: 0 12px 32px rgba(0, 0, 0, 0.18), 0 2px 6px rgba(0, 0, 0, 0.08);
+  font-family: var(--excel-font, -apple-system, system-ui, sans-serif);
+  font-size: 13px;
+  color: #1f2329;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+}
+
+/* Reset the global "> * { padding: 12px 16px }" rule from styles.css. */
+[role='dialog'].validation-dialog > * {
+  padding: 0;
+}
+
+/* ---- Header ---------------------------------------------------------- */
+
+.dv-dialog-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  height: 44px;
+  padding: 0 14px;
+  border-bottom: 1px solid #ebedf0;
+  background: #ffffff;
+  flex: 0 0 auto;
+}
+
+.dv-dialog-title {
+  font-size: 14px;
+  font-weight: 600;
+  color: #1f2329;
+  letter-spacing: 0.1px;
+}
+
+[role='dialog'].validation-dialog .dialog-close-x {
+  position: static;
+  width: 24px;
+  height: 24px;
+  border: none;
+  background: transparent;
+  color: #6b7280;
+  font-size: 18px;
+  line-height: 1;
+  cursor: pointer;
+  border-radius: 4px;
+}
+
+[role='dialog'].validation-dialog .dialog-close-x:hover {
+  background: #f3f4f6;
+  color: #1f2329;
+}
+
+/* ---- Body ------------------------------------------------------------ */
+
+.dv-dialog-body {
+  flex: 1 1 auto;
+  overflow-y: auto;
+  padding: 14px 16px;
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+
+/* Range chip — single highlighted value that displays the selected range. */
+.dv-range-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.dv-range-label {
+  font-size: 12px;
+  font-weight: 600;
+  color: #4e5969;
+  letter-spacing: 0.2px;
+}
+
+.validation-range {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 4px 10px;
+  background: #eef4ff;
+  border: 1px solid #b9d3ff;
+  border-radius: 12px;
+  color: #1f5cd6;
+  font-size: 12px;
+  font-weight: 500;
+  font-family: var(--excel-font, ui-monospace, monospace);
+}
+
+.validation-range::before {
+  content: '';
+  display: inline-block;
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: #2c6fef;
+}
+
+/* Form rows — label + control, label sits on its own line on top to keep the
+ * dialog readable when the control widens. */
+.dv-form-row {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.dv-form-row > label {
+  font-size: 12px;
+  font-weight: 500;
+  color: #4e5969;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+[role='dialog'].validation-dialog .dv-dialog-body select,
+[role='dialog'].validation-dialog .dv-dialog-body input {
+  width: 100%;
+  height: 30px;
+  padding: 0 10px;
+  border: 1px solid #d9dde2;
+  border-radius: 4px;
+  background: #ffffff;
+  color: #1f2329;
+  font: inherit;
+  outline: none;
+  transition: border-color 120ms ease, box-shadow 120ms ease;
+  box-sizing: border-box;
+}
+
+[role='dialog'].validation-dialog .dv-dialog-body select:hover,
+[role='dialog'].validation-dialog .dv-dialog-body input:hover {
+  border-color: #b7bdc7;
+}
+
+[role='dialog'].validation-dialog .dv-dialog-body select:focus,
+[role='dialog'].validation-dialog .dv-dialog-body input:focus {
+  border-color: #4c8df5;
+  box-shadow: 0 0 0 2px rgba(76, 141, 245, 0.16);
+}
+
+/* Range min/max pair — render side-by-side on the same row. */
+.dv-range-pair {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 10px;
+}
+
+/* Mode radio group — custom selected highlight, no native browser look. */
+.dv-mode-group {
+  display: flex;
+  gap: 8px;
+}
+
+.dv-mode-option {
+  flex: 1 1 0;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  height: 30px;
+  padding: 0 12px;
+  border: 1px solid #d9dde2;
+  border-radius: 4px;
+  background: #ffffff;
+  color: #4e5969;
+  font-size: 13px;
+  font-weight: 500;
+  cursor: pointer;
+  transition: background 120ms ease, border-color 120ms ease, color 120ms ease;
+  user-select: none;
+}
+
+.dv-mode-option:hover {
+  border-color: #b7bdc7;
+  background: #f9fafb;
+}
+
+.dv-mode-option[data-selected='true'] {
+  border-color: #2c6fef;
+  background: #eef4ff;
+  color: #1f5cd6;
+}
+
+/* Visually hide the underlying native control but keep it accessible. */
+.dv-mode-option input {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  margin: -1px;
+  padding: 0;
+  border: 0;
+  clip: rect(0 0 0 0);
+  overflow: hidden;
+  white-space: nowrap;
+}
+
+/* ---- Footer ---------------------------------------------------------- */
+
+.dv-dialog-footer {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 8px;
+  height: 52px;
+  padding: 0 14px;
+  border-top: 1px solid #ebedf0;
+  background: #ffffff;
+  flex: 0 0 auto;
+}
+
+[role='dialog'].validation-dialog .dv-dialog-footer button {
+  height: 30px;
+  min-width: 72px;
+  padding: 0 16px;
+  border: 1px solid #d9dde2;
+  border-radius: 4px;
+  background: #ffffff;
+  color: #1f2329;
+  font: inherit;
+  font-weight: 500;
+  cursor: pointer;
+  transition: background 120ms ease, border-color 120ms ease, color 120ms ease;
+}
+
+[role='dialog'].validation-dialog .dv-dialog-footer button:hover:not(:disabled) {
+  background: #f3f4f6;
+  border-color: #b7bdc7;
+}
+
+[role='dialog'].validation-dialog .dv-dialog-footer button[data-variant='primary'] {
+  background: #2c6fef;
+  border-color: #2c6fef;
+  color: #ffffff;
+}
+
+[role='dialog'].validation-dialog
+  .dv-dialog-footer
+  button[data-variant='primary']:hover:not(:disabled) {
+  background: #1f5cd6;
+  border-color: #1f5cd6;
+}
+
+[role='dialog'].validation-dialog .dv-dialog-footer button[data-variant='danger'] {
+  color: #d4380d;
+  border-color: #f1c0b1;
+  background: #fff4f0;
+}
+
+[role='dialog'].validation-dialog
+  .dv-dialog-footer
+  button[data-variant='danger']:hover:not(:disabled) {
+  background: #ffe6dc;
+  border-color: #e4886c;
+}

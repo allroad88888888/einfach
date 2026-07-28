@@ -1,11 +1,11 @@
 ---
 name: einfach-core-engine
-description: "Use when reading, debugging, or modifying the @einfach/core store engine in vanilla/core/src — atom state tables, dependency tracking, the isFresh snapshot check, the 256-depth recursion budget and FAULT frame loop for deep chains, flushPending propagation, circular-dependency errors, continuable promises for async atoms, or the dev-only Object.freeze on atom values. Also use when a bug looks like a stale atom value, a read function running more than once, RangeError maximum call stack, a frozen-object write failure, or an O(N^2) propagation slowdown."
+description: "Use when reading, debugging, or modifying the @einfach/core store engine in core/core/src — atom state tables, dependency tracking, the isFresh snapshot check, the 256-depth recursion budget and FAULT frame loop for deep chains, flushPending propagation, circular-dependency errors, continuable promises for async atoms, or the dev-only Object.freeze on atom values. Also use when a bug looks like a stale atom value, a read function running more than once, RangeError maximum call stack, a frozen-object write failure, or an O(N^2) propagation slowdown."
 ---
 
 # @einfach/core 引擎内核
 
-`vanilla/core/src` 的求值模型。**改这里之前先读完本文** —— 这个 store 有若干与 Jotai 不同、且被测试逐条钉住的刻意行为，凭直觉改会静默破坏 Excel 深公式链。
+`core/core/src` 的求值模型。**改这里之前先读完本文** —— 这个 store 有若干与 Jotai 不同、且被测试逐条钉住的刻意行为，凭直觉改会静默破坏 Excel 深公式链。
 
 不涉及：`utils/` 那一层的用法（selectAtom / createUndoRedo / family 等）、React/Solid 绑定、vnext 分层规则。
 
@@ -99,7 +99,7 @@ setter(atom, …args)
 ## 8. 改动后怎么验证
 
 ```bash
-npx jest vanilla/core --no-coverage
+npx jest core/core --no-coverage
 ```
 
 三份深链护栏是这块代码的合同，**任何一条红了都说明改坏了语义，不要调阈值**：

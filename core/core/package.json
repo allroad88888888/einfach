@@ -1,0 +1,44 @@
+{
+  "name": "@einfach/core",
+  "version": "0.2.19",
+  "description": "Lightweight Jotai-inspired atomic state management core",
+  "type": "module",
+  "main": "./cjs/index.cjs",
+  "module": "./esm/index.mjs",
+  "typings": "./@types/index.d.ts",
+  "license": "MIT",
+  "author": "dol",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/allroad88888888/einfach.git",
+    "directory": "core/core"
+  },
+  "homepage": "https://github.com/allroad88888888/einfach/tree/main/core/core",
+  "bugs": {
+    "url": "https://github.com/allroad88888888/einfach/issues"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "files": [
+    "esm",
+    "cjs",
+    "@types",
+    "README.md"
+  ],
+  "scripts": {
+    "build": "tsc"
+  },
+  "sideEffects": false,
+  "engines": {
+    "node": ">=14.18.0"
+  },
+  "keywords": [
+    "einfach",
+    "state",
+    "atom"
+  ],
+  "devDependencies": {
+    "@types/node": "^20.11.30"
+  }
+}

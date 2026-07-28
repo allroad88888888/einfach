@@ -127,20 +127,147 @@ importers:
         specifier: 1.9.12
         version: 1.9.12
 
-  apps/excel-showcase:
+  core/core:
+    devDependencies:
+      '@types/node':
+        specifier: ^20.11.30
+        version: 20.17.30
+
+  core/react:
     dependencies:
       '@einfach/core':
         specifier: workspace:*
-        version: link:../../vanilla/core
+        version: link:../core
+      react:
+        specifier: '>=16.8 <20'
+        version: 18.3.1
+    devDependencies:
+      '@types/node':
+        specifier: ^20.11.30
+        version: 20.17.30
+      '@types/react':
+        specifier: ^18.3.3
+        version: 18.3.20
+
+  core/react-form:
+    dependencies:
+      '@einfach/core':
+        specifier: workspace:*
+        version: link:../core
+      '@einfach/react':
+        specifier: workspace:*
+        version: link:../react
+      '@einfach/react-utils':
+        specifier: workspace:*
+        version: link:../react-utils
+      '@einfach/utils':
+        specifier: workspace:*
+        version: link:../utils
+      react:
+        specifier: '>=16.8 <20'
+        version: 18.3.1
+    devDependencies:
+      '@types/node':
+        specifier: ^20.11.30
+        version: 20.17.30
+      '@types/react':
+        specifier: '>=16.8 <20'
+        version: 18.3.20
+
+  core/react-utils:
+    dependencies:
+      '@einfach/core':
+        specifier: workspace:*
+        version: link:../core
+      '@einfach/react':
+        specifier: workspace:*
+        version: link:../react
+      '@einfach/utils':
+        specifier: workspace:*
+        version: link:../utils
+      react:
+        specifier: '>=16.8 <20'
+        version: 18.3.1
+      react-dom:
+        specifier: '>=16.8 <20'
+        version: 18.3.1(react@18.3.1)
+    devDependencies:
+      '@types/node':
+        specifier: ^20.11.30
+        version: 20.17.30
+      '@types/react':
+        specifier: ^18.3.3
+        version: 18.3.20
+      '@types/react-dom':
+        specifier: ^18.3.0
+        version: 18.3.6(@types/react@18.3.20)
+
+  core/solid:
+    dependencies:
+      '@einfach/core':
+        specifier: workspace:*
+        version: link:../core
+      solid-js:
+        specifier: 1.9.12
+        version: 1.9.12
+    devDependencies:
+      '@types/node':
+        specifier: ^20.11.30
+        version: 20.17.30
+
+  core/solid-form:
+    dependencies:
+      '@einfach/core':
+        specifier: workspace:*
+        version: link:../core
       '@einfach/solid':
         specifier: workspace:*
-        version: link:../../solid/solid
+        version: link:../solid
+      '@einfach/utils':
+        specifier: workspace:*
+        version: link:../utils
+      solid-js:
+        specifier: 1.9.12
+        version: 1.9.12
+    devDependencies:
+      '@types/node':
+        specifier: ^20.11.30
+        version: 20.17.30
+
+  core/utils:
+    dependencies:
+      '@einfach/core':
+        specifier: workspace:*
+        version: link:../core
+    devDependencies:
+      '@types/node':
+        specifier: ^20.11.30
+        version: 20.17.30
+
+  excel/excel-core-ts:
+    dependencies:
+      '@einfach/core':
+        specifier: workspace:*
+        version: link:../../core/core
+    devDependencies:
+      '@types/node':
+        specifier: ^20.11.30
+        version: 20.17.30
+
+  excel/showcase:
+    dependencies:
+      '@einfach/core':
+        specifier: workspace:*
+        version: link:../../core/core
+      '@einfach/solid':
+        specifier: workspace:*
+        version: link:../../core/solid
       '@einfach/solid-excel':
         specifier: workspace:*
-        version: link:../../solid/excel
+        version: link:../solid-excel
       '@einfach/spreadsheet-ui-core':
         specifier: workspace:*
-        version: link:../../vanilla/spreadsheet-ui-core
+        version: link:../spreadsheet-ui-core
       '@lingui/core':
         specifier: 6.0.1
         version: 6.0.1
@@ -161,89 +288,20 @@ importers:
         specifier: ^2.8.0
         version: 2.11.11(@testing-library/jest-dom@6.6.3)(solid-js@1.9.12)(vite@5.4.21(@types/node@20.17.30)(terser@5.39.0))
 
-  react/form:
+  excel/solid-excel:
     dependencies:
       '@einfach/core':
         specifier: workspace:*
-        version: link:../../vanilla/core
-      '@einfach/react':
-        specifier: workspace:*
-        version: link:../react
-      '@einfach/react-utils':
-        specifier: workspace:*
-        version: link:../utils
-      '@einfach/utils':
-        specifier: workspace:*
-        version: link:../../vanilla/utils
-      react:
-        specifier: '>=16.8 <20'
-        version: 18.3.1
-    devDependencies:
-      '@types/node':
-        specifier: ^20.11.30
-        version: 20.17.30
-      '@types/react':
-        specifier: '>=16.8 <20'
-        version: 18.3.20
-
-  react/react:
-    dependencies:
-      '@einfach/core':
-        specifier: workspace:*
-        version: link:../../vanilla/core
-      react:
-        specifier: '>=16.8 <20'
-        version: 18.3.1
-    devDependencies:
-      '@types/node':
-        specifier: ^20.11.30
-        version: 20.17.30
-      '@types/react':
-        specifier: ^18.3.3
-        version: 18.3.20
-
-  react/utils:
-    dependencies:
-      '@einfach/core':
-        specifier: workspace:*
-        version: link:../../vanilla/core
-      '@einfach/react':
-        specifier: workspace:*
-        version: link:../react
-      '@einfach/utils':
-        specifier: workspace:*
-        version: link:../../vanilla/utils
-      react:
-        specifier: '>=16.8 <20'
-        version: 18.3.1
-      react-dom:
-        specifier: '>=16.8 <20'
-        version: 18.3.1(react@18.3.1)
-    devDependencies:
-      '@types/node':
-        specifier: ^20.11.30
-        version: 20.17.30
-      '@types/react':
-        specifier: ^18.3.3
-        version: 18.3.20
-      '@types/react-dom':
-        specifier: ^18.3.0
-        version: 18.3.6(@types/react@18.3.20)
-
-  solid/excel:
-    dependencies:
-      '@einfach/core':
-        specifier: workspace:*
-        version: link:../../vanilla/core
+        version: link:../../core/core
       '@einfach/excel-core-ts':
         specifier: workspace:*
-        version: link:../../vanilla/excel-core-ts
+        version: link:../excel-core-ts
       '@einfach/solid':
         specifier: workspace:*
-        version: link:../solid
+        version: link:../../core/solid
       '@einfach/spreadsheet-ui-core':
         specifier: workspace:*
-        version: link:../../vanilla/spreadsheet-ui-core
+        version: link:../spreadsheet-ui-core
       '@lingui/core':
         specifier: ^6.0.1
         version: 6.0.1
@@ -273,71 +331,11 @@ importers:
         specifier: ^3.3.0
         version: 3.6.0(vite@5.4.21(@types/node@20.17.30)(terser@5.39.0))
 
-  solid/excel/wasm-pkg: {}
-
-  solid/form:
+  excel/spreadsheet-ui-core:
     dependencies:
       '@einfach/core':
         specifier: workspace:*
-        version: link:../../vanilla/core
-      '@einfach/solid':
-        specifier: workspace:*
-        version: link:../solid
-      '@einfach/utils':
-        specifier: workspace:*
-        version: link:../../vanilla/utils
-      solid-js:
-        specifier: 1.9.12
-        version: 1.9.12
-    devDependencies:
-      '@types/node':
-        specifier: ^20.11.30
-        version: 20.17.30
-
-  solid/solid:
-    dependencies:
-      '@einfach/core':
-        specifier: workspace:*
-        version: link:../../vanilla/core
-      solid-js:
-        specifier: 1.9.12
-        version: 1.9.12
-    devDependencies:
-      '@types/node':
-        specifier: ^20.11.30
-        version: 20.17.30
-
-  vanilla/core:
-    devDependencies:
-      '@types/node':
-        specifier: ^20.11.30
-        version: 20.17.30
-
-  vanilla/excel-core-ts:
-    dependencies:
-      '@einfach/core':
-        specifier: workspace:*
-        version: link:../core
-    devDependencies:
-      '@types/node':
-        specifier: ^20.11.30
-        version: 20.17.30
-
-  vanilla/spreadsheet-ui-core:
-    dependencies:
-      '@einfach/core':
-        specifier: workspace:*
-        version: link:../core
-    devDependencies:
-      '@types/node':
-        specifier: ^20.11.30
-        version: 20.17.30
-
-  vanilla/utils:
-    dependencies:
-      '@einfach/core':
-        specifier: workspace:*
-        version: link:../core
+        version: link:../../core/core
     devDependencies:
       '@types/node':
         specifier: ^20.11.30
@@ -2208,9 +2206,6 @@ packages:
   cssstyle@2.3.0:
     resolution: {integrity: sha512-AZL67abkUzIuvcHqk7c09cezpGNcxUxU4Ioi/05xHk4DQeTkWmGYftIE6ctU6AEt+Gn4n1lDStOtj7FKycP71A==}
     engines: {node: '>=8'}
-
-  csstype@3.1.3:
-    resolution: {integrity: sha512-M1uQkMl8rQK/szD0LNhtqxIPLpimGm8sOBwU7lLnCpSbTyY3yeU1Vc7l4KT5zT4s/yOxHH5O7tIuuLOCnLADRw==}
 
   csstype@3.2.3:
     resolution: {integrity: sha512-z1HGKcYy2xA8AGQfwrn0PAy+PB7X/GSj3UVJW9qKyn43xWa+gl5nXmU4qqLMRzWVLFC8KusUX8T/0kCiOYpAIQ==}
@@ -5816,7 +5811,7 @@ snapshots:
   '@types/react@18.3.20':
     dependencies:
       '@types/prop-types': 15.7.14
-      csstype: 3.1.3
+      csstype: 3.2.3
 
   '@types/resolve@1.20.2': {}
 
@@ -6338,8 +6333,6 @@ snapshots:
   cssstyle@2.3.0:
     dependencies:
       cssom: 0.3.8
-
-  csstype@3.1.3: {}
 
   csstype@3.2.3: {}
 

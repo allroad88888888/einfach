@@ -1,0 +1,56 @@
+{
+  "name": "@einfach/react",
+  "version": "0.3.26",
+  "description": "Lightweight Jotai-inspired atomic state management for React",
+  "type": "module",
+  "main": "./cjs/index.cjs",
+  "module": "./esm/index.mjs",
+  "typings": "./@types/index.d.ts",
+  "license": "MIT",
+  "author": "dol",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/allroad88888888/einfach.git",
+    "directory": "core/react"
+  },
+  "homepage": "https://github.com/allroad88888888/einfach/tree/main/core/react",
+  "bugs": {
+    "url": "https://github.com/allroad88888888/einfach/issues"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "files": [
+    "esm",
+    "cjs",
+    "@types",
+    "README.md"
+  ],
+  "scripts": {
+    "build": "tsc"
+  },
+  "sideEffects": false,
+  "engines": {
+    "node": ">=14.18.0"
+  },
+  "keywords": [
+    "einfach",
+    "react",
+    "atom"
+  ],
+  "dependencies": {
+    "@einfach/core": "workspace:*"
+  },
+  "peerDependencies": {
+    "react": ">=16.8 <20"
+  },
+  "peerDependenciesMeta": {
+    "react": {
+      "optional": false
+    }
+  },
+  "devDependencies": {
+    "@types/node": "^20.11.30",
+    "@types/react": "^18.3.3"
+  }
+}

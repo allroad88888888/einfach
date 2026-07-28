@@ -1,0 +1,53 @@
+{
+  "name": "@einfach/utils",
+  "version": "0.2.18",
+  "description": "Utility functions for Einfach state management",
+  "type": "module",
+  "main": "./cjs/index.cjs",
+  "module": "./esm/index.mjs",
+  "typings": "./@types/index.d.ts",
+  "license": "MIT",
+  "author": "dol",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/allroad88888888/einfach.git",
+    "directory": "core/utils"
+  },
+  "homepage": "https://github.com/allroad88888888/einfach/tree/main/core/utils",
+  "bugs": {
+    "url": "https://github.com/allroad88888888/einfach/issues"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "files": [
+    "esm",
+    "cjs",
+    "@types",
+    "README.md"
+  ],
+  "scripts": {
+    "build": "tsc"
+  },
+  "keywords": [
+    "einfach",
+    "utils",
+    "memoize",
+    "lodash"
+  ],
+  "sideEffects": false,
+  "engines": {
+    "node": ">=14.18.0"
+  },
+  "peerDependencies": {
+    "@einfach/core": "workspace:*"
+  },
+  "peerDependenciesMeta": {
+    "@einfach/core": {
+      "optional": true
+    }
+  },
+  "devDependencies": {
+    "@types/node": "^20.11.30"
+  }
+}

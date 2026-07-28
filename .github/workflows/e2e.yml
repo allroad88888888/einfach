@@ -3,7 +3,7 @@ name: e2e
 # Solid Excel browser tests. Separate from `ci.yml` (jest + build) so
 # e2e flake doesn't block the unit-test signal while the suite settles in.
 #
-# Policy (per `solid/excel/docs/E2E_TEST_PLAN.md` "CI Gate Policy"):
+# Policy (per `excel/solid-excel/docs/E2E_TEST_PLAN.md` "CI Gate Policy"):
 #   - Advisory for the first 2 weeks of green runs (no PR merge gate).
 #   - Failures upload `playwright-report/` + `test-results/` for triage.
 #   - Promote to PR-blocking once stable.
@@ -50,8 +50,8 @@ jobs:
           path: |
             ~/.cargo/registry
             ~/.cargo/git
-            rust/target
-          key: ${{ runner.os }}-cargo-e2e-${{ hashFiles('rust/**/Cargo.lock', 'rust/**/Cargo.toml') }}
+            excel/rust/target
+          key: ${{ runner.os }}-cargo-e2e-${{ hashFiles('excel/rust/**/Cargo.lock', 'excel/rust/**/Cargo.toml') }}
           restore-keys: |
             ${{ runner.os }}-cargo-e2e-
 
@@ -83,7 +83,7 @@ jobs:
         with:
           name: playwright-report
           path: |
-            solid/excel/playwright-report/
-            solid/excel/test-results/
+            excel/solid-excel/playwright-report/
+            excel/solid-excel/test-results/
           retention-days: 14
           if-no-files-found: ignore

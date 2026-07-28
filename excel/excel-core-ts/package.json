@@ -1,0 +1,46 @@
+{
+  "name": "@einfach/excel-core-ts",
+  "version": "0.0.0",
+  "private": true,
+  "description": "TypeScript port of the Rust einfach-excel-core. Formula parser + evaluator + workbook state; reactive layer delegated to @einfach/core.",
+  "type": "module",
+  "main": "./cjs/index.cjs",
+  "module": "./esm/index.mjs",
+  "typings": "./@types/index.d.ts",
+  "license": "MIT",
+  "author": "dol",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/allroad88888888/einfach.git",
+    "directory": "excel/excel-core-ts"
+  },
+  "homepage": "https://github.com/allroad88888888/einfach/tree/main/excel/excel-core-ts",
+  "bugs": {
+    "url": "https://github.com/allroad88888888/einfach/issues"
+  },
+  "files": [
+    "esm",
+    "cjs",
+    "@types",
+    "README.md"
+  ],
+  "scripts": {
+    "build": "tsc"
+  },
+  "sideEffects": false,
+  "engines": {
+    "node": ">=14.18.0"
+  },
+  "keywords": [
+    "spreadsheet",
+    "formula",
+    "atom",
+    "einfach"
+  ],
+  "dependencies": {
+    "@einfach/core": "workspace:*"
+  },
+  "devDependencies": {
+    "@types/node": "^20.11.30"
+  }
+}

@@ -8,12 +8,12 @@ alwaysApply: true
 Einfach是一个轻量级状态管理和表单处理库集合，类似于Jotai和AntD Form。
 
 ## 目录结构
-- `vanilla/core`: 框架无关的原子状态管理核心
-- `react/react`: React状态管理钩子
-- `react/form`: 表单处理库
-- `react/utils`: React工具钩子
-- `vanilla/utils`: 通用工具函数
-- `solid/solid`: Solid.js绑定
+- `core/core`: 框架无关的原子状态管理核心
+- `core/react`: React状态管理钩子
+- `core/react-form`: 表单处理库
+- `core/react-utils`: React工具钩子
+- `core/utils`: 通用工具函数
+- `core/solid`: Solid.js绑定
 
 ## 技术框架约定
 

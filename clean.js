@@ -5,8 +5,8 @@ import { fileURLToPath } from 'url'
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url))
 
-// 新的包名称
-const packages = ['react', 'solid', 'vanilla']
+// 两个顶层分组：core/（库）与 excel/（表格栈）
+const packages = ['core', 'excel']
 
 // 需要删除的目录和文件后缀
 const targets = ['tsconfig.tsbuildinfo', 'es', 'esm', 'cjs', '@types', 'dist']
