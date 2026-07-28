@@ -67,7 +67,9 @@ describe('DATE', () => {
   })
 
   test('day overflow rolls forward — DATE(2024, 1, 32) === 2024-02-01', () => {
-    expect(call(DATE, [num(2024), num(1), num(32)])).toEqual(call(DATE, [num(2024), num(2), num(1)]))
+    expect(call(DATE, [num(2024), num(1), num(32)])).toEqual(
+      call(DATE, [num(2024), num(2), num(1)]),
+    )
   })
 
   test('years 0..1899 add 1900 and negative years return #NUM!', () => {

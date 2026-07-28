@@ -19,12 +19,14 @@
 
 import { beforeAll, describe, expect, jest, test } from '@jest/globals'
 
+import type * as NodeFsModule from 'node:fs'
+import type * as NodePathModule from 'node:path'
 import type { WorkerLike, WorkerWorkbookClient } from '../src-vnext/adapter'
 
 jest.mock('../wasm-pkg/einfach_wasm.js', () => {
   /* eslint-disable @typescript-eslint/no-var-requires */
-  const { readFileSync } = require('node:fs') as typeof import('node:fs')
-  const nodePath = require('node:path') as typeof import('node:path')
+  const { readFileSync } = require('node:fs') as typeof NodeFsModule
+  const nodePath = require('node:path') as typeof NodePathModule
   const real = jest.requireActual('../wasm-pkg/einfach_wasm.js') as {
     initSync: (input: { module: ArrayBufferLike }) => unknown
     WasmWorkbook: unknown

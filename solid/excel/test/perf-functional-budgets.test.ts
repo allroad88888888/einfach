@@ -34,13 +34,15 @@
 
 import { beforeAll, describe, expect, jest, test } from '@jest/globals'
 import type { CellRange, ImportCellInput, VisibleWindow } from '@einfach/spreadsheet-ui-core'
+import type * as NodeFsModule from 'node:fs'
+import type * as NodePathModule from 'node:path'
 
 import type { WorkerLike, WorkerWorkbookSpreadsheetBackend } from '../src-vnext/adapter'
 
 jest.mock('../wasm-pkg/einfach_wasm.js', () => {
   /* eslint-disable @typescript-eslint/no-var-requires */
-  const { readFileSync } = require('node:fs') as typeof import('node:fs')
-  const nodePath = require('node:path') as typeof import('node:path')
+  const { readFileSync } = require('node:fs') as typeof NodeFsModule
+  const nodePath = require('node:path') as typeof NodePathModule
   const real = jest.requireActual('../wasm-pkg/einfach_wasm.js') as {
     initSync: (input: { module: ArrayBufferLike }) => unknown
     WasmWorkbook: unknown
@@ -167,8 +169,8 @@ async function createBackend(): Promise<WorkerWorkbookSpreadsheetBackend> {
 let requestSeq = 1
 const nextId = (): number => (requestSeq += 1)
 
-function makeRng(seed: number): () => number {
-  let s = seed >>> 0
+function makeRng(rngSeed: number): () => number {
+  let s = rngSeed >>> 0
   return () => {
     s = (s * 1664525 + 1013904223) >>> 0
     return s / 0xffffffff

@@ -1,4 +1,5 @@
 import { describe, it, expect } from '@jest/globals'
+import type * as JestGlobalsModule from '@jest/globals'
 import { createWorkerSheet, type WorkerLike } from '../src/wasm-sheet-proxy'
 
 /**
@@ -7,6 +8,11 @@ import { createWorkerSheet, type WorkerLike } from '../src/wasm-sheet-proxy'
  * records postMessage payloads and exposes `_emit` to simulate the worker
  * side pushing 'change' events back.
  */
+
+// jest provides `jest` globally via @types/jest; keep it nominal for the
+// strict TS config above (the `import { describe, ... } from '@jest/globals'`
+// already pulls in the namespace).
+declare const jest: typeof JestGlobalsModule.jest
 
 interface FakeWorker extends WorkerLike {
   sent: unknown[]
@@ -452,8 +458,3 @@ describe('wasm-sheet-proxy (7C Step 1)', () => {
     })
   })
 })
-
-// jest provides `jest` globally via @types/jest; keep it nominal for the
-// strict TS config above (the `import { describe, ... } from '@jest/globals'`
-// already pulls in the namespace).
-declare const jest: typeof import('@jest/globals').jest

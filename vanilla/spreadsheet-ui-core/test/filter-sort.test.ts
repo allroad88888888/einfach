@@ -2494,6 +2494,11 @@ describe('shared history producer lane — Reapply', () => {
     prepareReapply(store)
     let capturedRequest: SetFilterSortRequest | undefined
     let replacement: Promise<void> | undefined
+    // Declared ahead of `acknowledgement` (assigned below) so the Proxy's
+    // re-entrant getter can close over it without a forward reference —
+    // `source` and `acknowledgement` refer to each other by design.
+    // eslint-disable-next-line prefer-const -- must predate `acknowledgement` as an uninitialized `let`; assigned exactly once below
+    let source: FilterSortControllerPort
     const acknowledgement = new Proxy(Object.create(null) as FilterSortMutationResult, {
       get(_target, property) {
         switch (property) {
@@ -2515,7 +2520,7 @@ describe('shared history producer lane — Reapply', () => {
       },
     })
     const requests: SetFilterSortRequest[] = []
-    const source: FilterSortControllerPort = {
+    source = {
       async setFilterSort(request) {
         requests.push(request)
         capturedRequest = request

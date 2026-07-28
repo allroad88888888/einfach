@@ -118,8 +118,8 @@ describe('useAtomCallback', () => {
 
     const { result } = renderHook(() => {
       const callback = useAtomCallback(calc.multiply, [])
-      const result = useAtomValue(resultAtom)
-      return { callback, result }
+      const atomValue = useAtomValue(resultAtom)
+      return { callback, result: atomValue }
     })
 
     act(() => {
@@ -223,9 +223,9 @@ describe('useAtomCallback', () => {
         const callback = useAtomCallback(
           (get, set, value: number) => {
             callbackCreateCount++
-            const result = value * multiplier
-            set(countAtom, result)
-            return result
+            const product = value * multiplier
+            set(countAtom, product)
+            return product
           },
           [multiplier],
         ) // multiplier 作为依赖
@@ -259,9 +259,9 @@ describe('useAtomCallback', () => {
       ({ multiplier }) => {
         const callback = useAtomCallback(
           (get, set, value: number) => {
-            const result = value * multiplier
-            set(countAtom, result)
-            return result
+            const product = value * multiplier
+            set(countAtom, product)
+            return product
           },
           [multiplier],
         ) // multiplier 作为依赖
@@ -300,8 +300,8 @@ describe('useAtomCallback', () => {
           [prefix, suffix],
         ) // prefix 和 suffix 作为依赖
 
-        const result = useAtomValue(resultAtom)
-        return { formatMessage, result }
+        const resultValue = useAtomValue(resultAtom)
+        return { formatMessage, result: resultValue }
       },
       { initialProps: { prefix: '[', suffix: ']' } },
     )

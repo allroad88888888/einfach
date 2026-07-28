@@ -90,8 +90,8 @@ describe('FormItem', () => {
             <div>
               <Input dataTestid="foo-input" value={value} onChange={onChange} />
               <FormItem<string> name="bar" dataTestid="bar-item">
-                {({ value, onChange }) => (
-                  <Input dataTestid="bar-input" value={value} onChange={onChange} />
+                {({ value: barValue, onChange: barOnChange }) => (
+                  <Input dataTestid="bar-input" value={barValue} onChange={barOnChange} />
                 )}
               </FormItem>
             </div>

@@ -40,7 +40,12 @@ type Backend = ReturnType<typeof seededBackend>
 
 const A1_D4 = { rowStart: 0, rowEnd: 3, colStart: 0, colEnd: 5 }
 
-async function readCell(backend: Backend, sheetId: string, row: number, col: number): Promise<DisplayCell | undefined> {
+async function readCell(
+  backend: Backend,
+  sheetId: string,
+  row: number,
+  col: number,
+): Promise<DisplayCell | undefined> {
   const result = await backend.readRangeProjection(
     createRangeProjectionRequest({
       sheetId,
@@ -52,12 +57,22 @@ async function readCell(backend: Backend, sheetId: string, row: number, col: num
   return result.cells.find((c) => c.row === row && c.col === col)
 }
 
-async function setFormula(backend: Backend, sheetId: string, row: number, col: number, input: string): Promise<void> {
+async function setFormula(
+  backend: Backend,
+  sheetId: string,
+  row: number,
+  col: number,
+  input: string,
+): Promise<void> {
   await backend.setCellInput({ kind: 'set-cell-input', sheetId, row, col, input })
 }
 
 /** Set a formula at H1 (outside the seeded table) and read back its display. */
-async function evalFormula(backend: Backend, input: string, sheetId: string = SHEET): Promise<string> {
+async function evalFormula(
+  backend: Backend,
+  input: string,
+  sheetId: string = SHEET,
+): Promise<string> {
   await setFormula(backend, sheetId, 0, 7, input)
   const cell = await readCell(backend, sheetId, 0, 7)
   return cell?.displayValue ?? ''

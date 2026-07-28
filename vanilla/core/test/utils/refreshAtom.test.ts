@@ -11,7 +11,7 @@ describe('atomWithRefresh', () => {
   test('应该创建一个可刷新的atom', () => {
     let computeCount = 0
 
-    const refreshableAtom = atomWithRefresh(get => {
+    const refreshableAtom = atomWithRefresh(_get => {
       computeCount++
       return 'computed value'
     })

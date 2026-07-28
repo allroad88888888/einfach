@@ -141,8 +141,8 @@ describe('async', () => {
     )
 
     const xx = renderHook(() => {
-      const [state, setState] = useAtom(serverInfoAtom)
-      return [state, setState]
+      const [currentState, setState] = useAtom(serverInfoAtom)
+      return [currentState, setState]
     })
 
     await waitFor(

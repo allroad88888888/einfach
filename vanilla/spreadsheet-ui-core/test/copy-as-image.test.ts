@@ -72,7 +72,9 @@ describe('encodeSelectionAsImage', () => {
 
   test('returns empty-bytes failure when backend returns empty bytes', async () => {
     const backend = makeMinimalBackend({
-      exportRangeAsImage: async (req: RangeImageExportRequest): Promise<RangeImageExportResult> => ({
+      exportRangeAsImage: async (
+        req: RangeImageExportRequest,
+      ): Promise<RangeImageExportResult> => ({
         kind: 'range-image',
         sheetId: req.sheetId,
         range: req.range,

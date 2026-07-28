@@ -44,7 +44,7 @@ function createBackend(
   readResult: VisibleProjectionResult,
   setCellInputSpy: (request: SetCellInputRequest) => Promise<BackendMutationResult>,
 ) {
-  const readVisibleProjection = jest.fn(async (request: VisibleProjectionRequest) => {
+  const readVisibleProjection = jest.fn(async (_request: VisibleProjectionRequest) => {
     return readResult
   })
 

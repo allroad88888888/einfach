@@ -654,7 +654,9 @@ function writeReport() {
   // ran AFTER the bulk import completed; this table reports the
   // installed edge counts so the MEGA_TRACE doc can quantify how much
   // state the eager-build phase produced.
-  const tiersWithStats = results.filter((r): r is TierResult & { depStats: DepGraphStats } => !!r.depStats)
+  const tiersWithStats = results.filter(
+    (r): r is TierResult & { depStats: DepGraphStats } => !!r.depStats,
+  )
   if (tiersWithStats.length > 0) {
     lines.push('')
     lines.push('## Dep-graph stats after import (Phase 1B)')

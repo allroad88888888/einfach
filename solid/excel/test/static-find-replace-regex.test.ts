@@ -150,7 +150,9 @@ describe('static backend supported find baselines', () => {
 
     const result = await search(backend, 'fo+', { regex: true, caseSensitive: true })
 
-    expect(result.matches.map((match) => [match.matchStart, match.matchEnd, match.target])).toEqual([
+    expect(
+      result.matches.map((match) => [match.matchStart, match.matchEnd, match.target]),
+    ).toEqual([
       [7, 11, 'displayValue'],
       [16, 19, 'displayValue'],
     ])

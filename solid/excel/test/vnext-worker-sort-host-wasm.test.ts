@@ -23,12 +23,14 @@
 import { beforeAll, describe, expect, jest, test } from '@jest/globals'
 import type { BackendMutationResult, CellRange, DisplayCell } from '@einfach/spreadsheet-ui-core'
 
+import type * as NodeFsModule from 'node:fs'
+import type * as NodePathModule from 'node:path'
 import type { WorkerLike, WorkerWorkbookSpreadsheetBackend } from '../src-vnext/adapter'
 
 jest.mock('../wasm-pkg/einfach_wasm.js', () => {
   /* eslint-disable @typescript-eslint/no-var-requires */
-  const { readFileSync } = require('node:fs') as typeof import('node:fs')
-  const nodePath = require('node:path') as typeof import('node:path')
+  const { readFileSync } = require('node:fs') as typeof NodeFsModule
+  const nodePath = require('node:path') as typeof NodePathModule
   const real = jest.requireActual('../wasm-pkg/einfach_wasm.js') as {
     initSync: (input: { module: ArrayBufferLike }) => unknown
     WasmWorkbook: unknown
@@ -111,7 +113,12 @@ async function readCol(
   col: number,
   rows: number,
 ): Promise<string[]> {
-  const cells = await readCells(backend, { rowStart: 0, rowEnd: rows - 1, colStart: col, colEnd: col })
+  const cells = await readCells(backend, {
+    rowStart: 0,
+    rowEnd: rows - 1,
+    colStart: col,
+    colEnd: col,
+  })
   const byRow = new Map<number, string>()
   for (const cell of cells) if (cell.col === col) byRow.set(cell.row, cell.displayValue)
   return Array.from({ length: rows }, (_, row) => byRow.get(row) ?? '')

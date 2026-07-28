@@ -467,7 +467,14 @@ interface ParityEngine {
 interface PersistenceSnapshot {
   version: number
   sheets: Array<{ idx: number; name: string }>
-  cells: Array<{ sheet: number; addr: string; row: number; col: number; kind: string; value?: unknown }>
+  cells: Array<{
+    sheet: number
+    addr: string
+    row: number
+    col: number
+    kind: string
+    value?: unknown
+  }>
   [key: string]: unknown
 }
 
@@ -585,12 +592,25 @@ interface WasmWorkbookLike {
   snapshotCell(
     sheet: number,
     addr: string,
-  ): { sheet: number; addr: string; display: string; type: string; isError: boolean; formula: string }
+  ): {
+    sheet: number
+    addr: string
+    display: string
+    type: string
+    isError: boolean
+    formula: string
+  }
   set_cell_number(sheet: number, addr: string, value: number): void
   set_cell_text(sheet: number, addr: string, value: string): void
   clearCellAt(sheet: number, addr: string): void
   setFormulaAt(sheet: number, addr: string, src: string): boolean
-  clear_range(sheet: number, startRow: number, startCol: number, endRow: number, endCol: number): number
+  clear_range(
+    sheet: number,
+    startRow: number,
+    startCol: number,
+    endRow: number,
+    endCol: number,
+  ): number
   debug_formula_cache_state(sheet: number, addr: string): string
   snapshot_persistence_v1(): unknown
   restore_persistence_v1(snapshot: unknown): unknown

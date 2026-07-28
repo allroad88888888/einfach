@@ -65,9 +65,9 @@ describe('性能测试', () => {
             const tempIds = getter(idsAtom)
             const options: any[] = []
             tempIds.forEach((id) => {
-                const selectAtom = optionsSelectAtomMap.get(id)
-                if (selectAtom) {
-                    options.push(getter(selectAtom))
+                const optionSelectAtom = optionsSelectAtomMap.get(id)
+                if (optionSelectAtom) {
+                    options.push(getter(optionSelectAtom))
                 }
             })
             return options
@@ -86,10 +86,10 @@ describe('性能测试', () => {
 
         // 给每个选项设置订阅
         ids.forEach((id) => {
-            const atom = optionsMap.get(id)
-            if (atom) {
-                store.sub(atom, () => {
-                    store.getter(atom)
+            const targetAtom = optionsMap.get(id)
+            if (targetAtom) {
+                store.sub(targetAtom, () => {
+                    store.getter(targetAtom)
                 })
             }
         })
@@ -97,9 +97,9 @@ describe('性能测试', () => {
         // 批量更新所有选项
         const updateAllAtom = atom<number, [number], void>(0, (_getter, setter, _value) => {
             ids.forEach((id) => {
-                const atom = optionsMap.get(id)
-                if (atom) {
-                    setter(atom, {
+                const targetAtom = optionsMap.get(id)
+                if (targetAtom) {
+                    setter(targetAtom, {
                         id: id,
                         name: 'option next' + id,
                         index: id,

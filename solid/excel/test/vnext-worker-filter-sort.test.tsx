@@ -253,7 +253,10 @@ function createFilterFakeClient(
       const hiddenRows = filterHiddenRowsFromDisplayRows(displayRows, rowCount)
       // The engine commits the rules + derived set; the double mirrors it so a
       // subsequent `snapshotFilters` reports the committed filter.
-      filtersBySheet.set(sheet, { rules: rules.map((rule) => ({ ...rule })), hiddenRows: [...hiddenRows] })
+      filtersBySheet.set(sheet, {
+        rules: rules.map((rule) => ({ ...rule })),
+        hiddenRows: [...hiddenRows],
+      })
       return { ok: true, hiddenRows, scannedRows: rowCount, predicateCells }
     },
     async clearFilter(sheet): Promise<FilterApplyResultWire> {

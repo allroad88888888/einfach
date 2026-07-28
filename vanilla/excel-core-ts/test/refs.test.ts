@@ -490,9 +490,9 @@ describe('refs/ranges — rangeContains', () => {
     expect(rangeContains(r, { row: 3, col: 4 })).toBe(false)
   })
   test('handles inverted range input', () => {
-    expect(rangeContains({ rowStart: 4, rowEnd: 2, colStart: 3, colEnd: 1 }, { row: 3, col: 2 })).toBe(
-      true,
-    )
+    expect(
+      rangeContains({ rowStart: 4, rowEnd: 2, colStart: 3, colEnd: 1 }, { row: 3, col: 2 }),
+    ).toBe(true)
   })
 })
 

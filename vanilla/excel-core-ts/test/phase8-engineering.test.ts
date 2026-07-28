@@ -300,6 +300,7 @@ describe('ERF / ERFC', () => {
   })
 
   test('ERFC matches IEEE 754 double-precision reference values', () => {
+    // eslint-disable-next-line @typescript-eslint/no-loss-of-precision -- exact reference value, not roundable
     expectNumberClose(call(ERFC, [NUM(0.1)]), 0.8875370839817151, 15)
     expectNumberClose(call(ERFC, [NUM(0.5)]), 0.4795001221869535, 15)
     expectNumberClose(call(ERFC, [NUM(1)]), 0.1572992070502851, 15)
@@ -341,12 +342,14 @@ describe('CONVERT', () => {
     expectNumberClose(call(CONVERT, [NUM(1), STR('e'), STR('J')]), 1e-7, 12)
     expectNumberClose(call(CONVERT, [NUM(1), STR('c'), STR('J')]), 4.184, 9)
     expectNumberClose(call(CONVERT, [NUM(1), STR('cal'), STR('J')]), 4.184, 9)
+    // eslint-disable-next-line @typescript-eslint/no-loss-of-precision -- exact reference value, not roundable
     expectNumberClose(call(CONVERT, [NUM(1), STR('flb'), STR('J')]), 1.3558179483314004, 9)
     expectNumberClose(call(CONVERT, [NUM(1), STR('Wh'), STR('J')]), 3600, 9)
     expectNumberClose(call(CONVERT, [NUM(1), STR('wh'), STR('J')]), 3600, 9)
     expectNumberClose(call(CONVERT, [NUM(1), STR('HPh'), STR('J')]), 2684519.537696173, 3)
     expectNumberClose(call(CONVERT, [NUM(1), STR('hh'), STR('J')]), 2684519.537696173, 3)
     expectNumberClose(call(CONVERT, [NUM(1), STR('kWh'), STR('J')]), 3600000, 3)
+    // eslint-disable-next-line @typescript-eslint/no-loss-of-precision -- exact reference value, not roundable
     expectNumberClose(call(CONVERT, [NUM(1), STR('HP'), STR('W')]), 745.69987158227022, 3)
     expectNumberClose(call(CONVERT, [NUM(212), STR('F'), STR('C')]), 100, 9)
     expectNumberClose(call(CONVERT, [NUM(0), STR('C'), STR('K')]), 273.15, 9)

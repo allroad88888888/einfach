@@ -747,7 +747,7 @@ describe('conditional-formatting core state machine', () => {
     const pending = store.setter(
       runConditionalFormatMutationAtom,
       saveInput(async (request) => acknowledged(request, 8), {
-        listRules: (request) => {
+        listRules: (_request) => {
           listStarted.resolve(undefined)
           return listed.promise
         },

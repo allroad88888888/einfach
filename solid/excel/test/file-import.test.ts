@@ -47,6 +47,8 @@ function makeChunkedTextBlob(chunks: string[], name: string) {
           index += 1
           return { done: false, value }
         },
+        // No-op stub: the fake reader has nothing to release on cancel.
+        // eslint-disable-next-line @typescript-eslint/no-empty-function
         async cancel() {},
       }
     },

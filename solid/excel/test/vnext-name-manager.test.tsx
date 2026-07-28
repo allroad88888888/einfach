@@ -171,7 +171,7 @@ describe('SpreadsheetNameManagerDialog core adapter', () => {
     const mutationResult = deferred<NamedRangeMutationResult>()
     const refreshedRegistry = deferred<NamedRangeListResult>()
     let listCall = 0
-    const setNamedRange = jest.fn((request: SetNamedRangeRequest) => mutationResult.promise)
+    const setNamedRange = jest.fn((_request: SetNamedRangeRequest) => mutationResult.promise)
     const listNamedRanges = jest.fn((request: ListNamedRangesRequest) => {
       listCall += 1
       if (listCall === 1) {

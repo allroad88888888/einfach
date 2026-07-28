@@ -680,7 +680,7 @@ function requestWorkerResponse<T>(
         return
       }
       if (findResponse()) return
-      await new Promise((resolve) => setTimeout(resolve, 0))
+      await new Promise((sleepResolve) => setTimeout(sleepResolve, 0))
       void tick()
     }
     void tick()
@@ -714,7 +714,9 @@ function withMockedWorker(options: MockWasmWorkbookOptions = {}) {
           .slice(1)
           .reduce((sum, workbook) => sum + (workbook.__mockCalls?.bulkImportCells ?? 0), 0),
       importBulkInstallPayloads: () =>
-        workbooks.slice(1).flatMap((workbook) => workbook.__mockCalls?.bulkInstallWorkbookPayloads ?? []),
+        workbooks
+          .slice(1)
+          .flatMap((workbook) => workbook.__mockCalls?.bulkInstallWorkbookPayloads ?? []),
       importBulkImportPayloads: () =>
         workbooks.slice(1).flatMap((workbook) => workbook.__mockCalls?.bulkImportPayloads ?? []),
       mainRestoreSparsePayloads: () => workbooks[0]?.__mockCalls?.restoreSparse ?? [],

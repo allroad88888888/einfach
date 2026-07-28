@@ -170,7 +170,7 @@ describe('SpreadsheetHistoryTimeline', () => {
     const store = createStore()
     seedEntries(store, 2)
     const acknowledgement = deferred<HistoryTransactionResult>()
-    const undoSpy = jest.fn((request: UndoTransactionRequest) => acknowledgement.promise)
+    const undoSpy = jest.fn((_request: UndoTransactionRequest) => acknowledgement.promise)
     const backend: SpreadsheetBackend = { ...createBaseBackend(), undoTransaction: undoSpy }
 
     const { getByTestId } = render(() => (

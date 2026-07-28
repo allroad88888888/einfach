@@ -894,7 +894,7 @@ describe('history Core lifecycle', () => {
     store.setter(pushHistoryAtom, makeEntry('tx-1', 1))
     store.setter(pushHistoryAtom, makeEntry('tx-2', 2))
     const acknowledgement = deferred<HistoryMutationResult>()
-    const undo = jest.fn((request: HistoryUndoRequest) => acknowledgement.promise)
+    const undo = jest.fn((_request: HistoryUndoRequest) => acknowledgement.promise)
     const source: HistoryControllerPort = { undoTransaction: undo }
     const input = { source, refreshProjection: async () => {} }
 

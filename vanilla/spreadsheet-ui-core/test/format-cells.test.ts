@@ -327,7 +327,11 @@ describe('format-cells Core-owned save lifecycle', () => {
     const never = deferred<readonly CellRange[]>()
     store.setter(openFormatCellsAtom, { sheetId: 'sheet-1', range: RANGE })
 
+    // Self-referential: the port's `resolveSourceRanges` closes over
+    // `reentrantPorts` to re-enter the save atom, so the binding must exist
+    // (as `let`) before the object that captures it is assigned.
     let reentrantPorts!: RunFormatCellsSaveInput
+    // eslint-disable-next-line prefer-const -- assigned exactly once, but must predate its own self-referential initializer
     reentrantPorts = successfulPorts({
       resolveSourceRanges: () => {
         void store.setter(runFormatCellsSaveAtom, reentrantPorts)

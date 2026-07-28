@@ -206,8 +206,8 @@ function makeFakeWorkerWorkbookClient(
 
   return {
     calls,
-    emitHydrated(cells) {
-      for (const listener of hydratedListeners) listener(cells)
+    emitHydrated(hydratedCells) {
+      for (const listener of hydratedListeners) listener(hydratedCells)
     },
     setFormulaResult(sheet, addr, result) {
       formulaResults.set(key(sheet, addr), result)

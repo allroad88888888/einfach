@@ -37,13 +37,15 @@
 import { beforeAll, describe, expect, jest, test } from '@jest/globals'
 
 import type { ColumnFilterRule, DisplayCell } from '@einfach/spreadsheet-ui-core'
+import type * as NodeFsModule from 'node:fs'
+import type * as NodePathModule from 'node:path'
 import type { WorkerLike, WorkerWorkbookSpreadsheetBackend } from '../src-vnext/adapter'
 import { createStaticSpreadsheetBackend } from '../src-vnext/adapter/static-backend'
 
 jest.mock('../wasm-pkg/einfach_wasm.js', () => {
   /* eslint-disable @typescript-eslint/no-var-requires */
-  const { readFileSync } = require('node:fs') as typeof import('node:fs')
-  const nodePath = require('node:path') as typeof import('node:path')
+  const { readFileSync } = require('node:fs') as typeof NodeFsModule
+  const nodePath = require('node:path') as typeof NodePathModule
   const real = jest.requireActual('../wasm-pkg/einfach_wasm.js') as {
     initSync: (input: { module: ArrayBufferLike }) => unknown
     WasmWorkbook: unknown
@@ -144,7 +146,10 @@ async function seedCells(
   }
 }
 
-async function applyFilter(backend: FilterBackend, rules: readonly ColumnFilterRule[]): Promise<void> {
+async function applyFilter(
+  backend: FilterBackend,
+  rules: readonly ColumnFilterRule[],
+): Promise<void> {
   await backend.setFilterSort!({
     kind: 'set-filter-sort',
     sheetId: SHEET,

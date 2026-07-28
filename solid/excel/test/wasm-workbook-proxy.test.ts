@@ -595,7 +595,7 @@ describe('wasm-workbook-proxy (Phase 5 Track A)', () => {
   it('sends persistence snapshot/restore commands with expected payloads', async () => {
     const fake = makeFakeWorker()
     const workbook = createWorkerWorkbook({ workerFactory: () => fake })
-    const snapshot = workbook.snapshotPersistenceV1()
+    const snapshotPromise = workbook.snapshotPersistenceV1()
     expect(lastSent(fake)).toEqual({ id: 1, cmd: 'snapshotPersistenceV1' })
     const snapshotPayload: WorkbookPersistenceSnapshotWire = {
       version: 1,
@@ -614,7 +614,7 @@ describe('wasm-workbook-proxy (Phase 5 Track A)', () => {
       sizes: [],
     }
     ok(fake, snapshotPayload)
-    await expect(snapshot).resolves.toEqual(snapshotPayload)
+    await expect(snapshotPromise).resolves.toEqual(snapshotPayload)
 
     const restore = workbook.restorePersistenceV1(snapshotPayload)
     expect(lastSent(fake)).toEqual({
@@ -642,21 +642,21 @@ describe('wasm-workbook-proxy (Phase 5 Track A)', () => {
       cmd: 'snapshotFormatRange',
       range,
     })
-    const snapshot = {
+    const formatSnapshot = {
       ...range,
       cellFormats: [{ addr: 'G6', format: { italic: true } }],
       rangeFormats: [
         { startRow: 0, startCol: 0, endRow: 1, endCol: 1, format: { bold: true } },
       ],
     }
-    ok(fake, snapshot)
-    await expect(snapshotPromise).resolves.toEqual(snapshot)
+    ok(fake, formatSnapshot)
+    await expect(snapshotPromise).resolves.toEqual(formatSnapshot)
 
-    const restorePromise = workbook.restoreFormatSnapshot(snapshot)
+    const restorePromise = workbook.restoreFormatSnapshot(formatSnapshot)
     expect(lastSent(fake)).toEqual({
       id: 2,
       cmd: 'restoreFormatSnapshot',
-      snapshot,
+      snapshot: formatSnapshot,
     })
     ok(fake, 1)
     await expect(restorePromise).resolves.toBe(1)
@@ -673,13 +673,13 @@ describe('wasm-workbook-proxy (Phase 5 Track A)', () => {
       cmd: 'snapshotViewportSizes',
       range,
     })
-    const snapshot = {
+    const viewportSnapshot = {
       ...range,
       rowHeights: [{ rowIndex: 4, heightPx: 36 }],
       colWidths: [{ colIndex: 5, widthPx: 128 }],
     }
-    ok(fake, snapshot)
-    await expect(snapshotPromise).resolves.toEqual(snapshot)
+    ok(fake, viewportSnapshot)
+    await expect(snapshotPromise).resolves.toEqual(viewportSnapshot)
 
     const rowPromise = workbook.setRowHeight(0, 4, 36)
     expect(lastSent(fake)).toEqual({

@@ -723,11 +723,11 @@ describe('XIRR', () => {
     expect(tiny.kind).toBe('number')
     if (tiny.kind === 'number') {
       const flows = [-1e-9, 2e-9]
-      const dates = [43831, 44196]
-      const d0 = dates[0]
+      const flowDates = [43831, 44196]
+      const d0 = flowDates[0]
       let f = 0
       for (let i = 0; i < flows.length; i++) {
-        f += flows[i] / Math.pow(1 + tiny.value, (dates[i] - d0) / 365)
+        f += flows[i] / Math.pow(1 + tiny.value, (flowDates[i] - d0) / 365)
       }
       expect(Math.abs(f)).toBeLessThan(1e-9)
     }
@@ -977,7 +977,14 @@ describe('DURATION / MDURATION', () => {
   const jan1_2025 = dateSerial(2025, 1, 1)
 
   test('DURATION returns a positive Macaulay duration under maturity', () => {
-    const result = call(DURATION, [NUM(jan1_2020), NUM(jan1_2025), NUM(0.05), NUM(0.05), NUM(2), NUM(0)])
+    const result = call(DURATION, [
+      NUM(jan1_2020),
+      NUM(jan1_2025),
+      NUM(0.05),
+      NUM(0.05),
+      NUM(2),
+      NUM(0),
+    ])
     expect(result.kind).toBe('number')
     if (result.kind === 'number') {
       expect(result.value).toBeGreaterThan(0)
