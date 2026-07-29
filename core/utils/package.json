@@ -1,6 +1,6 @@
 {
   "name": "@einfach/utils",
-  "version": "0.2.18",
+  "version": "0.4.0",
   "description": "Utility functions for Einfach state management",
   "type": "module",
   "main": "./cjs/index.cjs",

@@ -1,5 +1,14 @@
 # @einfach/react
 
+## 0.4.0
+
+### Minor Changes
+
+- 版本线统一：七个包自本版起同步版本号（changeset `fixed` 组）。本包自身无功能变更。
+
+- Updated dependencies
+  - @einfach/core@0.4.0
+
 ## 0.3.26
 
 ### Patch Changes
