@@ -14,20 +14,17 @@
   },
   "scripts": {
     "eslint": "npx eslint --config rules/.eslintrc --ext=.tsx,.ts --ignore-path ./rules/.eslintignore ./ --fix ",
-    "lint:check": "npx eslint --config rules/.eslintrc --ext=.ts,.tsx --ignore-path ./rules/.eslintignore core/*/src core/*/test excel/*/src excel/*/test excel/solid-excel/src-vnext",
-    "typecheck:apps": "npx tsc --noEmit -p excel/showcase/tsconfig.json",
+    "lint:check": "npx eslint --config rules/.eslintrc --ext=.ts,.tsx --ignore-path ./rules/.eslintignore core/*/src core/*/test",
     "test": "jest --collect-coverage",
     "clearTypes": "node clean.js",
-    "ensureWasm": "test -f excel/solid-excel/wasm-pkg/einfach_wasm.js || npm run build:wasm -w @einfach/solid-excel",
-    "build": "npm run clearTypes&&npm run ensureWasm&&tsc -build&&npx rollup -c ./rollup.config.mjs",
+    "build": "npm run clearTypes&&tsc -build&&npx rollup -c ./rollup.config.mjs",
     "prepare": "husky"
   },
   "keywords": [],
   "author": "dol",
   "license": "MIT",
   "workspaces": [
-    "core/*",
-    "excel/*"
+    "core/*"
   ],
   "pnpm": {
     "overrides": {

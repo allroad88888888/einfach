@@ -41,8 +41,7 @@
   "exclude": [
     "node_modules",
     "**/node_modules",
-    "**/@types/",
-    "./excel/solid-excel/**"
+    "**/@types/"
   ],
   "references": [
     {
@@ -65,15 +64,6 @@
     },
     {
       "path": "./core/solid-form/tsconfig.json"
-    },
-    {
-      "path": "./excel/spreadsheet-ui-core/tsconfig.json"
-    },
-    {
-      "path": "./excel/excel-core-ts/tsconfig.json"
-    },
-    {
-      "path": "./excel/solid-excel/tsconfig.json"
     },
   ]
 }

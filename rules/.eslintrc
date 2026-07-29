@@ -8,8 +8,7 @@
     "sourceType": "module",
     "project": [
       "./tsconfig.json",
-      "./core/*/tsconfig.json",
-      "./excel/*/tsconfig.json"
+      "./core/*/tsconfig.json"
     ]
   },
   "plugins": [
@@ -284,40 +283,12 @@
     },
     {
       "files": [
-        "excel/solid-excel/src-vnext/demos/**"
-      ],
-      "rules": {
-        "no-console": "off"
-      }
-    },
-    {
-      "files": [
         "core/solid/**",
-        "core/solid-form/**",
-        "excel/solid-excel/**"
+        "core/solid-form/**"
       ],
       "rules": {
         "react-hooks/rules-of-hooks": "off",
         "react-hooks/exhaustive-deps": "off"
-      }
-    },
-    {
-      "files": [
-        "excel/solid-excel/src-vnext/**",
-        "excel/solid-excel/src/**",
-        "excel/spreadsheet-ui-core/src/**",
-        "excel/excel-core-ts/src/**"
-      ],
-      "rules": {
-        "@typescript-eslint/no-use-before-define": [
-          "error",
-          {
-            "functions": false,
-            "classes": false,
-            "variables": false
-          }
-        ],
-        "max-lines-per-function": "off"
       }
     }
   ]

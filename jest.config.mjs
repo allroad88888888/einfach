@@ -10,11 +10,11 @@ const jestConfig = {
     // 为 Solid.js 的 TSX 文件使用特定的 Babel 配置。
     //
     // 匹配的是绝对路径,所以必须逐个列出 Solid 包所在的目录段:目录扁平化到
-    // core/ 与 excel/ 之后,`solid-form` / `solid-excel` 不再含有 `solid/`
+    // core/ 之下 `solid-form` 不再含有 `solid/`
     // 这个片段,只写 `solid/` 会让它们漏到下面的 SWC 分支,Solid 的 JSX 就
     // 会被当成 React JSX 编译。前后的 `/` 保证按目录段匹配,不会命中
     // node_modules/solid-js。
-    '/(solid|solid-form|solid-excel)/.*\\.tsx?$': ['babel-jest'],
+    '/(solid|solid-form)/.*\\.tsx?$': ['babel-jest'],
     // 其他文件保持现有的 SWC 配置(上面的规则先匹配先生效)。Includes
     // `.mjs` / `.cjs` so ESM-only dependencies (e.g. @lingui/core 6.x and
     // its message-utils helper) get re-emitted as CJS once they're
@@ -36,10 +36,8 @@ const jestConfig = {
   /**
    * Skip generated `@types` directories — composite projects emit `.d.ts`
    * + transpiled `.jsx` there, and jest would re-run those duplicates.
-   * Also skip Playwright e2e specs (`excel/solid-excel/e2e/`) — those run under
-   * `npm run e2e` from `excel/solid-excel/`, not jest.
    */
-  testPathIgnorePatterns: ['/node_modules/', '/@types/', '/excel/solid-excel/e2e/'],
+  testPathIgnorePatterns: ['/node_modules/', '/@types/'],
 
   /**
    * - wasm-pkg/: ships its own package.json from wasm-pack; haste-map
@@ -47,15 +45,13 @@ const jestConfig = {
    * - .claude/: contains agent worktrees during multi-agent development;
    *   each holds a full repo copy that haste-map would dupe-detect.
    */
-  modulePathIgnorePatterns: ['<rootDir>/excel/solid-excel/wasm-pkg/', '<rootDir>/.claude/'],
+  modulePathIgnorePatterns: ['<rootDir>/.claude/'],
 
   /**
    * 模块名称映射，用于解析 @einfach/core 和 @einfach/react 包
    */
   moduleNameMapper: {
     '^@einfach/core$': '<rootDir>/core/core/src',
-    '^@einfach/spreadsheet-ui-core$': '<rootDir>/excel/spreadsheet-ui-core/src',
-    '^@einfach/excel-core-ts$': '<rootDir>/excel/excel-core-ts/src',
     '^@einfach/utils$': '<rootDir>/core/utils/src',
     '^@einfach/react$': '<rootDir>/core/react/src',
     '^@einfach/react-utils$': '<rootDir>/core/react-utils/src',
