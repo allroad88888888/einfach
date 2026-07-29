@@ -15,6 +15,7 @@
   "scripts": {
     "eslint": "npx eslint --config rules/.eslintrc --ext=.tsx,.ts --ignore-path ./rules/.eslintignore ./ --fix ",
     "lint:check": "npx eslint --config rules/.eslintrc --ext=.ts,.tsx --ignore-path ./rules/.eslintignore core/*/src core/*/test",
+    "typecheck": "npx tsc --noEmit -p tsconfig.json",
     "test": "jest --collect-coverage",
     "clearTypes": "node clean.js",
     "build": "npm run clearTypes&&tsc -build&&npx rollup -c ./rollup.config.mjs",

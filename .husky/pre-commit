@@ -2,5 +2,6 @@
 # every package's @types, so a later failure would leave the tree without
 # declaration output.
 npm run lint:check
+npm run typecheck
 npm run build
 npm test
