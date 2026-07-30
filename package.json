@@ -2,7 +2,7 @@
   "name": "einfach",
   "private": true,
   "version": "1.0.0",
-  "description": "轻量级 atom 状态管理库，支持 React 和 Solid.js",
+  "description": "TypeScript atomic state management with derived, async derived, and command atoms for React and Solid.js",
   "type": "module",
   "repository": {
     "type": "git",
@@ -19,13 +19,26 @@
     "test": "jest --collect-coverage",
     "clearTypes": "node clean.js",
     "build": "npm run clearTypes&&tsc -build&&npx rollup -c ./rollup.config.mjs",
+    "docs:dev": "pnpm --filter @einfach/site dev",
+    "docs:build": "pnpm --filter @einfach/site build",
+    "docs:typecheck": "pnpm --filter @einfach/site typecheck",
     "prepare": "husky"
   },
-  "keywords": [],
+  "keywords": [
+    "atom",
+    "state-management",
+    "atomic-state",
+    "derived-state",
+    "async-derived-state",
+    "react",
+    "solidjs",
+    "typescript"
+  ],
   "author": "dol",
   "license": "MIT",
   "workspaces": [
-    "core/*"
+    "core/*",
+    "apps/*"
   ],
   "pnpm": {
     "overrides": {

@@ -39,6 +39,13 @@ function App() {
 }
 ```
 
+## React 状态边界
+
+- 同一 `Provider` 下，组件直接通过 `useAtomValue(atom)` 或 `useAtom(atom)` 读取共享状态；不要为了
+  传递共享状态建立 props 链。
+- 跨 atom 更新推荐使用 `atom(null, (getter, setter, ...args) => {})` 定义命令 atom。
+- 业务异步用 `atom(async (getter) => ...)` 建模；`loadable` 只负责把已有 Promise 映射为 UI 状态。
+
 ## API
 
 ### 组件
@@ -64,7 +71,7 @@ function App() {
 
 | API | 说明 |
 |-----|------|
-| `loadable(atom)` | 将异步 atom 转为 `{ state, data, error }` |
+| `loadable(atom)` | 为 UI 将异步衍生 atom 转为状态对象：`loading`、`hasData`、`hasError`，并按需提供 `data`、`error`。 |
 
 ### 来自 @einfach/core
 
@@ -83,8 +90,8 @@ const userLoadableAtom = loadable(userAtom)
 function User() {
   const { state, data, error } = useAtomValue(userLoadableAtom)
 
-  if (state === 'pending') return <p>加载中...</p>
-  if (state === 'rejected') return <p>错误: {error}</p>
+  if (state === 'loading') return <p>加载中...</p>
+  if (state === 'hasError') return <p>错误: {String(error)}</p>
   return <p>用户: {data.name}</p>
 }
 ```

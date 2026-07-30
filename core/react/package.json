@@ -1,7 +1,7 @@
 {
   "name": "@einfach/react",
   "version": "0.4.0",
-  "description": "Lightweight Jotai-inspired atomic state management for React",
+  "description": "React atomic state with direct atom reads, derived state, async derived state, and command atoms",
   "type": "module",
   "main": "./cjs/index.cjs",
   "module": "./esm/index.mjs",
@@ -36,7 +36,13 @@
   "keywords": [
     "einfach",
     "react",
-    "atom"
+    "react-hooks",
+    "atom",
+    "state-management",
+    "atomic-state",
+    "derived-state",
+    "async-derived-state",
+    "typescript"
   ],
   "dependencies": {
     "@einfach/core": "workspace:*"

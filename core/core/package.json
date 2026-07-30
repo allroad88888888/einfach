@@ -1,7 +1,7 @@
 {
   "name": "@einfach/core",
   "version": "0.4.0",
-  "description": "Lightweight Jotai-inspired atomic state management core",
+  "description": "Framework-agnostic TypeScript atomic state with derived, async derived, and command atoms",
   "type": "module",
   "main": "./cjs/index.cjs",
   "module": "./esm/index.mjs",
@@ -36,7 +36,12 @@
   "keywords": [
     "einfach",
     "state",
-    "atom"
+    "atom",
+    "state-management",
+    "atomic-state",
+    "derived-state",
+    "async-derived-state",
+    "typescript"
   ],
   "devDependencies": {
     "@types/node": "^20.11.30"

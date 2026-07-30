@@ -1,0 +1,236 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Einfach — 原子实验室</title>
+    <style>
+      :root {
+        color: #e9f1e8;
+        background: #111712;
+        font-family: Inter, ui-sans-serif, system-ui, sans-serif;
+      }
+      * {
+        box-sizing: border-box;
+      }
+      body {
+        margin: 0;
+        background:
+          radial-gradient(circle at 76% 11%, rgba(182, 255, 83, 0.2), transparent 25rem), #111712;
+      }
+      .page {
+        width: min(1120px, calc(100% - 48px));
+        margin: 0 auto;
+      }
+      header {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        min-height: 82px;
+        border-bottom: 1px solid #2b392c;
+      }
+      .brand {
+        color: #b6ff53;
+        font-size: 21px;
+        font-weight: 800;
+        letter-spacing: -0.06em;
+      }
+      nav {
+        display: flex;
+        gap: 25px;
+        color: #a5b0a4;
+        font-size: 14px;
+      }
+      .tag {
+        padding: 8px 13px;
+        border: 1px solid #b6ff53;
+        border-radius: 999px;
+        color: #111712;
+        background: #b6ff53;
+        font-size: 13px;
+        font-weight: 800;
+      }
+      .hero {
+        display: grid;
+        grid-template-columns: 1.1fr 0.9fr;
+        gap: 72px;
+        align-items: center;
+        min-height: 600px;
+      }
+      .label {
+        color: #b6ff53;
+        font-family: ui-monospace, monospace;
+        font-size: 12px;
+        letter-spacing: 0.15em;
+      }
+      h1 {
+        margin: 15px 0 25px;
+        font-size: clamp(52px, 7vw, 84px);
+        line-height: 0.94;
+        letter-spacing: -0.08em;
+      }
+      h1 b {
+        display: block;
+        color: #b6ff53;
+        font-weight: inherit;
+      }
+      .intro {
+        max-width: 530px;
+        color: #aebbad;
+        font-size: 18px;
+        line-height: 1.75;
+      }
+      .cta {
+        display: inline-block;
+        margin-top: 18px;
+        padding: 13px 18px;
+        border-radius: 8px;
+        background: #b6ff53;
+        color: #111712;
+        font-weight: 800;
+      }
+      .flow {
+        padding: 26px;
+        border: 1px solid #476243;
+        border-radius: 18px;
+        background: rgba(9, 14, 9, 0.78);
+      }
+      .flow-head {
+        display: flex;
+        justify-content: space-between;
+        color: #7e927c;
+        font-family: ui-monospace, monospace;
+        font-size: 12px;
+      }
+      .nodes {
+        display: grid;
+        grid-template-columns: 1fr 72px 1fr;
+        align-items: center;
+        gap: 10px;
+        margin-top: 42px;
+      }
+      .node {
+        min-height: 155px;
+        padding: 18px;
+        border-radius: 12px;
+      }
+      .node small {
+        display: block;
+        margin-bottom: 32px;
+        text-transform: uppercase;
+        font-family: ui-monospace, monospace;
+      }
+      .node strong {
+        font-size: 34px;
+      }
+      .source {
+        background: #b6ff53;
+        color: #111712;
+      }
+      .derived {
+        border: 1px solid #648363;
+        color: #e9f1e8;
+      }
+      .arrow {
+        color: #b6ff53;
+        text-align: center;
+        font-family: ui-monospace, monospace;
+      }
+      .arrow i {
+        display: block;
+        height: 1px;
+        margin-top: 8px;
+        background: #b6ff53;
+      }
+      .features {
+        display: grid;
+        grid-template-columns: repeat(3, 1fr);
+        gap: 1px;
+        background: #314230;
+      }
+      .features div {
+        min-height: 190px;
+        padding: 28px;
+        background: #172018;
+      }
+      .features span {
+        color: #b6ff53;
+        font-family: ui-monospace, monospace;
+      }
+      .features h2 {
+        margin: 38px 0 8px;
+        font-size: 21px;
+      }
+      .features p {
+        margin: 0;
+        color: #aab8aa;
+        line-height: 1.6;
+      }
+      footer {
+        padding: 35px 0;
+        color: #7d907c;
+        font-size: 13px;
+      }
+      @media (max-width: 720px) {
+        nav {
+          display: none;
+        }
+        .hero,
+        .features {
+          grid-template-columns: 1fr;
+        }
+        .hero {
+          min-height: auto;
+          padding: 88px 0;
+        }
+      }
+    </style>
+  </head>
+  <body>
+    <div class="page">
+      <header>
+        <span class="brand">[ E ] einfach</span>
+        <nav><span>Core</span><span>React</span><span>Solid</span><span>API</span></nav>
+        <span class="tag">v0.4.0</span>
+      </header>
+      <main>
+        <section class="hero">
+          <div>
+            <span class="label">ATOM STATE / TYPESCRIPT FIRST</span>
+            <h1>一切复杂，<b>归于原子。</b></h1>
+            <p class="intro">
+              轻量、可组合、框架无关的状态管理。只维护状态事实，让派生关系自己生长。
+            </p>
+            <span class="cta">探索 API →</span>
+          </div>
+          <div class="flow">
+            <div class="flow-head"><span>LIVE STATE GRAPH</span><span>01 / 01</span></div>
+            <div class="nodes">
+              <div class="node source"><small>source atom</small><strong>count: 3</strong></div>
+              <div class="arrow">derive<i></i></div>
+              <div class="node derived"><small>derived atom</small><strong>double: 6</strong></div>
+            </div>
+          </div>
+        </section>
+        <section class="features">
+          <div>
+            <span>01</span>
+            <h2>原子粒度</h2>
+            <p>状态只在需要的地方存在，更新路径不再绕远路。</p>
+          </div>
+          <div>
+            <span>02</span>
+            <h2>核心独立</h2>
+            <p>同一套状态模型，交给 React 或 Solid 渲染。</p>
+          </div>
+          <div>
+            <span>03</span>
+            <h2>自然组合</h2>
+            <p>从派生到缓存，从历史记录到表单，沿着 atom 继续搭建。</p>
+          </div>
+        </section>
+      </main>
+      <footer>方向 A：适合强调「开源技术感 + 交互演示」的官网。</footer>
+    </div>
+  </body>
+</html>

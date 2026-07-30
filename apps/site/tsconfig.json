@@ -1,0 +1,17 @@
+{
+  "extends": "../../tsconfig.base.json",
+  "compilerOptions": {
+    "baseUrl": ".",
+    "composite": false,
+    "declaration": false,
+    "declarationMap": false,
+    "jsx": "react-jsx",
+    "moduleResolution": "Bundler",
+    "noEmit": true,
+    "paths": {
+      "@einfach/core": ["../../core/core/src/index.ts"],
+      "@einfach/react": ["../../core/react/src/index.ts"]
+    }
+  },
+  "include": ["src", "vite.config.ts"]
+}

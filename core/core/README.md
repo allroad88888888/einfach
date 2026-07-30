@@ -64,6 +64,14 @@ const userAtom = atom(async (get) => {
 })
 ```
 
+## 状态建模规则
+
+- `atom(initialValue)` 表达一个小颗粒、可写的业务事实。
+- `atom((getter) => ...)` 表达可追踪的派生规则；派生 atom 默认只读。
+- 跨 atom 的读取和写入使用命令 atom：`atom(null, (getter, setter, ...args) => {})`。
+- `atom(async (getter) => ...)` 是业务异步衍生：它读取 source atom 并返回 Promise。
+- 新需求优先新增相关的 source atom 或 derived atom，避免把无关字段塞进一个大状态对象。
+
 ## API
 
 ### 核心
