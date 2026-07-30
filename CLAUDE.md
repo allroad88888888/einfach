@@ -4,7 +4,15 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-Einfach ("simple" in German) is a lightweight, Jotai-inspired atom-based state management library. It provides a framework-agnostic core with bindings for React and Solid.js, plus form handling utilities.
+Einfach ("simple" in German) is TypeScript-first atomic state management. It provides a framework-agnostic core
+with React and Solid bindings, plus form handling utilities. Source atoms express facts; derived, async derived,
+and command atoms express state rules and write boundaries.
+
+## State model
+
+Read [AGENTS.md](./AGENTS.md) and [docs/AI_GUIDE.md](./docs/AI_GUIDE.md) before changing state behavior or
+examples. They define the package choice, small-atom model, direct component reads, command atoms, and the
+distinction between async derived atoms and the `loadable` UI adapter.
 
 ## Commands
 
@@ -51,6 +59,8 @@ pnpm workspace 的 glob 是 `core/*`，目录叶子名与包名对齐（`core/re
 **Atoms** (`core/core/src/atom.ts`): Fundamental state units. Two types:
 - Primitive atoms: `atom(initialValue)` — writable state
 - Derived atoms: `atom(get => get(otherAtom) * 2)` — computed from other atoms
+- Async derived atoms: `atom(async get => ...)` — read source atoms and return Promise results
+- Command atoms: `atom(null, (getter, setter, ...args) => {})` — named cross-atom write boundaries
 
 **Store** (`core/core/src/store.ts`): Manages atom state with automatic dependency tracking via WeakMaps (`atomStateMap`, `backDependenciesMap`, `dependenciesMap`). Key API: `getter(atom)`, `setter(atom, ...args)`, `sub(atom, listener)`.
 
@@ -58,17 +68,12 @@ pnpm workspace 的 glob 是 `core/*`，目录叶子名与包名对齐（`core/re
 
 **Form system** (`core/react-form/src/core/`, `core/solid-form/src/core/`): Backs form state (values, errors, validation rules) with atoms via `useForm()`.
 
-**Spill-derived atoms** (`excel/rust/excel-core/src/sheet.rs` § "Spill (dynamic-array) infrastructure"): when a formula evaluates to `Value::Array`, the anchor cell's atom holds the array and each non-(0,0) target gets a derived atom that reads the anchor and indexes into it. Reads, dependency tracking, and subscription propagation reuse the existing atom framework — no parallel spill index — and the WASM boundary collapses `Value::Array` to its top-left scalar for cell-projection reads. **Exception:** custom-formula callbacks (Wave 8.1) DO receive `Value::Array` as a 2-D JS array when a range arg is passed (`=MYFN(A1:A10)`), because the engine forwards array args directly to the JS callback — see `excel/rust/excel-core/src/CUSTOM_FORMULAS.md` "Marshaling".
-
-**Custom formulas** (Wave 8.1): host-registered JS callbacks invoked as cell-level functions (`=MYTAX(B1)`). Source of truth for the engine contract is `excel/rust/excel-core/src/CUSTOM_FORMULAS.md`; the JS-side host API (registration atoms, name validation, built-in shadow list mirrored from the Rust evaluator) lives in `excel/spreadsheet-ui-core/src/custom-formulas/README.md`. The Solid provider (`excel/solid-excel/src-vnext/provider/SpreadsheetUiProvider.tsx`) diffs the registry atom and forwards add/replace/remove ops to the worker through the optional `registerCustomFormula` / `unregisterCustomFormula` backend ports. **Async (Wave 8.2)**: registrations with `isAsync: true` may `await`; the cell holds `#BUSY!` until the worker pump (`excel/solid-excel/src-vnext/adapter/async-custom-pump.ts`, shared by both worker runtimes) settles the Promise back into the engine, and results are memoized per (name, args) until the next registry change — see CUSTOM_FORMULAS.md § "Async custom formulas".
-
 ## Build Pipeline
 
 - TypeScript composite project with `tsc -build` for declarations
 - Rollup bundles to `cjs/` (.cjs), `esm/` (.mjs), and `dist/`
 - SWC transforms React/Vanilla; Babel transforms Solid.js (for JSX)
 - All packages have `sideEffects: false` for tree-shaking
-- `excel/solid-excel` runs `npm run build:wasm` before `vite build` to refresh `excel/solid-excel/wasm-pkg/` from `excel/rust/wasm`
 
 ## Testing
 
@@ -77,7 +82,6 @@ pnpm workspace 的 glob 是 `core/*`，目录叶子名与包名对齐（`core/re
 - `moduleNameMapper` in `jest.config.mjs` resolves `@einfach/*` to source directories
 - React tests use `@testing-library/react` with `renderHook`/`act`
 - Always create a fresh store per test via `createStore()`
-- vnext spreadsheet suites: `npx jest excel/spreadsheet-ui-core --no-coverage` and `npx jest excel/solid-excel --no-coverage`
 
 ## Code Style
 

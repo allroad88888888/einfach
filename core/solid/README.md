@@ -34,6 +34,12 @@ function Counter() {
 }
 ```
 
+## Solid 状态边界
+
+- 同一 Provider/store 边界内，组件直接订阅所需 atom；不要为了传递共享状态建立 props 链。
+- 跨 atom 更新推荐使用 `atom(null, (getter, setter, ...args) => {})` 定义命令 atom。
+- 业务异步用 `atom(async (getter) => ...)` 建模；`loadable` 只负责把已有 Promise 映射为 UI 状态。
+
 ## API
 
 ### Hooks
@@ -48,7 +54,7 @@ function Counter() {
 - `createHistory(options?)` - 事务日志式撤销/重做（由 `@einfach/core` 导出）
 - `createSelector(atom, selectorFn)` - 创建一个选择器 atom
 - `useSelector(atom, selectorFn)` - 从 atom 中选择部分状态
-- `loadable(asyncFn)` - 从异步函数创建 loadable atom
+- `loadable(asyncDerivedAtom)` - 把已有异步 derived atom 映射为 UI 状态
 
 ## 许可证
 

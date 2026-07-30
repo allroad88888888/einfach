@@ -1,0 +1,28 @@
+# Einfach
+
+> TypeScript atomic state management for React and Solid: small source atoms, derived atoms, async derived
+> atoms, and command atoms.
+
+## Start here
+
+- [AI Guide](https://github.com/allroad88888888/einfach/blob/main/docs/AI_GUIDE.md): package choice and exact state-modeling rules.
+- [Repository README](https://github.com/allroad88888888/einfach): installation and minimal examples.
+- [Homepage](/): interactive async-derived-state, direct-read, command-atom, and fine-grained-state examples.
+
+## API reference
+
+- [Core](/api/core/): atoms, stores, derived state, async derived state, and command atoms.
+- [React](/api/react/): Provider, read/write hooks, and `loadable` as a UI adapter.
+- [Solid](/api/solid/): Solid bindings and `loadable` as a UI adapter.
+- [React Form](/api/react-form/)
+- [Solid Form](/api/solid-form/)
+- [Utilities](/api/utils/)
+- [React utilities](/api/react-utils/)
+
+## Critical semantics
+
+- Business async state is `atom(async (getter) => ...)`, which reads source atoms and returns a Promise.
+- `loadable(asyncDerivedAtom)` only maps that existing Promise to `loading`, `hasData`, or `hasError` for UI.
+- Components under the same Provider read shared atoms directly; do not relay shared state through props.
+- Use `atom(null, (getter, setter, ...args) => {})` for named cross-atom write commands.
+- Keep atoms small. Add a source or derived atom for a new requirement so its dependency path stays local.

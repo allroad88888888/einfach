@@ -1,7 +1,7 @@
 {
   "name": "@einfach/solid",
   "version": "0.4.0",
-  "description": "Solid.js integration for Einfach atomic state management",
+  "description": "Solid.js atomic state with direct atom reads, derived state, async derived state, and command atoms",
   "type": "module",
   "main": "./cjs/index.cjs",
   "module": "./esm/index.mjs",
@@ -37,7 +37,12 @@
     "einfach",
     "solid",
     "solidjs",
-    "atom"
+    "atom",
+    "state-management",
+    "atomic-state",
+    "derived-state",
+    "async-derived-state",
+    "typescript"
   ],
   "dependencies": {
     "@einfach/core": "workspace:*"

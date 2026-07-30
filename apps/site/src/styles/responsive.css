@@ -1,0 +1,151 @@
+@media (max-width: 1050px) {
+  .async-layout {
+    grid-template-columns: 1fr;
+  }
+}
+
+@media (max-width: 760px) {
+  .site-header {
+    min-height: 68px;
+  }
+
+  nav {
+    display: none;
+  }
+
+  .hero {
+    grid-template-columns: 1fr;
+    gap: 42px;
+    min-height: auto;
+    padding: 70px 0;
+  }
+
+  .async-layout,
+  .principles-grid,
+  .contract-layout,
+  .demo-card,
+  .api-reference-layout {
+    grid-template-columns: 1fr;
+  }
+
+  .demo-card {
+    gap: 18px;
+  }
+
+  .async-flow {
+    grid-template-columns: 1fr;
+  }
+
+  .async-arrow {
+    min-height: 24px;
+    flex-direction: row;
+    font-size: 0;
+  }
+
+  .async-arrow span {
+    order: 1;
+  }
+
+  .async-arrow::after {
+    content: '↓';
+    font-size: 18px;
+  }
+
+  .async-step {
+    min-height: 120px;
+  }
+
+  .async-step span {
+    margin-bottom: 18px;
+  }
+
+  .contract-row {
+    grid-template-columns: 42px 1fr;
+  }
+
+  .contract-row small {
+    grid-column: 2;
+    text-align: left;
+  }
+
+  .atom-link i {
+    width: 1px;
+    height: 34px;
+    margin: 9px auto 0;
+  }
+
+  .api-reference-nav {
+    position: static;
+  }
+
+  .api-reference-nav nav {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(120px, 1fr));
+    gap: 13px;
+  }
+
+  .api-nav-package-link {
+    border-left: 0;
+    border-bottom: 2px solid transparent;
+    padding-left: 0;
+  }
+
+  .api-nav-package-link:hover {
+    border-bottom-color: #b6ff53;
+  }
+
+  .api-reference-link-content {
+    flex-direction: column;
+    gap: 12px;
+  }
+
+  .api-entry-heading,
+  .api-entry-detail {
+    grid-template-columns: 1fr;
+    gap: 7px;
+  }
+
+  .api-entry-heading > code {
+    white-space: normal;
+  }
+}
+
+@media (max-width: 500px) {
+  .site-header,
+  .section,
+  .hero,
+  .site-footer {
+    width: min(100% - 32px, 1120px);
+  }
+
+  .header-github {
+    padding: 8px 10px;
+    font-size: 12px;
+  }
+
+  .section {
+    padding: 78px 0;
+  }
+
+  .api-reference-heading {
+    padding: 44px 0 10px;
+  }
+
+  .api-reference-layout {
+    padding: 22px 0 0;
+  }
+
+  .hero-actions {
+    align-items: start;
+    flex-direction: column;
+  }
+
+  .hero-terminal pre {
+    padding: 18px;
+    font-size: 11px;
+  }
+
+  .atom-node {
+    min-height: 210px;
+  }
+}

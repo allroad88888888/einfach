@@ -1,6 +1,8 @@
 # Einfach
 
-轻量级、受 [Jotai](https://github.com/pmndrs/jotai) 启发的 atom 状态管理库。提供框架无关的核心，以及 React 和 Solid.js 绑定。
+TypeScript 优先的 atom 状态管理库。用小颗粒 source atom 表达事实，用 derived atom 表达规则；
+`atom(async (get) => ...)` 直接表达异步衍生，命令 atom 负责跨 atom 写入。提供框架无关的核心，
+以及 React 和 Solid.js 绑定。
 
 > "einfach" 在德语中意为"简单"
 
@@ -16,15 +18,33 @@
 
 ## 包
 
-| 包 | 版本 | 说明 |
-|---|---|---|
-| [@einfach/core](./core/core) | ![npm](https://img.shields.io/npm/v/@einfach/core) | 核心 atom 引擎（框架无关） |
-| [@einfach/utils](./core/utils) | ![npm](https://img.shields.io/npm/v/@einfach/utils) | 工具函数（深拷贝、路径操作、记忆化） |
-| [@einfach/react](./react/react) | ![npm](https://img.shields.io/npm/v/@einfach/react) | React hooks 绑定 |
-| [@einfach/react-utils](./react/utils) | ![npm](https://img.shields.io/npm/v/@einfach/react-utils) | React 工具 hooks |
-| [@einfach/react-form](./react/form) | ![npm](https://img.shields.io/npm/v/@einfach/react-form) | React 表单处理 |
-| [@einfach/solid](./solid/solid) | ![npm](https://img.shields.io/npm/v/@einfach/solid) | Solid.js 绑定 |
-| [@einfach/solid-form](./solid/form) | ![npm](https://img.shields.io/npm/v/@einfach/solid-form) | Solid.js 表单处理 |
+| 包                                         | 版本                                                      | 说明                                 |
+| ------------------------------------------ | --------------------------------------------------------- | ------------------------------------ |
+| [@einfach/core](./core/core)               | ![npm](https://img.shields.io/npm/v/@einfach/core)        | 核心 atom 引擎（框架无关）           |
+| [@einfach/utils](./core/utils)             | ![npm](https://img.shields.io/npm/v/@einfach/utils)       | 工具函数（深拷贝、路径操作、记忆化） |
+| [@einfach/react](./core/react)             | ![npm](https://img.shields.io/npm/v/@einfach/react)       | React hooks 绑定                     |
+| [@einfach/react-utils](./core/react-utils) | ![npm](https://img.shields.io/npm/v/@einfach/react-utils) | React 工具 hooks                     |
+| [@einfach/react-form](./core/react-form)   | ![npm](https://img.shields.io/npm/v/@einfach/react-form)  | React 表单处理                       |
+| [@einfach/solid](./core/solid)             | ![npm](https://img.shields.io/npm/v/@einfach/solid)       | Solid.js 绑定                        |
+| [@einfach/solid-form](./core/solid-form)   | ![npm](https://img.shields.io/npm/v/@einfach/solid-form)  | Solid.js 表单处理                    |
+
+## 文档与演示站
+
+官网以真实 `@einfach/react` atom 驱动交互演示，并提供核心包的 API 导览。它位于
+[`apps/site`](./apps/site)，可在本地启动：
+
+```bash
+pnpm docs:dev
+```
+
+构建静态产物：
+
+```bash
+pnpm docs:build
+```
+
+给编码 Agent 的简明状态建模规则见 [AI Guide](./docs/AI_GUIDE.md)；站点同时暴露
+[`/llms.txt`](./apps/site/public/llms.txt)，供文档工具发现正确入口。
 
 ## 快速上手
 

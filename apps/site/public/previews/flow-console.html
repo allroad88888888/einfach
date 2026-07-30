@@ -1,0 +1,251 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Einfach — 技术控制台</title>
+    <style>
+      :root {
+        color: #10213e;
+        background: #f4f8ff;
+        font-family: Inter, ui-sans-serif, system-ui, sans-serif;
+      }
+      * {
+        box-sizing: border-box;
+      }
+      body {
+        margin: 0;
+      }
+      .page {
+        width: min(1180px, calc(100% - 44px));
+        margin: 0 auto;
+      }
+      header {
+        display: flex;
+        align-items: center;
+        min-height: 72px;
+        gap: 34px;
+        border-bottom: 1px solid #c9d7ec;
+      }
+      .brand {
+        padding-right: 30px;
+        border-right: 1px solid #c9d7ec;
+        color: #246cff;
+        font-size: 20px;
+        font-weight: 820;
+        letter-spacing: -0.06em;
+      }
+      nav {
+        display: flex;
+        gap: 24px;
+        color: #5a6c88;
+        font-family: ui-monospace, monospace;
+        font-size: 12px;
+      }
+      .version {
+        margin-left: auto;
+        padding: 6px 10px;
+        border: 1px solid #adc5ee;
+        border-radius: 4px;
+        color: #246cff;
+        font-family: ui-monospace, monospace;
+        font-size: 12px;
+      }
+      .hero {
+        display: grid;
+        grid-template-columns: 1fr 0.9fr;
+        gap: 66px;
+        padding: 94px 0 70px;
+      }
+      .label {
+        color: #246cff;
+        font-family: ui-monospace, monospace;
+        font-size: 12px;
+        font-weight: 800;
+        letter-spacing: 0.12em;
+      }
+      h1 {
+        margin: 18px 0 22px;
+        font-size: clamp(52px, 7vw, 84px);
+        line-height: 0.96;
+        letter-spacing: -0.075em;
+      }
+      h1 span {
+        color: #246cff;
+      }
+      .intro {
+        max-width: 520px;
+        color: #5c6b80;
+        font-size: 18px;
+        line-height: 1.7;
+      }
+      .command {
+        display: inline-block;
+        margin-top: 17px;
+        padding: 12px 14px;
+        background: #10213e;
+        color: #c9e2ff;
+        font-family: ui-monospace, monospace;
+        font-size: 13px;
+      }
+      .matrix {
+        display: grid;
+        grid-template-columns: 1fr 1fr;
+        border: 1px solid #afc5e8;
+        background: #fff;
+      }
+      .matrix div {
+        min-height: 142px;
+        padding: 18px;
+        border-right: 1px solid #d9e5f5;
+        border-bottom: 1px solid #d9e5f5;
+      }
+      .matrix div:nth-child(even) {
+        border-right: 0;
+      }
+      .matrix div:nth-last-child(-n + 2) {
+        border-bottom: 0;
+      }
+      .matrix small {
+        display: block;
+        color: #7990b0;
+        font-family: ui-monospace, monospace;
+        font-size: 10px;
+        text-transform: uppercase;
+      }
+      .matrix strong {
+        display: block;
+        margin-top: 40px;
+        color: #10213e;
+        font-size: 21px;
+      }
+      .matrix .highlight {
+        background: #246cff;
+        color: #fff;
+      }
+      .matrix .highlight small,
+      .matrix .highlight strong {
+        color: #fff;
+      }
+      .api {
+        border-top: 1px solid #c9d7ec;
+        padding: 53px 0 76px;
+      }
+      .api-head {
+        display: flex;
+        justify-content: space-between;
+        align-items: end;
+        margin-bottom: 22px;
+      }
+      h2 {
+        margin: 0;
+        font-size: 30px;
+        letter-spacing: -0.05em;
+      }
+      .api-head span {
+        color: #667a98;
+        font-family: ui-monospace, monospace;
+        font-size: 12px;
+      }
+      .rows {
+        border: 1px solid #c9d7ec;
+      }
+      .row {
+        display: grid;
+        grid-template-columns: 200px 1fr 220px;
+        gap: 22px;
+        align-items: center;
+        padding: 17px 20px;
+        border-bottom: 1px solid #d9e5f5;
+      }
+      .row:last-child {
+        border-bottom: 0;
+      }
+      .row b {
+        color: #246cff;
+        font-family: ui-monospace, monospace;
+        font-size: 13px;
+      }
+      .row p {
+        margin: 0;
+        color: #60728c;
+        font-size: 14px;
+      }
+      .row code {
+        color: #3d4d67;
+        font-family: ui-monospace, monospace;
+        font-size: 12px;
+      }
+      footer {
+        padding: 23px 0 34px;
+        border-top: 1px solid #c9d7ec;
+        color: #6a7e9a;
+        font-size: 13px;
+      }
+      @media (max-width: 720px) {
+        nav {
+          display: none;
+        }
+        .hero {
+          grid-template-columns: 1fr;
+        }
+        .row {
+          grid-template-columns: 1fr;
+          gap: 7px;
+        }
+      }
+    </style>
+  </head>
+  <body>
+    <div class="page">
+      <header>
+        <span class="brand">EINFACH</span>
+        <nav><span>OVERVIEW</span><span>GUIDES</span><span>API</span><span>EXAMPLES</span></nav>
+        <span class="version">v0.4.0</span>
+      </header>
+      <main>
+        <section class="hero">
+          <div>
+            <span class="label">STATE, MADE COMPOSABLE</span>
+            <h1>一个核心。<br /><span>两种框架。</span></h1>
+            <p class="intro">
+              通过明确的 atom 图谱组织状态。核心包保持独立，React 与 Solid
+              只负责把状态接到正确的位置。
+            </p>
+            <span class="command">$ pnpm add @einfach/react</span>
+          </div>
+          <div class="matrix">
+            <div><small>model</small><strong>@einfach/core</strong></div>
+            <div class="highlight"><small>binding</small><strong>React</strong></div>
+            <div class="highlight"><small>binding</small><strong>Solid</strong></div>
+            <div><small>extension</small><strong>Form / Utils</strong></div>
+          </div>
+        </section>
+        <section class="api">
+          <div class="api-head">
+            <h2>从概念，到 API。</h2>
+            <span>SELECTED EXPORTS / CORE</span>
+          </div>
+          <div class="rows">
+            <div class="row">
+              <b>atom</b>
+              <p>创建一份源状态或派生状态。</p>
+              <code>atom(initialValue)</code>
+            </div>
+            <div class="row">
+              <b>createStore</b>
+              <p>在框架外管理、读取与写入 atom。</p>
+              <code>createStore()</code>
+            </div>
+            <div class="row">
+              <b>selectAtom</b>
+              <p>从较大的状态中提取稳定切片。</p>
+              <code>selectAtom(atom, fn)</code>
+            </div>
+          </div>
+        </section>
+      </main>
+      <footer>方向 C：适合强调「API 清晰、框架体系完整、面向工程师」。</footer>
+    </div>
+  </body>
+</html>

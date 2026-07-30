@@ -24,3 +24,5 @@ jobs:
       - run: pnpm install --frozen-lockfile
       - run: npm run build
       - run: npm test
+      - if: matrix.node-version == 20
+        run: pnpm docs:typecheck && pnpm docs:build

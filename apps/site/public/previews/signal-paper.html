@@ -1,0 +1,201 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Einfach — 编辑式文档</title>
+    <style>
+      :root {
+        color: #20201c;
+        background: #f5efdf;
+        font-family: ui-sans-serif, system-ui, sans-serif;
+      }
+      * {
+        box-sizing: border-box;
+      }
+      body {
+        margin: 0;
+      }
+      .page {
+        width: min(1160px, calc(100% - 44px));
+        margin: 0 auto;
+      }
+      header {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        min-height: 80px;
+        border-bottom: 1px solid #292922;
+      }
+      .brand {
+        font-family: Georgia, serif;
+        font-size: 28px;
+        font-weight: 700;
+        letter-spacing: -0.08em;
+      }
+      .edition {
+        color: #a94838;
+        font-family: ui-monospace, monospace;
+        font-size: 11px;
+        letter-spacing: 0.13em;
+      }
+      .intro {
+        display: grid;
+        grid-template-columns: 1.05fr 0.95fr;
+        gap: 54px;
+        padding: 84px 0 67px;
+      }
+      .kicker {
+        color: #a94838;
+        font-size: 12px;
+        font-weight: 800;
+        letter-spacing: 0.14em;
+      }
+      h1,
+      h2 {
+        font-family: Georgia, 'Times New Roman', serif;
+        font-weight: 500;
+      }
+      h1 {
+        margin: 15px 0 0;
+        font-size: clamp(57px, 8vw, 98px);
+        line-height: 0.88;
+        letter-spacing: -0.085em;
+      }
+      .summary {
+        align-self: end;
+        padding-bottom: 9px;
+        border-bottom: 3px solid #dd4f37;
+        color: #56564e;
+        font-size: 20px;
+        line-height: 1.6;
+      }
+      .statement {
+        display: grid;
+        grid-template-columns: 1.1fr 0.9fr;
+        min-height: 285px;
+        border: 1px solid #2a2a23;
+      }
+      .statement > div {
+        padding: 34px;
+      }
+      .statement-copy {
+        border-right: 1px solid #2a2a23;
+      }
+      .statement h2 {
+        margin: 0 0 17px;
+        font-size: 34px;
+        line-height: 1.1;
+        letter-spacing: -0.05em;
+      }
+      .statement p {
+        color: #5b5b52;
+        line-height: 1.65;
+      }
+      .code {
+        display: flex;
+        flex-direction: column;
+        justify-content: space-between;
+        background: #20201c;
+        color: #f5efdf;
+        font-family: ui-monospace, monospace;
+        font-size: 14px;
+        line-height: 1.8;
+      }
+      .code small {
+        color: #f5b9a9;
+      }
+      .sections {
+        display: grid;
+        grid-template-columns: repeat(3, 1fr);
+        gap: 40px;
+        padding: 75px 0;
+      }
+      .sections span {
+        color: #a94838;
+        font-family: ui-monospace, monospace;
+        font-size: 12px;
+      }
+      .sections h3 {
+        margin: 15px 0 10px;
+        font-size: 20px;
+      }
+      .sections p {
+        margin: 0;
+        color: #69695f;
+        line-height: 1.6;
+      }
+      footer {
+        display: flex;
+        justify-content: space-between;
+        padding: 24px 0 35px;
+        border-top: 1px solid #292922;
+        color: #74746a;
+        font-size: 13px;
+      }
+      @media (max-width: 720px) {
+        .intro,
+        .statement,
+        .sections {
+          grid-template-columns: 1fr;
+        }
+        .statement-copy {
+          border-right: 0;
+          border-bottom: 1px solid #2a2a23;
+        }
+      }
+    </style>
+  </head>
+  <body>
+    <div class="page">
+      <header>
+        <span class="brand">einfach.</span><span class="edition">STATE MANAGEMENT NOTES / 001</span>
+      </header>
+      <main>
+        <section class="intro">
+          <div>
+            <span class="kicker">THE ATOM STATE LIBRARY</span>
+            <h1>把状态，<br />还给代码。</h1>
+          </div>
+          <p class="summary">一个更安静的状态管理库：不让框架、术语或仪式感遮住你的业务逻辑。</p>
+        </section>
+        <section class="statement">
+          <div class="statement-copy">
+            <span class="kicker">THE PREMISE</span>
+            <h2>每一份状态，都是一个值得被命名的事实。</h2>
+            <p>
+              Einfach 从 atom 开始。小、明确、可组合的状态单元，让复杂界面保有可以阅读的因果关系。
+            </p>
+          </div>
+          <div class="code">
+            <small>count.ts</small
+            ><code
+              >const countAtom = atom(0)<br /><br />const doubledAtom = atom((get) =&gt;<br />&nbsp;&nbsp;get(countAtom)
+              * 2<br />)</code
+            ><small>TypeScript first</small>
+          </div>
+        </section>
+        <section class="sections">
+          <div>
+            <span>01 / CORE</span>
+            <h3>从框架外开始</h3>
+            <p>核心模型独立存在，视图层只是订阅与呈现。</p>
+          </div>
+          <div>
+            <span>02 / BINDINGS</span>
+            <h3>各用各的框架</h3>
+            <p>React 和 Solid 使用各自熟悉的方式，却共享状态语义。</p>
+          </div>
+          <div>
+            <span>03 / REFERENCE</span>
+            <h3>先读概念，再查 API</h3>
+            <p>把教程、参考与示例分开，让文档像一本好读的技术书。</p>
+          </div>
+        </section>
+      </main>
+      <footer>
+        <span>方向 B：适合强调「可信赖、长期可读的文档品牌」。</span><span>Einfach / v0.4.0</span>
+      </footer>
+    </div>
+  </body>
+</html>
