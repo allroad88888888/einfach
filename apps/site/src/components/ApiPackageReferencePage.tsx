@@ -9,11 +9,6 @@ function sectionAnchor(packageId: string, sectionIndex: number) {
   return `${packageAnchor(packageId)}-section-${sectionIndex + 1}`
 }
 
-function getCompactUsage(code: string) {
-  const firstLine = code.split('\n')[0]
-  return firstLine.length > 74 ? `${firstLine.slice(0, 71)}…` : firstLine
-}
-
 export function ApiPackageReferencePage({ apiPackage }: { apiPackage: ApiPackage }) {
   const apiCount = apiPackage.sections.reduce((sum, section) => sum + section.entries.length, 0)
 
@@ -72,26 +67,27 @@ export function ApiPackageReferencePage({ apiPackage }: { apiPackage: ApiPackage
                 key={section.title}
               >
                 <div className="api-section-heading">
-                  <strong>{section.title}</strong>
-                  <b>{section.entries.length} 项</b>
+                  <div>
+                    <p>MODULE</p>
+                    <h2>{section.title}</h2>
+                    <span>{section.description}</span>
+                  </div>
+                  <b>{section.entries.length} APIs</b>
                 </div>
                 <div className="api-entries">
                   {section.entries.map((entry) => (
                     <article className="api-entry" key={entry.name}>
-                      <div className="api-entry-heading">
+                      <header className="api-entry-heading">
                         <span className="api-entry-meta">
                           <strong>{entry.name}</strong>
                           <span className="api-role">{entry.role}</span>
                           {entry.kind === 'type' ? <span className="api-kind">TYPE</span> : null}
                         </span>
-                        <code title={entry.code}>{getCompactUsage(entry.code)}</code>
-                      </div>
-                      <div className="api-entry-detail">
-                        <p>{entry.description}</p>
-                        <pre>
-                          <code>{entry.code}</code>
-                        </pre>
-                      </div>
+                      </header>
+                      <p className="api-entry-description">{entry.description}</p>
+                      <pre>
+                        <code>{entry.code}</code>
+                      </pre>
                     </article>
                   ))}
                 </div>
